@@ -510,7 +510,10 @@ export function TerminalPane({
     <section
       ref={pane}
       class={`terminal-pane ${active ? "active" : ""}`}
-      style={{ "--terminal-color": terminal.color }}
+      style={{
+        "--terminal-color": terminal.color,
+        "--terminal-background": mixedBackground(theme, terminal.color),
+      }}
       onPointerDown={onActivate}
     >
       <header
