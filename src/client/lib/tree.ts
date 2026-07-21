@@ -20,6 +20,18 @@ interface MutableNode {
   children: Map<string, MutableNode>;
 }
 
+const compactPath = (node: TerminalTreeNode): TerminalTreeNode => {
+  if (node.workspaceCwd || node.children.length !== 1) return node;
+
+  const [child] = node.children;
+  if (!child || child.terminal) return node;
+
+  return {
+    ...child,
+    name: node.name === "/" ? `/${child.name}` : `${node.name}/${child.name}`,
+  };
+};
+
 export function buildTerminalTree(terminals: TerminalInfo[]): TerminalTreeNode[] {
   const roots = new Map<string, MutableNode>();
   for (const terminal of terminals) {
@@ -54,14 +66,16 @@ export function buildTerminalTree(terminals: TerminalInfo[]): TerminalTreeNode[]
         const rightFolder = right.children.size > 0;
         return leftFolder === rightFolder ? left.name.localeCompare(right.name) : leftFolder ? -1 : 1;
       })
-      .map((node) => ({
-        key: node.key,
-        name: node.name,
-        path: node.path,
-        terminal: node.terminal,
-        workspaceCwd: node.workspaceCwd,
-        color: node.color,
-        children: freeze(node.children),
-      }));
+      .map((node) =>
+        compactPath({
+          key: node.key,
+          name: node.name,
+          path: node.path,
+          terminal: node.terminal,
+          workspaceCwd: node.workspaceCwd,
+          color: node.color,
+          children: freeze(node.children),
+        }),
+      );
   return freeze(roots);
 }

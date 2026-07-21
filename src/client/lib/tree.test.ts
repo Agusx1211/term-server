@@ -27,10 +27,10 @@ describe("buildTerminalTree", () => {
       terminal("shell", "/tmp/scratch", "shell"),
     ]);
 
-    expect(tree.map((node) => node.name)).toEqual(["/", "~"]);
-    expect(tree[1]?.children[0]?.children[0]?.children.map((node) => node.name)).toEqual(["api", "worker"]);
-    expect(tree[1]?.children[0]?.children[0]?.children[0]?.terminal?.id).toBe("api");
-    expect(tree[1]?.children[0]?.children[0]?.workspaceCwd).toBe("~/services/production");
+    expect(tree.map((node) => node.name)).toEqual(["/tmp/scratch", "~/services/production"]);
+    expect(tree[1]?.children.map((node) => node.name)).toEqual(["api", "worker"]);
+    expect(tree[1]?.children[0]?.terminal?.id).toBe("api");
+    expect(tree[1]?.workspaceCwd).toBe("~/services/production");
   });
 
   it("groups multiple terminals inside one workspace", () => {
@@ -43,5 +43,30 @@ describe("buildTerminalTree", () => {
   it("keeps duplicate process names as separate terminal leaves", () => {
     const tree = buildTerminalTree([terminal("one", "~", "codex"), terminal("two", "~", "codex")]);
     expect(tree[0]?.children.map((node) => node.terminal?.id)).toEqual(["one", "two"]);
+  });
+
+  it("compacts single-child workspace paths", () => {
+    const tree = buildTerminalTree([terminal("shell", "~/path/a/b/c", "shell")]);
+
+    expect(tree).toHaveLength(1);
+    expect(tree[0]).toMatchObject({
+      name: "~/path/a/b/c",
+      path: "~/path/a/b/c",
+      workspaceCwd: "~/path/a/b/c",
+    });
+    expect(tree[0]?.children[0]?.terminal?.id).toBe("shell");
+  });
+
+  it("stops compaction where a workspace owns terminals or branches", () => {
+    const tree = buildTerminalTree([
+      terminal("parent", "~/path/a/b", "parent"),
+      terminal("child-c", "~/path/a/b/c", "child-c"),
+      terminal("child-d", "~/path/a/b/d", "child-d"),
+    ]);
+
+    expect(tree[0]).toMatchObject({ name: "~/path/a/b", path: "~/path/a/b", workspaceCwd: "~/path/a/b" });
+    expect(tree[0]?.children.map((node) => node.name)).toEqual(["c", "d", "parent"]);
+    expect(tree[0]?.children[0]?.path).toBe("~/path/a/b/c");
+    expect(tree[0]?.children[1]?.path).toBe("~/path/a/b/d");
   });
 });
