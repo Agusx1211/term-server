@@ -35,6 +35,7 @@ const defaultConfig: ClientConfig = {
   maxPanes: 4,
   secure: true,
   hostname: "",
+  passwordManagedExternally: true,
   pi: { available: false, enabled: false, model: "", models: [] },
 };
 const dropPositions: DropPosition[] = ["left", "top", "center", "bottom", "right"];
@@ -512,6 +513,7 @@ export function App() {
           creating={creating}
           theme={theme}
           pi={config.pi}
+          passwordManagedExternally={config.passwordManagedExternally}
           notificationsEnabled={notificationsEnabled}
           fileRoot={terminalById.get(activeId ?? "")?.cwd ?? "~"}
           onMobileClose={closeMobileSidebar}
@@ -522,6 +524,7 @@ export function App() {
           onTheme={setTheme}
           onPiChange={(enabled, model) => void updatePiConfig(enabled, model)}
           onNotificationsChange={(enabled) => void updateNotifications(enabled)}
+          onPasswordChanged={() => showNotice("Password changed; other sessions were signed out")}
           onOpenFile={(entry) => void openResource({ path: entry.path }, entry)}
           onLogout={() => void logout()}
           onDragStart={(id) => {

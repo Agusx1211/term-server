@@ -37,6 +37,7 @@ import {
 } from "../lib/sidebar-width";
 import { buildTerminalTree, type TerminalTreeNode } from "../lib/tree";
 import type { ThemeName } from "./TerminalPane";
+import { ChangePassword } from "./ChangePassword";
 import { FileExplorer } from "./FileExplorer";
 
 interface SidebarProps {
@@ -46,6 +47,7 @@ interface SidebarProps {
   creating: boolean;
   theme: ThemeName;
   pi: PiConfig;
+  passwordManagedExternally: boolean;
   notificationsEnabled: boolean;
   fileRoot: string;
   onMobileClose: () => void;
@@ -56,6 +58,7 @@ interface SidebarProps {
   onTheme: (theme: ThemeName) => void;
   onPiChange: (enabled: boolean, model: string) => void;
   onNotificationsChange: (enabled: boolean) => void;
+  onPasswordChanged: () => void;
   onOpenFile: (entry: FileEntry) => void;
   onLogout: () => void;
   onDragStart: (id: string) => void;
@@ -205,6 +208,7 @@ export function Sidebar({
   creating,
   theme,
   pi,
+  passwordManagedExternally,
   notificationsEnabled,
   fileRoot,
   onMobileClose,
@@ -215,6 +219,7 @@ export function Sidebar({
   onTheme,
   onPiChange,
   onNotificationsChange,
+  onPasswordChanged,
   onOpenFile,
   onLogout,
   onDragStart,
@@ -427,6 +432,11 @@ export function Sidebar({
             <p class="settings-hint">Pi was not found in the daemon’s PATH.</p>
           )}
           <p class="settings-hint">Titles use your submitted message; completion summaries use recent terminal output.</p>
+          <div class="settings-title settings-section-title">Security</div>
+          <ChangePassword
+            managedExternally={passwordManagedExternally}
+            onChanged={onPasswordChanged}
+          />
           <button class="settings-logout" onClick={onLogout}><LogOut size={14} /> Sign out</button>
         </section>
       )}
