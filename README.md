@@ -72,6 +72,15 @@ On a phone, term-server keeps that pane layout but shows one terminal at a time.
 
 Closing a pane keeps the PTY running. The trash action kills it. A normal shell exit removes the terminal automatically.
 
+### Install on a phone
+
+Serve term-server from a trusted HTTPS origin, then open it in your phone's browser:
+
+- On iPhone or iPad, use Safari's **Share → Add to Home Screen** action.
+- On Android, use the browser menu's **Install app** or **Add to Home screen** action.
+
+The installed app launches in its own standalone window and respects the device safe areas. Its interface assets are cached for resilient loading, but terminals, files, and authentication still require a connection to the term-server daemon. A browser warning bypass for the generated self-signed certificate may not qualify as a trusted origin; use a trusted certificate or TLS-terminating reverse proxy when installing from another device.
+
 Useful shortcuts:
 
 | Action | Shortcut |
