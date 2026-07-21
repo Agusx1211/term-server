@@ -1,0 +1,11 @@
+node_modules/
+target/
+dist/
+artifacts/
+coverage/
+*.log
+.DS_Store
+.env
+.term-server/
+*.pem
+*.key

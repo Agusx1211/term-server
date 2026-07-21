@@ -1,0 +1,15 @@
+[Unit]
+Description=term-server web terminal workspace
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/term-server/environment
+ExecStart=%h/.local/bin/term-server
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=10
+LimitNOFILE=65536
+
+[Install]
+WantedBy=default.target

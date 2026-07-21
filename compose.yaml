@@ -1,0 +1,17 @@
+services:
+  term-server:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8090:8090"
+    environment:
+      TERM_SERVER_PASSWORD: ${TERM_SERVER_PASSWORD:?set TERM_SERVER_PASSWORD}
+    volumes:
+      - term-server-data:/data
+      # Add project mounts as needed; UID/GID 10001 must be able to read them.
+      # - ./projects:/workspace
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  term-server-data:

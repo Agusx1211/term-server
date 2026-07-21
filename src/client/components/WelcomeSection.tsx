@@ -1,0 +1,73 @@
+import { useState } from "preact/hooks";
+import { Plus, ChevronDown, ChevronUp, Sparkles } from "lucide-preact";
+import { getAsciiArt, getDailyText } from "../lib/welcome-data";
+
+interface WelcomeSectionProps {
+  terminalsCount: number;
+  maxPanes: number;
+  creating: boolean;
+  onCreate: () => void;
+}
+
+const HOW_TO_USE_STEPS = [
+  { icon: "➕", text: "Click **New terminal** to create a persistent session" },
+  { icon: "📂", text: "Sessions appear in the sidebar — click to open them" },
+  { icon: "✂️", text: "Drag terminals to split panes (left, right, top, bottom)" },
+  { icon: "✏️", text: "Right-click a session to rename it" },
+  { icon: "🧠", text: "Enable Pi in settings for AI-powered terminal intelligence" },
+  { icon: "🔔", text: "Turn on notifications to get alerts when agents finish" },
+];
+
+export function WelcomeSection({
+  terminalsCount,
+  maxPanes,
+  creating,
+  onCreate,
+}: WelcomeSectionProps) {
+  const today = new Date();
+  const asciiLines = getAsciiArt(today);
+  const daily = getDailyText(maxPanes, today);
+  const [showHowTo, setShowHowTo] = useState(false);
+
+  return (
+    <section class="welcome">
+      <pre class="welcome-ascii">{asciiLines.join("\n")}</pre>
+      <p class="eyebrow">TERMINAL WORKSPACE</p>
+      <h1>{daily.title}</h1>
+      <p class="welcome-body">{daily.body}</p>
+      <button class="button primary" onClick={onCreate} disabled={creating}>
+        <Plus size={16} /> New terminal
+      </button>
+      <button
+        class="button how-to-button"
+        onClick={() => setShowHowTo(!showHowTo)}
+        aria-expanded={showHowTo}
+      >
+        {showHowTo ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+        {showHowTo ? "Hide how to use" : "How to use"}
+        <Sparkles size={14} />
+      </button>
+      {showHowTo && (
+        <div class="how-to-panel">
+          <h3>Quick start guide</h3>
+          <ul>
+            {HOW_TO_USE_STEPS.map((step, i) => (
+              <li key={i}>
+                <span class="step-icon">{step.icon}</span>
+                <span
+                  class="step-text"
+                  dangerouslySetInnerHTML={{
+                    __html: step.text.replace(
+                      /\*\*(.+?)\*\*/g,
+                      "<b>$1</b>",
+                    ),
+                  }}
+                />
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </section>
+  );
+}

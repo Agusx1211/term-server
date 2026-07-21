@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - run: npm run typecheck
+      - run: npm run test:web
+      - run: npm run build:client
+
+  artifacts:
+    name: Linux ${{ matrix.architecture }} artifact
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: x86_64
+            runner: ubuntu-22.04
+          - architecture: aarch64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.architecture }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build:client
+      - run: cargo build --release --locked
+      - run: scripts/package-release.sh "${{ matrix.architecture }}"
+        env:
+          SOURCE_DATE_EPOCH: 0
+      - uses: actions/upload-artifact@v7
+        with:
+          name: term-server-linux-${{ matrix.architecture }}
+          path: artifacts/term-server-linux-${{ matrix.architecture }}.tar.gz
+          if-no-files-found: error
+
+  publish-main:
+    name: Publish rolling main release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: artifacts
+    runs-on: ubuntu-22.04
+    concurrency:
+      group: publish-main
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: term-server-linux-*
+          path: artifacts
+          merge-multiple: true
+      - name: Generate checksums
+        working-directory: artifacts
+        run: sha256sum term-server-linux-*.tar.gz > SHA256SUMS
+      - name: Move the rolling tag
+        run: |
+          git tag --force main "$GITHUB_SHA"
+          git push --force origin refs/tags/main
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view main >/dev/null 2>&1; then
+            gh release edit main \
+              --title "Latest main build" \
+              --notes "Automated build of \`main\` at ${GITHUB_SHA}." \
+              --prerelease
+          else
+            gh release create main \
+              --title "Latest main build" \
+              --notes "Automated build of \`main\` at ${GITHUB_SHA}." \
+              --prerelease
+          fi
+          gh release upload main artifacts/term-server-linux-*.tar.gz artifacts/SHA256SUMS --clobber

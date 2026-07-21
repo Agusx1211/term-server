@@ -1,0 +1,161 @@
+export type TerminalStatus = "running" | "exited";
+export type AgentStatus = "working" | "idle" | "finished";
+
+export interface AgentInfo {
+  kind: "codex" | "claude" | "pi" | string;
+  status: AgentStatus;
+  statusChangedAt: number;
+  startedAt: number;
+  revision: number;
+  summary: string | null;
+}
+
+export interface TerminalInfo {
+  id: string;
+  name: string;
+  workspace: string;
+  path: string;
+  cwd: string;
+  shell: string;
+  program: string;
+  color: string;
+  agent: AgentInfo | null;
+  createdAt: number;
+  pid: number | null;
+  status: TerminalStatus;
+  exitCode: number | null;
+  clients: number;
+}
+
+export interface CreateTerminalRequest {
+  path?: string;
+  cwd?: string;
+  shell?: string;
+  cloneFrom?: string;
+}
+
+export interface RenameTerminalRequest {
+  path: string;
+}
+
+export type ProcessStatus = "running" | "exited";
+export type ProcessActivityKind = "input" | "output";
+
+export interface ProcessRecord {
+  id: string;
+  pid: number;
+  parentPid: number;
+  parentId: string | null;
+  processGroup: number;
+  command: string;
+  arguments: string[];
+  cwd: string | null;
+  state: string;
+  status: ProcessStatus;
+  foreground: boolean;
+  observedAt: number;
+  lastSeenAt: number;
+  endedAt: number | null;
+  cpuTicks: number;
+}
+
+export interface ProcessActivityEvent {
+  sequence: number;
+  timestamp: number;
+  kind: ProcessActivityKind;
+  processGroup: number | null;
+  text: string;
+  bytes: number;
+  hidden: boolean;
+  truncated: boolean;
+}
+
+export interface ProcessInspectorSnapshot {
+  supported: boolean;
+  exactAttribution: boolean;
+  sampledAt: number;
+  processes: ProcessRecord[];
+  activity: ProcessActivityEvent[];
+  resetActivity: boolean;
+}
+
+export interface ClientConfig {
+  scrollbackLines: number;
+  maxPanes: number;
+  secure: boolean;
+  hostname: string;
+  pi: PiConfig;
+}
+
+export interface PiModel {
+  id: string;
+  label: string;
+}
+
+export interface PiConfig {
+  available: boolean;
+  enabled: boolean;
+  model: string;
+  models: PiModel[];
+}
+
+export interface UpdatePiConfig {
+  enabled: boolean;
+  model: string;
+}
+
+export type FileEntryKind = "file" | "directory";
+
+export interface FileEntry {
+  path: string;
+  name: string;
+  kind: FileEntryKind;
+  size: number;
+  modifiedAt: number;
+  mime: string;
+  image: boolean;
+  editable: boolean;
+}
+
+export interface DirectoryListing {
+  path: string;
+  parent: string | null;
+  entries: FileEntry[];
+  truncated: boolean;
+}
+
+export interface FileSearchResults {
+  root: string;
+  entries: FileEntry[];
+  truncated: boolean;
+}
+
+export interface FileDocument {
+  path: string;
+  name: string;
+  mime: string;
+  modifiedAt: number;
+  version: string;
+  content: string;
+}
+
+export interface FileTarget {
+  path: string;
+  cwd?: string;
+}
+
+export interface SaveFileRequest extends FileTarget {
+  content: string;
+  version: string;
+}
+
+export type ClientTerminalMessage =
+  | { type: "input"; data: string }
+  | { type: "resize"; cols: number; rows: number }
+  | { type: "ping" };
+
+export type ServerTerminalMessage =
+  | { type: "ready"; terminal: TerminalInfo }
+  | { type: "exit"; exitCode: number }
+  | { type: "pong" }
+  | { type: "error"; message: string };

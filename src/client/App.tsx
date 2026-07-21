@@ -1,0 +1,664 @@
+import { useEffect, useMemo, useRef, useState } from "preact/hooks";
+import { lazy, Suspense } from "preact/compat";
+import { Menu, Plus, ShieldCheck } from "lucide-preact";
+import type { ClientConfig, FileEntry, FileTarget, TerminalInfo } from "../shared/types";
+import { api, ApiError } from "./lib/api";
+import {
+  arrangeLayout,
+  insertBalanced,
+  isPaneLayout,
+  layoutFromIds,
+  paneIds as idsFromLayout,
+  paneLeaf,
+  paneRects,
+  pruneLayout,
+  reconcileMounted,
+  removePane,
+  TERMINAL_DRAG_TYPE,
+  type DropPosition,
+  type PaneLayout,
+} from "./lib/layout";
+import { Login } from "./components/Login";
+import { Sidebar } from "./components/Sidebar";
+import { TermServerLogo } from "./components/TermServerLogo";
+import { WelcomeSection } from "./components/WelcomeSection";
+import { ResourceTabBar, type ResourceTab } from "./components/ResourceTabs";
+import type { ThemeName } from "./components/TerminalPane";
+
+const TerminalPane = lazy(() =>
+  import("./components/TerminalPane").then((module) => ({ default: module.TerminalPane })),
+);
+const ResourceDocuments = lazy(() => import("./components/ResourceWorkspace"));
+
+const defaultConfig: ClientConfig = {
+  scrollbackLines: 200_000,
+  maxPanes: 4,
+  secure: true,
+  hostname: "",
+  pi: { available: false, enabled: false, model: "", models: [] },
+};
+const dropPositions: DropPosition[] = ["left", "top", "center", "bottom", "right"];
+
+const initialTheme = (): ThemeName => {
+  const stored = localStorage.getItem("term-server:theme");
+  if (stored === "dark" || stored === "light") return stored;
+  return matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+};
+
+const initialPanes = (): string[] => {
+  try {
+    const value = JSON.parse(localStorage.getItem("term-server:panes") ?? "[]");
+    return Array.isArray(value) && value.every((item) => typeof item === "string") ? value : [];
+  } catch {
+    return [];
+  }
+};
+
+const initialPaneLayout = (): PaneLayout | null => {
+  try {
+    const stored = JSON.parse(localStorage.getItem("term-server:layout") ?? "null") as unknown;
+    if (isPaneLayout(stored)) return stored;
+  } catch {
+    // Fall back to the previous flat pane state.
+  }
+  return layoutFromIds(initialPanes());
+};
+
+const initialNotifications = () =>
+  localStorage.getItem("term-server:notifications") === "true" &&
+  typeof Notification !== "undefined" &&
+  Notification.permission === "granted";
+
+export function App() {
+  const [authenticated, setAuthenticated] = useState<boolean | null>(null);
+  const [terminals, setTerminals] = useState<TerminalInfo[]>([]);
+  const [config, setConfig] = useState(defaultConfig);
+  const [layout, setLayout] = useState<PaneLayout | null>(initialPaneLayout);
+  const [mountedIds, setMountedIds] = useState<string[]>(initialPanes);
+  const [activeId, setActiveId] = useState<string>();
+  const [draggedId, setDraggedId] = useState<string>();
+  const [dropTarget, setDropTarget] = useState<{ id: string; position: DropPosition }>();
+  const [theme, setTheme] = useState<ThemeName>(initialTheme);
+  const [creating, setCreating] = useState(false);
+  const [notice, setNotice] = useState("");
+  const [mobileSidebar, setMobileSidebar] = useState(false);
+  const [notificationsEnabled, setNotificationsEnabled] = useState(initialNotifications);
+  const [resources, setResources] = useState<ResourceTab[]>([]);
+  const [activeResource, setActiveResource] = useState<string>();
+  const agentEventsInitialized = useRef(false);
+  const deliveredAgentEvents = useRef(new Map<string, number>());
+  const pendingAgentNotifications = useRef(new Map<string, { event: number; timer: number }>());
+  const terminalsRef = useRef(terminals);
+  terminalsRef.current = terminals;
+  const paneIds = useMemo(() => idsFromLayout(layout), [layout]);
+
+  const showNotice = (message: string) => {
+    setNotice(message);
+    window.setTimeout(() => setNotice((current) => (current === message ? "" : current)), 2400);
+  };
+
+  const loadWorkspace = async () => {
+    try {
+      const [nextConfig, nextTerminals] = await Promise.all([api.config(), api.terminals()]);
+      const runningTerminals = nextTerminals.filter((terminal) => terminal.status === "running");
+      setConfig(nextConfig);
+      setTerminals(runningTerminals);
+      setLayout((current) => {
+        const available = new Set(runningTerminals.map((terminal) => terminal.id));
+        const kept = pruneLayout(current, available);
+        return kept ?? (runningTerminals[0] ? paneLeaf(runningTerminals[0].id) : null);
+      });
+      setActiveId((current) =>
+        current && runningTerminals.some((terminal) => terminal.id === current)
+          ? current
+          : runningTerminals[0]?.id,
+      );
+      setAuthenticated(true);
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401) setAuthenticated(false);
+      else showNotice(error instanceof Error ? error.message : "Unable to load workspace");
+    }
+  };
+
+  useEffect(() => {
+    void api
+      .session()
+      .then(({ authenticated: active }) => {
+        setAuthenticated(active);
+        if (active) void loadWorkspace();
+      })
+      .catch(() => setAuthenticated(false));
+  }, []);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem("term-server:theme", theme);
+  }, [theme]);
+
+  useEffect(() => {
+    localStorage.setItem("term-server:panes", JSON.stringify(paneIds));
+    localStorage.setItem("term-server:layout", JSON.stringify(layout));
+  }, [paneIds, layout]);
+
+  useEffect(() => {
+    if (!authenticated) return;
+    const refresh = () => {
+      void api
+        .terminals()
+        .then((next) => {
+          const running = next.filter((terminal) => terminal.status === "running");
+          setTerminals(running);
+          const available = new Set(running.map((terminal) => terminal.id));
+          setLayout((current) => pruneLayout(current, available));
+        })
+        .catch((error) => {
+          if (error instanceof ApiError && error.status === 401) setAuthenticated(false);
+        });
+    };
+    const timer = window.setInterval(refresh, 1500);
+    return () => clearInterval(timer);
+  }, [authenticated]);
+
+  useEffect(() => {
+    if (!authenticated) {
+      agentEventsInitialized.current = false;
+      deliveredAgentEvents.current.clear();
+      return;
+    }
+    if (!agentEventsInitialized.current) {
+      for (const terminal of terminals) {
+        if (terminal.agent) deliveredAgentEvents.current.set(terminal.id, terminal.agent.statusChangedAt);
+      }
+      agentEventsInitialized.current = true;
+      return;
+    }
+
+    const deliver = (terminalId: string, event: number) => {
+      const terminal = terminalsRef.current.find((candidate) => candidate.id === terminalId);
+      if (!terminal?.agent || terminal.agent.statusChangedAt !== event) return;
+      deliveredAgentEvents.current.set(terminalId, event);
+      const pending = pendingAgentNotifications.current.get(terminalId);
+      if (pending) clearTimeout(pending.timer);
+      pendingAgentNotifications.current.delete(terminalId);
+      if (!notificationsEnabled || typeof Notification === "undefined" || Notification.permission !== "granted") return;
+      const body = terminal.agent.summary ?? (
+        terminal.agent.status === "idle"
+          ? `${terminal.agent.kind} is idle and ready for input in ${terminal.workspace}`
+          : `${terminal.agent.kind} finished in ${terminal.workspace}`
+      );
+      const notification = new Notification(terminal.name, {
+        body,
+        tag: `term-server:${terminal.id}:${event}`,
+      });
+      notification.onclick = () => {
+        window.focus();
+        openTerminal(terminal.id);
+        notification.close();
+      };
+    };
+
+    const activeIds = new Set(terminals.map((terminal) => terminal.id));
+    for (const [id, pending] of pendingAgentNotifications.current) {
+      if (!activeIds.has(id)) {
+        clearTimeout(pending.timer);
+        pendingAgentNotifications.current.delete(id);
+      }
+    }
+    for (const terminal of terminals) {
+      const agent = terminal.agent;
+      if (!agent || agent.status === "working") {
+        if (agent) deliveredAgentEvents.current.set(terminal.id, agent.statusChangedAt);
+        continue;
+      }
+      if (deliveredAgentEvents.current.get(terminal.id) === agent.statusChangedAt) continue;
+      const pending = pendingAgentNotifications.current.get(terminal.id);
+      if (pending?.event === agent.statusChangedAt) {
+        if (agent.summary) deliver(terminal.id, agent.statusChangedAt);
+        continue;
+      }
+      if (pending) clearTimeout(pending.timer);
+      if (config.pi.enabled && !agent.summary) {
+        const event = agent.statusChangedAt;
+        const timer = window.setTimeout(() => deliver(terminal.id, event), 12_000);
+        pendingAgentNotifications.current.set(terminal.id, { event, timer });
+      } else {
+        deliver(terminal.id, agent.statusChangedAt);
+      }
+    }
+  }, [authenticated, terminals, notificationsEnabled, config.pi.enabled]);
+
+  useEffect(() => () => {
+    for (const pending of pendingAgentNotifications.current.values()) clearTimeout(pending.timer);
+  }, []);
+
+  useEffect(() => {
+    const warnUnsaved = (event: BeforeUnloadEvent) => {
+      if (!resources.some((resource) => resource.dirty)) return;
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warnUnsaved);
+    return () => window.removeEventListener("beforeunload", warnUnsaved);
+  }, [resources]);
+
+  useEffect(() => {
+    if (paneIds.length && !paneIds.includes(activeId ?? "")) setActiveId(paneIds[0]);
+  }, [paneIds, activeId]);
+
+  const terminalById = useMemo(() => new Map(terminals.map((terminal) => [terminal.id, terminal])), [terminals]);
+  const visibleTerminals = paneIds.map((id) => terminalById.get(id)).filter(Boolean) as TerminalInfo[];
+  const renderedIds = [...mountedIds, ...paneIds.filter((id) => !mountedIds.includes(id))];
+  const mountedTerminals = renderedIds.map((id) => terminalById.get(id)).filter(Boolean) as TerminalInfo[];
+  const rectangles = useMemo(() => paneRects(layout), [layout]);
+  const previewLayout = useMemo(
+    () =>
+      draggedId && dropTarget
+        ? arrangeLayout(layout, draggedId, dropTarget.id, dropTarget.position, config.maxPanes)
+        : undefined,
+    [layout, draggedId, dropTarget, config.maxPanes],
+  );
+  const displayedLayout = previewLayout ?? (draggedId && !layout ? paneLeaf(draggedId) : layout) ?? null;
+  const displayedRectangles = useMemo(() => paneRects(displayedLayout), [displayedLayout]);
+  const displayedRectangleById = useMemo(
+    () => new Map(displayedRectangles.map((rectangle) => [rectangle.id, rectangle])),
+    [displayedRectangles],
+  );
+
+  useEffect(() => {
+    const available = new Set(terminals.map((terminal) => terminal.id));
+    const cacheLimit = Math.max(config.maxPanes, 6);
+    setMountedIds((current) => {
+      const next = reconcileMounted(current, paneIds, available, cacheLimit);
+      return next.length === current.length && next.every((id, index) => id === current[index]) ? current : next;
+    });
+  }, [paneIds, terminals, config.maxPanes]);
+
+  const openTerminal = (id: string, split = false) => {
+    setLayout((current) => {
+      const currentIds = idsFromLayout(current);
+      if (currentIds.includes(id)) return current;
+      if (!current) return paneLeaf(id);
+      const targetId = activeId && currentIds.includes(activeId) ? activeId : currentIds[0]!;
+      if (split && currentIds.length < config.maxPanes) {
+        return arrangeLayout(current, id, targetId, "right", config.maxPanes) ?? current;
+      }
+      return arrangeLayout(current, id, targetId, "center", config.maxPanes) ?? current;
+    });
+    setActiveId(id);
+    setActiveResource(undefined);
+    setMobileSidebar(false);
+  };
+
+  const openResource = async (target: FileTarget, known?: FileEntry) => {
+    try {
+      const file = known ?? await api.fileMetadata(target);
+      if (file.kind === "directory") {
+        showNotice("Open directories from the file explorer");
+        return;
+      }
+      const next: ResourceTab = {
+        path: file.path,
+        name: file.name,
+        type: file.image ? "image" : "text",
+        mime: file.mime,
+        dirty: false,
+      };
+      setResources((current) => current.some((resource) => resource.path === file.path) ? current : [...current, next]);
+      setActiveResource(file.path);
+      setMobileSidebar(false);
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : "Unable to open file");
+    }
+  };
+
+  const closeResource = (path: string) => {
+    const index = resources.findIndex((resource) => resource.path === path);
+    const resource = resources[index];
+    if (!resource) return;
+    if (resource.dirty && !confirm(`Close “${resource.name}” without saving?`)) return;
+    const next = resources.filter((candidate) => candidate.path !== path);
+    setResources(next);
+    if (activeResource === path) setActiveResource(next[Math.min(index, next.length - 1)]?.path);
+  };
+
+  const closePane = (id: string) => {
+    setLayout((current) => removePane(current, id));
+  };
+
+  const forgetTerminal = (id: string) => {
+    setTerminals((current) => current.filter((terminal) => terminal.id !== id));
+    setLayout((current) => removePane(current, id));
+    setMountedIds((current) => current.filter((mounted) => mounted !== id));
+  };
+
+  const finishDrag = () => {
+    setDraggedId(undefined);
+    setDropTarget(undefined);
+  };
+
+  const dropOnPane = (sourceId: string, targetId: string, position: DropPosition) => {
+    const next = arrangeLayout(layout, sourceId, targetId, position, config.maxPanes);
+    if (!next) {
+      showNotice(`A maximum of ${config.maxPanes} panes can be visible`);
+      finishDrag();
+      return;
+    }
+    setLayout(next);
+    setActiveId(sourceId);
+    finishDrag();
+  };
+
+  const createTerminal = async (cwd?: string, cloneFrom?: string) => {
+    setCreating(true);
+    try {
+      const created = await api.createTerminal({ cwd, cloneFrom });
+      setTerminals((current) => [...current, created].sort((left, right) => left.path.localeCompare(right.path)));
+      setLayout((current) => {
+        const currentIds = idsFromLayout(current);
+        if (!current) return paneLeaf(created.id);
+        if (currentIds.length < config.maxPanes) return insertBalanced(current, created.id);
+        const targetId = activeId && currentIds.includes(activeId) ? activeId : currentIds[0]!;
+        return arrangeLayout(current, created.id, targetId, "center", config.maxPanes) ?? current;
+      });
+      setActiveId(created.id);
+      setActiveResource(undefined);
+      setMobileSidebar(false);
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : "Unable to create terminal");
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  const removeTerminal = async (terminal: TerminalInfo) => {
+    if (!confirm(`Kill and remove “${terminal.path}”? The process and its scrollback will be lost.`)) return;
+    try {
+      await api.removeTerminal(terminal.id);
+      forgetTerminal(terminal.id);
+      showNotice(`Removed ${terminal.path}`);
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : "Unable to remove terminal");
+    }
+  };
+
+  const renameTerminal = async (terminal: TerminalInfo) => {
+    const path = prompt("Terminal name", terminal.name)?.trim();
+    if (!path || path === terminal.name) return;
+    try {
+      const renamed = await api.renameTerminal(terminal.id, { path });
+      updateTerminal(renamed);
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : "Unable to rename terminal");
+    }
+  };
+
+  const updateTerminal = (next: TerminalInfo) => {
+    setTerminals((current) => current.map((terminal) => (terminal.id === next.id ? next : terminal)));
+  };
+
+  const updatePiConfig = async (enabled: boolean, model: string) => {
+    try {
+      const pi = await api.updatePiConfig({ enabled, model });
+      setConfig((current) => ({ ...current, pi }));
+      showNotice(enabled ? "Pi terminal intelligence enabled" : "Pi terminal intelligence disabled");
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : "Unable to update Pi settings");
+    }
+  };
+
+  const updateNotifications = async (enabled: boolean) => {
+    if (!enabled) {
+      setNotificationsEnabled(false);
+      localStorage.setItem("term-server:notifications", "false");
+      return;
+    }
+    if (typeof Notification === "undefined") {
+      showNotice("This browser does not support notifications");
+      return;
+    }
+    const permission = Notification.permission === "default" ? await Notification.requestPermission() : Notification.permission;
+    if (permission !== "granted") {
+      showNotice("Browser notification permission was not granted");
+      return;
+    }
+    setNotificationsEnabled(true);
+    localStorage.setItem("term-server:notifications", "true");
+    showNotice("Agent completion notifications enabled");
+  };
+
+  const logout = async () => {
+    try {
+      await api.logout();
+    } finally {
+      setAuthenticated(false);
+      setTerminals([]);
+      setLayout(null);
+      setMountedIds([]);
+      setResources([]);
+      setActiveResource(undefined);
+    }
+  };
+
+  if (authenticated === null) {
+    return (
+      <main class="loading-screen">
+        <TermServerLogo class="brand-mark" />
+        <span>Starting term-server…</span>
+      </main>
+    );
+  }
+  if (!authenticated) return <Login onAuthenticated={() => void loadWorkspace()} />;
+
+  return (
+    <div class="workbench">
+      <div class="workbench-main">
+        <button class="mobile-menu-button" onClick={() => setMobileSidebar(true)} aria-label="Open workspaces">
+          <Menu size={17} />
+        </button>
+        {mobileSidebar && <button class="sidebar-scrim" onClick={() => setMobileSidebar(false)} aria-label="Close sidebar" />}
+        <Sidebar
+          terminals={terminals}
+          activeIds={paneIds}
+          mobileOpen={mobileSidebar}
+          creating={creating}
+          theme={theme}
+          pi={config.pi}
+          notificationsEnabled={notificationsEnabled}
+          fileRoot={terminalById.get(activeId ?? "")?.cwd ?? "~"}
+          onMobileClose={() => setMobileSidebar(false)}
+          onNew={(cwd) => void createTerminal(cwd)}
+          onOpen={(id) => openTerminal(id)}
+          onSplit={(id) => openTerminal(id, true)}
+          onRename={(terminal) => void renameTerminal(terminal)}
+          onTheme={setTheme}
+          onPiChange={(enabled, model) => void updatePiConfig(enabled, model)}
+          onNotificationsChange={(enabled) => void updateNotifications(enabled)}
+          onOpenFile={(entry) => void openResource({ path: entry.path }, entry)}
+          onLogout={() => void logout()}
+          onDragStart={(id) => {
+            setDraggedId(id);
+            setDropTarget(undefined);
+          }}
+          onDragEnd={finishDrag}
+        />
+        <div class={`workspace-area ${resources.length ? "with-resource-tabs" : ""}`}>
+          {resources.length > 0 && (
+            <ResourceTabBar
+              tabs={resources}
+              activePath={activeResource}
+              onTerminal={() => setActiveResource(undefined)}
+              onActivate={setActiveResource}
+              onClose={closeResource}
+            />
+          )}
+          <div class="workspace-stage">
+            <main
+          class={`editor-grid ${draggedId ? "dragging-terminal" : ""} ${activeResource ? "resource-hidden" : ""}`}
+          aria-hidden={Boolean(activeResource)}
+          onDragOver={(event) => {
+            if (draggedId && !visibleTerminals.length) event.preventDefault();
+          }}
+          onDrop={(event) => {
+            if (visibleTerminals.length) return;
+            event.preventDefault();
+            const sourceId = draggedId ?? event.dataTransfer?.getData(TERMINAL_DRAG_TYPE);
+            if (sourceId) openTerminal(sourceId);
+            finishDrag();
+          }}
+        >
+          <Suspense fallback={<div class="terminal-loading">Loading terminal renderer…</div>}>
+            {mountedTerminals.map((terminal) => {
+              const rectangle = displayedRectangleById.get(terminal.id);
+              const visible = Boolean(rectangle);
+              return (
+                <div
+                  key={terminal.id}
+                  class={`pane-slot ${visible ? "" : "cached"}`}
+                  style={
+                    rectangle
+                      ? {
+                          left: `${rectangle.x * 100}%`,
+                          top: `${rectangle.y * 100}%`,
+                          width: `${rectangle.width * 100}%`,
+                          height: `${rectangle.height * 100}%`,
+                        }
+                      : undefined
+                  }
+                >
+                  <TerminalPane
+                    terminal={terminal}
+                    config={config}
+                    theme={theme}
+                    active={visible && terminal.id === activeId && !activeResource}
+                    onActivate={() => setActiveId(terminal.id)}
+                    onClose={() => closePane(terminal.id)}
+                    onRemove={() => void removeTerminal(terminal)}
+                    onClone={() => void createTerminal(undefined, terminal.id)}
+                    onDragStart={() => {
+                      setDraggedId(terminal.id);
+                      setDropTarget(undefined);
+                    }}
+                    onDragEnd={finishDrag}
+                    onExit={() => forgetTerminal(terminal.id)}
+                    onUpdate={updateTerminal}
+                    onNotice={showNotice}
+                    onOpenFile={(target) => void openResource(target)}
+                  />
+                </div>
+              );
+            })}
+          </Suspense>
+          {draggedId && displayedLayout && !mountedTerminals.some((terminal) => terminal.id === draggedId) && (() => {
+            const rectangle = displayedRectangleById.get(draggedId);
+            const terminal = terminalById.get(draggedId);
+            return rectangle ? (
+              <div
+                class="pane-live-placeholder"
+                style={{
+                  left: `${rectangle.x * 100}%`,
+                  top: `${rectangle.y * 100}%`,
+                  width: `${rectangle.width * 100}%`,
+                  height: `${rectangle.height * 100}%`,
+                }}
+              >
+                <div class="pane-live-placeholder-header">
+                  <span class="terminal-color" style={{ background: terminal?.color }} />
+                  <span>{terminal?.name ?? "Terminal"}</span>
+                </div>
+                <div class="pane-live-placeholder-body">Drop to open here</div>
+              </div>
+            ) : null;
+          })()}
+          {draggedId && visibleTerminals.length > 0 && (
+            <div class="layout-drop-surface" aria-hidden="true">
+              {rectangles.map((rectangle) => (
+                <div
+                  key={rectangle.id}
+                  class="layout-drop-target"
+                  style={{
+                    left: `${rectangle.x * 100}%`,
+                    top: `${rectangle.y * 100}%`,
+                    width: `${rectangle.width * 100}%`,
+                    height: `${rectangle.height * 100}%`,
+                  }}
+                >
+                  {dropPositions.map((position) => (
+                    <div
+                      key={position}
+                      class={`pane-drop-zone ${position} ${dropTarget?.id === rectangle.id && dropTarget.position === position ? `active ${previewLayout ? "" : "invalid"}` : ""}`}
+                      onDragEnter={(event) => {
+                        event.preventDefault();
+                        setDropTarget({ id: rectangle.id, position });
+                      }}
+                      onDragOver={(event) => {
+                        event.preventDefault();
+                        if (event.dataTransfer) {
+                          event.dataTransfer.dropEffect = paneIds.includes(draggedId) ? "move" : "copy";
+                        }
+                      }}
+                      onDrop={(event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        const sourceId = draggedId ?? event.dataTransfer?.getData(TERMINAL_DRAG_TYPE);
+                        if (sourceId) dropOnPane(sourceId, rectangle.id, position);
+                      }}
+                    >
+                      <span>
+                        {position === "center"
+                          ? paneIds.includes(draggedId)
+                            ? "swap"
+                            : "replace"
+                          : `split ${position}`}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              ))}
+            </div>
+          )}
+          {!visibleTerminals.length && (
+            <WelcomeSection
+              terminalsCount={terminals.length}
+              maxPanes={config.maxPanes}
+              creating={creating}
+              onCreate={() => void createTerminal()}
+            />
+          )}
+            </main>
+            {resources.length > 0 && (
+              <Suspense fallback={<div class="terminal-loading">Loading file viewer…</div>}>
+                <ResourceDocuments
+                  tabs={resources}
+                  activePath={activeResource}
+                  theme={theme}
+                  onDirty={(path, dirty) => setResources((current) => current.map((resource) => (
+                    resource.path === path ? { ...resource, dirty } : resource
+                  )))}
+                  onNotice={showNotice}
+                />
+              </Suspense>
+            )}
+          </div>
+        </div>
+      </div>
+      <footer class="statusbar">
+        <span class="statusbar-group statusbar-left">
+          <span class="statusbar-item statusbar-connected"><span class="status-dot online" /> Connected</span>
+          {config.hostname && (
+            <span class="statusbar-item statusbar-host" title="Server hostname">
+              {config.hostname}
+            </span>
+          )}
+        </span>
+        <span class="statusbar-group statusbar-right">
+          <span class="statusbar-item">{visibleTerminals.length}/{config.maxPanes} panes</span>
+          <span class="statusbar-item statusbar-scrollback">{config.scrollbackLines.toLocaleString()} line scrollback</span>
+          <span class="statusbar-item" title={config.secure ? "HTTPS enabled" : "HTTPS disabled"}>
+            <ShieldCheck size={13} /> {config.secure ? "HTTPS" : "HTTP"}
+          </span>
+        </span>
+      </footer>
+      {notice && <div class="toast" role="status">{notice}</div>}
+    </div>
+  );
+}
