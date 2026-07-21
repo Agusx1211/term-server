@@ -3,6 +3,7 @@ import { lazy, Suspense } from "preact/compat";
 import { ChevronLeft, ChevronRight, Menu, Plus, ShieldCheck } from "lucide-preact";
 import type { ClientConfig, FileEntry, FileTarget, TerminalInfo } from "../shared/types";
 import { api, ApiError } from "./lib/api";
+import { documentTitle } from "./lib/document-title";
 import {
   arrangeLayout,
   insertBalanced,
@@ -136,6 +137,10 @@ export function App() {
     document.documentElement.dataset.theme = theme;
     localStorage.setItem("term-server:theme", theme);
   }, [theme]);
+
+  useEffect(() => {
+    document.title = documentTitle(terminals);
+  }, [terminals]);
 
   useEffect(() => {
     sessionStorage.setItem("term-server:panes", JSON.stringify(paneIds));
