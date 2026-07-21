@@ -38,45 +38,19 @@ export interface RenameTerminalRequest {
   path: string;
 }
 
-export type ProcessStatus = "running" | "exited";
-export type ProcessActivityKind = "input" | "output";
-
 export interface ProcessRecord {
   id: string;
   pid: number;
-  parentPid: number;
   parentId: string | null;
-  processGroup: number;
   command: string;
   arguments: string[];
   cwd: string | null;
-  state: string;
-  status: ProcessStatus;
   foreground: boolean;
-  observedAt: number;
-  lastSeenAt: number;
-  endedAt: number | null;
-  cpuTicks: number;
-}
-
-export interface ProcessActivityEvent {
-  sequence: number;
-  timestamp: number;
-  kind: ProcessActivityKind;
-  processGroup: number | null;
-  text: string;
-  bytes: number;
-  hidden: boolean;
-  truncated: boolean;
 }
 
 export interface ProcessInspectorSnapshot {
   supported: boolean;
-  exactAttribution: boolean;
-  sampledAt: number;
   processes: ProcessRecord[];
-  activity: ProcessActivityEvent[];
-  resetActivity: boolean;
 }
 
 export interface ClientConfig {

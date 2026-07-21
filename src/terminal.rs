@@ -31,11 +31,6 @@ const QUIET_SAMPLES_TO_IDLE: u8 = 5;
 const SUBMISSION_WORKING_MILLIS: u64 = 12_000;
 const REPORTED_WORKING_FRESH_MILLIS: u64 = 5_000;
 const MAX_CAPTURED_PROMPT_CHARS: usize = 16_000;
-const MAX_PROCESS_RECORDS: usize = 512;
-const MAX_PROCESS_ACTIVITY_EVENTS: usize = 512;
-const MAX_PROCESS_ACTIVITY_BYTES: usize = 512 * 1024;
-const MAX_PROCESS_ACTIVITY_EVENT_BYTES: usize = 32 * 1024;
-const PROCESS_ACTIVITY_COALESCE_MILLIS: u64 = 350;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -118,62 +113,23 @@ pub enum TerminalEvent {
     Exit(u32),
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum ProcessStatus {
-    Running,
-    Exited,
-}
-
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProcessRecord {
     pub id: String,
     pub pid: u32,
-    pub parent_pid: u32,
     pub parent_id: Option<String>,
-    pub process_group: i32,
     pub command: String,
     pub arguments: Vec<String>,
     pub cwd: Option<PathBuf>,
-    pub state: String,
-    pub status: ProcessStatus,
     pub foreground: bool,
-    pub observed_at: u64,
-    pub last_seen_at: u64,
-    pub ended_at: Option<u64>,
-    pub cpu_ticks: u64,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum ProcessActivityKind {
-    Input,
-    Output,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProcessActivityEvent {
-    pub sequence: u64,
-    pub timestamp: u64,
-    pub kind: ProcessActivityKind,
-    pub process_group: Option<i32>,
-    pub text: String,
-    pub bytes: usize,
-    pub hidden: bool,
-    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProcessInspectorSnapshot {
     pub supported: bool,
-    pub exact_attribution: bool,
-    pub sampled_at: u64,
     pub processes: Vec<ProcessRecord>,
-    pub activity: Vec<ProcessActivityEvent>,
-    pub reset_activity: bool,
 }
 
 #[derive(Debug)]
@@ -598,8 +554,8 @@ impl TerminalSession {
         (receiver, snapshot)
     }
 
-    pub fn process_inspector(&self, after: Option<u64>) -> ProcessInspectorSnapshot {
-        self.process_tracker.lock().snapshot(after)
+    pub fn process_inspector(&self) -> ProcessInspectorSnapshot {
+        self.process_tracker.lock().snapshot()
     }
 
     pub fn attach(&self) {
@@ -615,10 +571,6 @@ impl TerminalSession {
             return Ok(());
         }
         let now = current_millis();
-        let input_visible = self.input_visible();
-        self.process_tracker
-            .lock()
-            .record_input(data, input_visible, now);
         let agent_active = self
             .info
             .read()
@@ -683,7 +635,6 @@ impl TerminalSession {
     fn publish(&self, bytes: Bytes) {
         let now = current_millis();
         self.signals.lock().observe(&bytes, now);
-        self.process_tracker.lock().record_output(&bytes, now);
         self.output_bytes
             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         let mut replay = self.replay.lock();
@@ -737,7 +688,7 @@ impl TerminalSession {
         };
         self.process_tracker
             .lock()
-            .update(shell_pid, &processes.descendants(shell_pid), now);
+            .update(shell_pid, &processes.descendants(shell_pid));
         let shell_name = executable_name(&self.info.read().shell);
         let observation = processes.observe(shell_pid, &shell_name);
         let output_bytes = self.output_bytes.load(Ordering::Relaxed);
@@ -888,23 +839,6 @@ impl TerminalSession {
             info.path = terminal_path(&info.workspace, &info.name);
         }
         outcome
-    }
-
-    fn input_visible(&self) -> bool {
-        #[cfg(unix)]
-        {
-            use nix::sys::termios::LocalFlags;
-
-            return self
-                .master
-                .lock()
-                .get_termios()
-                .is_some_and(|termios| termios.local_flags.contains(LocalFlags::ECHO));
-        }
-        #[cfg(not(unix))]
-        {
-            false
-        }
     }
 
     fn pi_request(
@@ -1242,17 +1176,11 @@ impl ProcessIdentity {
 
 #[derive(Debug, Default)]
 struct ProcessTracker {
-    records: HashMap<ProcessIdentity, ProcessRecord>,
-    activity: VecDeque<ProcessActivityEvent>,
-    activity_bytes: usize,
-    next_sequence: u64,
-    current_foreground_group: Option<i32>,
-    sampled_at: u64,
+    records: Vec<ProcessRecord>,
 }
 
 impl ProcessTracker {
-    fn update(&mut self, shell_pid: u32, processes: &[&ProcessInfo], now: u64) {
-        self.sampled_at = now;
+    fn update(&mut self, shell_pid: u32, processes: &[&ProcessInfo]) {
         let identities = processes
             .iter()
             .map(|process| {
@@ -1265,177 +1193,43 @@ impl ProcessTracker {
                 )
             })
             .collect::<HashMap<_, _>>();
-        let active = identities.values().copied().collect::<HashSet<_>>();
         let foreground_group = processes
             .iter()
             .find(|process| process.pid == shell_pid)
             .map(|process| process.foreground_group)
             .filter(|group| *group > 0);
-        self.current_foreground_group = foreground_group;
 
-        for process in processes {
-            let identity = identities[&process.pid];
-            let parent_id = identities
-                .get(&process.parent)
-                .copied()
-                .map(ProcessIdentity::label);
-            let foreground = foreground_group == Some(process.group);
-            let record = self
-                .records
-                .entry(identity)
-                .or_insert_with(|| ProcessRecord {
+        self.records = processes
+            .iter()
+            .map(|process| {
+                let identity = identities[&process.pid];
+                ProcessRecord {
                     id: identity.label(),
                     pid: process.pid,
-                    parent_pid: process.parent,
-                    parent_id: parent_id.clone(),
-                    process_group: process.group,
+                    parent_id: identities
+                        .get(&process.parent)
+                        .copied()
+                        .map(ProcessIdentity::label),
                     command: process.command.clone(),
                     arguments: process.arguments.clone(),
                     cwd: process.cwd.clone(),
-                    state: process.state.to_string(),
-                    status: ProcessStatus::Running,
-                    foreground,
-                    observed_at: now,
-                    last_seen_at: now,
-                    ended_at: None,
-                    cpu_ticks: process.cpu_ticks,
-                });
-            record.parent_pid = process.parent;
-            record.parent_id = parent_id;
-            record.process_group = process.group;
-            record.command.clone_from(&process.command);
-            if !process.arguments.is_empty() {
-                record.arguments.clone_from(&process.arguments);
-            }
-            if process.cwd.is_some() {
-                record.cwd.clone_from(&process.cwd);
-            }
-            record.state = process.state.to_string();
-            record.status = ProcessStatus::Running;
-            record.foreground = foreground;
-            record.last_seen_at = now;
-            record.ended_at = None;
-            record.cpu_ticks = process.cpu_ticks;
-        }
-
-        for (identity, record) in &mut self.records {
-            if record.status == ProcessStatus::Running && !active.contains(identity) {
-                record.status = ProcessStatus::Exited;
-                record.foreground = false;
-                record.ended_at = Some(now);
-            }
-        }
-        self.prune_records();
+                    foreground: foreground_group == Some(process.group),
+                }
+            })
+            .collect();
     }
 
-    fn record_input(&mut self, bytes: &[u8], visible: bool, now: u64) {
-        self.record_activity(ProcessActivityKind::Input, bytes, !visible, now);
-    }
-
-    fn record_output(&mut self, bytes: &[u8], now: u64) {
-        self.record_activity(ProcessActivityKind::Output, bytes, false, now);
-    }
-
-    fn record_activity(&mut self, kind: ProcessActivityKind, bytes: &[u8], hidden: bool, now: u64) {
-        if bytes.is_empty() {
-            return;
-        }
-        let raw_bytes = bytes.len();
-        let cleaned = if hidden {
-            String::new()
-        } else {
-            sanitize_terminal_text(&String::from_utf8_lossy(bytes))
-        };
-        if cleaned.is_empty() && !hidden {
-            return;
-        }
-        let (text, truncated) = truncate_text_bytes(cleaned, MAX_PROCESS_ACTIVITY_EVENT_BYTES);
-
-        if let Some(last) = self.activity.back_mut()
-            && last.kind == kind
-            && last.process_group == self.current_foreground_group
-            && last.hidden == hidden
-            && now.saturating_sub(last.timestamp) <= PROCESS_ACTIVITY_COALESCE_MILLIS
-            && last.text.len().saturating_add(text.len()) <= MAX_PROCESS_ACTIVITY_EVENT_BYTES
-        {
-            last.timestamp = now;
-            last.bytes = last.bytes.saturating_add(raw_bytes);
-            last.truncated |= truncated;
-            last.text.push_str(&text);
-            self.activity_bytes = self.activity_bytes.saturating_add(text.len());
-            self.prune_activity();
-            return;
-        }
-
-        self.next_sequence = self.next_sequence.saturating_add(1);
-        self.activity_bytes = self.activity_bytes.saturating_add(text.len());
-        self.activity.push_back(ProcessActivityEvent {
-            sequence: self.next_sequence,
-            timestamp: now,
-            kind,
-            process_group: self.current_foreground_group,
-            text,
-            bytes: raw_bytes,
-            hidden,
-            truncated,
-        });
-        self.prune_activity();
-    }
-
-    fn snapshot(&self, after: Option<u64>) -> ProcessInspectorSnapshot {
-        let mut processes = self.records.values().cloned().collect::<Vec<_>>();
+    fn snapshot(&self) -> ProcessInspectorSnapshot {
+        let mut processes = self.records.clone();
         processes.sort_by(|left, right| {
-            let left_running = left.status == ProcessStatus::Running;
-            let right_running = right.status == ProcessStatus::Running;
-            right_running
-                .cmp(&left_running)
-                .then_with(|| right.last_seen_at.cmp(&left.last_seen_at))
+            right
+                .foreground
+                .cmp(&left.foreground)
                 .then_with(|| left.pid.cmp(&right.pid))
         });
-        let oldest_sequence = self.activity.front().map(|event| event.sequence);
-        let reset_activity =
-            after.is_some_and(|sequence| oldest_sequence.is_some_and(|oldest| sequence < oldest));
-        let activity = self
-            .activity
-            .iter()
-            // The cursor is inclusive so a coalesced tail event is refreshed in place.
-            .filter(|event| after.is_none_or(|sequence| event.sequence >= sequence))
-            .cloned()
-            .collect();
         ProcessInspectorSnapshot {
             supported: cfg!(target_os = "linux"),
-            exact_attribution: false,
-            sampled_at: self.sampled_at,
             processes,
-            activity,
-            reset_activity,
-        }
-    }
-
-    fn prune_records(&mut self) {
-        let overflow = self.records.len().saturating_sub(MAX_PROCESS_RECORDS);
-        if overflow == 0 {
-            return;
-        }
-        let mut exited = self
-            .records
-            .iter()
-            .filter(|(_, record)| record.status == ProcessStatus::Exited)
-            .map(|(identity, record)| (*identity, record.ended_at.unwrap_or(0)))
-            .collect::<Vec<_>>();
-        exited.sort_by_key(|(_, ended_at)| *ended_at);
-        for (identity, _) in exited.into_iter().take(overflow) {
-            self.records.remove(&identity);
-        }
-    }
-
-    fn prune_activity(&mut self) {
-        while self.activity.len() > MAX_PROCESS_ACTIVITY_EVENTS
-            || self.activity_bytes > MAX_PROCESS_ACTIVITY_BYTES && self.activity.len() > 1
-        {
-            if let Some(removed) = self.activity.pop_front() {
-                self.activity_bytes = self.activity_bytes.saturating_sub(removed.text.len());
-            }
         }
     }
 }
@@ -1461,7 +1255,6 @@ struct ProcessInfo {
     command: String,
     arguments: Vec<String>,
     cwd: Option<PathBuf>,
-    state: char,
     start_ticks: u64,
     cpu_ticks: u64,
 }
@@ -1596,7 +1389,6 @@ fn parse_process_stat(pid: u32, stat: &str, directory: &Path) -> Option<ProcessI
     let close = stat.rfind(')')?;
     let command = stat[open + 1..close].to_owned();
     let fields = stat[close + 1..].split_whitespace().collect::<Vec<_>>();
-    let state = fields.first()?.chars().next()?;
     let parent = fields.get(1)?.parse().ok()?;
     let group = fields.get(2)?.parse().ok()?;
     let foreground_group = fields.get(5)?.parse().ok()?;
@@ -1625,7 +1417,6 @@ fn parse_process_stat(pid: u32, stat: &str, directory: &Path) -> Option<ProcessI
         command,
         arguments,
         cwd,
-        state,
         start_ticks,
         cpu_ticks: user_ticks.saturating_add(system_ticks),
     })
@@ -1889,7 +1680,7 @@ mod tests {
     }
 
     #[test]
-    fn process_tracker_retains_exits_activity_and_pid_reuse() {
+    fn process_tracker_only_exposes_the_latest_live_snapshot() {
         let process =
             |pid, parent, group, foreground_group, command: &str, start_ticks| ProcessInfo {
                 pid,
@@ -1899,44 +1690,28 @@ mod tests {
                 command: command.to_owned(),
                 arguments: vec![command.to_owned()],
                 cwd: Some(PathBuf::from("/tmp")),
-                state: 'S',
                 start_ticks,
                 cpu_ticks: 1,
             };
         let shell = process(10, 1, 10, 20, "bash", 100);
         let child = process(20, 10, 20, 20, "codex", 200);
         let mut tracker = ProcessTracker::default();
-        tracker.update(10, &[&shell, &child], 1_000);
-        tracker.record_output(b"working\n", 1_010);
-        tracker.record_input(b"secret", false, 1_020);
+        tracker.update(10, &[&shell, &child]);
 
         let idle_shell = process(10, 1, 10, 10, "bash", 100);
-        tracker.update(10, &[&idle_shell], 2_000);
+        tracker.update(10, &[&idle_shell]);
         let reused = process(20, 10, 20, 20, "btop", 300);
-        tracker.update(10, &[&shell, &reused], 3_000);
+        tracker.update(10, &[&shell, &reused]);
 
-        let snapshot = tracker.snapshot(None);
+        let snapshot = tracker.snapshot();
         let reused_records = snapshot
             .processes
             .iter()
             .filter(|record| record.pid == 20)
             .collect::<Vec<_>>();
-        assert_eq!(reused_records.len(), 2);
-        assert!(
-            reused_records
-                .iter()
-                .any(|record| record.command == "codex" && record.status == ProcessStatus::Exited)
-        );
-        assert!(
-            reused_records
-                .iter()
-                .any(|record| record.command == "btop" && record.status == ProcessStatus::Running)
-        );
-        assert_eq!(snapshot.activity[0].process_group, Some(20));
-        assert_eq!(snapshot.activity[0].text, "working\n");
-        assert!(snapshot.activity[1].hidden);
-        assert!(snapshot.activity[1].text.is_empty());
-        assert_eq!(tracker.snapshot(Some(2)).activity.len(), 1);
+        assert_eq!(reused_records.len(), 1);
+        assert_eq!(reused_records[0].command, "btop");
+        assert!(reused_records[0].foreground);
     }
 
     #[test]
@@ -2048,7 +1823,6 @@ mod tests {
             command: command.to_owned(),
             arguments: arguments.iter().map(|value| (*value).to_owned()).collect(),
             cwd: Some(PathBuf::from("/tmp")),
-            state: 'S',
             start_ticks: 100,
             cpu_ticks: 0,
         };

@@ -358,32 +358,16 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
 .process-row {
   min-width: 0; min-height: 37px; flex: 1; display: flex; align-items: center; gap: 6px;
   padding: 3px 5px 3px calc(4px + var(--process-depth, 0) * 11px); border: 0; border-radius: 3px;
-  background: transparent; color: var(--foreground); text-align: left; cursor: pointer;
+  background: transparent; color: var(--foreground); text-align: left;
 }
 .process-row:hover { background: var(--hover); }
-.process-row.selected { background: var(--selected); box-shadow: inset 2px 0 var(--terminal-color); }
-.process-history .process-row + .process-row { margin-top: 1px; }
 .process-state { width: 22px; height: 22px; flex: none; display: grid; place-items: center; border: 1px solid var(--border); border-radius: 4px; color: var(--subtle); }
 .process-state.foreground { border-color: color-mix(in srgb, var(--terminal-color) 48%, var(--border)); background: color-mix(in srgb, var(--terminal-color) 8%, var(--panel)); color: var(--terminal-color); }
-.process-row.exited .process-state { opacity: .6; }
 .process-copy { min-width: 0; flex: 1; display: grid; gap: 1px; }
 .process-command { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 10.5px/13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-weight: 650; }
 .process-commandline { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--subtle); font: 8.5px/11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .process-pid { color: var(--subtle); font: 8.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .process-foreground { padding: 1px 4px; border-radius: 3px; background: color-mix(in srgb, var(--terminal-color) 13%, transparent); color: var(--terminal-color); font-size: 7.5px; font-weight: 800; }
-.process-duration { min-width: 31px; color: var(--subtle); font-size: 8px; text-align: right; }
-.process-activity-heading { margin-bottom: 2px; }
-.process-filter { height: 22px; max-width: 100%; margin: 0 0 7px; padding: 0 7px; display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--border); border-radius: 10px; background: var(--input); color: var(--muted); font-size: 9px; cursor: pointer; }
-.process-filter:hover { border-color: var(--border-strong); color: var(--foreground); }
-.process-activity-list { display: grid; gap: 6px; }
-.process-activity { overflow: hidden; border: 1px solid var(--border); border-radius: 4px; background: color-mix(in srgb, var(--editor) 70%, var(--panel)); }
-.process-activity.input { border-left: 2px solid var(--accent); }
-.process-activity > header { height: 23px; display: flex; align-items: center; gap: 8px; padding: 0 7px; border-bottom: 1px solid var(--border); color: var(--subtle); font-size: 8px; }
-.process-activity > header time { margin-left: auto; }
-.process-activity-kind { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
-.process-activity.input .process-activity-kind { color: #58a6e7; }
-.process-activity pre { max-height: 230px; margin: 0; padding: 7px 8px; overflow: auto; color: var(--foreground); font: 9.5px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
-.process-activity-hidden { padding: 8px; color: var(--subtle); font-size: 9.5px; font-style: italic; }
 
 .layout-drop-surface { position: absolute; inset: 0; z-index: 40; pointer-events: none; }
 .layout-drop-target {

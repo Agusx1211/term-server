@@ -165,11 +165,6 @@ struct ClientConfig {
 }
 
 #[derive(Debug, Deserialize)]
-struct ProcessInspectorQuery {
-    after: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
 struct FilePathQuery {
     path: String,
     cwd: Option<String>,
@@ -450,14 +445,13 @@ async fn remove_terminal(
 async fn terminal_processes(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-    Query(query): Query<ProcessInspectorQuery>,
     jar: CookieJar,
 ) -> Result<Json<crate::terminal::ProcessInspectorSnapshot>, ApiError> {
     require_auth(&jar, &state)?;
     state
         .terminals
         .get(id)
-        .map(|terminal| Json(terminal.process_inspector(query.after)))
+        .map(|terminal| Json(terminal.process_inspector()))
         .ok_or(ApiError::NotFound)
 }
 
