@@ -29,6 +29,8 @@ const MEANINGFUL_CPU_TICKS: u64 = 3;
 const ACTIVE_SAMPLES_TO_WORKING: u8 = 3;
 const QUIET_SAMPLES_TO_IDLE: u8 = 5;
 const SUBMISSION_WORKING_MILLIS: u64 = 12_000;
+const PI_QUIET_SAMPLES_TO_IDLE: u8 = 2;
+const PI_SUBMISSION_WORKING_MILLIS: u64 = 3_000;
 const REPORTED_WORKING_FRESH_MILLIS: u64 = 5_000;
 const MAX_CAPTURED_PROMPT_CHARS: usize = 16_000;
 
@@ -473,6 +475,7 @@ fn title_contains_word(title: &str, expected: &str) -> bool {
 }
 
 fn select_agent_status(
+    agent_kind: &str,
     current: AgentStatus,
     reported: Option<(ReportedAgentState, u64)>,
     now: u64,
@@ -480,6 +483,11 @@ fn select_agent_status(
     active_samples: u8,
     quiet_samples: u8,
 ) -> AgentStatus {
+    let (submission_working_millis, quiet_samples_to_idle) = if agent_kind == "pi" {
+        (PI_SUBMISSION_WORKING_MILLIS, PI_QUIET_SAMPLES_TO_IDLE)
+    } else {
+        (SUBMISSION_WORKING_MILLIS, QUIET_SAMPLES_TO_IDLE)
+    };
     match reported {
         Some((ReportedAgentState::Idle, reported_at)) if reported_at >= input_submitted_at => {
             return AgentStatus::Idle;
@@ -492,13 +500,21 @@ fn select_agent_status(
         _ => {}
     }
 
-    if input_submitted_at > 0 && now.saturating_sub(input_submitted_at) <= SUBMISSION_WORKING_MILLIS
+    if input_submitted_at > 0 && now.saturating_sub(input_submitted_at) <= submission_working_millis
         || active_samples >= ACTIVE_SAMPLES_TO_WORKING
-        || current == AgentStatus::Working && quiet_samples < QUIET_SAMPLES_TO_IDLE
+        || current == AgentStatus::Working && quiet_samples < quiet_samples_to_idle
     {
         AgentStatus::Working
     } else {
         AgentStatus::Idle
+    }
+}
+
+fn agent_sample_active(agent_kind: &str, cpu_delta: u64, output_delta: u64) -> bool {
+    if agent_kind == "pi" {
+        output_delta > 0
+    } else {
+        cpu_delta >= MEANINGFUL_CPU_TICKS || output_delta >= MEANINGFUL_OUTPUT_BYTES
     }
 }
 
@@ -724,7 +740,15 @@ impl TerminalSession {
                     .map_or(1, |current| current.revision.saturating_add(1));
                 info.agent = Some(AgentInfo {
                     kind: agent.kind.clone(),
-                    status: select_agent_status(AgentStatus::Idle, reported_state, now, 0, 0, 0),
+                    status: select_agent_status(
+                        &agent.kind,
+                        AgentStatus::Idle,
+                        reported_state,
+                        now,
+                        0,
+                        0,
+                        0,
+                    ),
                     status_changed_at: now,
                     started_at: now,
                     revision,
@@ -735,7 +759,7 @@ impl TerminalSession {
                 let output_delta = output_bytes.saturating_sub(activity.last_sample_output_bytes);
                 activity.last_cpu_ticks = agent.cpu_ticks;
                 activity.last_sample_output_bytes = output_bytes;
-                if cpu_delta >= MEANINGFUL_CPU_TICKS || output_delta >= MEANINGFUL_OUTPUT_BYTES {
+                if agent_sample_active(&agent.kind, cpu_delta, output_delta) {
                     activity.active_samples = activity.active_samples.saturating_add(1);
                     activity.quiet_samples = 0;
                 } else {
@@ -748,6 +772,7 @@ impl TerminalSession {
                     .map(|current| current.status.clone())
                     .unwrap_or(AgentStatus::Idle);
                 let next_status = select_agent_status(
+                    &agent.kind,
                     current_status,
                     reported_state,
                     now,
@@ -1882,27 +1907,28 @@ mod tests {
     #[test]
     fn debounces_fallback_activity_and_invalidates_stale_idle_signals() {
         assert_eq!(
-            select_agent_status(AgentStatus::Idle, None, 1_000, 0, 1, 0),
+            select_agent_status("codex", AgentStatus::Idle, None, 1_000, 0, 1, 0),
             AgentStatus::Idle
         );
         assert_eq!(
-            select_agent_status(AgentStatus::Idle, None, 1_000, 0, 2, 0),
+            select_agent_status("codex", AgentStatus::Idle, None, 1_000, 0, 2, 0),
             AgentStatus::Idle
         );
         assert_eq!(
-            select_agent_status(AgentStatus::Idle, None, 1_000, 0, 3, 0),
+            select_agent_status("codex", AgentStatus::Idle, None, 1_000, 0, 3, 0),
             AgentStatus::Working
         );
         assert_eq!(
-            select_agent_status(AgentStatus::Working, None, 1_000, 0, 0, 4),
+            select_agent_status("codex", AgentStatus::Working, None, 1_000, 0, 0, 4),
             AgentStatus::Working
         );
         assert_eq!(
-            select_agent_status(AgentStatus::Working, None, 1_000, 0, 0, 5),
+            select_agent_status("codex", AgentStatus::Working, None, 1_000, 0, 0, 5),
             AgentStatus::Idle
         );
         assert_eq!(
             select_agent_status(
+                "codex",
                 AgentStatus::Idle,
                 Some((ReportedAgentState::Idle, 900)),
                 1_050,
@@ -1914,6 +1940,7 @@ mod tests {
         );
         assert_eq!(
             select_agent_status(
+                "codex",
                 AgentStatus::Working,
                 Some((ReportedAgentState::Idle, 1_010)),
                 1_050,
@@ -1923,6 +1950,26 @@ mod tests {
             ),
             AgentStatus::Idle
         );
+    }
+
+    #[test]
+    fn settles_pi_after_two_quiet_samples() {
+        assert_eq!(
+            select_agent_status("pi", AgentStatus::Working, None, 5_000, 1_000, 0, 1),
+            AgentStatus::Working
+        );
+        assert_eq!(
+            select_agent_status("pi", AgentStatus::Working, None, 5_000, 1_000, 0, 2),
+            AgentStatus::Idle
+        );
+    }
+
+    #[test]
+    fn uses_pi_redraws_instead_of_background_cpu_as_activity() {
+        assert!(agent_sample_active("pi", 0, 1));
+        assert!(!agent_sample_active("pi", MEANINGFUL_CPU_TICKS, 0));
+        assert!(agent_sample_active("codex", MEANINGFUL_CPU_TICKS, 0));
+        assert!(agent_sample_active("claude", 0, MEANINGFUL_OUTPUT_BYTES));
     }
 
     #[test]
