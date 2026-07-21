@@ -10,7 +10,7 @@
   </p>
 </div>
 
-![term-server workspace with Codex, Claude, and Pi sessions in working, idle, and done states](docs/screenshots/hero.png)
+![Live term-server workspace with Codex working, Claude idle, and Pi finished](docs/screenshots/agents.png)
 
 term-server is a small Rust daemon that keeps native PTYs alive and makes them available through a focused web interface. Terminals automatically follow their live working directories, so the sidebar becomes a workspace tree without any manual project setup. Split panes, reconnect history, a lightweight file editor, and a Linux process inspector are available when you need them; the product still feels like a terminal, not a browser IDE.
 
@@ -61,8 +61,6 @@ On first boot, open `https://127.0.0.1:8090`. term-server prints a random passwo
     <td align="center"><strong>Live process tree</strong></td>
   </tr>
 </table>
-
-The unframed workspace capture used for the hero is also available at [docs/screenshots/workspaces.png](docs/screenshots/workspaces.png).
 
 ## Everyday use
 
