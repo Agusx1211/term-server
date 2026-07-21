@@ -24,7 +24,7 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import type { ClientConfig, FileEntry, FileTarget, ServerTerminalMessage, TerminalInfo } from "../../shared/types";
 import { configureTerminalDrag } from "../lib/layout";
 import { api } from "../lib/api";
-import { findFileLinks, imagePreviewPosition } from "../lib/file-links";
+import { createHoverPreviewController, findFileLinks, imagePreviewPosition } from "../lib/file-links";
 import { ProcessInspector } from "./ProcessInspector";
 
 export type ThemeName = "dark" | "light";
@@ -174,8 +174,6 @@ export function TerminalPane({
   const socket = useRef<WebSocket>();
   const exited = useRef(terminal.status === "exited");
   const reconnectTimer = useRef<number>();
-  const previewTimer = useRef<number>();
-  const previewRequest = useRef(0);
   const terminalState = useRef(terminal);
   const openFile = useRef(onOpenFile);
   terminalState.current = terminal;
@@ -225,11 +223,17 @@ export function TerminalPane({
       }),
     );
     term.open(container.current);
-    const hideImagePreview = () => {
-      previewRequest.current += 1;
-      if (previewTimer.current) clearTimeout(previewTimer.current);
-      setImagePreview(undefined);
-    };
+    const imagePreviews = createHoverPreviewController<
+      { key: string; path: string; cwd: string; left: number; top: number },
+      FileEntry
+    >({
+      load: async ({ path, cwd }) => {
+        const file = await api.fileMetadata({ path, cwd });
+        return file.image ? file : undefined;
+      },
+      show: (file, position) => setImagePreview({ file, left: position.left, top: position.top }),
+      hide: () => setImagePreview(undefined),
+    });
     const fileLinksDisposable = term.registerLinkProvider({
       provideLinks(bufferLineNumber, callback) {
         const line = fileLinkWindow(term, bufferLineNumber);
@@ -251,22 +255,17 @@ export function TerminalPane({
             decorations: { pointerCursor: true, underline: true },
             activate(event, text) {
               if (event.ctrlKey || event.metaKey) {
-                hideImagePreview();
+                imagePreviews.clear();
                 openFile.current({ path: text, cwd: terminalState.current.cwd });
               }
             },
             hover(event, text) {
-              const request = ++previewRequest.current;
-              if (previewTimer.current) clearTimeout(previewTimer.current);
               const position = imagePreviewPosition(event.clientX, event.clientY);
-              previewTimer.current = window.setTimeout(() => {
-                void api.fileMetadata({ path: text, cwd: terminalState.current.cwd }).then((file) => {
-                  if (request === previewRequest.current && file.image) setImagePreview({ file, ...position });
-                }).catch(() => undefined);
-              }, 180);
+              const cwd = terminalState.current.cwd;
+              imagePreviews.hover({ key: `${cwd}\u0000${text}`, path: text, cwd, ...position });
             },
             leave() {
-              hideImagePreview();
+              imagePreviews.leave();
             },
           }];
         });
@@ -371,7 +370,7 @@ export function TerminalPane({
       cancelAnimationFrame(resizeFrame);
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
       observer.disconnect();
-      hideImagePreview();
+      imagePreviews.clear();
       fileLinksDisposable.dispose();
       searchResultsDisposable.dispose();
       socket.current?.close(1000, "Pane closed");
