@@ -59,10 +59,8 @@ export const api = {
   renameTerminal: (id: string, terminal: RenameTerminalRequest) =>
     request<TerminalInfo>(`/api/terminals/${id}`, { method: "PATCH", body: JSON.stringify(terminal) }),
   removeTerminal: (id: string) => request<void>(`/api/terminals/${id}`, { method: "DELETE" }),
-  terminalProcesses: (id: string, after?: number) =>
-    request<ProcessInspectorSnapshot>(
-      `/api/terminals/${id}/processes${after === undefined ? "" : `?after=${encodeURIComponent(after)}`}`,
-    ),
+  terminalProcesses: (id: string) =>
+    request<ProcessInspectorSnapshot>(`/api/terminals/${id}/processes`),
   fileMetadata: (target: FileTarget) => request<FileEntry>(`/api/files/meta?${fileQuery(target)}`),
   listFiles: (target: FileTarget) => request<DirectoryListing>(`/api/files/list?${fileQuery(target)}`),
   searchFiles: (root: string, query: string, cwd?: string) => {

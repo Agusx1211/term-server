@@ -44,7 +44,7 @@ On first boot, open `https://127.0.0.1:8090`. term-server prints a random passwo
 - **Directory-aware organization:** terminals move between collapsible workspaces as their shell changes directory. Workspace colors, names, filters, and sidebar sizing stay stable across reconnects.
 - **Resilient sessions:** bounded server-side replay, slow-client protection, coherent WebSocket reconnects, and browser renderer caching. A closed pane detaches the view without killing its process.
 - **Files when needed:** searchable explorer, local image previews, and a lazy-loaded CodeMirror editor with syntax highlighting, atomic saves, and stale-file conflict detection.
-- **Process visibility:** a lightweight Linux `/proc` sampler shows descendant processes, foreground-job-associated activity, bounded exit history, and secret-aware command-line redaction.
+- **Process visibility:** a lightweight Linux `/proc` sampler shows the live descendant process tree and foreground job with secret-aware command-line redaction. It does not capture command input or output or retain exited processes.
 - **Agent awareness:** Codex, Claude, and Pi sessions can show active, idle, and finished states. Optional browser notifications focus the relevant terminal when work completes.
 - **Secure defaults:** loopback binding, HTTPS, Argon2 password hashing, signed HTTP-only SameSite cookies, origin enforcement, CSP, HSTS, login throttling, and bounded memory use.
 - **Deployment choices:** one native daemon plus static browser assets, with Docker Compose and a systemd user service included.
@@ -58,7 +58,7 @@ On first boot, open `https://127.0.0.1:8090`. term-server prints a random passwo
   </tr>
   <tr>
     <td align="center"><strong>Explorer and conflict-safe editor</strong></td>
-    <td align="center"><strong>Live process tree and associated activity</strong></td>
+    <td align="center"><strong>Live process tree</strong></td>
   </tr>
 </table>
 

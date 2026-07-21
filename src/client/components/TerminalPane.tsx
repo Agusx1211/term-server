@@ -546,7 +546,7 @@ export function TerminalPane({
             onClick={() => setProcessesOpen((current) => !current)}
             aria-label="Inspect terminal processes"
             aria-expanded={processesOpen}
-            title="Inspect child processes and associated terminal activity"
+            title="Inspect live child processes"
           >
             <ListTree size={14} />
           </button>
