@@ -12,8 +12,8 @@ interface WelcomeSectionProps {
 const HOW_TO_USE_STEPS = [
   { icon: "➕", text: "Click **New terminal** to create a persistent session" },
   { icon: "📂", text: "Sessions appear in the sidebar — click to open them" },
-  { icon: "✂️", text: "Drag terminals to split panes (left, right, top, bottom)" },
-  { icon: "✏️", text: "Right-click a session to rename it" },
+  { icon: "✂️", text: "Use a session's **split action** or drag it to build a pane layout" },
+  { icon: "✏️", text: "Use the **rename action** beside a session to give it a custom name" },
   { icon: "🧠", text: "Enable Pi in settings for AI-powered terminal intelligence" },
   { icon: "🔔", text: "Turn on notifications to get alerts when agents finish" },
 ];

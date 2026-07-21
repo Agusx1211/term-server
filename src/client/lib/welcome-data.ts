@@ -63,7 +63,7 @@ export const dailyTexts: { title: string; body: string }[] = [
   },
   {
     title: "Open a terminal",
-    body: "Choose a session from the sidebar. Drag terminals around to rearrange them, or split panes to multitask.",
+    body: "Choose a session from the sidebar. Use its split action to multitask, or drag panes around on a desktop.",
   },
   {
     title: "A new terminal awaits!",
@@ -71,7 +71,7 @@ export const dailyTexts: { title: string; body: string }[] = [
   },
   {
     title: "Terminal paradise",
-    body: "You can have up to {maxPanes} panes visible at once. Split left, right, top, or bottom by dragging.",
+    body: "You can keep up to {maxPanes} panes open. Phones focus one at a time, while larger screens show the full layout.",
   },
   {
     title: "Yarr, matey!",

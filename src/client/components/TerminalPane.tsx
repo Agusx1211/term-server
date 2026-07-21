@@ -6,7 +6,10 @@ import {
   ChevronUp,
   CircleCheckBig,
   CirclePause,
+  ClipboardCopy,
+  ClipboardPaste,
   CopyPlus,
+  EllipsisVertical,
   GripVertical,
   ListTree,
   Search,
@@ -164,6 +167,7 @@ export function TerminalPane({
 }: TerminalPaneProps) {
   const container = useRef<HTMLDivElement>(null);
   const pane = useRef<HTMLElement>(null);
+  const mobileActions = useRef<HTMLDivElement>(null);
   const xterm = useRef<XTerm>();
   const searchAddon = useRef<SearchAddon>();
   const searchInput = useRef<HTMLInputElement>(null);
@@ -177,6 +181,7 @@ export function TerminalPane({
   terminalState.current = terminal;
   openFile.current = onOpenFile;
   const [processesOpen, setProcessesOpen] = useState(false);
+  const [actionsOpen, setActionsOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState({ index: -1, count: 0 });
@@ -391,6 +396,26 @@ export function TerminalPane({
   }, [searchOpen]);
 
   useEffect(() => {
+    if (!actionsOpen) return;
+    const closeActions = (event: PointerEvent) => {
+      if (!mobileActions.current?.contains(event.target as Node)) setActionsOpen(false);
+    };
+    const closeActionsOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setActionsOpen(false);
+    };
+    window.addEventListener("pointerdown", closeActions);
+    window.addEventListener("keydown", closeActionsOnEscape);
+    return () => {
+      window.removeEventListener("pointerdown", closeActions);
+      window.removeEventListener("keydown", closeActionsOnEscape);
+    };
+  }, [actionsOpen]);
+
+  useEffect(() => {
+    if (!active) setActionsOpen(false);
+  }, [active]);
+
+  useEffect(() => {
     const search = searchAddon.current;
     if (!search) return;
     if (!searchOpen || !searchQuery) {
@@ -515,24 +540,61 @@ export function TerminalPane({
         )}
         <span class={`connection ${connection}`} title={connection} />
         <span class="pane-spacer" />
-        <button
-          class={`pane-action ${processesOpen ? "active" : ""}`}
-          onClick={() => setProcessesOpen((current) => !current)}
-          aria-label="Inspect terminal processes"
-          aria-expanded={processesOpen}
-          title="Inspect child processes and associated terminal activity"
-        >
-          <ListTree size={14} />
-        </button>
-        <button class="pane-action" onClick={onClone} aria-label="Clone terminal" title="New terminal in this directory">
-          <CopyPlus size={14} />
-        </button>
-        <button class="pane-action danger" onClick={onRemove} aria-label="Kill terminal" title="Kill terminal">
-          <Trash2 size={14} />
-        </button>
-        <button class="pane-action" onClick={onClose} aria-label="Close pane" title="Close pane">
-          <X size={15} />
-        </button>
+        <span class="desktop-pane-actions">
+          <button
+            class={`pane-action ${processesOpen ? "active" : ""}`}
+            onClick={() => setProcessesOpen((current) => !current)}
+            aria-label="Inspect terminal processes"
+            aria-expanded={processesOpen}
+            title="Inspect child processes and associated terminal activity"
+          >
+            <ListTree size={14} />
+          </button>
+          <button class="pane-action" onClick={onClone} aria-label="Clone terminal" title="New terminal in this directory">
+            <CopyPlus size={14} />
+          </button>
+          <button class="pane-action danger" onClick={onRemove} aria-label="Kill terminal" title="Kill terminal">
+            <Trash2 size={14} />
+          </button>
+          <button class="pane-action" onClick={onClose} aria-label="Close pane" title="Close pane">
+            <X size={15} />
+          </button>
+        </span>
+        <div ref={mobileActions} class="mobile-pane-actions">
+          <button
+            class={`pane-action ${actionsOpen ? "active" : ""}`}
+            onClick={() => setActionsOpen((current) => !current)}
+            aria-label="Terminal actions"
+            aria-expanded={actionsOpen}
+          >
+            <EllipsisVertical size={19} />
+          </button>
+          {actionsOpen && (
+            <div class="pane-action-menu" role="menu">
+              <button role="menuitem" onClick={() => { setActionsOpen(false); setSearchOpen(true); }}>
+                <Search size={16} /> Search scrollback
+              </button>
+              <button role="menuitem" onClick={() => { setActionsOpen(false); void copy(); }}>
+                <ClipboardCopy size={16} /> Copy selection
+              </button>
+              <button role="menuitem" onClick={() => { setActionsOpen(false); void paste(); }}>
+                <ClipboardPaste size={16} /> Paste
+              </button>
+              <button role="menuitem" onClick={() => { setActionsOpen(false); setProcessesOpen(true); }}>
+                <ListTree size={16} /> Inspect processes
+              </button>
+              <button role="menuitem" onClick={() => { setActionsOpen(false); onClone(); }}>
+                <CopyPlus size={16} /> Clone terminal
+              </button>
+              <button class="danger" role="menuitem" onClick={() => { setActionsOpen(false); onRemove(); }}>
+                <Trash2 size={16} /> Kill terminal
+              </button>
+              <button role="menuitem" onClick={() => { setActionsOpen(false); onClose(); }}>
+                <X size={16} /> Close pane
+              </button>
+            </div>
+          )}
+        </div>
       </header>
       <div
         ref={container}

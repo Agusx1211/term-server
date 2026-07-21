@@ -40,6 +40,7 @@ On first boot, open `https://127.0.0.1:8090`. term-server prints a random passwo
 ## What it includes
 
 - **Terminal-first workspace:** native PTYs, xterm.js WebGL rendering, truecolor, selection, clipboard shortcuts, search, links, up to eight panes, and as many as 2,000,000 scrollback lines per pane.
+- **Phone and tablet support:** touch-sized navigation, a workspace drawer, focused pane switching, safe-area-aware layouts, and terminal actions that do not depend on hover or hardware-keyboard shortcuts.
 - **Directory-aware organization:** terminals move between collapsible workspaces as their shell changes directory. Workspace colors, names, filters, and sidebar sizing stay stable across reconnects.
 - **Resilient sessions:** bounded server-side replay, slow-client protection, coherent WebSocket reconnects, and browser renderer caching. A closed pane detaches the view without killing its process.
 - **Files when needed:** searchable explorer, local image previews, and a lazy-loaded CodeMirror editor with syntax highlighting, atomic saves, and stale-file conflict detection.
@@ -66,6 +67,8 @@ The unframed workspace capture used for the hero is also available at [docs/scre
 ## Everyday use
 
 Click the main `+` to open a shell in your home directory, or use a workspace row’s `+` to start in that directory. A terminal’s name follows its foreground process until you pin a custom name. Click a terminal to open it in the active pane; use its split action or drag it onto the left, right, top, or bottom of another pane to build a nested layout.
+
+On a phone, term-server keeps that pane layout but shows one terminal at a time. Use the arrows in the mobile toolbar to move between visible panes, the workspace drawer to open another session, and the terminal action menu for search, clipboard, process inspection, clone, kill, and close controls.
 
 Closing a pane keeps the PTY running. The trash action kills it. A normal shell exit removes the terminal automatically.
 
