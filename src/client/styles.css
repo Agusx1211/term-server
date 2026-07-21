@@ -278,7 +278,7 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
 .pane-slot.cached { display: none; }
 .terminal-pane {
   position: relative; width: 100%; height: 100%; min-width: 0; min-height: 0; display: grid;
-  grid-template-rows: 30px minmax(0, 1fr); background: color-mix(in srgb, var(--terminal-color) 6.5%, var(--editor));
+  grid-template-rows: 30px minmax(0, 1fr); background: var(--terminal-background);
   box-shadow: inset 0 2px 0 color-mix(in srgb, var(--terminal-color) 80%, transparent);
 }
 .terminal-loading { position: absolute; inset: 0; display: grid; place-items: center; background: var(--editor); color: var(--muted); }
@@ -309,9 +309,9 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
 .pane-action.active { background: var(--selected); color: var(--foreground); }
 .pane-action.danger:hover { color: var(--danger); }
 .desktop-pane-actions { display: flex; align-items: center; }
-.xterm-host { min-width: 0; min-height: 0; overflow: hidden; background: color-mix(in srgb, var(--terminal-color) 6.5%, var(--editor)); }
+.xterm-host { min-width: 0; min-height: 0; overflow: hidden; background: var(--terminal-background); }
 .xterm-host .xterm { height: 100%; padding: 7px 7px 3px 9px; }
-.xterm-host .xterm-viewport { scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
+.xterm-host .xterm-viewport { background-color: var(--terminal-background); scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
 .terminal-search {
   position: absolute; top: 35px; right: 8px; z-index: 12; width: min(370px, calc(100% - 16px)); height: 31px;
   display: flex; align-items: center; gap: 4px; padding: 3px 4px 3px 8px; border: 1px solid var(--border-strong); border-radius: 4px;
