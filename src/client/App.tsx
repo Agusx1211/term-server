@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { lazy, Suspense } from "preact/compat";
-import { Menu, Plus, ShieldCheck } from "lucide-preact";
+import { ChevronLeft, ChevronRight, Menu, Plus, ShieldCheck } from "lucide-preact";
 import type { ClientConfig, FileEntry, FileTarget, TerminalInfo } from "../shared/types";
 import { api, ApiError } from "./lib/api";
 import {
@@ -88,6 +88,7 @@ export function App() {
   const agentEventsInitialized = useRef(false);
   const deliveredAgentEvents = useRef(new Map<string, number>());
   const pendingAgentNotifications = useRef(new Map<string, { event: number; timer: number }>());
+  const mobileMenuButton = useRef<HTMLButtonElement>(null);
   const terminalsRef = useRef(terminals);
   terminalsRef.current = terminals;
   const paneIds = useMemo(() => idsFromLayout(layout), [layout]);
@@ -245,6 +246,17 @@ export function App() {
     if (paneIds.length && !paneIds.includes(activeId ?? "")) setActiveId(paneIds[0]);
   }, [paneIds, activeId]);
 
+  useEffect(() => {
+    if (!mobileSidebar) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setMobileSidebar(false);
+      requestAnimationFrame(() => mobileMenuButton.current?.focus());
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [mobileSidebar]);
+
   const terminalById = useMemo(() => new Map(terminals.map((terminal) => [terminal.id, terminal])), [terminals]);
   const visibleTerminals = paneIds.map((id) => terminalById.get(id)).filter(Boolean) as TerminalInfo[];
   const renderedIds = [...mountedIds, ...paneIds.filter((id) => !mountedIds.includes(id))];
@@ -334,6 +346,19 @@ export function App() {
   const finishDrag = () => {
     setDraggedId(undefined);
     setDropTarget(undefined);
+  };
+
+  const focusAdjacentPane = (offset: number) => {
+    if (paneIds.length < 2) return;
+    const currentIndex = Math.max(0, paneIds.indexOf(activeId ?? ""));
+    const nextIndex = (currentIndex + offset + paneIds.length) % paneIds.length;
+    setActiveId(paneIds[nextIndex]);
+    setActiveResource(undefined);
+  };
+
+  const closeMobileSidebar = () => {
+    setMobileSidebar(false);
+    requestAnimationFrame(() => mobileMenuButton.current?.focus());
   };
 
   const dropOnPane = (sourceId: string, targetId: string, position: DropPosition) => {
@@ -452,10 +477,34 @@ export function App() {
   return (
     <div class="workbench">
       <div class="workbench-main">
-        <button class="mobile-menu-button" onClick={() => setMobileSidebar(true)} aria-label="Open workspaces">
-          <Menu size={17} />
-        </button>
-        {mobileSidebar && <button class="sidebar-scrim" onClick={() => setMobileSidebar(false)} aria-label="Close sidebar" />}
+        <header class="mobile-toolbar">
+          <button
+            ref={mobileMenuButton}
+            class="mobile-menu-button"
+            onClick={() => setMobileSidebar(true)}
+            aria-label="Open workspaces"
+            aria-expanded={mobileSidebar}
+          >
+            <Menu size={19} />
+          </button>
+          <span class="mobile-workspace-title">
+            {activeResource
+              ? resources.find((resource) => resource.path === activeResource)?.name
+              : terminalById.get(activeId ?? "")?.name ?? "Terminal workspace"}
+          </span>
+          {!activeResource && paneIds.length > 1 && (
+            <nav class="mobile-pane-navigation" aria-label="Visible terminal panes">
+              <button onClick={() => focusAdjacentPane(-1)} aria-label="Previous terminal pane">
+                <ChevronLeft size={18} />
+              </button>
+              <span>{Math.max(1, paneIds.indexOf(activeId ?? "") + 1)}/{paneIds.length}</span>
+              <button onClick={() => focusAdjacentPane(1)} aria-label="Next terminal pane">
+                <ChevronRight size={18} />
+              </button>
+            </nav>
+          )}
+        </header>
+        {mobileSidebar && <button class="sidebar-scrim" onClick={closeMobileSidebar} aria-label="Close sidebar" />}
         <Sidebar
           terminals={terminals}
           activeIds={paneIds}
@@ -465,7 +514,7 @@ export function App() {
           pi={config.pi}
           notificationsEnabled={notificationsEnabled}
           fileRoot={terminalById.get(activeId ?? "")?.cwd ?? "~"}
-          onMobileClose={() => setMobileSidebar(false)}
+          onMobileClose={closeMobileSidebar}
           onNew={(cwd) => void createTerminal(cwd)}
           onOpen={(id) => openTerminal(id)}
           onSplit={(id) => openTerminal(id, true)}
@@ -481,7 +530,10 @@ export function App() {
           }}
           onDragEnd={finishDrag}
         />
-        <div class={`workspace-area ${resources.length ? "with-resource-tabs" : ""}`}>
+        <div
+          class={`workspace-area ${resources.length ? "with-resource-tabs" : ""}`}
+          aria-hidden={mobileSidebar || undefined}
+        >
           {resources.length > 0 && (
             <ResourceTabBar
               tabs={resources}
@@ -513,7 +565,7 @@ export function App() {
               return (
                 <div
                   key={terminal.id}
-                  class={`pane-slot ${visible ? "" : "cached"}`}
+                  class={`pane-slot ${visible ? "" : "cached"} ${visible && terminal.id === activeId ? "active" : ""}`}
                   style={
                     rectangle
                       ? {

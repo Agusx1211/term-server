@@ -227,6 +227,7 @@ export function Sidebar({
   const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth);
   const sidebarWidthRef = useRef(sidebarWidth);
   const resizeStart = useRef<{ pointerId: number; x: number; width: number }>();
+  const mobileCloseButton = useRef<HTMLButtonElement>(null);
   const matching = useMemo(() => {
     const needle = query.trim().toLocaleLowerCase();
     return needle ? terminals.filter((terminal) => terminal.path.toLocaleLowerCase().includes(needle)) : terminals;
@@ -234,6 +235,10 @@ export function Sidebar({
   const tree = useMemo(() => buildTerminalTree(matching), [matching]);
 
   useEffect(() => () => document.body.classList.remove("sidebar-resizing"), []);
+
+  useEffect(() => {
+    if (mobileOpen) requestAnimationFrame(() => mobileCloseButton.current?.focus());
+  }, [mobileOpen]);
 
   const updateSidebarWidth = (width: number, persist = false) => {
     sidebarWidthRef.current = width;
@@ -310,11 +315,14 @@ export function Sidebar({
     <aside
       class={`sidebar ${mobileOpen ? "mobile-open" : ""}`}
       style={{ "--sidebar-width": `${sidebarWidth}px` }}
+      role={mobileOpen ? "dialog" : undefined}
+      aria-modal={mobileOpen ? "true" : undefined}
+      aria-label={mobileOpen ? "Workspaces and files" : undefined}
     >
       <header class="sidebar-header">
         <span>{filesOpen ? "FILES" : "WORKSPACES"}</span>
         <div>
-          <button class="icon-button mobile-only" onClick={onMobileClose} aria-label="Close sidebar"><X size={16} /></button>
+          <button ref={mobileCloseButton} class="icon-button mobile-only" onClick={onMobileClose} aria-label="Close sidebar"><X size={18} /></button>
           <button
             class={`icon-button ${filesOpen ? "active" : ""}`}
             onClick={() => {
