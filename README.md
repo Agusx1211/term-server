@@ -42,7 +42,7 @@ On first boot, open `https://127.0.0.1:8090`. term-server prints a random passwo
 - **Terminal-first workspace:** native PTYs, xterm.js WebGL rendering, truecolor, selection, clipboard shortcuts, search, links, up to eight panes, and as many as 2,000,000 scrollback lines per pane.
 - **Phone and tablet support:** touch-sized navigation, a workspace drawer, focused pane switching, safe-area-aware layouts, and terminal actions that do not depend on hover or hardware-keyboard shortcuts.
 - **Directory-aware organization:** terminals move between collapsible workspaces as their shell changes directory. Workspace colors, names, filters, and sidebar sizing stay stable across reconnects.
-- **Resilient sessions:** bounded server-side replay, slow-client protection, coherent WebSocket reconnects, and browser renderer caching. A closed pane detaches the view without killing its process.
+- **Resilient sessions:** bounded server-side replay, slow-client protection, coherent WebSocket reconnects, browser renderer caching, and a separate pane layout in each browser tab. A closed pane detaches the view without killing its process.
 - **Files when needed:** searchable explorer, local image previews, and a lazy-loaded CodeMirror editor with syntax highlighting, atomic saves, and stale-file conflict detection.
 - **Process visibility:** a lightweight Linux `/proc` sampler shows descendant processes, foreground-job-associated activity, bounded exit history, and secret-aware command-line redaction.
 - **Agent awareness:** Codex, Claude, and Pi sessions can show active, idle, and finished states. Optional browser notifications focus the relevant terminal when work completes.

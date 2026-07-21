@@ -47,7 +47,7 @@ const initialTheme = (): ThemeName => {
 
 const initialPanes = (): string[] => {
   try {
-    const value = JSON.parse(localStorage.getItem("term-server:panes") ?? "[]");
+    const value = JSON.parse(sessionStorage.getItem("term-server:panes") ?? "[]");
     return Array.isArray(value) && value.every((item) => typeof item === "string") ? value : [];
   } catch {
     return [];
@@ -56,7 +56,7 @@ const initialPanes = (): string[] => {
 
 const initialPaneLayout = (): PaneLayout | null => {
   try {
-    const stored = JSON.parse(localStorage.getItem("term-server:layout") ?? "null") as unknown;
+    const stored = JSON.parse(sessionStorage.getItem("term-server:layout") ?? "null") as unknown;
     if (isPaneLayout(stored)) return stored;
   } catch {
     // Fall back to the previous flat pane state.
@@ -137,8 +137,8 @@ export function App() {
   }, [theme]);
 
   useEffect(() => {
-    localStorage.setItem("term-server:panes", JSON.stringify(paneIds));
-    localStorage.setItem("term-server:layout", JSON.stringify(layout));
+    sessionStorage.setItem("term-server:panes", JSON.stringify(paneIds));
+    sessionStorage.setItem("term-server:layout", JSON.stringify(layout));
   }, [paneIds, layout]);
 
   useEffect(() => {
