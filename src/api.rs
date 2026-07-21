@@ -141,6 +141,13 @@ struct LoginRequest {
     password: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChangePasswordRequest {
+    current_password: String,
+    new_password: String,
+}
+
 #[derive(Serialize)]
 struct SessionResponse {
     authenticated: bool,
@@ -153,6 +160,7 @@ struct ClientConfig {
     max_panes: u8,
     secure: bool,
     hostname: String,
+    password_managed_externally: bool,
     pi: PiClientConfig,
 }
 
@@ -220,6 +228,16 @@ fn require_auth(jar: &CookieJar, state: &AppState) -> Result<(), ApiError> {
         .ok_or(ApiError::Unauthorized)
 }
 
+fn session_cookie(state: &AppState) -> Cookie<'static> {
+    Cookie::build((SESSION_COOKIE, state.auth.create_session()))
+        .path("/")
+        .http_only(true)
+        .secure(state.secure || state.secure_cookie)
+        .same_site(SameSite::Strict)
+        .max_age(Duration::days(7))
+        .build()
+}
+
 fn require_origin(headers: &HeaderMap, uri: &Uri, state: &AppState) -> Result<(), ApiError> {
     let Some(origin) = headers.get(header::ORIGIN) else {
         return Ok(());
@@ -282,14 +300,10 @@ async fn login(
     }
     state.login_limiter.reset(&client);
 
-    let cookie = Cookie::build((SESSION_COOKIE, state.auth.create_session()))
-        .path("/")
-        .http_only(true)
-        .secure(state.secure || state.secure_cookie)
-        .same_site(SameSite::Strict)
-        .max_age(Duration::days(7))
-        .build();
-    Ok((jar.add(cookie), Json(serde_json::json!({ "ok": true }))))
+    Ok((
+        jar.add(session_cookie(&state)),
+        Json(serde_json::json!({ "ok": true })),
+    ))
 }
 
 async fn logout(
@@ -310,6 +324,38 @@ async fn logout(
     Ok((jar.remove(removal), Json(serde_json::json!({ "ok": true }))))
 }
 
+async fn change_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+    Json(body): Json<ChangePasswordRequest>,
+) -> Result<(CookieJar, Json<serde_json::Value>), ApiError> {
+    require_origin(&headers, &uri, &state)?;
+    require_auth(&jar, &state)?;
+    if body.current_password.len() > 4096 || body.new_password.len() > 4096 {
+        return Err(ApiError::BadRequest("password is too long".to_owned()));
+    }
+
+    let changed = state
+        .auth
+        .change_password(body.current_password, body.new_password)
+        .await
+        .map_err(|error| match error {
+            error @ AuthError::ShortPassword => ApiError::BadRequest(error.to_string()),
+            error @ AuthError::ExternallyManaged => ApiError::Conflict(error.to_string()),
+            _ => ApiError::Internal,
+        })?;
+    if !changed {
+        return Err(ApiError::InvalidLogin);
+    }
+
+    Ok((
+        jar.add(session_cookie(&state)),
+        Json(serde_json::json!({ "ok": true })),
+    ))
+}
+
 async fn config(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -320,6 +366,7 @@ async fn config(
         max_panes: state.max_panes,
         secure: state.secure,
         hostname: state.hostname.clone(),
+        password_managed_externally: state.auth.password_is_externally_managed(),
         pi: state.pi.client_config(),
     }))
 }
@@ -636,6 +683,7 @@ pub fn build_router(state: AppState, client_directory: Option<PathBuf>) -> Route
         .route("/session", get(session))
         .route("/login", post(login))
         .route("/logout", post(logout))
+        .route("/password", patch(change_password))
         .route("/config", get(config))
         .route("/config/pi", patch(update_pi_config))
         .route("/terminals", get(list_terminals).post(create_terminal))
@@ -704,7 +752,10 @@ mod tests {
 
     async fn test_state() -> AppState {
         let directory = tempfile::tempdir().unwrap();
-        let auth = load_auth(directory.path(), Some("testing-password".into()), None)
+        load_auth(directory.path(), Some("testing-password".into()), None)
+            .await
+            .unwrap();
+        let auth = load_auth(directory.path(), None, None)
             .await
             .unwrap()
             .service;
@@ -759,6 +810,86 @@ mod tests {
             .unwrap();
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("SameSite=Strict"));
+    }
+
+    #[tokio::test]
+    async fn password_change_rotates_credentials_and_session_cookie() {
+        let app = build_router(test_state().await, None);
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))))
+                    .body(Body::from(r#"{"password":"testing-password"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let old_cookie = login
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/password")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &old_cookie)
+                    .body(Body::from(
+                        r#"{"currentPassword":"testing-password","newPassword":"replacement-password"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let new_cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(new_cookie.contains("HttpOnly"));
+        assert!(new_cookie.contains("SameSite=Strict"));
+        let new_cookie = new_cookie.split(';').next().unwrap().to_owned();
+
+        let old_session = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config")
+                    .header(header::COOKIE, old_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(old_session.status(), StatusCode::UNAUTHORIZED);
+
+        let new_session = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config")
+                    .header(header::COOKIE, new_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(new_session.status(), StatusCode::OK);
     }
 
     #[tokio::test]

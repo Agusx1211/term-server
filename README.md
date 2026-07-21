@@ -114,6 +114,11 @@ TERM_SERVER_PASSWORD='use-a-long-random-secret' term-server
 term-server --password-file /run/secrets/term-server-password
 ```
 
+Passwords stored in `credentials.json` can be changed from **Settings → Security**. Changing
+the password signs out other browser sessions. Passwords supplied through the environment or a
+secret file remain externally managed and must be changed at their source before restarting the
+server.
+
 Use `--no-https` only for local development or behind a trusted TLS-terminating proxy. When proxying, forward WebSocket upgrades and declare the public origin:
 
 ```bash

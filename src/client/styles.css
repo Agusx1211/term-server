@@ -171,11 +171,11 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
 .sidebar-empty { height: 180px; padding: 46px 20px 0; display: flex; flex-direction: column; align-items: center; gap: 9px; text-align: center; color: var(--muted); font-size: 12px; }
 .sidebar-empty button { color: #58a6e7; border: 0; background: transparent; cursor: pointer; }
 .sidebar-footer { display: flex; align-items: center; gap: 6px; padding: 0 6px; color: var(--muted); border-top: 1px solid var(--border); font-size: 11px; }
-.sidebar-settings, .settings-logout, .theme-switch button {
+.sidebar-settings, .settings-password, .settings-logout, .theme-switch button {
   display: flex; align-items: center; gap: 6px; border: 0; border-radius: 3px; background: transparent; color: inherit; cursor: pointer;
 }
 .sidebar-settings { height: 23px; padding: 0 5px; }
-.sidebar-settings:hover, .settings-logout:hover, .theme-switch button:hover { background: var(--hover); color: var(--foreground); }
+.sidebar-settings:hover, .settings-password:hover:not(:disabled), .settings-logout:hover, .theme-switch button:hover { background: var(--hover); color: var(--foreground); }
 .settings-popover {
   position: absolute; right: 7px; bottom: 29px; left: 7px; z-index: 20; padding: 10px;
   max-height: calc(100% - 42px); overflow: auto; border: 1px solid var(--border-strong); border-radius: 5px;
@@ -202,6 +202,25 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
 }
 .pi-model-field select:disabled { opacity: .55; }
 .settings-hint { margin: 7px 2px 0; color: var(--subtle); font-size: 10px; line-height: 1.35; }
+.settings-password { width: 100%; min-height: 30px; padding: 0 7px; color: var(--muted); }
+.settings-password:disabled { opacity: .6; cursor: default; }
+.settings-password-form { display: grid; gap: 8px; }
+.settings-password-form label { display: grid; gap: 4px; color: var(--muted); font-size: 10px; }
+.settings-password-form input {
+  width: 100%; height: 29px; padding: 0 7px; border: 1px solid var(--border-strong); border-radius: 3px;
+  background: var(--input); color: var(--foreground); outline: 0;
+}
+.settings-password-form input:focus { border-color: var(--focus); }
+.settings-password-form .form-error { margin: 0; font-size: 10px; }
+.settings-password-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; margin-top: 2px; }
+.settings-password-actions button {
+  min-height: 29px; display: inline-flex; align-items: center; justify-content: center; gap: 5px; padding: 0 7px;
+  border: 1px solid var(--border); border-radius: 3px; background: transparent; color: var(--muted); cursor: pointer;
+}
+.settings-password-actions button:hover:not(:disabled) { border-color: var(--border-strong); background: var(--hover); color: var(--foreground); }
+.settings-password-actions button.primary { border-color: var(--accent); background: var(--accent); color: #fff; }
+.settings-password-actions button.primary:hover:not(:disabled) { background: var(--accent-hover); }
+.settings-password-actions button:disabled { opacity: .6; cursor: default; }
 .settings-logout { width: 100%; height: 29px; margin-top: 8px; padding: 0 8px; color: var(--muted); }
 .settings-logout:hover { color: var(--danger); }
 .footer-spacer { flex: 1; }
@@ -551,8 +570,9 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
     right: 8px; bottom: calc(48px + env(safe-area-inset-bottom)); left: 8px;
     max-height: calc(100% - 62px - env(safe-area-inset-top) - env(safe-area-inset-bottom)); padding: 12px;
   }
-  .theme-switch button, .settings-toggle, .settings-logout { min-height: 44px; }
-  .pi-model-field select { height: 44px; }
+  .theme-switch button, .settings-toggle, .settings-password, .settings-logout { min-height: 44px; }
+  .pi-model-field select, .settings-password-form input { height: 44px; }
+  .settings-password-actions button { min-height: 44px; }
 
   .pane-slot {
     inset: 0 !important; width: 100% !important; height: 100% !important; display: none; padding: 0;

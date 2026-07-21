@@ -84,6 +84,7 @@ export interface ClientConfig {
   maxPanes: number;
   secure: boolean;
   hostname: string;
+  passwordManagedExternally: boolean;
   pi: PiConfig;
 }
 

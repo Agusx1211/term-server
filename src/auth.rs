@@ -11,12 +11,12 @@ use argon2::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use rand::{Rng, distr::Alphanumeric};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use thiserror::Error;
-use tokio::fs;
+use tokio::{fs, sync::Mutex as AsyncMutex};
 use uuid::Uuid;
 
 const SESSION_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -26,6 +26,8 @@ const CREDENTIALS_VERSION: u8 = 1;
 pub enum AuthError {
     #[error("passwords must contain at least 8 characters")]
     ShortPassword,
+    #[error("password is managed by TERM_SERVER_PASSWORD or TERM_SERVER_PASSWORD_FILE")]
+    ExternallyManaged,
     #[error("invalid credentials file: {0}")]
     InvalidCredentials(String),
     #[error("unable to hash password: {0}")]
@@ -54,8 +56,19 @@ struct SessionPayload {
 
 #[derive(Clone)]
 pub struct AuthService {
-    password_hash: Arc<str>,
-    cookie_secret: Arc<[u8]>,
+    inner: Arc<AuthInner>,
+}
+
+struct AuthInner {
+    state: RwLock<AuthState>,
+    credentials_path: PathBuf,
+    change_lock: AsyncMutex<()>,
+    externally_managed: bool,
+}
+
+struct AuthState {
+    password_hash: String,
+    cookie_secret: Vec<u8>,
 }
 
 pub struct LoadedAuth {
@@ -126,6 +139,7 @@ pub async fn load_auth(
         None
     };
     let supplied_password = supplied_password.or(file_password);
+    let externally_managed = supplied_password.is_some();
     if supplied_password
         .as_ref()
         .is_some_and(|value| value.len() < 8)
@@ -167,11 +181,17 @@ pub async fn load_auth(
         .unwrap_or(credentials.password_hash);
     Ok(LoadedAuth {
         service: AuthService {
-            password_hash: effective_hash.into(),
-            cookie_secret: URL_SAFE_NO_PAD
-                .decode(credentials.cookie_secret)
-                .map_err(|error| AuthError::InvalidCredentials(error.to_string()))?
-                .into(),
+            inner: Arc::new(AuthInner {
+                state: RwLock::new(AuthState {
+                    password_hash: effective_hash,
+                    cookie_secret: URL_SAFE_NO_PAD
+                        .decode(credentials.cookie_secret)
+                        .map_err(|error| AuthError::InvalidCredentials(error.to_string()))?,
+                }),
+                credentials_path: path,
+                change_lock: AsyncMutex::new(()),
+                externally_managed,
+            }),
         },
         generated_password,
     })
@@ -179,16 +199,51 @@ pub async fn load_auth(
 
 impl AuthService {
     pub async fn verify_password(&self, password: String) -> Result<bool, AuthError> {
-        let encoded = self.password_hash.clone();
-        tokio::task::spawn_blocking(move || {
-            let hash = PasswordHash::new(&encoded)
-                .map_err(|error| AuthError::PasswordHash(error.to_string()))?;
-            Ok(Argon2::default()
-                .verify_password(password.as_bytes(), &hash)
-                .is_ok())
-        })
-        .await
-        .map_err(|error| AuthError::Task(error.to_string()))?
+        let encoded = self.inner.state.read().password_hash.clone();
+        verify_password(encoded, password).await
+    }
+
+    pub fn password_is_externally_managed(&self) -> bool {
+        self.inner.externally_managed
+    }
+
+    pub async fn change_password(
+        &self,
+        current_password: String,
+        new_password: String,
+    ) -> Result<bool, AuthError> {
+        if self.inner.externally_managed {
+            return Err(AuthError::ExternallyManaged);
+        }
+        if new_password.len() < 8 {
+            return Err(AuthError::ShortPassword);
+        }
+
+        let _guard = self.inner.change_lock.lock().await;
+        let encoded = self.inner.state.read().password_hash.clone();
+        if !verify_password(encoded, current_password).await? {
+            return Ok(false);
+        }
+
+        let password_hash = tokio::task::spawn_blocking(move || password_hash(&new_password))
+            .await
+            .map_err(|error| AuthError::Task(error.to_string()))??;
+        let cookie_secret = rand::random::<[u8; 32]>();
+        let credentials = CredentialFile {
+            version: CREDENTIALS_VERSION,
+            cookie_secret: URL_SAFE_NO_PAD.encode(cookie_secret),
+            password_hash: password_hash.clone(),
+        };
+        write_private(
+            &self.inner.credentials_path,
+            serde_json::to_string_pretty(&credentials)?.as_bytes(),
+        )
+        .await?;
+
+        let mut state = self.inner.state.write();
+        state.password_hash = password_hash;
+        state.cookie_secret = cookie_secret.to_vec();
+        Ok(true)
     }
 
     pub fn create_session(&self) -> String {
@@ -196,6 +251,7 @@ impl AuthService {
     }
 
     fn create_session_at(&self, now: u64) -> String {
+        let state = self.inner.state.read();
         let payload = SessionPayload {
             iat: now,
             exp: now + SESSION_LIFETIME.as_secs(),
@@ -203,8 +259,8 @@ impl AuthService {
         };
         let encoded =
             URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).expect("serializable session"));
-        let mut mac =
-            Hmac::<Sha256>::new_from_slice(&self.cookie_secret).expect("HMAC accepts any key size");
+        let mut mac = Hmac::<Sha256>::new_from_slice(&state.cookie_secret)
+            .expect("HMAC accepts any key size");
         mac.update(format!("v1.{encoded}").as_bytes());
         format!(
             "v1.{encoded}.{}",
@@ -217,6 +273,7 @@ impl AuthService {
     }
 
     fn verify_session_at(&self, token: Option<&str>, now: u64) -> bool {
+        let state = self.inner.state.read();
         let Some(token) = token else { return false };
         let mut parts = token.split('.');
         let (Some("v1"), Some(encoded), Some(signature), None) =
@@ -227,7 +284,7 @@ impl AuthService {
         let Ok(signature) = URL_SAFE_NO_PAD.decode(signature) else {
             return false;
         };
-        let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(&self.cookie_secret) else {
+        let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(&state.cookie_secret) else {
             return false;
         };
         mac.update(format!("v1.{encoded}").as_bytes());
@@ -242,6 +299,18 @@ impl AuthService {
         };
         payload.iat <= now && payload.exp >= now
     }
+}
+
+async fn verify_password(encoded: String, password: String) -> Result<bool, AuthError> {
+    tokio::task::spawn_blocking(move || {
+        let hash = PasswordHash::new(&encoded)
+            .map_err(|error| AuthError::PasswordHash(error.to_string()))?;
+        Ok(Argon2::default()
+            .verify_password(password.as_bytes(), &hash)
+            .is_ok())
+    })
+    .await
+    .map_err(|error| AuthError::Task(error.to_string()))?
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -330,6 +399,79 @@ mod tests {
             .unwrap();
         assert!(!stored.contains(&generated));
         assert!(stored.contains("$argon2"));
+    }
+
+    #[tokio::test]
+    async fn changing_password_persists_the_hash_and_revokes_existing_sessions() {
+        let directory = tempfile::tempdir().unwrap();
+        let loaded = load_auth(directory.path(), None, None).await.unwrap();
+        let current_password = loaded.generated_password.unwrap();
+        let existing_session = loaded.service.create_session();
+
+        assert!(
+            !loaded
+                .service
+                .change_password("incorrect-password".into(), "unused-new-password".into())
+                .await
+                .unwrap()
+        );
+        assert!(
+            loaded
+                .service
+                .verify_password(current_password.clone())
+                .await
+                .unwrap()
+        );
+        assert!(loaded.service.verify_session(Some(&existing_session)));
+
+        assert!(
+            loaded
+                .service
+                .change_password(current_password.clone(), "a-new-secure-password".into())
+                .await
+                .unwrap()
+        );
+        assert!(
+            !loaded
+                .service
+                .verify_password(current_password)
+                .await
+                .unwrap()
+        );
+        assert!(
+            loaded
+                .service
+                .verify_password("a-new-secure-password".into())
+                .await
+                .unwrap()
+        );
+        assert!(!loaded.service.verify_session(Some(&existing_session)));
+
+        let reloaded = load_auth(directory.path(), None, None).await.unwrap();
+        assert!(
+            reloaded
+                .service
+                .verify_password("a-new-secure-password".into())
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn externally_managed_passwords_cannot_be_changed() {
+        let directory = tempfile::tempdir().unwrap();
+        let loaded = load_auth(directory.path(), Some("external-password".into()), None)
+            .await
+            .unwrap();
+
+        assert!(loaded.service.password_is_externally_managed());
+        assert!(matches!(
+            loaded
+                .service
+                .change_password("external-password".into(), "replacement-password".into())
+                .await,
+            Err(AuthError::ExternallyManaged)
+        ));
     }
 
     #[test]
