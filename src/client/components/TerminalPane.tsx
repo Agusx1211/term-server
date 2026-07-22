@@ -26,6 +26,7 @@ import { configureTerminalDrag } from "../lib/layout";
 import { api } from "../lib/api";
 import { createHoverPreviewController, findFileLinks, imagePreviewPosition } from "../lib/file-links";
 import { ProcessInspector } from "./ProcessInspector";
+import { WorkingDuration } from "./WorkingDuration";
 
 export type ThemeName = "dark" | "light";
 
@@ -671,9 +672,12 @@ function PaneAgentState({ agent }: { agent: NonNullable<TerminalInfo["agent"]> }
   const Icon = agent.status === "working" ? Activity : agent.status === "idle" ? CirclePause : CircleCheckBig;
   return (
     <span class={`pane-agent ${agent.status}`} title={agent.summary ?? `${agent.kind} is ${label.toLocaleLowerCase()}`}>
-      <Bot size={12} />
+      <Bot size={12} aria-hidden="true" />
       <span class="pane-agent-kind">{agent.kind}</span>
-      <span class="pane-agent-state"><Icon size={11} strokeWidth={2.2} /> {label}</span>
+      <span class="pane-agent-state">
+        <Icon size={11} strokeWidth={2.2} aria-hidden="true" />
+        {agent.status === "working" ? <WorkingDuration since={agent.statusChangedAt} /> : label}
+      </span>
     </span>
   );
 }

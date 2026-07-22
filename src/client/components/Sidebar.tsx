@@ -39,6 +39,7 @@ import { buildTerminalTree, type TerminalTreeNode } from "../lib/tree";
 import type { ThemeName } from "./TerminalPane";
 import { ChangePassword } from "./ChangePassword";
 import { FileExplorer } from "./FileExplorer";
+import { WorkingDuration } from "./WorkingDuration";
 
 interface SidebarProps {
   terminals: TerminalInfo[];
@@ -491,10 +492,10 @@ function AgentState({ agent }: { agent: AgentInfo }) {
     <span
       class={`agent-status-badge ${agent.status}`}
       title={agent.summary ?? `${agent.kind} is ${label.toLocaleLowerCase()}`}
-      aria-label={`${agent.kind} is ${label.toLocaleLowerCase()}`}
+      aria-label={agent.status === "working" ? undefined : `${agent.kind} is ${label.toLocaleLowerCase()}`}
     >
-      <Icon size={12} strokeWidth={2.2} />
-      <span>{label}</span>
+      <Icon size={12} strokeWidth={2.2} aria-hidden="true" />
+      {agent.status === "working" ? <WorkingDuration since={agent.statusChangedAt} /> : <span class="agent-status-label">{label}</span>}
     </span>
   );
 }

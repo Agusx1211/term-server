@@ -158,9 +158,16 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
   margin-right: 3px; padding: 0 6px; border: 1px solid color-mix(in srgb, var(--agent-color) 55%, var(--border)); border-radius: 4px;
   background: color-mix(in srgb, var(--agent-color) 13%, var(--sidebar)); color: var(--agent-color); font-size: 8.5px; font-weight: 700; letter-spacing: .045em; text-transform: uppercase;
 }
+.agent-status-badge.working { min-width: 65px; }
 .agent-status-badge.working, .pane-agent.working { --agent-color: #4daafc; }
 .agent-status-badge.idle, .pane-agent.idle { --agent-color: #d29922; }
 .agent-status-badge.finished, .pane-agent.finished { --agent-color: #3fb950; }
+.agent-working-readout { display: inline-flex; align-items: center; gap: 3px; font: 700 8.5px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; letter-spacing: 0; text-transform: none; white-space: nowrap; }
+.agent-working-dots { width: 11px; display: inline-grid; grid-template-columns: repeat(3, 1fr); }
+.agent-working-dots > span { opacity: .25; animation: agent-working-dot 1.2s steps(1, end) infinite; }
+.agent-working-dots > span:nth-child(1) { animation-delay: -.8s; }
+.agent-working-dots > span:nth-child(2) { animation-delay: -.4s; }
+@keyframes agent-working-dot { 0%, 32% { opacity: 1; } 33%, 100% { opacity: .25; } }
 .terminal-row:hover .agent-status-badge { display: none; }
 .tree-status { margin-left: auto; color: var(--muted); font: 10px ui-monospace, monospace; }
 .row-actions { display: none; align-items: center; padding-right: 4px; }
@@ -540,7 +547,7 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
   .row-action { width: 40px; height: 40px; }
   .workspace-add { margin-right: 2px; }
   .agent-status-badge { min-width: 34px; height: 28px; margin-right: 0; padding: 0 7px; }
-  .agent-status-badge span { display: none; }
+  .agent-status-badge > .agent-status-label, .agent-status-badge > .agent-working-readout { display: none; }
   .terminal-row:hover .agent-status-badge { display: inline-flex; }
   .file-explorer { grid-template-rows: 44px 44px minmax(0, 1fr) auto; }
   .file-location, .file-search { margin: 4px 8px; }
