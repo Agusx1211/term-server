@@ -25,6 +25,19 @@ async fn write_private(path: &Path, contents: &[u8]) -> Result<(), std::io::Erro
     Ok(())
 }
 
+fn generated_names(host: &str) -> Vec<String> {
+    let mut names = vec![
+        "localhost".to_owned(),
+        "vscode11".to_owned(),
+        "127.0.0.1".to_owned(),
+        "::1".to_owned(),
+    ];
+    if !["0.0.0.0", "::"].contains(&host) && !names.iter().any(|name| name == host) {
+        names.push(host.to_owned());
+    }
+    names
+}
+
 async fn generated_paths(data_dir: &Path, host: &str) -> Result<(PathBuf, PathBuf), TlsError> {
     let directory = data_dir.join("tls");
     let cert_path = directory.join("cert.pem");
@@ -40,14 +53,7 @@ async fn generated_paths(data_dir: &Path, host: &str) -> Result<(PathBuf, PathBu
         fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).await?;
     }
 
-    let mut names = vec![
-        "localhost".to_owned(),
-        "127.0.0.1".to_owned(),
-        "::1".to_owned(),
-    ];
-    if !["0.0.0.0", "::", "127.0.0.1", "localhost"].contains(&host) {
-        names.push(host.to_owned());
-    }
+    let names = generated_names(host);
     let CertifiedKey { cert, signing_key } = generate_simple_self_signed(names)?;
     fs::write(&cert_path, cert.pem()).await?;
     write_private(&key_path, signing_key.serialize_pem().as_bytes()).await?;
@@ -72,6 +78,28 @@ mod tests {
     use clap::Parser;
 
     use super::*;
+
+    #[test]
+    fn generated_tls_names_include_vscode11() {
+        assert_eq!(
+            generated_names("0.0.0.0"),
+            ["localhost", "vscode11", "127.0.0.1", "::1"]
+        );
+        assert_eq!(
+            generated_names("vscode11"),
+            ["localhost", "vscode11", "127.0.0.1", "::1"]
+        );
+        assert_eq!(
+            generated_names("terminal.example.com"),
+            [
+                "localhost",
+                "vscode11",
+                "127.0.0.1",
+                "::1",
+                "terminal.example.com",
+            ]
+        );
+    }
 
     #[tokio::test]
     async fn generates_and_reuses_tls_material() {
