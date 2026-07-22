@@ -37,7 +37,14 @@ const defaultConfig: ClientConfig = {
   secure: true,
   hostname: "",
   passwordManagedExternally: true,
-  pi: { available: false, enabled: false, model: "", models: [] },
+  pi: {
+    available: false,
+    enabled: false,
+    titlesEnabled: false,
+    summariesEnabled: false,
+    model: "",
+    models: [],
+  },
 };
 const dropPositions: DropPosition[] = ["left", "top", "center", "bottom", "right"];
 const TILE_NEW_TERMINALS_STORAGE_KEY = "term-server:tile-new-terminals";
@@ -229,7 +236,7 @@ export function App() {
         continue;
       }
       if (pending) clearTimeout(pending.timer);
-      if (config.pi.enabled && !agent.summary) {
+      if (config.pi.summariesEnabled && !agent.summary) {
         const event = agent.statusChangedAt;
         const timer = window.setTimeout(() => deliver(terminal.id, event), 12_000);
         pendingAgentNotifications.current.set(terminal.id, { event, timer });
@@ -237,7 +244,7 @@ export function App() {
         deliver(terminal.id, agent.statusChangedAt);
       }
     }
-  }, [authenticated, terminals, notificationsEnabled, config.pi.enabled]);
+  }, [authenticated, terminals, notificationsEnabled, config.pi.summariesEnabled]);
 
   useEffect(() => () => {
     for (const pending of pendingAgentNotifications.current.values()) clearTimeout(pending.timer);
@@ -432,11 +439,11 @@ export function App() {
     setTerminals((current) => current.map((terminal) => (terminal.id === next.id ? next : terminal)));
   };
 
-  const updatePiConfig = async (enabled: boolean, model: string) => {
+  const updatePiConfig = async (titlesEnabled: boolean, summariesEnabled: boolean, model: string) => {
     try {
-      const pi = await api.updatePiConfig({ enabled, model });
+      const pi = await api.updatePiConfig({ titlesEnabled, summariesEnabled, model });
       setConfig((current) => ({ ...current, pi }));
-      showNotice(enabled ? "Pi terminal intelligence enabled" : "Pi terminal intelligence disabled");
+      showNotice("Pi settings updated");
     } catch (error) {
       showNotice(error instanceof Error ? error.message : "Unable to update Pi settings");
     }
@@ -538,7 +545,9 @@ export function App() {
           onSplit={(id) => openTerminal(id, true)}
           onRename={(terminal) => void renameTerminal(terminal)}
           onTheme={setTheme}
-          onPiChange={(enabled, model) => void updatePiConfig(enabled, model)}
+          onPiChange={(titlesEnabled, summariesEnabled, model) => (
+            void updatePiConfig(titlesEnabled, summariesEnabled, model)
+          )}
           onNotificationsChange={(enabled) => void updateNotifications(enabled)}
           onTileNewTerminalsChange={updateTileNewTerminals}
           onPasswordChanged={() => showNotice("Password changed; other sessions were signed out")}

@@ -69,13 +69,17 @@ export interface PiModel {
 
 export interface PiConfig {
   available: boolean;
+  /** Compatibility aggregate for older clients. */
   enabled: boolean;
+  titlesEnabled: boolean;
+  summariesEnabled: boolean;
   model: string;
   models: PiModel[];
 }
 
 export interface UpdatePiConfig {
-  enabled: boolean;
+  titlesEnabled: boolean;
+  summariesEnabled: boolean;
   model: string;
 }
 

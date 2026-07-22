@@ -163,6 +163,8 @@ systemctl --user enable --now term-server
 
 The daemon finds Pi on its inherited `PATH` and in common per-user install locations, including npm, pnpm, Volta, Bun, asdf, mise, and installed NVM Node versions. Restart the service after installing or upgrading Pi.
 
+Pi-generated titles and notification summaries have independent settings. A title is generated when an idle agent receives a new task; approvals and other input submitted while it is already working do not trigger another title request.
+
 ## Build from source
 
 Prerequisites are Rust 1.88+, Node.js 22+, npm, and a C toolchain for the PTY dependency.
@@ -207,7 +209,7 @@ The browser delegates terminal parsing and rendering to xterm.js. Recently viewe
 
 ## Security and privacy
 
-Read [SECURITY.md](SECURITY.md) before exposing term-server beyond a trusted machine or network. Pi titles and completion summaries are disabled by default; enabling them sends a bounded, ANSI-sanitized slice of the relevant prompt or terminal output to the selected Pi model provider.
+Read [SECURITY.md](SECURITY.md) before exposing term-server beyond a trusted machine or network. Pi titles and completion summaries are independently disabled by default; enabling either sends a bounded, ANSI-sanitized slice of the relevant prompt or terminal output to the selected Pi model provider.
 
 Please report vulnerabilities privately as described in the security policy. Contributions are welcome—see [CONTRIBUTING.md](CONTRIBUTING.md).
 

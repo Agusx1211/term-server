@@ -39,18 +39,48 @@ export default function (pi: ExtensionAPI) {
 }
 "#;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PiSettings {
-    pub enabled: bool,
+    pub titles_enabled: bool,
+    pub summaries_enabled: bool,
     #[serde(default)]
     pub model: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredPiSettings {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    titles_enabled: Option<bool>,
+    #[serde(default)]
+    summaries_enabled: Option<bool>,
+    #[serde(default)]
+    model: String,
+}
+
+impl From<StoredPiSettings> for PiSettings {
+    fn from(stored: StoredPiSettings) -> Self {
+        let legacy_enabled = stored.enabled.unwrap_or(false);
+        Self {
+            titles_enabled: stored.titles_enabled.unwrap_or(legacy_enabled),
+            summaries_enabled: stored.summaries_enabled.unwrap_or(legacy_enabled),
+            model: stored.model,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdatePiSettings {
-    pub enabled: bool,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub titles_enabled: Option<bool>,
+    #[serde(default)]
+    pub summaries_enabled: Option<bool>,
     #[serde(default)]
     pub model: String,
 }
@@ -65,7 +95,10 @@ pub struct PiModel {
 #[serde(rename_all = "camelCase")]
 pub struct PiClientConfig {
     pub available: bool,
+    /// Retained for older clients. New clients use the independent feature flags.
     pub enabled: bool,
+    pub titles_enabled: bool,
+    pub summaries_enabled: bool,
     pub model: String,
     pub models: Vec<PiModel>,
 }
@@ -130,7 +163,8 @@ impl PiService {
         let settings_path = data_directory.join(SETTINGS_FILE);
         let settings = fs::read(&settings_path)
             .ok()
-            .and_then(|bytes| serde_json::from_slice::<PiSettings>(&bytes).ok())
+            .and_then(|bytes| serde_json::from_slice::<StoredPiSettings>(&bytes).ok())
+            .map(PiSettings::from)
             .unwrap_or_default();
         let executable = find_executable("pi");
         let extension = executable.as_ref().and_then(|_| {
@@ -159,20 +193,44 @@ impl PiService {
     pub fn client_config(&self) -> PiClientConfig {
         let settings = self.settings.read().clone();
         let available = self.available();
+        let titles_enabled = available && settings.titles_enabled;
+        let summaries_enabled = available && settings.summaries_enabled;
         PiClientConfig {
             available,
-            enabled: available && settings.enabled,
+            enabled: titles_enabled || summaries_enabled,
+            titles_enabled,
+            summaries_enabled,
             model: settings.model,
             models: self.models.to_vec(),
         }
     }
 
-    pub fn enabled(&self) -> bool {
-        self.available() && self.settings.read().enabled
+    pub fn titles_enabled(&self) -> bool {
+        self.available() && self.settings.read().titles_enabled
+    }
+
+    pub fn summaries_enabled(&self) -> bool {
+        self.available() && self.settings.read().summaries_enabled
+    }
+
+    fn task_enabled(&self, kind: PiTaskKind) -> bool {
+        match kind {
+            PiTaskKind::Title => self.titles_enabled(),
+            PiTaskKind::Summary => self.summaries_enabled(),
+        }
     }
 
     pub fn update(&self, input: UpdatePiSettings) -> Result<PiClientConfig, String> {
-        if input.enabled && !self.available() {
+        let current = self.settings.read().clone();
+        let titles_enabled = input
+            .titles_enabled
+            .or(input.enabled)
+            .unwrap_or(current.titles_enabled);
+        let summaries_enabled = input
+            .summaries_enabled
+            .or(input.enabled)
+            .unwrap_or(current.summaries_enabled);
+        if (titles_enabled || summaries_enabled) && !self.available() {
             return Err("Pi is not available to the term-server process".to_owned());
         }
         let model = input.model.trim().to_owned();
@@ -180,7 +238,8 @@ impl PiService {
             return Err("the selected Pi model is not available".to_owned());
         }
         let settings = PiSettings {
-            enabled: input.enabled,
+            titles_enabled,
+            summaries_enabled,
             model,
         };
         let encoded = serde_json::to_vec_pretty(&settings).map_err(|error| error.to_string())?;
@@ -190,8 +249,11 @@ impl PiService {
     }
 
     pub async fn generate(&self, mut request: PiRequest) -> Result<String, String> {
-        if !self.enabled() {
-            return Err("Pi metadata generation is disabled".to_owned());
+        if !self.task_enabled(request.kind) {
+            return Err(format!(
+                "Pi {} generation is disabled",
+                request.kind.as_str()
+            ));
         }
         let executable = self
             .executable
@@ -515,6 +577,30 @@ mod tests {
     fn executable(path: &Path) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, "").unwrap();
+    }
+
+    #[test]
+    fn migrates_the_legacy_pi_toggle_to_both_features() {
+        let legacy =
+            serde_json::from_str::<StoredPiSettings>(r#"{"enabled":true,"model":"local/tiny"}"#)
+                .map(PiSettings::from)
+                .unwrap();
+        assert_eq!(
+            legacy,
+            PiSettings {
+                titles_enabled: true,
+                summaries_enabled: true,
+                model: "local/tiny".to_owned(),
+            }
+        );
+
+        let independent = serde_json::from_str::<StoredPiSettings>(
+            r#"{"titlesEnabled":true,"summariesEnabled":false}"#,
+        )
+        .map(PiSettings::from)
+        .unwrap();
+        assert!(independent.titles_enabled);
+        assert!(!independent.summaries_enabled);
     }
 
     #[test]

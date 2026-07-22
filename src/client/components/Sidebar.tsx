@@ -58,7 +58,7 @@ interface SidebarProps {
   onSplit: (id: string) => void;
   onRename: (terminal: TerminalInfo) => void;
   onTheme: (theme: ThemeName) => void;
-  onPiChange: (enabled: boolean, model: string) => void;
+  onPiChange: (titlesEnabled: boolean, summariesEnabled: boolean, model: string) => void;
   onNotificationsChange: (enabled: boolean) => void;
   onTileNewTerminalsChange: (enabled: boolean) => void;
   onPasswordChanged: () => void;
@@ -422,14 +422,32 @@ export function Sidebar({
             {notificationsEnabled ? <Bell size={14} /> : <BellOff size={14} />}
             Browser notifications
           </button>
-          <label class={`settings-toggle ${pi.enabled ? "active" : ""} ${pi.available ? "" : "disabled"}`}>
+          <label class={`settings-toggle ${pi.titlesEnabled ? "active" : ""} ${pi.available ? "" : "disabled"}`}>
             <Sparkles size={14} />
-            <span>Pi titles & summaries</span>
+            <span>Pi-generated titles</span>
             <input
               type="checkbox"
-              checked={pi.enabled}
+              checked={pi.titlesEnabled}
               disabled={!pi.available}
-              onChange={(event) => onPiChange(event.currentTarget.checked, pi.model)}
+              onChange={(event) => onPiChange(
+                event.currentTarget.checked,
+                pi.summariesEnabled,
+                pi.model,
+              )}
+            />
+          </label>
+          <label class={`settings-toggle ${pi.summariesEnabled ? "active" : ""} ${pi.available ? "" : "disabled"}`}>
+            <Sparkles size={14} />
+            <span>Pi notification summaries</span>
+            <input
+              type="checkbox"
+              checked={pi.summariesEnabled}
+              disabled={!pi.available}
+              onChange={(event) => onPiChange(
+                pi.titlesEnabled,
+                event.currentTarget.checked,
+                pi.model,
+              )}
             />
           </label>
           {pi.available ? (
@@ -437,8 +455,12 @@ export function Sidebar({
               <span>Pi model</span>
               <select
                 value={pi.model}
-                disabled={!pi.enabled}
-                onChange={(event) => onPiChange(pi.enabled, event.currentTarget.value)}
+                disabled={!pi.titlesEnabled && !pi.summariesEnabled}
+                onChange={(event) => onPiChange(
+                  pi.titlesEnabled,
+                  pi.summariesEnabled,
+                  event.currentTarget.value,
+                )}
               >
                 <option value="">Pi configured default</option>
                 {pi.models.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}
@@ -447,7 +469,7 @@ export function Sidebar({
           ) : (
             <p class="settings-hint">Pi is unavailable to the daemon. Install it for this user, then restart term-server.</p>
           )}
-          <p class="settings-hint">Titles use your submitted message; completion summaries use recent terminal output.</p>
+          <p class="settings-hint">Title and notification-summary generation can be enabled independently.</p>
           <div class="settings-title settings-section-title">Security</div>
           <ChangePassword
             managedExternally={passwordManagedExternally}

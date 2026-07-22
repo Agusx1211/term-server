@@ -201,6 +201,17 @@ struct PromptInput {
     prompt: Option<String>,
 }
 
+fn title_prompt_for_submission(
+    agent_status: &AgentStatus,
+    prompt: Option<String>,
+) -> Option<String> {
+    if *agent_status == AgentStatus::Idle {
+        prompt
+    } else {
+        None
+    }
+}
+
 impl PromptCapture {
     fn observe(&mut self, bytes: &[u8]) -> PromptInput {
         let mut input = PromptInput::default();
@@ -597,17 +608,20 @@ impl TerminalSession {
             let mut activity = self.activity.lock();
             let input = activity.prompt_capture.observe(data);
             if input.submitted {
-                if let Some(prompt) = input.prompt
-                    && activity.automatic_name
-                {
-                    activity.title_revision = activity.title_revision.saturating_add(1);
-                    let revision = activity.title_revision;
-                    activity.pending_title_prompt = Some((revision, prompt));
-                }
                 let mut info = self.info.write();
                 if let Some(agent) = info.agent.as_mut()
                     && agent.status != AgentStatus::Finished
                 {
+                    // A submitted line while the agent is already working is usually an
+                    // approval or answer, not a new dashboard task. Only retitle when an
+                    // idle agent starts a fresh work cycle.
+                    if let Some(prompt) = title_prompt_for_submission(&agent.status, input.prompt)
+                        && activity.automatic_name
+                    {
+                        activity.title_revision = activity.title_revision.saturating_add(1);
+                        let revision = activity.title_revision;
+                        activity.pending_title_prompt = Some((revision, prompt));
+                    }
                     activity.input_submitted_at = now;
                     activity.active_samples = 0;
                     activity.quiet_samples = 0;
@@ -694,7 +708,8 @@ impl TerminalSession {
     fn refresh_process_metadata(
         &self,
         processes: &ProcessSnapshot,
-        pi_enabled: bool,
+        pi_titles_enabled: bool,
+        pi_summaries_enabled: bool,
         now: u64,
     ) -> RefreshOutcome {
         self.refresh_working_directory();
@@ -788,7 +803,7 @@ impl TerminalSession {
                     current.status_changed_at = now;
                     current.revision = current.revision.saturating_add(1);
                     current.summary = None;
-                    if was_working && next_status == AgentStatus::Idle && pi_enabled {
+                    if was_working && next_status == AgentStatus::Idle && pi_summaries_enabled {
                         let revision = current.revision;
                         if activity.summary_in_flight_revision != Some(revision) {
                             activity.summary_in_flight_revision = Some(revision);
@@ -804,7 +819,7 @@ impl TerminalSession {
             if activity.automatic_name && activity.generated_title.is_none() {
                 info.name = agent.kind.clone();
             }
-            if !pi_enabled || !activity.automatic_name {
+            if !pi_titles_enabled || !activity.automatic_name {
                 activity.pending_title_prompt = None;
             } else if activity.title_in_flight_revision.is_none()
                 && let Some((revision, prompt)) = activity.pending_title_prompt.take()
@@ -825,7 +840,7 @@ impl TerminalSession {
                 current.summary = None;
                 let revision = current.revision;
                 let kind = current.kind.clone();
-                if pi_enabled && activity.summary_in_flight_revision != Some(revision) {
+                if pi_summaries_enabled && activity.summary_in_flight_revision != Some(revision) {
                     activity.summary_in_flight_revision = Some(revision);
                     outcome.summary = Some((
                         revision,
@@ -983,9 +998,15 @@ impl TerminalManager {
             .collect::<Vec<_>>();
         let processes = ProcessSnapshot::read(&shell_pids);
         let now = current_millis();
-        let pi_enabled = pi.enabled();
+        let pi_titles_enabled = pi.titles_enabled();
+        let pi_summaries_enabled = pi.summaries_enabled();
         for session in sessions {
-            let outcome = session.refresh_process_metadata(&processes, pi_enabled, now);
+            let outcome = session.refresh_process_metadata(
+                &processes,
+                pi_titles_enabled,
+                pi_summaries_enabled,
+                now,
+            );
             if let Some((revision, request)) = outcome.title {
                 let pi = pi.clone();
                 let session = session.clone();
@@ -1970,6 +1991,19 @@ mod tests {
         assert!(!agent_sample_active("pi", MEANINGFUL_CPU_TICKS, 0));
         assert!(agent_sample_active("codex", MEANINGFUL_CPU_TICKS, 0));
         assert!(agent_sample_active("claude", 0, MEANINGFUL_OUTPUT_BYTES));
+    }
+
+    #[test]
+    fn only_titles_submissions_that_start_a_new_work_cycle() {
+        assert_eq!(
+            title_prompt_for_submission(&AgentStatus::Idle, Some("new task".to_owned())),
+            Some("new task".to_owned())
+        );
+        assert_eq!(
+            title_prompt_for_submission(&AgentStatus::Working, Some("approve".to_owned())),
+            None
+        );
+        assert_eq!(title_prompt_for_submission(&AgentStatus::Idle, None), None);
     }
 
     #[test]
