@@ -20,9 +20,16 @@ use uuid::Uuid;
 
 use crate::ai::{PiRequest, PiService, PiTaskKind};
 
-const COLORS: [&str; 12] = [
-    "#4daafc", "#b180d7", "#3dc9b0", "#d19a66", "#e06c75", "#c5c95a", "#56b6c2", "#d670d6",
-    "#7aa2f7", "#e0af68", "#9ece6a", "#ff7a93",
+// Neighboring buckets jump across the hue wheel and keep similar luminance across themes.
+const COLORS: [&str; 64] = [
+    "#e05b5b", "#179874", "#ea42a1", "#1e9b31", "#d14ae4", "#489811", "#9572e4", "#888c15",
+    "#5c81ed", "#c67126", "#1a92ae", "#eb4e5d", "#1d996a", "#e447ae", "#119c1a", "#c259df",
+    "#569616", "#8d72ef", "#90891c", "#5284e5", "#dc6218", "#1f94a0", "#e5536e", "#119a5a",
+    "#dd4cb9", "#1b9c17", "#be58ec", "#63941c", "#8576eb", "#9b8611", "#4688dc", "#df5e2c",
+    "#119696", "#df577d", "#179a51", "#e834cc", "#2d9b1d", "#b162e8", "#6a9310", "#7d7ae6",
+    "#a58219", "#2089e6", "#db6144", "#16978b", "#eb4885", "#1d9a48", "#e23ad7", "#2f9b11",
+    "#a66ae3", "#769116", "#737bef", "#ae7e21", "#1f8dd0", "#ea5243", "#1d9780", "#e44d94",
+    "#119c34", "#d746dc", "#409917", "#a06aee", "#808e1b", "#6b7ee9", "#c07515", "#2490bb",
 ];
 const MEANINGFUL_OUTPUT_BYTES: u64 = 2 * 1024;
 const MEANINGFUL_CPU_TICKS: u64 = 3;
@@ -1658,8 +1665,8 @@ pub fn normalize_terminal_path(input: &str) -> Result<String, TerminalError> {
 }
 
 fn color_for(path: &str) -> String {
-    let hash = path.bytes().fold(0_u32, |hash, byte| {
-        hash.wrapping_mul(31).wrapping_add(byte.into())
+    let hash = path.bytes().fold(2_166_136_261_u32, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(16_777_619)
     });
     COLORS[hash as usize % COLORS.len()].to_owned()
 }
@@ -1888,6 +1895,11 @@ mod tests {
 
     #[test]
     fn workspace_colors_and_terminal_text_are_stable() {
+        assert_eq!(COLORS.len(), 64);
+        assert_eq!(
+            COLORS.iter().copied().collect::<HashSet<_>>().len(),
+            COLORS.len()
+        );
         assert_eq!(color_for("~/code"), color_for("~/code"));
         assert_eq!(
             sanitize_terminal_text("\u{1b}[31mred\u{1b}[0m\rnext"),
