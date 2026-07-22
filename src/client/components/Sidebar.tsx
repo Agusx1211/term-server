@@ -444,7 +444,7 @@ export function Sidebar({
               </select>
             </label>
           ) : (
-            <p class="settings-hint">Pi was not found in the daemon’s PATH.</p>
+            <p class="settings-hint">Pi is unavailable to the daemon. Install it for this user, then restart term-server.</p>
           )}
           <p class="settings-hint">Titles use your submitted message; completion summaries use recent terminal output.</p>
           <div class="settings-title settings-section-title">Security</div>

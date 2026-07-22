@@ -161,6 +161,8 @@ systemctl --user daemon-reload
 systemctl --user enable --now term-server
 ```
 
+The daemon finds Pi on its inherited `PATH` and in common per-user install locations, including npm, pnpm, Volta, Bun, asdf, mise, and installed NVM Node versions. Restart the service after installing or upgrading Pi.
+
 ## Build from source
 
 Prerequisites are Rust 1.88+, Node.js 22+, npm, and a C toolchain for the PTY dependency.
