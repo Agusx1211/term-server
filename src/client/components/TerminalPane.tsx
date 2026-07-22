@@ -304,6 +304,7 @@ export function TerminalPane({
     term.attachCustomKeyEventHandler((event) => {
       const modifier = event.ctrlKey || event.metaKey;
       if (modifier && event.shiftKey && event.code === "KeyC" && event.type === "keydown") {
+        event.preventDefault();
         if (term.hasSelection()) {
           void navigator.clipboard?.writeText(term.getSelection()).catch(() => onNotice("Clipboard permission was denied"));
         }
