@@ -1,5 +1,7 @@
 use std::{
-    env, fs,
+    env,
+    ffi::{OsStr, OsString},
+    fs,
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -207,6 +209,9 @@ impl PiService {
         let settings = self.settings.read().clone();
 
         let mut command = Command::new(executable);
+        if let Some(path) = command_path(executable, env::var_os("PATH").as_deref()) {
+            command.env("PATH", path);
+        }
         command
             .arg("--mode")
             .arg("json")
@@ -318,7 +323,11 @@ fn truncate_chars(value: &str, maximum: usize) -> String {
 }
 
 fn discover_models(executable: &Path) -> Vec<PiModel> {
-    let Ok(output) = std::process::Command::new(executable)
+    let mut command = std::process::Command::new(executable);
+    if let Some(path) = command_path(executable, env::var_os("PATH").as_deref()) {
+        command.env("PATH", path);
+    }
+    let Ok(output) = command
         .arg("--list-models")
         .stdin(Stdio::null())
         .stderr(Stdio::null())
@@ -347,20 +356,267 @@ fn discover_models(executable: &Path) -> Vec<PiModel> {
 }
 
 fn find_executable(name: &str) -> Option<PathBuf> {
+    let path = env::var_os("PATH");
+    let home = env::var_os("HOME").map(PathBuf::from);
+    find_executable_in(name, path.as_deref(), home.as_deref())
+}
+
+fn find_executable_in(name: &str, path: Option<&OsStr>, home: Option<&Path>) -> Option<PathBuf> {
     let candidate = Path::new(name);
     if candidate.components().count() > 1 && candidate.is_file() {
         return Some(candidate.to_path_buf());
     }
-    env::var_os("PATH").and_then(|paths| {
-        env::split_paths(&paths)
-            .map(|directory| directory.join(name))
-            .find(|path| path.is_file())
-    })
+    executable_directories(path, home)
+        .into_iter()
+        .map(|directory| directory.join(name))
+        .find(|path| path.is_file())
+}
+
+fn executable_directories(path: Option<&OsStr>, home: Option<&Path>) -> Vec<PathBuf> {
+    let mut directories = path
+        .map(env::split_paths)
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let Some(home) = home else {
+        return directories;
+    };
+
+    directories.extend(
+        [
+            ".local/bin",
+            ".local/share/npm/bin",
+            ".local/share/pnpm",
+            ".npm-global/bin",
+            ".volta/bin",
+            ".bun/bin",
+            ".asdf/shims",
+            ".mise/shims",
+        ]
+        .map(|directory| home.join(directory)),
+    );
+
+    let nvm_versions = home.join(".nvm/versions/node");
+    let mut nvm_directories = fs::read_dir(nvm_versions)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("bin"))
+        .filter(|directory| directory.is_dir())
+        .collect::<Vec<_>>();
+    nvm_directories.sort_by(|left, right| {
+        nvm_version(right)
+            .cmp(&nvm_version(left))
+            .then_with(|| right.cmp(left))
+    });
+    if let Some(default) = nvm_default_directory(home, &nvm_directories)
+        && let Some(index) = nvm_directories
+            .iter()
+            .position(|directory| directory == &default)
+    {
+        directories.push(nvm_directories.remove(index));
+    }
+    directories.extend(nvm_directories);
+
+    let mut unique = Vec::with_capacity(directories.len());
+    for directory in directories {
+        if !unique.contains(&directory) {
+            unique.push(directory);
+        }
+    }
+    unique
+}
+
+fn nvm_version(bin_directory: &Path) -> Option<Vec<u64>> {
+    bin_directory
+        .parent()?
+        .file_name()?
+        .to_str()?
+        .strip_prefix('v')?
+        .split('.')
+        .map(|component| component.parse().ok())
+        .collect()
+}
+
+fn nvm_default_directory(home: &Path, directories: &[PathBuf]) -> Option<PathBuf> {
+    let selector = fs::read_to_string(home.join(".nvm/alias/default")).ok()?;
+    let selector = resolve_nvm_alias(home, selector.trim(), 4)?;
+    if selector == "node" || selector == "stable" {
+        return directories.first().cloned();
+    }
+    let selector = selector.strip_prefix('v').unwrap_or(&selector);
+    if !selector.split('.').all(|component| {
+        !component.is_empty()
+            && component
+                .chars()
+                .all(|character| character.is_ascii_digit())
+    }) {
+        return None;
+    }
+    directories
+        .iter()
+        .find(|directory| {
+            let Some(version) = directory
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(OsStr::to_str)
+                .and_then(|version| version.strip_prefix('v'))
+            else {
+                return false;
+            };
+            version == selector
+                || version
+                    .strip_prefix(selector)
+                    .is_some_and(|suffix| suffix.starts_with('.'))
+        })
+        .cloned()
+}
+
+fn resolve_nvm_alias(home: &Path, selector: &str, remaining: usize) -> Option<String> {
+    if selector == "node"
+        || selector == "stable"
+        || selector
+            .strip_prefix('v')
+            .unwrap_or(selector)
+            .split('.')
+            .all(|component| {
+                !component.is_empty()
+                    && component
+                        .chars()
+                        .all(|character| character.is_ascii_digit())
+            })
+    {
+        return Some(selector.to_owned());
+    }
+    if remaining == 0
+        || Path::new(selector)
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    let target = fs::read_to_string(home.join(".nvm/alias").join(selector)).ok()?;
+    resolve_nvm_alias(home, target.trim(), remaining - 1)
+}
+
+fn command_path(executable: &Path, inherited: Option<&OsStr>) -> Option<OsString> {
+    let directory = executable.parent()?;
+    let mut directories = vec![directory.to_path_buf()];
+    if let Some(inherited) = inherited {
+        directories.extend(env::split_paths(inherited));
+    }
+    env::join_paths(directories).ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn executable(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "").unwrap();
+    }
+
+    #[test]
+    fn executable_path_takes_priority_over_user_fallbacks() {
+        let directory = tempfile::tempdir().unwrap();
+        let path_pi = directory.path().join("path/bin/pi");
+        let user_pi = directory.path().join("home/.local/bin/pi");
+        executable(&path_pi);
+        executable(&user_pi);
+        let path = env::join_paths([path_pi.parent().unwrap()]).unwrap();
+
+        assert_eq!(
+            find_executable_in("pi", Some(&path), Some(&directory.path().join("home"))),
+            Some(path_pi)
+        );
+    }
+
+    #[test]
+    fn finds_executables_in_common_user_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let pi = directory.path().join(".local/bin/pi");
+        executable(&pi);
+
+        assert_eq!(
+            find_executable_in("pi", None, Some(directory.path())),
+            Some(pi)
+        );
+    }
+
+    #[test]
+    fn finds_executable_in_newest_nvm_node_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let older = directory.path().join(".nvm/versions/node/v20.19.0/bin/pi");
+        let newer = directory.path().join(".nvm/versions/node/v24.13.0/bin/pi");
+        executable(&older);
+        executable(&newer);
+
+        assert_eq!(
+            find_executable_in("pi", None, Some(directory.path())),
+            Some(newer)
+        );
+    }
+
+    #[test]
+    fn prefers_nvm_default_version_when_available() {
+        let directory = tempfile::tempdir().unwrap();
+        let preferred = directory.path().join(".nvm/versions/node/v20.19.0/bin/pi");
+        let newer = directory.path().join(".nvm/versions/node/v24.13.0/bin/pi");
+        executable(&preferred);
+        executable(&newer);
+        fs::create_dir_all(directory.path().join(".nvm/alias")).unwrap();
+        fs::write(directory.path().join(".nvm/alias/default"), "20\n").unwrap();
+
+        assert_eq!(
+            find_executable_in("pi", None, Some(directory.path())),
+            Some(preferred)
+        );
+    }
+
+    #[test]
+    fn child_path_starts_with_executable_directory() {
+        let inherited =
+            env::join_paths([Path::new("/usr/local/bin"), Path::new("/usr/bin")]).unwrap();
+        let path =
+            command_path(Path::new("/home/me/.nvm/node/v24/bin/pi"), Some(&inherited)).unwrap();
+
+        assert_eq!(
+            env::split_paths(&path).collect::<Vec<_>>(),
+            [
+                PathBuf::from("/home/me/.nvm/node/v24/bin"),
+                PathBuf::from("/usr/local/bin"),
+                PathBuf::from("/usr/bin"),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_discovery_resolves_node_next_to_pi() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let node = directory.path().join("bin/node");
+        let pi = directory.path().join("bin/pi");
+        fs::create_dir_all(node.parent().unwrap()).unwrap();
+        fs::write(
+            &node,
+            "#!/bin/sh\nprintf 'provider  model  context\\nlocal  tiny  8K\\n'\n",
+        )
+        .unwrap();
+        fs::write(&pi, "#!/usr/bin/env node\n").unwrap();
+        fs::set_permissions(&node, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&pi, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(
+            discover_models(&pi),
+            vec![PiModel {
+                id: "local/tiny".to_owned(),
+                label: "local/tiny".to_owned(),
+            }]
+        );
+    }
 
     #[test]
     fn parses_models_from_pi_table() {
