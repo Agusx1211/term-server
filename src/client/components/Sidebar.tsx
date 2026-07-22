@@ -49,6 +49,7 @@ interface SidebarProps {
   pi: PiConfig;
   passwordManagedExternally: boolean;
   notificationsEnabled: boolean;
+  tileNewTerminals: boolean;
   fileRoot: string;
   onMobileClose: () => void;
   onNew: (cwd?: string) => void;
@@ -58,6 +59,7 @@ interface SidebarProps {
   onTheme: (theme: ThemeName) => void;
   onPiChange: (enabled: boolean, model: string) => void;
   onNotificationsChange: (enabled: boolean) => void;
+  onTileNewTerminalsChange: (enabled: boolean) => void;
   onPasswordChanged: () => void;
   onOpenFile: (entry: FileEntry) => void;
   onLogout: () => void;
@@ -210,6 +212,7 @@ export function Sidebar({
   pi,
   passwordManagedExternally,
   notificationsEnabled,
+  tileNewTerminals,
   fileRoot,
   onMobileClose,
   onNew,
@@ -219,6 +222,7 @@ export function Sidebar({
   onTheme,
   onPiChange,
   onNotificationsChange,
+  onTileNewTerminalsChange,
   onPasswordChanged,
   onOpenFile,
   onLogout,
@@ -398,6 +402,17 @@ export function Sidebar({
             <button class={theme === "dark" ? "active" : ""} onClick={() => onTheme("dark")}><Moon size={14} /> Dark</button>
             <button class={theme === "light" ? "active" : ""} onClick={() => onTheme("light")}><Sun size={14} /> Light</button>
           </div>
+          <div class="settings-title settings-section-title">Terminal layout</div>
+          <label class={`settings-toggle ${tileNewTerminals ? "active" : ""}`}>
+            <SplitSquareHorizontal size={14} />
+            <span>Tile new terminals</span>
+            <input
+              type="checkbox"
+              checked={tileNewTerminals}
+              onChange={(event) => onTileNewTerminalsChange(event.currentTarget.checked)}
+            />
+          </label>
+          <p class="settings-hint">When off, a new terminal replaces the active pane.</p>
           <div class="settings-title settings-section-title">Agent awareness</div>
           <button
             class={`settings-toggle ${notificationsEnabled ? "active" : ""}`}
