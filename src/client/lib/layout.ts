@@ -84,6 +84,25 @@ export function insertBalanced(layout: PaneLayout | null, id: string): PaneLayou
   return splitAt(layout, largest.id, id, position);
 }
 
+export function placeNewTerminal(
+  layout: PaneLayout | null,
+  id: string,
+  activeId: string | undefined,
+  maximumPanes: number,
+  tile = false,
+): PaneLayout {
+  if (!layout) return paneLeaf(id);
+
+  const visibleIds = paneIds(layout);
+  if (visibleIds.includes(id)) return layout;
+  if (tile && visibleIds.length < maximumPanes) return insertBalanced(layout, id);
+
+  const targetId = activeId && visibleIds.includes(activeId) ? activeId : visibleIds[0];
+  return targetId
+    ? arrangeLayout(layout, id, targetId, "center", maximumPanes) ?? layout
+    : paneLeaf(id);
+}
+
 export function arrangeLayout(
   layout: PaneLayout | null,
   sourceId: string,

@@ -6,12 +6,12 @@ import { api, ApiError } from "./lib/api";
 import { documentTitle } from "./lib/document-title";
 import {
   arrangeLayout,
-  insertBalanced,
   isPaneLayout,
   layoutFromIds,
   paneIds as idsFromLayout,
   paneLeaf,
   paneRects,
+  placeNewTerminal,
   pruneLayout,
   reconcileMounted,
   removePane,
@@ -40,6 +40,7 @@ const defaultConfig: ClientConfig = {
   pi: { available: false, enabled: false, model: "", models: [] },
 };
 const dropPositions: DropPosition[] = ["left", "top", "center", "bottom", "right"];
+const TILE_NEW_TERMINALS_STORAGE_KEY = "term-server:tile-new-terminals";
 
 const initialTheme = (): ThemeName => {
   const stored = localStorage.getItem("term-server:theme");
@@ -71,6 +72,9 @@ const initialNotifications = () =>
   typeof Notification !== "undefined" &&
   Notification.permission === "granted";
 
+const initialTileNewTerminals = () =>
+  localStorage.getItem(TILE_NEW_TERMINALS_STORAGE_KEY) === "true";
+
 export function App() {
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
   const [terminals, setTerminals] = useState<TerminalInfo[]>([]);
@@ -85,6 +89,7 @@ export function App() {
   const [notice, setNotice] = useState("");
   const [mobileSidebar, setMobileSidebar] = useState(false);
   const [notificationsEnabled, setNotificationsEnabled] = useState(initialNotifications);
+  const [tileNewTerminals, setTileNewTerminals] = useState(initialTileNewTerminals);
   const [resources, setResources] = useState<ResourceTab[]>([]);
   const [activeResource, setActiveResource] = useState<string>();
   const agentEventsInitialized = useRef(false);
@@ -384,13 +389,13 @@ export function App() {
     try {
       const created = await api.createTerminal({ cwd, cloneFrom });
       setTerminals((current) => [...current, created].sort((left, right) => left.path.localeCompare(right.path)));
-      setLayout((current) => {
-        const currentIds = idsFromLayout(current);
-        if (!current) return paneLeaf(created.id);
-        if (currentIds.length < config.maxPanes) return insertBalanced(current, created.id);
-        const targetId = activeId && currentIds.includes(activeId) ? activeId : currentIds[0]!;
-        return arrangeLayout(current, created.id, targetId, "center", config.maxPanes) ?? current;
-      });
+      setLayout((current) => placeNewTerminal(
+        current,
+        created.id,
+        activeId,
+        config.maxPanes,
+        tileNewTerminals,
+      ));
       setActiveId(created.id);
       setActiveResource(undefined);
       setMobileSidebar(false);
@@ -457,6 +462,11 @@ export function App() {
     showNotice("Agent completion notifications enabled");
   };
 
+  const updateTileNewTerminals = (enabled: boolean) => {
+    setTileNewTerminals(enabled);
+    localStorage.setItem(TILE_NEW_TERMINALS_STORAGE_KEY, String(enabled));
+  };
+
   const logout = async () => {
     try {
       await api.logout();
@@ -520,6 +530,7 @@ export function App() {
           pi={config.pi}
           passwordManagedExternally={config.passwordManagedExternally}
           notificationsEnabled={notificationsEnabled}
+          tileNewTerminals={tileNewTerminals}
           fileRoot={terminalById.get(activeId ?? "")?.cwd ?? "~"}
           onMobileClose={closeMobileSidebar}
           onNew={(cwd) => void createTerminal(cwd)}
@@ -529,6 +540,7 @@ export function App() {
           onTheme={setTheme}
           onPiChange={(enabled, model) => void updatePiConfig(enabled, model)}
           onNotificationsChange={(enabled) => void updateNotifications(enabled)}
+          onTileNewTerminalsChange={updateTileNewTerminals}
           onPasswordChanged={() => showNotice("Password changed; other sessions were signed out")}
           onOpenFile={(entry) => void openResource({ path: entry.path }, entry)}
           onLogout={() => void logout()}

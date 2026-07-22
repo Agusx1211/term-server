@@ -5,6 +5,7 @@ import {
   layoutFromIds,
   paneIds,
   paneRects,
+  placeNewTerminal,
   pruneLayout,
   reconcileMounted,
 } from "./layout";
@@ -61,6 +62,14 @@ describe("split layouts", () => {
   it("balances automatic insertion by splitting the largest region", () => {
     const rectangles = paneRects(layoutFromIds(["one", "two", "three", "four"]));
     expect(rectangles.every((rectangle) => rectangle.width === 0.5 && rectangle.height === 0.5)).toBe(true);
+  });
+
+  it("replaces the active pane for new terminals unless tiling is enabled", () => {
+    const layout = layoutFromIds(["one", "two"]);
+
+    expect(paneIds(placeNewTerminal(layout, "three", "two", 4))).toEqual(["one", "three"]);
+    expect(paneIds(placeNewTerminal(layout, "three", "two", 4, true))).toEqual(["one", "three", "two"]);
+    expect(paneIds(placeNewTerminal(layout, "three", "two", 2, true))).toEqual(["one", "three"]);
   });
 });
 
