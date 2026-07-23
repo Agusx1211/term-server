@@ -123,6 +123,8 @@ export interface FileEntry {
 export interface ArtifactEntry extends FileEntry {
   id: string;
   sessionId: string;
+  createdAt: number;
+  producer?: string;
 }
 
 export interface DirectoryListing {

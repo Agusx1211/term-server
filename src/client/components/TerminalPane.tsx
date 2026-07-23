@@ -14,6 +14,7 @@ import {
   GripVertical,
   ListTree,
   Maximize2,
+  PackageOpen,
   Search,
   Trash2,
   WifiOff,
@@ -24,6 +25,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon, type ISearchOptions } from "@xterm/addon-search";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import type {
+  ArtifactEntry,
   ClientConfig,
   ClientTerminalMessage,
   FileEntry,
@@ -41,6 +43,7 @@ import {
   type TerminalModifiers,
 } from "../lib/mobile-terminal";
 import { ProcessInspector } from "./ProcessInspector";
+import { ArtifactDrawer } from "./ArtifactDrawer";
 import { WorkingDuration } from "./WorkingDuration";
 
 export type ThemeName = "dark" | "light";
@@ -51,6 +54,7 @@ interface TerminalPaneProps {
   theme: ThemeName;
   active: boolean;
   needsAttention: boolean;
+  artifacts: ArtifactEntry[];
   onActivate: () => void;
   onClose: () => void;
   onRemove: () => void;
@@ -61,6 +65,7 @@ interface TerminalPaneProps {
   onUpdate: (terminal: TerminalInfo) => void;
   onNotice: (message: string) => void;
   onOpenFile: (target: FileTarget) => void;
+  onOpenArtifact: (artifact: ArtifactEntry) => void;
 }
 
 const terminalThemes: Record<ThemeName, ITheme> = {
@@ -172,6 +177,7 @@ export function TerminalPane({
   theme,
   active,
   needsAttention,
+  artifacts,
   onActivate,
   onClose,
   onRemove,
@@ -182,6 +188,7 @@ export function TerminalPane({
   onUpdate,
   onNotice,
   onOpenFile,
+  onOpenArtifact,
 }: TerminalPaneProps) {
   const container = useRef<HTMLDivElement>(null);
   const pane = useRef<HTMLElement>(null);
@@ -198,6 +205,8 @@ export function TerminalPane({
   terminalState.current = terminal;
   openFile.current = onOpenFile;
   const [processesOpen, setProcessesOpen] = useState(false);
+  const knownArtifactIds = useRef(new Set(artifacts.map((artifact) => artifact.id)));
+  const [artifactsOpen, setArtifactsOpen] = useState(artifacts.length > 0);
   const [actionsOpen, setActionsOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
@@ -209,6 +218,16 @@ export function TerminalPane({
   const [connection, setConnection] = useState<"connecting" | "connected" | "disconnected" | "exited">(
     terminal.status === "exited" ? "exited" : "connecting",
   );
+  const artifactSignature = artifacts.map((artifact) => artifact.id).join("\u0000");
+  const artifactsVisible = artifactsOpen && artifacts.length > 0;
+
+  useEffect(() => {
+    const discovered = artifacts.some((artifact) => !knownArtifactIds.current.has(artifact.id));
+    for (const artifact of artifacts) knownArtifactIds.current.add(artifact.id);
+    if (!discovered) return;
+    setProcessesOpen(false);
+    setArtifactsOpen(true);
+  }, [artifactSignature]);
 
   const updateMobileModifiers = (next: TerminalModifiers) => {
     modifiers.current = next;
@@ -592,7 +611,7 @@ export function TerminalPane({
   return (
     <section
       ref={pane}
-      class={`terminal-pane ${active ? "active" : ""}`}
+      class={`terminal-pane ${active ? "active" : ""} ${artifactsVisible ? "artifacts-visible" : ""}`}
       style={{
         "--terminal-color": terminal.color,
         "--terminal-background": mixedBackground(theme, terminal.color),
@@ -623,6 +642,21 @@ export function TerminalPane({
         {terminal.agent && (
           <PaneAgentState agent={terminal.agent} needsAttention={needsAttention} />
         )}
+        {artifacts.length > 0 && (
+          <button
+            class={`pane-artifacts ${artifactsVisible ? "active" : ""}`}
+            onClick={() => {
+              setProcessesOpen(false);
+              setArtifactsOpen((current) => !current);
+            }}
+            aria-label={`${artifactsVisible ? "Close" : "Open"} ${artifacts.length} session ${artifacts.length === 1 ? "artifact" : "artifacts"}`}
+            aria-expanded={artifactsVisible}
+            title={`${artifacts.length} ${terminal.agent?.kind ?? "terminal"} ${artifacts.length === 1 ? "artifact" : "artifacts"}`}
+          >
+            <PackageOpen size={13} />
+            <span>{artifacts.length}</span>
+          </button>
+        )}
         <span class={`connection ${connection}`} title={connection} />
         <span class="pane-spacer" />
         <span class="desktop-pane-actions">
@@ -637,7 +671,10 @@ export function TerminalPane({
           </button>
           <button
             class={`pane-action ${processesOpen ? "active" : ""}`}
-            onClick={() => setProcessesOpen((current) => !current)}
+            onClick={() => {
+              setArtifactsOpen(false);
+              setProcessesOpen((current) => !current);
+            }}
             aria-label="Inspect terminal processes"
             aria-expanded={processesOpen}
             title="Inspect live child processes"
@@ -678,9 +715,25 @@ export function TerminalPane({
               <button role="menuitem" onClick={() => { setActionsOpen(false); void paste(); }}>
                 <ClipboardPaste size={16} /> Paste
               </button>
-              <button role="menuitem" onClick={() => { setActionsOpen(false); setProcessesOpen(true); }}>
+              <button role="menuitem" onClick={() => {
+                setActionsOpen(false);
+                setArtifactsOpen(false);
+                setProcessesOpen(true);
+              }}>
                 <ListTree size={16} /> Inspect processes
               </button>
+              {artifacts.length > 0 && (
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    setActionsOpen(false);
+                    setProcessesOpen(false);
+                    setArtifactsOpen(true);
+                  }}
+                >
+                  <PackageOpen size={16} /> Open artifacts ({artifacts.length})
+                </button>
+              )}
               <button role="menuitem" onClick={() => { setActionsOpen(false); onClone(); }}>
                 <CopyPlus size={16} /> Clone terminal
               </button>
@@ -694,15 +747,26 @@ export function TerminalPane({
           )}
         </div>
       </header>
-      <div
-        ref={container}
-        class="xterm-host"
-        onContextMenu={(event) => {
-          event.preventDefault();
-          if (xterm.current?.hasSelection()) void copy();
-          else void paste();
-        }}
-      />
+      <div class="terminal-body">
+        <div
+          ref={container}
+          class="xterm-host"
+          onContextMenu={(event) => {
+            event.preventDefault();
+            if (xterm.current?.hasSelection()) void copy();
+            else void paste();
+          }}
+        />
+        {artifactsVisible && (
+          <ArtifactDrawer
+            terminal={terminal}
+            artifacts={artifacts}
+            onClose={() => setArtifactsOpen(false)}
+            onOpen={onOpenArtifact}
+            onNotice={onNotice}
+          />
+        )}
+      </div>
       <nav
         class="terminal-keybar"
         aria-label="Terminal keyboard shortcuts"

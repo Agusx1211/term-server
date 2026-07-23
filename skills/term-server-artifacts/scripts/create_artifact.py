@@ -4,15 +4,19 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sys
 import tempfile
+import time
 import uuid
 
 
 SAFE_SESSION = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+SAFE_PRODUCER = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 
 def parse_args() -> argparse.Namespace:
@@ -23,6 +27,11 @@ def parse_args() -> argparse.Namespace:
         "--name",
         default=None,
         help="Artifact filename, including an appropriate extension (default: artifact.md).",
+    )
+    parser.add_argument(
+        "--producer",
+        default=None,
+        help="Agent or tool creating the artifact, for example codex.",
     )
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--from-file", type=Path, help="Copy bytes from an existing file.")
@@ -66,27 +75,48 @@ def content_bytes(args: argparse.Namespace) -> bytes:
     return sys.stdin.buffer.read()
 
 
-def create_artifact(name: str, content: bytes) -> Path:
+def producer_name(requested: str | None) -> str | None:
+    if requested is None:
+        return None
+    producer = requested.strip().lower()
+    if not SAFE_PRODUCER.fullmatch(producer):
+        raise ValueError("--producer contains unsupported characters")
+    return producer
+
+
+def write_private(path: Path, content: bytes) -> None:
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.fchmod(descriptor, 0o600)
+    with os.fdopen(descriptor, "wb") as output:
+        output.write(content)
+        output.flush()
+        os.fsync(output.fileno())
+
+
+def create_artifact(name: str, content: bytes, producer: str | None) -> Path:
     root = artifact_root()
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     session_directory = root / session_name()
     session_directory.mkdir(mode=0o700, exist_ok=True)
-    directory = session_directory / str(uuid.uuid4())
-    directory.mkdir(mode=0o700)
-    destination = directory / name
-    descriptor, temporary_name = tempfile.mkstemp(prefix=".artifact-", dir=directory)
-    temporary = Path(temporary_name)
+    artifact_id = str(uuid.uuid4())
+    staging = Path(tempfile.mkdtemp(prefix=".artifact-", dir=session_directory))
+    destination = staging / name
     try:
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "wb") as output:
-            output.write(content)
-            output.flush()
-            os.fsync(output.fileno())
-        temporary.replace(destination)
+        metadata = {
+            "createdAt": int(time.time() * 1000),
+            **({"producer": producer} if producer else {}),
+        }
+        write_private(
+            staging / ".artifact.json",
+            json.dumps(metadata, separators=(",", ":")).encode(),
+        )
+        write_private(destination, content)
+        final_directory = session_directory / artifact_id
+        staging.replace(final_directory)
     except BaseException:
-        temporary.unlink(missing_ok=True)
+        shutil.rmtree(staging, ignore_errors=True)
         raise
-    return destination
+    return final_directory / name
 
 
 def main() -> int:
@@ -95,6 +125,7 @@ def main() -> int:
         path = create_artifact(
             filename(args.name, args.from_file),
             content_bytes(args),
+            producer_name(args.producer),
         ).resolve()
     except (OSError, ValueError) as error:
         print(f"create_artifact.py: {error}", file=sys.stderr)

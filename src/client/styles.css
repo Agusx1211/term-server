@@ -175,7 +175,15 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
 .terminal-kind.agent { color: var(--workspace-color); border-color: color-mix(in srgb, var(--workspace-color) 40%, var(--border)); }
 .terminal-copy { min-width: 0; flex: 1; display: grid; gap: 1px; }
 .terminal-title { overflow: hidden; color: var(--foreground); font-size: 11.5px; font-weight: 540; line-height: 14px; text-overflow: ellipsis; white-space: nowrap; }
-.terminal-meta { overflow: hidden; color: var(--subtle); font-size: 8.5px; line-height: 10px; letter-spacing: .045em; text-overflow: ellipsis; text-transform: uppercase; white-space: nowrap; }
+.terminal-meta {
+  min-width: 0; overflow: hidden; display: flex; align-items: center; gap: 5px; color: var(--subtle);
+  font-size: 8.5px; line-height: 10px; letter-spacing: .045em; text-transform: uppercase; white-space: nowrap;
+}
+.terminal-meta > span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.terminal-artifact-count {
+  height: 13px; flex: none; display: inline-flex; align-items: center; gap: 2px; padding: 0 4px; border-radius: 6px;
+  background: color-mix(in srgb, var(--artifact) 14%, var(--sidebar)); color: var(--artifact); font-weight: 750; letter-spacing: 0;
+}
 .agent-status-badge {
   --agent-color: var(--muted); height: 20px; min-width: 59px; flex: none; display: inline-flex; align-items: center; justify-content: center; gap: 4px;
   margin-right: 3px; padding: 0 6px; border: 1px solid color-mix(in srgb, var(--agent-color) 55%, var(--border)); border-radius: 4px;
@@ -388,8 +396,17 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
 }
 .artifact-document .resource-document-header > svg { color: var(--artifact); }
 .artifact-document .resource-document-header > em {
-  padding: 3px 7px; border-radius: 999px; background: var(--artifact); color: var(--artifact-ink); font-weight: 750;
+  margin-left: 0; padding: 3px 7px; border-radius: 999px; background: var(--artifact); color: var(--artifact-ink); font-weight: 750;
 }
+.artifact-origin {
+  min-width: 0; max-width: 210px; height: 22px; margin-left: auto; flex: 0 1 auto; display: flex; align-items: center; gap: 5px;
+  padding: 0 7px; border: 1px solid color-mix(in srgb, var(--artifact) 42%, var(--border)); border-radius: 3px;
+  background: color-mix(in srgb, var(--artifact) 8%, var(--input)); color: var(--foreground); cursor: pointer;
+  font-size: 9px; text-transform: none;
+}
+.artifact-origin:hover { border-color: var(--artifact); background: color-mix(in srgb, var(--artifact) 14%, var(--input)); }
+.artifact-origin > svg { flex: none; color: var(--artifact); }
+.artifact-origin > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .resource-editor-action { height: 23px; flex: none; display: flex; align-items: center; gap: 5px; padding: 0 7px; border: 1px solid var(--border); border-radius: 3px; background: var(--input); color: var(--foreground); font-size: 9.5px; text-decoration: none; cursor: pointer; }
 .resource-editor-action:hover:not(:disabled), .resource-editor-action.active { border-color: var(--border-strong); background: var(--hover); }
 .artifact-document .resource-editor-action {
@@ -423,6 +440,7 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
 .terminal-pane {
   position: relative; width: 100%; height: 100%; min-width: 0; min-height: 0; display: grid;
   grid-template-rows: 30px minmax(0, 1fr); background: var(--terminal-background);
+  container: terminal-pane / inline-size;
   box-shadow: inset 0 2px 0 color-mix(in srgb, var(--terminal-color) 80%, transparent);
 }
 .terminal-loading { position: absolute; inset: 0; display: grid; place-items: center; background: var(--editor); color: var(--muted); }
@@ -445,6 +463,16 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
 }
 .pane-agent-kind { color: var(--foreground); font-weight: 600; text-transform: uppercase; }
 .pane-agent-state { height: 14px; display: inline-flex; align-items: center; gap: 3px; padding: 0 4px; border-radius: 2px; background: color-mix(in srgb, var(--agent-color) 14%, transparent); font-weight: 700; letter-spacing: .035em; text-transform: uppercase; }
+.pane-artifacts {
+  height: 20px; flex: none; display: inline-flex; align-items: center; gap: 4px; padding: 0 6px;
+  border: 1px solid color-mix(in srgb, var(--artifact) 38%, var(--border)); border-radius: 4px;
+  background: color-mix(in srgb, var(--artifact) 7%, var(--panel)); color: var(--artifact); cursor: pointer;
+  font-size: 9px; font-weight: 750;
+}
+.pane-artifacts:hover, .pane-artifacts.active {
+  border-color: color-mix(in srgb, var(--artifact) 75%, var(--border));
+  background: color-mix(in srgb, var(--artifact) 14%, var(--panel));
+}
 .connection { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); }
 .connection.connecting { background: #d29922; }
 .connection.disconnected, .connection.exited { background: var(--danger); }
@@ -453,9 +481,10 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
 .pane-action.active { background: var(--selected); color: var(--foreground); }
 .pane-action.danger:hover { color: var(--danger); }
 .desktop-pane-actions { display: flex; align-items: center; }
+.terminal-body { position: relative; min-width: 0; min-height: 0; display: flex; overflow: hidden; }
 .xterm-host {
   min-width: 0; min-height: 0; overflow: hidden; background: var(--terminal-background);
-  overscroll-behavior: contain;
+  flex: 1; overscroll-behavior: contain;
 }
 .xterm-host .xterm { height: 100%; padding: 7px 7px 3px 9px; }
 .xterm-host .xterm-viewport { background-color: var(--terminal-background); scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
@@ -515,6 +544,91 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
 .process-commandline { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--subtle); font: 8.5px/11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .process-pid { color: var(--subtle); font: 8.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .process-foreground { padding: 1px 4px; border-radius: 3px; background: color-mix(in srgb, var(--terminal-color) 13%, transparent); color: var(--terminal-color); font-size: 7.5px; font-weight: 800; }
+
+.artifact-drawer {
+  width: min(390px, 42%); min-width: 300px; min-height: 0; flex: none; display: flex; flex-direction: column;
+  border-left: 1px solid color-mix(in srgb, var(--artifact) 42%, var(--border)); background: var(--artifact-surface);
+  color: var(--foreground); box-shadow: -8px 0 24px var(--shadow);
+}
+.artifact-drawer-header {
+  min-width: 0; min-height: 48px; flex: none; display: flex; align-items: center; gap: 8px; padding: 0 5px 0 9px;
+  border-bottom: 1px solid color-mix(in srgb, var(--artifact) 30%, var(--border)); background: var(--artifact-surface-raised);
+}
+.artifact-drawer-mark {
+  width: 29px; height: 29px; flex: none; display: grid; place-items: center; border-radius: 7px;
+  background: var(--artifact); color: var(--artifact-ink);
+}
+.artifact-drawer-heading { min-width: 0; flex: 1; display: grid; gap: 2px; }
+.artifact-drawer-heading strong {
+  overflow: hidden; color: var(--foreground); font-size: 11px; font-weight: 680; text-overflow: ellipsis;
+  text-transform: capitalize; white-space: nowrap;
+}
+.artifact-drawer-heading small {
+  overflow: hidden; color: var(--muted); font-size: 8.5px; text-overflow: ellipsis; white-space: nowrap;
+}
+.artifact-drawer-context {
+  min-width: 0; flex: none; display: flex; align-items: center; gap: 6px; padding: 7px 9px;
+  border-bottom: 1px solid color-mix(in srgb, var(--artifact) 18%, var(--border));
+  background: color-mix(in srgb, var(--artifact) 4%, var(--artifact-surface)); color: var(--muted);
+  font-size: 9px; line-height: 1.35;
+}
+.artifact-drawer-context > svg { flex: none; color: var(--artifact); }
+.artifact-drawer-list {
+  min-height: 52px; max-height: 32%; flex: 0 1 auto; overflow: auto; padding: 5px;
+  border-bottom: 1px solid color-mix(in srgb, var(--artifact) 24%, var(--border));
+  scrollbar-color: color-mix(in srgb, var(--artifact) 35%, var(--border-strong)) transparent;
+}
+.artifact-list-item {
+  width: 100%; min-width: 0; min-height: 42px; display: flex; align-items: center; gap: 7px; padding: 5px 7px;
+  border: 1px solid transparent; border-radius: 4px; background: transparent; color: var(--muted); text-align: left; cursor: pointer;
+}
+.artifact-list-item:hover { background: color-mix(in srgb, var(--artifact) 7%, var(--hover)); color: var(--foreground); }
+.artifact-list-item.active {
+  border-color: color-mix(in srgb, var(--artifact) 42%, var(--border));
+  background: color-mix(in srgb, var(--artifact) 11%, var(--artifact-surface)); color: var(--foreground);
+}
+.artifact-list-icon {
+  width: 27px; height: 27px; flex: none; display: grid; place-items: center; border-radius: 5px;
+  background: color-mix(in srgb, var(--artifact) 11%, var(--artifact-surface-raised)); color: var(--artifact);
+}
+.artifact-list-copy { min-width: 0; display: grid; gap: 2px; }
+.artifact-list-copy strong { overflow: hidden; font-size: 10.5px; font-weight: 620; text-overflow: ellipsis; white-space: nowrap; }
+.artifact-list-copy small { color: var(--subtle); font-size: 8.5px; }
+.artifact-inline { min-width: 0; min-height: 0; flex: 1; display: grid; grid-template-rows: auto minmax(0, 1fr); }
+.artifact-inline-header {
+  min-width: 0; display: flex; align-items: center; gap: 5px; padding: 6px;
+  border-bottom: 1px solid color-mix(in srgb, var(--artifact) 18%, var(--border)); background: var(--artifact-surface-raised);
+}
+.artifact-inline-header > svg { flex: none; color: var(--artifact); }
+.artifact-inline-header > span { min-width: 0; flex: 1; display: grid; gap: 1px; }
+.artifact-inline-header strong { overflow: hidden; font-size: 9.5px; text-overflow: ellipsis; white-space: nowrap; }
+.artifact-inline-header small { overflow: hidden; color: var(--subtle); font-size: 7.5px; text-overflow: ellipsis; white-space: nowrap; }
+.artifact-inline-action {
+  height: 25px; flex: none; display: inline-flex; align-items: center; justify-content: center; gap: 4px; padding: 0 6px;
+  border: 1px solid color-mix(in srgb, var(--artifact) 32%, var(--border)); border-radius: 3px;
+  background: color-mix(in srgb, var(--artifact) 5%, var(--input)); color: var(--foreground); font-size: 8.5px;
+  text-decoration: none; cursor: pointer;
+}
+.artifact-inline-action:hover { border-color: var(--artifact); background: color-mix(in srgb, var(--artifact) 13%, var(--input)); }
+.artifact-inline-action.primary { border-color: var(--artifact); background: var(--artifact); color: var(--artifact-ink); font-weight: 700; }
+.artifact-inline-body { min-width: 0; min-height: 0; overflow: auto; background: var(--artifact-surface); }
+.artifact-inline-body pre {
+  min-width: 100%; min-height: 100%; margin: 0; padding: 10px 11px; color: var(--foreground);
+  font: 10.5px/1.48 SFMono-Regular, Consolas, Liberation Mono, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.artifact-inline-body > img { width: 100%; height: 100%; display: block; padding: 9px; object-fit: contain; }
+.artifact-inline-body > iframe { width: 100%; height: 100%; display: block; border: 0; background: #525659; }
+.artifact-inline-state {
+  min-height: 100%; display: flex; align-items: center; justify-content: center; gap: 7px; padding: 18px;
+  color: var(--muted); font-size: 9.5px; line-height: 1.45; text-align: center;
+}
+.artifact-inline-state.error { color: var(--danger); }
+
+@container terminal-pane (max-width: 720px) {
+  .artifact-drawer {
+    position: absolute; inset: 0 0 0 auto; z-index: 9; width: min(390px, 100%); min-width: 0;
+  }
+}
 
 .layout-drop-surface { position: absolute; inset: 0; z-index: 40; pointer-events: none; }
 .layout-drop-target {
@@ -749,6 +863,7 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
   .pane-agent { height: 28px; padding: 0 4px; }
   .pane-agent-kind { display: none; }
   .pane-agent-state { height: 20px; padding: 0 5px; }
+  .pane-artifacts { height: 28px; padding: 0 7px; }
   .desktop-pane-actions { display: none; }
   .mobile-pane-actions { position: relative; flex: none; display: block; }
   .mobile-pane-actions > .pane-action { width: 40px; height: 40px; }
@@ -783,6 +898,8 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
     border-color: var(--accent); background: var(--accent-soft); color: var(--foreground);
     box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 25%, transparent);
   }
+  .terminal-pane.artifacts-visible { grid-template-rows: 44px minmax(0, 1fr); }
+  .terminal-pane.artifacts-visible .terminal-keybar { display: none; }
   .terminal-keybar-divider { width: 1px; height: 24px; flex: none; margin: 0 1px; background: var(--border-strong); }
   .terminal-scroll-latest {
     position: absolute; right: 10px; bottom: calc(55px + env(safe-area-inset-bottom)); z-index: 7;
@@ -797,6 +914,17 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
   .process-inspector-header { min-height: 44px; padding-left: 12px; }
   .process-inspector-header > .pane-action { width: 40px; height: 40px; }
   .process-row { min-height: 48px; }
+  .artifact-drawer {
+    width: 100%; max-width: none; border-left: 0; box-shadow: none;
+  }
+  .artifact-drawer-list { max-height: 30%; }
+  .artifact-drawer-header { padding-left: 10px; }
+  .artifact-drawer-header > .pane-action { width: 40px; height: 40px; }
+  .artifact-list-item { min-height: 48px; }
+  .artifact-inline-header { min-height: 48px; }
+  .artifact-inline-action { width: 36px; height: 36px; padding: 0; }
+  .artifact-inline-action > span { display: none; }
+  .artifact-inline-body pre { padding: 13px; font-size: 13px; line-height: 1.5; }
 
   .workspace-area.with-resource-tabs { grid-template-rows: 44px minmax(0, 1fr); }
   .resource-tabbar { height: 44px; }
@@ -807,6 +935,7 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
   .text-document, .image-document, .pdf-document { grid-template-rows: 44px minmax(0, 1fr); }
   .resource-document-header { padding: 0 6px 0 10px; }
   .resource-document-header > em { display: none; }
+  .artifact-origin { max-width: 115px; height: 34px; padding: 0 7px; }
   .resource-editor-action { height: 36px; justify-content: center; font-size: 11px; }
   .resource-wrap { width: 36px; padding: 0; }
   .resource-wrap > span { display: none; }
