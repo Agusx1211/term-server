@@ -1,17 +1,5 @@
 import { FileCode2, FileText, Image, PackageOpen, Settings, TerminalSquare, X } from "lucide-preact";
-
-export interface ResourceTab {
-  path: string;
-  name: string;
-  type: "text" | "image" | "pdf";
-  mime: string;
-  modifiedAt: number;
-  dirty: boolean;
-  artifact?: {
-    id: string;
-    sessionId: string;
-  };
-}
+import type { ResourceTab } from "../lib/resources";
 
 interface ResourceTabBarProps {
   tabs: ResourceTab[];
@@ -81,7 +69,9 @@ export function ResourceTabBar({
             onAuxClick={(event) => {
               if (event.button === 1) onClose(tab.path);
             }}
-            title={`${tab.artifact ? "Artifact · " : ""}${tab.path}`}
+            title={tab.artifact
+              ? `Artifact from ${tab.artifact.agentKind ? `${tab.artifact.agentKind} · ` : ""}${tab.artifact.terminalName}\n${tab.path}`
+              : tab.path}
           >
             <Icon size={13} />
             <span>{tab.name}</span>

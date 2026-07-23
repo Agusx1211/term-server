@@ -5,6 +5,7 @@ import { LanguageDescription } from "@codemirror/language";
 import { languages } from "@codemirror/language-data";
 import { oneDark } from "@codemirror/theme-one-dark";
 import {
+  Bot,
   Copy,
   Download,
   FileCode2,
@@ -17,8 +18,8 @@ import {
 } from "lucide-preact";
 import type { FileDocument } from "../../shared/types";
 import { api } from "../lib/api";
+import type { ResourceTab } from "../lib/resources";
 import type { ThemeName } from "./TerminalPane";
-import type { ResourceTab } from "./ResourceTabs";
 
 const LINE_WRAPPING_STORAGE_KEY = "term-server:editor-line-wrapping";
 
@@ -28,9 +29,17 @@ interface ResourceDocumentsProps {
   theme: ThemeName;
   onDirty: (path: string, dirty: boolean) => void;
   onNotice: (message: string) => void;
+  onOpenArtifactSession: (sessionId: string) => void;
 }
 
-export function ResourceDocuments({ tabs, activePath, theme, onDirty, onNotice }: ResourceDocumentsProps) {
+export function ResourceDocuments({
+  tabs,
+  activePath,
+  theme,
+  onDirty,
+  onNotice,
+  onOpenArtifactSession,
+}: ResourceDocumentsProps) {
   const [lineWrapping, setLineWrapping] = useState(
     () => localStorage.getItem(LINE_WRAPPING_STORAGE_KEY) !== "false",
   );
@@ -47,9 +56,9 @@ export function ResourceDocuments({ tabs, activePath, theme, onDirty, onNotice }
       {tabs.map((tab) => (
         <div key={tab.path} class={`resource-document ${activePath === tab.path ? "active" : "cached"}`}>
           {tab.type === "image" ? (
-            <ImageDocument tab={tab} />
+            <ImageDocument tab={tab} onOpenArtifactSession={onOpenArtifactSession} />
           ) : tab.type === "pdf" ? (
-            <PdfDocument tab={tab} />
+            <PdfDocument tab={tab} onOpenArtifactSession={onOpenArtifactSession} />
           ) : (
             <TextDocument
               tab={tab}
@@ -58,6 +67,7 @@ export function ResourceDocuments({ tabs, activePath, theme, onDirty, onNotice }
               onToggleLineWrapping={toggleLineWrapping}
               onDirty={onDirty}
               onNotice={onNotice}
+              onOpenArtifactSession={onOpenArtifactSession}
             />
           )}
         </div>
@@ -68,7 +78,13 @@ export function ResourceDocuments({ tabs, activePath, theme, onDirty, onNotice }
 
 export default ResourceDocuments;
 
-function ImageDocument({ tab }: { tab: ResourceTab }) {
+function ImageDocument({
+  tab,
+  onOpenArtifactSession,
+}: {
+  tab: ResourceTab;
+  onOpenArtifactSession: (sessionId: string) => void;
+}) {
   const [failed, setFailed] = useState(false);
   const isArtifact = Boolean(tab.artifact);
   const Icon = isArtifact ? PackageOpen : Image;
@@ -77,7 +93,8 @@ function ImageDocument({ tab }: { tab: ResourceTab }) {
     <section class={`image-document ${isArtifact ? "artifact-document" : ""}`}>
       <header class="resource-document-header">
         <Icon size={14} />
-        <span>{tab.path}</span>
+        <span>{isArtifact ? tab.name : tab.path}</span>
+        <ArtifactOriginAction tab={tab} onOpen={onOpenArtifactSession} />
         <em>{isArtifact ? "Artifact" : tab.mime}</em>
         <DownloadAction tab={tab} />
       </header>
@@ -96,13 +113,21 @@ function ImageDocument({ tab }: { tab: ResourceTab }) {
   );
 }
 
-function PdfDocument({ tab }: { tab: ResourceTab }) {
+function PdfDocument({
+  tab,
+  onOpenArtifactSession,
+}: {
+  tab: ResourceTab;
+  onOpenArtifactSession: (sessionId: string) => void;
+}) {
+  const isArtifact = Boolean(tab.artifact);
   return (
-    <section class="pdf-document">
+    <section class={`pdf-document ${isArtifact ? "artifact-document" : ""}`}>
       <header class="resource-document-header">
-        <FileText size={14} />
-        <span>{tab.path}</span>
-        <em>{tab.mime}</em>
+        {isArtifact ? <PackageOpen size={14} /> : <FileText size={14} />}
+        <span>{isArtifact ? tab.name : tab.path}</span>
+        <ArtifactOriginAction tab={tab} onOpen={onOpenArtifactSession} />
+        <em>{isArtifact ? "Artifact · PDF" : tab.mime}</em>
         <DownloadAction tab={tab} />
       </header>
       <iframe
@@ -136,6 +161,7 @@ interface TextDocumentProps {
   onToggleLineWrapping: () => void;
   onDirty: (path: string, dirty: boolean) => void;
   onNotice: (message: string) => void;
+  onOpenArtifactSession: (sessionId: string) => void;
 }
 
 function TextDocument({
@@ -145,6 +171,7 @@ function TextDocument({
   onToggleLineWrapping,
   onDirty,
   onNotice,
+  onOpenArtifactSession,
 }: TextDocumentProps) {
   const host = useRef<HTMLDivElement>(null);
   const editor = useRef<EditorView>();
@@ -286,7 +313,8 @@ function TextDocument({
     <section class={`text-document ${isArtifact ? "artifact-document" : ""}`}>
       <header class="resource-document-header">
         {isArtifact ? <PackageOpen size={14} /> : <FileCode2 size={14} />}
-        <span>{tab.path}</span>
+        <span>{isArtifact ? tab.name : tab.path}</span>
+        <ArtifactOriginAction tab={tab} onOpen={onOpenArtifactSession} />
         <em>{isArtifact ? `Artifact · ${language}` : language}</em>
         <DownloadAction tab={tab} />
         <button
@@ -327,5 +355,28 @@ function TextDocument({
         )}
       </div>
     </section>
+  );
+}
+
+function ArtifactOriginAction({
+  tab,
+  onOpen,
+}: {
+  tab: ResourceTab;
+  onOpen: (sessionId: string) => void;
+}) {
+  if (!tab.artifact) return null;
+  const label = tab.artifact.agentKind
+    ? `${tab.artifact.agentKind} · ${tab.artifact.terminalName}`
+    : tab.artifact.terminalName;
+  return (
+    <button
+      class="artifact-origin"
+      onClick={() => onOpen(tab.artifact!.sessionId)}
+      title={`Return to ${label}`}
+    >
+      <Bot size={12} />
+      <span>{label}</span>
+    </button>
   );
 }
