@@ -102,6 +102,8 @@ creates a private file under `/tmp/artifacts/<session>/<artifact-id>/` and print
 `file://` URI and absolute path. Term-server discovers the file and opens it as an artifact tab;
 the same path remains usable with normal tools such as `cat` in any other terminal.
 
+![Editable session artifact opened in term-server](docs/screenshots/session-artifact.jpg)
+
 Artifact tabs reuse the file editor, including conflict-safe saves, line wrapping, syntax
 highlighting, and one-click copy. Edits are visible to the agent at the same path on later turns.
 Artifacts are temporary: the operating system may clear `/tmp`, and they are not added to a
