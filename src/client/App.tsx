@@ -1,7 +1,21 @@
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { lazy, Suspense } from "preact/compat";
-import { ChevronLeft, ChevronRight, Menu, Plus, ShieldCheck } from "lucide-preact";
-import type { ClientConfig, FileEntry, FileTarget, TerminalInfo } from "../shared/types";
+import {
+  ChevronLeft,
+  ChevronRight,
+  LoaderCircle,
+  Menu,
+  Plus,
+  ShieldCheck,
+} from "lucide-preact";
+import type {
+  ClientConfig,
+  FileEntry,
+  FileTarget,
+  ReleaseInfo,
+  TerminalInfo,
+  UpdateStatus,
+} from "../shared/types";
 import { api, ApiError } from "./lib/api";
 import {
   agentNeedsAttention,
@@ -51,6 +65,15 @@ const defaultConfig: ClientConfig = {
     summariesEnabled: false,
     model: "",
     models: [],
+  },
+  build: {
+    version: "unknown",
+    commit: "unknown",
+  },
+  updates: {
+    enabled: false,
+    channel: "main",
+    reason: null,
   },
 };
 const dropPositions: DropPosition[] = ["left", "top", "center", "bottom", "right"];
@@ -104,6 +127,10 @@ export function App() {
   const [dropTarget, setDropTarget] = useState<{ id: string; position: DropPosition }>();
   const [theme, setTheme] = useState<ThemeName>(initialTheme);
   const [creating, setCreating] = useState(false);
+  const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
+  const [checkingForUpdate, setCheckingForUpdate] = useState(false);
+  const [installingUpdate, setInstallingUpdate] = useState(false);
+  const [restartingForUpdate, setRestartingForUpdate] = useState<ReleaseInfo>();
   const [notice, setNotice] = useState("");
   const [mobileSidebar, setMobileSidebar] = useState(false);
   const [notificationsEnabled, setNotificationsEnabled] = useState(initialNotifications);
@@ -122,6 +149,29 @@ export function App() {
   const showNotice = (message: string) => {
     setNotice(message);
     window.setTimeout(() => setNotice((current) => (current === message ? "" : current)), 2400);
+  };
+
+  const checkForUpdates = async (notify = false) => {
+    setCheckingForUpdate(true);
+    try {
+      const status = await api.updateStatus();
+      setUpdateStatus(status);
+      if (notify) {
+        showNotice(
+          status.state === "available" && status.latest
+            ? `term-server v${status.latest.version} is available`
+            : status.state === "current"
+              ? "term-server is up to date"
+              : "Automatic updates are unavailable for this installation",
+        );
+      }
+    } catch (error) {
+      if (notify) {
+        showNotice(error instanceof Error ? error.message : "Unable to check for updates");
+      }
+    } finally {
+      setCheckingForUpdate(false);
+    }
   };
 
   const loadWorkspace = async () => {
@@ -157,6 +207,13 @@ export function App() {
       })
       .catch(() => setAuthenticated(false));
   }, []);
+
+  useEffect(() => {
+    if (!authenticated || !config.updates.enabled) return;
+    void checkForUpdates();
+    const timer = window.setInterval(() => void checkForUpdates(), 6 * 60 * 60 * 1000);
+    return () => clearInterval(timer);
+  }, [authenticated, config.updates.enabled, config.updates.channel]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -548,6 +605,43 @@ export function App() {
     localStorage.setItem(TILE_NEW_TERMINALS_STORAGE_KEY, String(enabled));
   };
 
+  const waitForUpdatedServer = async (expectedCommit: string) => {
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+      await new Promise((resolve) => window.setTimeout(resolve, 500));
+      try {
+        const nextConfig = await api.config();
+        if (nextConfig.build.commit === expectedCommit) {
+          location.reload();
+          return;
+        }
+      } catch {
+        // The server is expected to be briefly unavailable while it restarts.
+      }
+    }
+    setRestartingForUpdate(undefined);
+    showNotice("The update was installed, but the server did not restart; restart term-server manually");
+  };
+
+  const installUpdate = async () => {
+    const release = updateStatus?.latest;
+    if (!release) return;
+    const dirtyWarning = resources.some((resource) => resource.dirty)
+      ? " You also have unsaved file edits."
+      : "";
+    if (!confirm(
+      `Update to term-server v${release.version}? The server will restart and all terminal sessions will end.${dirtyWarning}`,
+    )) return;
+    setInstallingUpdate(true);
+    try {
+      const installed = await api.installUpdate(release.commit);
+      setRestartingForUpdate(installed);
+      void waitForUpdatedServer(installed.commit);
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : "Unable to install the update");
+      setInstallingUpdate(false);
+    }
+  };
+
   const logout = async () => {
     try {
       await api.logout();
@@ -559,6 +653,7 @@ export function App() {
       setMountedIds([]);
       setResources([]);
       setActiveResource(undefined);
+      setUpdateStatus(null);
     }
   };
 
@@ -611,6 +706,11 @@ export function App() {
           creating={creating}
           theme={theme}
           pi={config.pi}
+          build={config.build}
+          updateConfig={config.updates}
+          updateStatus={updateStatus}
+          checkingForUpdate={checkingForUpdate}
+          installingUpdate={installingUpdate}
           passwordManagedExternally={config.passwordManagedExternally}
           notificationsEnabled={notificationsEnabled}
           tileNewTerminals={tileNewTerminals}
@@ -624,6 +724,8 @@ export function App() {
           onPiChange={(titlesEnabled, summariesEnabled, model) => (
             void updatePiConfig(titlesEnabled, summariesEnabled, model)
           )}
+          onCheckForUpdate={() => void checkForUpdates(true)}
+          onInstallUpdate={() => void installUpdate()}
           onNotificationsChange={(enabled) => void updateNotifications(enabled)}
           onTileNewTerminalsChange={updateTileNewTerminals}
           onPasswordChanged={() => showNotice("Password changed; other sessions were signed out")}
@@ -809,6 +911,12 @@ export function App() {
           )}
         </span>
         <span class="statusbar-group statusbar-right">
+          <span
+            class="statusbar-item statusbar-build"
+            title={`term-server v${config.build.version} · ${config.build.commit}`}
+          >
+            v{config.build.version} · {config.build.commit.slice(0, 7)}
+          </span>
           <span class="statusbar-item">{visibleTerminals.length}/{config.maxPanes} panes</span>
           <span class="statusbar-item statusbar-scrollback">{config.scrollbackLines.toLocaleString()} line scrollback</span>
           <span class="statusbar-item" title={config.secure ? "HTTPS enabled" : "HTTPS disabled"}>
@@ -816,6 +924,13 @@ export function App() {
           </span>
         </span>
       </footer>
+      {restartingForUpdate && (
+        <div class="update-restarting" role="status" aria-live="assertive">
+          <LoaderCircle class="spin" size={22} />
+          <strong>Installing term-server v{restartingForUpdate.version}</strong>
+          <span>Verified update installed. Waiting for the server to restart…</span>
+        </div>
+      )}
       {notice && <div class="toast" role="status">{notice}</div>}
     </div>
   );

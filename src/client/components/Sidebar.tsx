@@ -9,6 +9,7 @@ import {
   ChevronsDownUp,
   CirclePause,
   CircleX,
+  Download,
   Folder,
   FolderSearch,
   FolderOpen,
@@ -17,6 +18,7 @@ import {
   Moon,
   Pencil,
   Plus,
+  RefreshCw,
   Search,
   Settings,
   SplitSquareHorizontal,
@@ -25,7 +27,15 @@ import {
   TerminalSquare,
   X,
 } from "lucide-preact";
-import type { AgentInfo, FileEntry, PiConfig, TerminalInfo } from "../../shared/types";
+import type {
+  AgentInfo,
+  BuildInfo,
+  FileEntry,
+  PiConfig,
+  TerminalInfo,
+  UpdateConfig,
+  UpdateStatus,
+} from "../../shared/types";
 import { configureTerminalDrag } from "../lib/layout";
 import {
   clampSidebarWidth,
@@ -49,6 +59,11 @@ interface SidebarProps {
   creating: boolean;
   theme: ThemeName;
   pi: PiConfig;
+  build: BuildInfo;
+  updateConfig: UpdateConfig;
+  updateStatus: UpdateStatus | null;
+  checkingForUpdate: boolean;
+  installingUpdate: boolean;
   passwordManagedExternally: boolean;
   notificationsEnabled: boolean;
   tileNewTerminals: boolean;
@@ -60,6 +75,8 @@ interface SidebarProps {
   onRename: (terminal: TerminalInfo) => void;
   onTheme: (theme: ThemeName) => void;
   onPiChange: (titlesEnabled: boolean, summariesEnabled: boolean, model: string) => void;
+  onCheckForUpdate: () => void;
+  onInstallUpdate: () => void;
   onNotificationsChange: (enabled: boolean) => void;
   onTileNewTerminalsChange: (enabled: boolean) => void;
   onPasswordChanged: () => void;
@@ -217,6 +234,11 @@ export function Sidebar({
   creating,
   theme,
   pi,
+  build,
+  updateConfig,
+  updateStatus,
+  checkingForUpdate,
+  installingUpdate,
   passwordManagedExternally,
   notificationsEnabled,
   tileNewTerminals,
@@ -228,6 +250,8 @@ export function Sidebar({
   onRename,
   onTheme,
   onPiChange,
+  onCheckForUpdate,
+  onInstallUpdate,
   onNotificationsChange,
   onTileNewTerminalsChange,
   onPasswordChanged,
@@ -477,6 +501,54 @@ export function Sidebar({
             <p class="settings-hint">Pi is unavailable to the daemon. Install it for this user, then restart term-server.</p>
           )}
           <p class="settings-hint">Title and notification-summary generation can be enabled independently.</p>
+          <div class="settings-title settings-section-title">Updates</div>
+          <div class="settings-update">
+            <div class="settings-update-version">
+              <span>term-server v{build.version}</span>
+              <code title={build.commit}>{build.commit.slice(0, 12)}</code>
+            </div>
+            {updateStatus?.state === "available" && updateStatus.latest ? (
+              <>
+                <p class="settings-update-available">
+                  v{updateStatus.latest.version} is available
+                  <code title={updateStatus.latest.commit}>
+                    {updateStatus.latest.commit.slice(0, 12)}
+                  </code>
+                </p>
+                <button
+                  class="settings-update-action primary"
+                  onClick={onInstallUpdate}
+                  disabled={installingUpdate}
+                >
+                  {installingUpdate
+                    ? <LoaderCircle class="spin" size={14} />
+                    : <Download size={14} />}
+                  {installingUpdate ? "Installing…" : "Update and restart"}
+                </button>
+              </>
+            ) : (
+              <button
+                class="settings-update-action"
+                onClick={onCheckForUpdate}
+                disabled={!updateConfig.enabled || checkingForUpdate}
+              >
+                <RefreshCw class={checkingForUpdate ? "spin" : ""} size={14} />
+                {checkingForUpdate
+                  ? "Checking…"
+                  : updateStatus?.state === "current"
+                    ? "Up to date · Check again"
+                    : "Check for updates"}
+              </button>
+            )}
+            {!updateConfig.enabled && (
+              <p class="settings-hint">{updateConfig.reason ?? "Automatic updates are unavailable."}</p>
+            )}
+            {updateConfig.enabled && (
+              <p class="settings-hint">
+                Channel: {updateConfig.channel}. Downloads require a valid release signature and SHA-256 checksum.
+              </p>
+            )}
+          </div>
           <div class="settings-title settings-section-title">Security</div>
           <ChangePassword
             managedExternally={passwordManagedExternally}
@@ -489,6 +561,14 @@ export function Sidebar({
         <button class="sidebar-settings" onClick={() => setSettingsOpen((current) => !current)} aria-expanded={settingsOpen}>
           <Settings size={14} /> Settings
         </button>
+        {updateStatus?.state === "available" && (
+          <button class="sidebar-update" onClick={onInstallUpdate} disabled={installingUpdate}>
+            {installingUpdate
+              ? <LoaderCircle class="spin" size={13} />
+              : <Download size={13} />}
+            Update
+          </button>
+        )}
         <span class="footer-spacer" />
         <span class="status-dot online" />
         <span>{terminals.filter((terminal) => terminal.status === "running").length}</span>

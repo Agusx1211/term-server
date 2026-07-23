@@ -12,6 +12,8 @@ import type {
   FileSearchResults,
   FileTarget,
   SaveFileRequest,
+  UpdateStatus,
+  ReleaseInfo,
 } from "../../shared/types";
 
 export class ApiError extends Error {
@@ -56,6 +58,12 @@ export const api = {
       body: JSON.stringify({ currentPassword, newPassword }),
     }),
   config: () => request<ClientConfig>("/api/config"),
+  updateStatus: () => request<UpdateStatus>("/api/update"),
+  installUpdate: (commit: string) =>
+    request<ReleaseInfo>("/api/update", {
+      method: "POST",
+      body: JSON.stringify({ commit }),
+    }),
   updatePiConfig: (config: UpdatePiConfig) =>
     request<PiConfig>("/api/config/pi", { method: "PATCH", body: JSON.stringify(config) }),
   terminals: () => request<TerminalInfo[]>("/api/terminals"),

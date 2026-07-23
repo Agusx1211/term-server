@@ -1,20 +1,23 @@
-use std::{env, net::SocketAddr, sync::Arc, time::Duration};
+use std::{env, ffi::OsString, net::SocketAddr, path::Path, process::Command, sync::Arc};
 
 use axum_server::Handle;
 use clap::Parser;
 use term_server::{
     ai::PiService,
-    api::{AppState, build_router},
+    api::{AppState, ServerControl, build_router},
     auth::{LoginLimiter, load_auth},
     config::Cli,
     terminal::TerminalManager,
     tls::load_tls,
+    update::UpdateService,
 };
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    let executable = env::current_exe()?;
+    let restart_arguments = env::args_os().skip(1).collect::<Vec<_>>();
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_new(&cli.log)?)
         .compact()
@@ -46,6 +49,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let terminals = Arc::new(TerminalManager::new(cli.shell.clone(), cli.replay_bytes()));
     let pi = Arc::new(PiService::new(&cli.data_dir));
     terminals.start_monitor(pi.clone());
+    let updates = Arc::new(UpdateService::new(
+        client_directory.as_deref(),
+        cli.update_channel.clone(),
+        cli.release_base_url.clone(),
+        cli.disable_updates,
+    ));
+    let handle = Handle::new();
+    let server_control = ServerControl::new(handle.clone(), terminals.clone());
     let hostname = env::var("HOSTNAME")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -64,10 +75,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         scrollback_lines: cli.scrollback_lines,
         max_panes: cli.max_panes,
         hostname,
+        updates,
+        server_control: server_control.clone(),
     };
     let app = build_router(state, client_directory);
-    let handle = Handle::new();
-    tokio::spawn(shutdown_signal(handle.clone(), terminals));
+    tokio::spawn(shutdown_signal(server_control.clone()));
 
     let scheme = if cli.is_https() { "https" } else { "http" };
     tracing::info!(url = %format!("{scheme}://{address}"), "term-server is ready");
@@ -90,10 +102,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .serve(service)
             .await?;
     }
+    if server_control.restart_requested() {
+        restart_process(&executable, &restart_arguments)?;
+    }
     Ok(())
 }
 
-async fn shutdown_signal(handle: Handle<SocketAddr>, terminals: Arc<TerminalManager>) {
+async fn shutdown_signal(server_control: ServerControl) {
     #[cfg(unix)]
     {
         let mut terminate =
@@ -108,6 +123,22 @@ async fn shutdown_signal(handle: Handle<SocketAddr>, terminals: Arc<TerminalMana
     let _ = tokio::signal::ctrl_c().await;
 
     tracing::info!("shutting down terminal sessions");
-    terminals.shutdown();
-    handle.graceful_shutdown(Some(Duration::from_secs(5)));
+    server_control.shutdown(false);
+}
+
+#[cfg(unix)]
+fn restart_process(executable: &Path, arguments: &[OsString]) -> std::io::Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    tracing::info!("restarting into the installed update");
+    let error = Command::new(executable).args(arguments).exec();
+    Err(error)
+}
+
+#[cfg(not(unix))]
+fn restart_process(_executable: &Path, _arguments: &[OsString]) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "automatic restart is unsupported on this platform",
+    ))
 }

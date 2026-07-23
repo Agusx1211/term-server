@@ -1,7 +1,10 @@
 use std::{
     net::SocketAddr,
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -19,6 +22,7 @@ use axum_extra::extract::{
     CookieJar,
     cookie::{Cookie, SameSite},
 };
+use axum_server::Handle;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -36,11 +40,13 @@ use uuid::Uuid;
 use crate::{
     ai::{PiClientConfig, PiService, UpdatePiSettings},
     auth::{AuthError, AuthService, LoginLimiter},
+    build,
     files::{self, FileError},
     terminal::{
         CreateTerminal, RenameTerminal, TerminalError, TerminalEvent, TerminalManager,
         TerminalSession,
     },
+    update::{UpdateConfig, UpdateError, UpdateService, UpdateStatus},
 };
 
 const SESSION_COOKIE: &str = "term_server_session";
@@ -57,6 +63,38 @@ pub struct AppState {
     pub scrollback_lines: u32,
     pub max_panes: u8,
     pub hostname: String,
+    pub updates: Arc<UpdateService>,
+    pub server_control: ServerControl,
+}
+
+#[derive(Clone)]
+pub struct ServerControl {
+    handle: Handle<SocketAddr>,
+    terminals: Arc<TerminalManager>,
+    restart_requested: Arc<AtomicBool>,
+}
+
+impl ServerControl {
+    pub fn new(handle: Handle<SocketAddr>, terminals: Arc<TerminalManager>) -> Self {
+        Self {
+            handle,
+            terminals,
+            restart_requested: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn shutdown(&self, restart: bool) {
+        if restart {
+            self.restart_requested.store(true, Ordering::SeqCst);
+        }
+        self.terminals.shutdown();
+        self.handle
+            .graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+    }
+
+    pub fn restart_requested(&self) -> bool {
+        self.restart_requested.load(Ordering::SeqCst)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -77,6 +115,8 @@ pub enum ApiError {
     Conflict(String),
     #[error("{0}")]
     PayloadTooLarge(String),
+    #[error("{0}")]
+    BadGateway(String),
     #[error("too many login attempts; try again in {0} seconds")]
     RateLimited(u64),
     #[error("internal server error")]
@@ -97,6 +137,7 @@ impl IntoResponse for ApiError {
             Self::BadRequest(_) => (StatusCode::BAD_REQUEST, None),
             Self::Conflict(_) => (StatusCode::CONFLICT, None),
             Self::PayloadTooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, None),
+            Self::BadGateway(_) => (StatusCode::BAD_GATEWAY, None),
             Self::RateLimited(seconds) => (StatusCode::TOO_MANY_REQUESTS, Some(seconds)),
             Self::Internal => (StatusCode::INTERNAL_SERVER_ERROR, None),
         };
@@ -136,6 +177,18 @@ impl From<FileError> for ApiError {
     }
 }
 
+impl From<UpdateError> for ApiError {
+    fn from(error: UpdateError) -> Self {
+        match error {
+            UpdateError::Unsupported(_)
+            | UpdateError::Busy
+            | UpdateError::Stale
+            | UpdateError::AlreadyCurrent => Self::Conflict(error.to_string()),
+            _ => Self::BadGateway(error.to_string()),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct LoginRequest {
     password: String,
@@ -162,6 +215,13 @@ struct ClientConfig {
     hostname: String,
     password_managed_externally: bool,
     pi: PiClientConfig,
+    build: build::BuildInfo,
+    updates: UpdateConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct InstallUpdateRequest {
+    commit: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -363,7 +423,35 @@ async fn config(
         hostname: state.hostname.clone(),
         password_managed_externally: state.auth.password_is_externally_managed(),
         pi: state.pi.client_config(),
+        build: build::info(),
+        updates: state.updates.config(),
     }))
+}
+
+async fn update_status(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> Result<Json<UpdateStatus>, ApiError> {
+    require_auth(&jar, &state)?;
+    state.updates.check().await.map(Json).map_err(Into::into)
+}
+
+async fn install_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+    Json(body): Json<InstallUpdateRequest>,
+) -> Result<Json<crate::update::ReleaseInfo>, ApiError> {
+    require_origin(&headers, &uri, &state)?;
+    require_auth(&jar, &state)?;
+    let release = state.updates.install(&body.commit).await?;
+    let control = state.server_control.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+        control.shutdown(true);
+    });
+    Ok(Json(release))
 }
 
 async fn update_pi_config(
@@ -680,6 +768,7 @@ pub fn build_router(state: AppState, client_directory: Option<PathBuf>) -> Route
         .route("/password", patch(change_password))
         .route("/config", get(config))
         .route("/config/pi", patch(update_pi_config))
+        .route("/update", get(update_status).post(install_update))
         .route("/terminals", get(list_terminals).post(create_terminal))
         .route(
             "/terminals/{id}",
@@ -764,6 +853,16 @@ mod tests {
             scrollback_lines: 200_000,
             max_panes: 4,
             hostname: "test-machine".to_string(),
+            updates: Arc::new(UpdateService::new(
+                None,
+                "main".to_owned(),
+                "https://example.invalid/releases/download".to_owned(),
+                true,
+            )),
+            server_control: ServerControl::new(
+                Handle::new(),
+                Arc::new(TerminalManager::new(Some("/bin/sh".into()), 1024 * 1024)),
+            ),
         }
     }
 
@@ -773,6 +872,20 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/api/terminals")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn protects_update_checks() {
+        let response = build_router(test_state().await, None)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/update")
                     .body(Body::empty())
                     .unwrap(),
             )
