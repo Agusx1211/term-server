@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -55,6 +56,8 @@ jobs:
       - run: npm ci
       - run: npm run build:client
       - run: cargo build --release --locked
+        env:
+          TERM_SERVER_BUILD_COMMIT: ${{ github.sha }}
       - run: scripts/package-release.sh "${{ matrix.architecture }}"
         env:
           SOURCE_DATE_EPOCH: 0
@@ -64,16 +67,18 @@ jobs:
           path: artifacts/term-server-linux-${{ matrix.architecture }}.tar.gz
           if-no-files-found: error
 
-  publish-main:
-    name: Publish rolling main release
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+  publish-release:
+    name: Publish signed release
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     needs: artifacts
     runs-on: ubuntu-22.04
     concurrency:
-      group: publish-main
+      group: publish-${{ github.ref }}
       cancel-in-progress: false
     permissions:
       contents: write
+    env:
+      RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -83,10 +88,53 @@ jobs:
           pattern: term-server-linux-*
           path: artifacts
           merge-multiple: true
-      - name: Generate checksums
-        working-directory: artifacts
-        run: sha256sum term-server-linux-*.tar.gz > SHA256SUMS
+      - name: Read release identity
+        id: release
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            channel="${GITHUB_REF_NAME}"
+            if [[ "$channel" != "v$version" ]]; then
+              echo "tag $channel does not match Cargo version $version" >&2
+              exit 1
+            fi
+          else
+            channel=main
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - name: Generate and sign release metadata
+        run: |
+          if [[ -z "$RELEASE_SIGNING_KEY" ]]; then
+            echo "RELEASE_SIGNING_KEY is not configured" >&2
+            exit 1
+          fi
+          node scripts/release-metadata.mjs \
+            artifacts \
+            "${{ steps.release.outputs.channel }}" \
+            "${{ steps.release.outputs.version }}" \
+            "$GITHUB_SHA"
+          signing_key="$RUNNER_TEMP/term-server-release-signing-key.pem"
+          printf '%s' "$RELEASE_SIGNING_KEY" > "$signing_key"
+          chmod 600 "$signing_key"
+          openssl pkeyutl -sign -rawin \
+            -inkey "$signing_key" \
+            -in artifacts/release-manifest.json \
+            -out artifacts/release-manifest.json.sig
+          openssl pkeyutl -sign -rawin \
+            -inkey "$signing_key" \
+            -in artifacts/SHA256SUMS \
+            -out artifacts/SHA256SUMS.sig
+          openssl pkeyutl -verify -pubin -rawin \
+            -inkey release/public-key.txt \
+            -in artifacts/release-manifest.json \
+            -sigfile artifacts/release-manifest.json.sig
+          openssl pkeyutl -verify -pubin -rawin \
+            -inkey release/public-key.txt \
+            -in artifacts/SHA256SUMS \
+            -sigfile artifacts/SHA256SUMS.sig
       - name: Move the rolling tag
+        if: steps.release.outputs.channel == 'main'
         run: |
           git tag --force main "$GITHUB_SHA"
           git push --force origin refs/tags/main
@@ -94,15 +142,33 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view main >/dev/null 2>&1; then
-            gh release edit main \
-              --title "Latest main build" \
-              --notes "Automated build of \`main\` at ${GITHUB_SHA}." \
-              --prerelease
+          channel="${{ steps.release.outputs.channel }}"
+          version="${{ steps.release.outputs.version }}"
+          short_commit="${GITHUB_SHA::12}"
+          if [[ "$channel" == main ]]; then
+            title="term-server v${version} (${short_commit})"
+            notes="Signed automated build of \`main\` at \`${GITHUB_SHA}\`."
+            prerelease_flag=--prerelease
           else
-            gh release create main \
-              --title "Latest main build" \
-              --notes "Automated build of \`main\` at ${GITHUB_SHA}." \
-              --prerelease
+            title="term-server v${version}"
+            notes="Signed term-server v${version} release at \`${GITHUB_SHA}\`."
+            prerelease_flag=
           fi
-          gh release upload main artifacts/term-server-linux-*.tar.gz artifacts/SHA256SUMS --clobber
+          if gh release view "$channel" >/dev/null 2>&1; then
+            gh release edit "$channel" \
+              --title "$title" \
+              --notes "$notes" \
+              $prerelease_flag
+          else
+            gh release create "$channel" \
+              --title "$title" \
+              --notes "$notes" \
+              $prerelease_flag
+          fi
+          gh release upload "$channel" \
+            artifacts/term-server-linux-*.tar.gz \
+            artifacts/SHA256SUMS \
+            artifacts/SHA256SUMS.sig \
+            artifacts/release-manifest.json \
+            artifacts/release-manifest.json.sig \
+            --clobber

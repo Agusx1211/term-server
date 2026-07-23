@@ -13,6 +13,8 @@ term-server exposes an interactive shell with all permissions of the operating-s
 
 Generated credentials and private keys are written with owner-only permissions on Unix. Cookies are HTTP-only and SameSite=Strict; Secure is added whenever built-in HTTPS is enabled. Mutating requests and WebSocket upgrades enforce same-origin checks.
 
+Official update metadata and checksum lists are signed with Ed25519. Installed releases verify the embedded public key before parsing release metadata, then verify the selected archive's signed size and SHA-256 checksum and the extracted binary's version and commit before installation. A checksum without a valid signature is not trusted.
+
 Pi-generated titles and notification summaries are independently disabled by default. Enabling titles sends a bounded copy of the submitted task message to the selected Pi model provider. Enabling notification summaries sends a bounded, ANSI-sanitized tail of terminal output, which may contain source code, command output, paths, or secrets. Use only a provider appropriate for that data. term-server starts Pi without project context, sessions, skills, or built-in tools and exposes only a single metadata-result tool, but model-provider data handling remains governed by the selected provider.
 
 ## Reporting a vulnerability
