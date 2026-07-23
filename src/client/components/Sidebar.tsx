@@ -8,6 +8,7 @@ import {
   ChevronsDownUp,
   CirclePause,
   CircleX,
+  Download,
   Folder,
   FolderSearch,
   FolderOpen,
@@ -41,6 +42,7 @@ interface SidebarProps {
   mobileOpen: boolean;
   creating: boolean;
   settingsActive: boolean;
+  updateAvailable: boolean;
   fileRoot: string;
   onMobileClose: () => void;
   onNew: (cwd?: string) => void;
@@ -200,6 +202,7 @@ export function Sidebar({
   mobileOpen,
   creating,
   settingsActive,
+  updateAvailable,
   fileRoot,
   onMobileClose,
   onNew,
@@ -382,6 +385,12 @@ export function Sidebar({
         >
           <Settings size={14} /> Settings
         </button>
+        {updateAvailable && (
+          <button class="sidebar-update" onClick={onSettings}>
+            <Download size={13} />
+            Update
+          </button>
+        )}
         <span class="footer-spacer" />
         <span class="status-dot online" />
         <span>{terminals.filter((terminal) => terminal.status === "running").length}</span>

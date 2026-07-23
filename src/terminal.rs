@@ -18,7 +18,10 @@ use thiserror::Error;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use crate::ai::{PiRequest, PiService, PiTaskKind};
+use crate::{
+    ai::{PiRequest, PiService, PiTaskKind},
+    artifacts,
+};
 
 // Neighboring buckets jump across the hue wheel and keep similar luminance across themes.
 const COLORS: [&str; 64] = [
@@ -40,15 +43,19 @@ const PI_QUIET_SAMPLES_TO_IDLE: u8 = 2;
 const PI_SUBMISSION_WORKING_MILLIS: u64 = 3_000;
 const REPORTED_WORKING_FRESH_MILLIS: u64 = 5_000;
 const MAX_CAPTURED_PROMPT_CHARS: usize = 16_000;
+const DEFAULT_VIEWPORT_SIZE: ViewportSize = ViewportSize {
+    cols: 100,
+    rows: 30,
+};
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum TerminalStatus {
     Running,
     Exited,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentStatus {
     Working,
@@ -56,7 +63,7 @@ pub enum AgentStatus {
     Closed,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentInfo {
     pub kind: String,
@@ -67,7 +74,7 @@ pub struct AgentInfo {
     pub summary: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalInfo {
     pub id: Uuid,
@@ -86,7 +93,7 @@ pub struct TerminalInfo {
     pub clients: usize,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateTerminal {
     pub path: Option<String>,
@@ -95,7 +102,7 @@ pub struct CreateTerminal {
     pub clone_from: Option<Uuid>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RenameTerminal {
     pub path: String,
 }
@@ -120,9 +127,104 @@ pub enum TerminalError {
 pub enum TerminalEvent {
     Output(Bytes),
     Exit(u32),
+    Size(TerminalSizeState),
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalSizeState {
+    pub cols: u16,
+    pub rows: u16,
+    pub focused_client: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ViewportSize {
+    cols: u16,
+    rows: u16,
+}
+
+impl ViewportSize {
+    fn new(cols: u16, rows: u16) -> Self {
+        Self {
+            cols: cols.clamp(2, 500),
+            rows: rows.clamp(1, 300),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ClientViewports {
+    sizes: HashMap<Uuid, Option<ViewportSize>>,
+    focused_client: Option<Uuid>,
+    published: TerminalSizeState,
+}
+
+impl Default for ClientViewports {
+    fn default() -> Self {
+        Self {
+            sizes: HashMap::new(),
+            focused_client: None,
+            published: TerminalSizeState {
+                cols: DEFAULT_VIEWPORT_SIZE.cols,
+                rows: DEFAULT_VIEWPORT_SIZE.rows,
+                focused_client: None,
+            },
+        }
+    }
+}
+
+impl ClientViewports {
+    fn attach(&mut self, client_id: Uuid, size: Option<ViewportSize>) {
+        self.sizes.insert(client_id, size);
+    }
+
+    fn detach(&mut self, client_id: Uuid) {
+        self.sizes.remove(&client_id);
+        if self.focused_client == Some(client_id) {
+            self.focused_client = None;
+        }
+    }
+
+    fn resize(&mut self, client_id: Uuid, size: ViewportSize) {
+        if let Some(current) = self.sizes.get_mut(&client_id) {
+            *current = Some(size);
+        }
+    }
+
+    fn focus(&mut self, client_id: Uuid, focused: bool) {
+        if focused && self.sizes.get(&client_id).is_some_and(Option::is_some) {
+            self.focused_client = Some(client_id);
+        } else if !focused && self.focused_client == Some(client_id) {
+            self.focused_client = None;
+        }
+    }
+
+    fn state(&self) -> TerminalSizeState {
+        let size = self
+            .focused_client
+            .and_then(|client_id| self.sizes.get(&client_id).copied().flatten())
+            .or_else(|| {
+                self.sizes
+                    .values()
+                    .filter_map(|size| *size)
+                    .reduce(|smallest, size| ViewportSize {
+                        cols: smallest.cols.min(size.cols),
+                        rows: smallest.rows.min(size.rows),
+                    })
+            })
+            .unwrap_or(ViewportSize {
+                cols: self.published.cols,
+                rows: self.published.rows,
+            });
+        TerminalSizeState {
+            cols: size.cols,
+            rows: size.rows,
+            focused_client: self.focused_client,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProcessRecord {
     pub id: String,
@@ -134,7 +236,7 @@ pub struct ProcessRecord {
     pub foreground: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProcessInspectorSnapshot {
     pub supported: bool,
@@ -206,17 +308,6 @@ struct PromptCapture {
 struct PromptInput {
     submitted: bool,
     prompt: Option<String>,
-}
-
-fn title_prompt_for_submission(
-    agent_status: &AgentStatus,
-    prompt: Option<String>,
-) -> Option<String> {
-    if *agent_status == AgentStatus::Idle {
-        prompt
-    } else {
-        None
-    }
 }
 
 impl PromptCapture {
@@ -355,6 +446,7 @@ fn csi_count(sequence: &str) -> usize {
 struct SessionActivity {
     automatic_name: bool,
     generated_title: Option<String>,
+    initial_title_prompt: Option<String>,
     agent_pid: Option<u32>,
     last_cpu_ticks: u64,
     last_sample_output_bytes: u64,
@@ -373,6 +465,7 @@ impl Default for SessionActivity {
         Self {
             automatic_name: true,
             generated_title: None,
+            initial_title_prompt: None,
             agent_pid: None,
             last_cpu_ticks: 0,
             last_sample_output_bytes: 0,
@@ -385,6 +478,31 @@ impl Default for SessionActivity {
             title_in_flight_revision: None,
             summary_in_flight_revision: None,
         }
+    }
+}
+
+impl SessionActivity {
+    fn queue_title_for_submission(
+        &mut self,
+        agent_status: &AgentStatus,
+        submitted_prompt: Option<String>,
+    ) {
+        if *agent_status != AgentStatus::Idle
+            || !self.automatic_name
+            || self.generated_title.is_some()
+            || self.pending_title_prompt.is_some()
+            || self.title_in_flight_revision.is_some()
+        {
+            return;
+        }
+        if self.initial_title_prompt.is_none() {
+            self.initial_title_prompt = submitted_prompt;
+        }
+        let Some(prompt) = self.initial_title_prompt.clone() else {
+            return;
+        };
+        self.title_revision = self.title_revision.saturating_add(1);
+        self.pending_title_prompt = Some((self.title_revision, prompt));
     }
 }
 
@@ -563,7 +681,7 @@ pub struct TerminalSession {
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     replay: Mutex<ReplayBuffer>,
     events: broadcast::Sender<TerminalEvent>,
-    clients: AtomicUsize,
+    viewports: Mutex<ClientViewports>,
     output_bytes: AtomicU64,
     activity: Mutex<SessionActivity>,
     signals: Mutex<TerminalSignals>,
@@ -575,7 +693,7 @@ impl TerminalSession {
     pub fn info(&self) -> TerminalInfo {
         self.refresh_working_directory();
         let mut info = self.info.read().clone();
-        info.clients = self.clients.load(Ordering::Relaxed);
+        info.clients = self.viewports.lock().sizes.len();
         info
     }
 
@@ -592,12 +710,42 @@ impl TerminalSession {
         self.process_tracker.lock().snapshot()
     }
 
-    pub fn attach(&self) {
-        self.clients.fetch_add(1, Ordering::Relaxed);
+    pub fn attach(
+        &self,
+        client_id: Uuid,
+        size: Option<(u16, u16)>,
+    ) -> Result<TerminalSizeState, TerminalError> {
+        self.update_viewports(|viewports| {
+            viewports.attach(
+                client_id,
+                size.map(|(cols, rows)| ViewportSize::new(cols, rows)),
+            );
+        })
     }
 
-    pub fn detach(&self) {
-        self.clients.fetch_sub(1, Ordering::Relaxed);
+    pub fn detach(&self, client_id: Uuid) {
+        if let Err(error) = self.update_viewports(|viewports| viewports.detach(client_id)) {
+            tracing::debug!(%error, "terminal resize after client detach failed");
+        }
+    }
+
+    pub fn resize_client(
+        &self,
+        client_id: Uuid,
+        cols: u16,
+        rows: u16,
+    ) -> Result<TerminalSizeState, TerminalError> {
+        self.update_viewports(|viewports| {
+            viewports.resize(client_id, ViewportSize::new(cols, rows));
+        })
+    }
+
+    pub fn focus_client(
+        &self,
+        client_id: Uuid,
+        focused: bool,
+    ) -> Result<TerminalSizeState, TerminalError> {
+        self.update_viewports(|viewports| viewports.focus(client_id, focused))
     }
 
     pub fn write(&self, data: &[u8]) -> Result<(), TerminalError> {
@@ -619,16 +767,9 @@ impl TerminalSession {
                 if let Some(agent) = info.agent.as_mut()
                     && agent.status != AgentStatus::Closed
                 {
-                    // A submitted line while the agent is already working is usually an
-                    // approval or answer, not a new dashboard task. Only retitle when an
-                    // idle agent starts a fresh work cycle.
-                    if let Some(prompt) = title_prompt_for_submission(&agent.status, input.prompt)
-                        && activity.automatic_name
-                    {
-                        activity.title_revision = activity.title_revision.saturating_add(1);
-                        let revision = activity.title_revision;
-                        activity.pending_title_prompt = Some((revision, prompt));
-                    }
+                    // Anchor the chat title to its first task. Follow-up work cycles keep
+                    // that title, and a failed generation retries with the original task.
+                    activity.queue_title_for_submission(&agent.status, input.prompt);
                     activity.input_submitted_at = now;
                     activity.active_samples = 0;
                     activity.quiet_samples = 0;
@@ -648,19 +789,36 @@ impl TerminalSession {
             .map_err(|error| TerminalError::Io(error.to_string()))
     }
 
-    pub fn resize(&self, cols: u16, rows: u16) -> Result<(), TerminalError> {
-        if self.info.read().status != TerminalStatus::Running {
-            return Ok(());
+    fn update_viewports(
+        &self,
+        update: impl FnOnce(&mut ClientViewports),
+    ) -> Result<TerminalSizeState, TerminalError> {
+        let mut viewports = self.viewports.lock();
+        update(&mut viewports);
+        let state = viewports.state();
+        let size_changed =
+            (state.cols, state.rows) != (viewports.published.cols, viewports.published.rows);
+        // Keep resize redraws behind the size control frame so every browser
+        // applies the shared grid before it processes output for that grid.
+        let replay = size_changed.then(|| self.replay.lock());
+        if size_changed && self.info.read().status == TerminalStatus::Running {
+            self.master
+                .lock()
+                .resize(PtySize {
+                    cols: state.cols,
+                    rows: state.rows,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .map_err(|error| TerminalError::Io(error.to_string()))?;
         }
-        self.master
-            .lock()
-            .resize(PtySize {
-                cols: cols.clamp(2, 500),
-                rows: rows.clamp(1, 300),
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|error| TerminalError::Io(error.to_string()))
+        let publish = state != viewports.published;
+        viewports.published = state;
+        if publish {
+            let _ = self.events.send(TerminalEvent::Size(state));
+        }
+        drop(replay);
+        Ok(state)
     }
 
     pub fn kill(&self) {
@@ -755,6 +913,7 @@ impl TerminalSession {
                 activity.title_revision = 0;
                 activity.title_in_flight_revision = None;
                 activity.generated_title = None;
+                activity.initial_title_prompt = None;
                 activity.summary_in_flight_revision = None;
                 let revision = info
                     .agent
@@ -952,8 +1111,8 @@ impl TerminalSession {
 
 pub struct TerminalManager {
     sessions: Arc<RwLock<HashMap<Uuid, Arc<TerminalSession>>>>,
-    default_shell: Option<String>,
-    replay_bytes: usize,
+    default_shell: RwLock<Option<String>>,
+    replay_bytes: AtomicUsize,
     home_directory: PathBuf,
 }
 
@@ -964,10 +1123,15 @@ impl TerminalManager {
             .unwrap_or_else(|| PathBuf::from("/"));
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
-            default_shell,
-            replay_bytes,
+            default_shell: RwLock::new(default_shell),
+            replay_bytes: AtomicUsize::new(replay_bytes),
             home_directory,
         }
+    }
+
+    pub fn configure(&self, default_shell: Option<String>, replay_bytes: usize) {
+        *self.default_shell.write() = default_shell;
+        self.replay_bytes.store(replay_bytes, Ordering::Relaxed);
     }
 
     pub fn list(&self) -> Vec<TerminalInfo> {
@@ -1054,7 +1218,12 @@ impl TerminalManager {
         let shell = request
             .shell
             .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| self.default_shell.clone().unwrap_or_else(default_shell));
+            .unwrap_or_else(|| {
+                self.default_shell
+                    .read()
+                    .clone()
+                    .unwrap_or_else(default_shell)
+            });
 
         let mut sessions = self.sessions.write();
         let (name, automatic_name) = if let Some(name) = requested_name {
@@ -1075,8 +1244,8 @@ impl TerminalManager {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
-                rows: 30,
-                cols: 100,
+                rows: DEFAULT_VIEWPORT_SIZE.rows,
+                cols: DEFAULT_VIEWPORT_SIZE.cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
@@ -1131,9 +1300,9 @@ impl TerminalManager {
             master: Mutex::new(pair.master),
             writer: Mutex::new(writer),
             killer: Mutex::new(killer),
-            replay: Mutex::new(ReplayBuffer::new(self.replay_bytes)),
+            replay: Mutex::new(ReplayBuffer::new(self.replay_bytes.load(Ordering::Relaxed))),
             events,
-            clients: AtomicUsize::new(0),
+            viewports: Mutex::new(ClientViewports::default()),
             output_bytes: AtomicU64::new(0),
             activity: Mutex::new(SessionActivity {
                 automatic_name,
@@ -1686,6 +1855,7 @@ fn configure_terminal_environment(command: &mut CommandBuilder) {
     command.env_remove("NO_COLOR");
     command.env("TERM_PROGRAM", "term-server");
     command.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+    command.env("TERM_SERVER_ARTIFACTS_DIR", artifacts::root_directory());
 }
 
 fn workspace_for(cwd: &Path, home: &Path) -> String {
@@ -1730,6 +1900,67 @@ mod tests {
         replay.push(Bytes::from_static(b"abc"));
         replay.push(Bytes::from_static(b"def"));
         assert_eq!(replay.snapshot(), vec![Bytes::from_static(b"def")]);
+    }
+
+    #[test]
+    fn terminal_size_uses_the_smallest_viewport_until_one_client_is_focused() {
+        let desktop = Uuid::from_u128(1);
+        let mobile = Uuid::from_u128(2);
+        let mut viewports = ClientViewports::default();
+
+        viewports.attach(desktop, Some(ViewportSize::new(180, 50)));
+        viewports.attach(mobile, Some(ViewportSize::new(60, 22)));
+        assert_eq!(
+            viewports.state(),
+            TerminalSizeState {
+                cols: 60,
+                rows: 22,
+                focused_client: None,
+            }
+        );
+
+        viewports.focus(desktop, true);
+        assert_eq!(
+            viewports.state(),
+            TerminalSizeState {
+                cols: 180,
+                rows: 50,
+                focused_client: Some(desktop),
+            }
+        );
+
+        viewports.resize(mobile, ViewportSize::new(40, 16));
+        assert_eq!((viewports.state().cols, viewports.state().rows), (180, 50));
+
+        viewports.detach(desktop);
+        assert_eq!(
+            viewports.state(),
+            TerminalSizeState {
+                cols: 40,
+                rows: 16,
+                focused_client: None,
+            }
+        );
+
+        viewports.published = viewports.state();
+        viewports.detach(mobile);
+        assert_eq!(
+            viewports.state(),
+            TerminalSizeState {
+                cols: 40,
+                rows: 16,
+                focused_client: None,
+            }
+        );
+    }
+
+    #[test]
+    fn terminal_size_clamps_untrusted_client_dimensions() {
+        let client = Uuid::from_u128(1);
+        let mut viewports = ClientViewports::default();
+        viewports.attach(client, Some(ViewportSize::new(0, u16::MAX)));
+
+        assert_eq!((viewports.state().cols, viewports.state().rows), (2, 300));
     }
 
     #[test]
@@ -1801,6 +2032,10 @@ mod tests {
         assert_eq!(command.get_env("COLORTERM"), Some(OsStr::new("truecolor")));
         assert_eq!(command.get_env("CLICOLOR"), Some(OsStr::new("1")));
         assert_eq!(command.get_env("NO_COLOR"), None);
+        assert_eq!(
+            command.get_env("TERM_SERVER_ARTIFACTS_DIR"),
+            Some(artifacts::root_directory().as_os_str())
+        );
     }
 
     #[test]
@@ -1808,8 +2043,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let manager = TerminalManager {
             sessions: Arc::new(RwLock::new(HashMap::new())),
-            default_shell: Some("/bin/sh".into()),
-            replay_bytes: 1024 * 1024,
+            default_shell: RwLock::new(Some("/bin/sh".into())),
+            replay_bytes: AtomicUsize::new(1024 * 1024),
             home_directory: directory.path().to_path_buf(),
         };
         let info = manager
@@ -1824,7 +2059,8 @@ mod tests {
         assert_eq!(info.program, "sh");
         assert_eq!(info.workspace, "~");
         let session = manager.get(info.id).unwrap();
-        session.resize(80, 24).unwrap();
+        let client_id = Uuid::new_v4();
+        session.attach(client_id, Some((80, 24))).unwrap();
         session.write(b"printf 'hello-from-pty\\n'\n").unwrap();
         session.write(b"cd /tmp\n").unwrap();
         let moved = (0..100).find_map(|_| {
@@ -2006,16 +2242,41 @@ mod tests {
     }
 
     #[test]
-    fn only_titles_submissions_that_start_a_new_work_cycle() {
-        assert_eq!(
-            title_prompt_for_submission(&AgentStatus::Idle, Some("new task".to_owned())),
-            Some("new task".to_owned())
+    fn keeps_generated_titles_anchored_to_the_initial_task() {
+        let mut activity = SessionActivity::default();
+        activity.queue_title_for_submission(
+            &AgentStatus::Working,
+            Some("approve the command".to_owned()),
+        );
+        assert_eq!(activity.pending_title_prompt, None);
+
+        activity.queue_title_for_submission(
+            &AgentStatus::Idle,
+            Some("fix checkout latency".to_owned()),
         );
         assert_eq!(
-            title_prompt_for_submission(&AgentStatus::Working, Some("approve".to_owned())),
-            None
+            activity.pending_title_prompt,
+            Some((1, "fix checkout latency".to_owned()))
         );
-        assert_eq!(title_prompt_for_submission(&AgentStatus::Idle, None), None);
+
+        activity.queue_title_for_submission(&AgentStatus::Idle, Some("update".to_owned()));
+        assert_eq!(
+            activity.pending_title_prompt,
+            Some((1, "fix checkout latency".to_owned()))
+        );
+
+        activity.pending_title_prompt = None;
+        activity.queue_title_for_submission(&AgentStatus::Idle, Some("update".to_owned()));
+        assert_eq!(
+            activity.pending_title_prompt,
+            Some((2, "fix checkout latency".to_owned()))
+        );
+
+        activity.pending_title_prompt = None;
+        activity.generated_title = Some("checkout latency fix".to_owned());
+        activity
+            .queue_title_for_submission(&AgentStatus::Idle, Some("add payment retries".to_owned()));
+        assert_eq!(activity.pending_title_prompt, None);
     }
 
     #[test]

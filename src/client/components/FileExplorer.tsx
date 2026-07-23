@@ -3,6 +3,7 @@ import {
   ArrowUp,
   File,
   FileCode2,
+  FileText,
   Folder,
   Image,
   LoaderCircle,
@@ -149,6 +150,7 @@ export function FileExplorer({ initialRoot, onOpen }: FileExplorerProps) {
 function FileIcon({ entry }: { entry: FileEntry }) {
   if (entry.kind === "directory") return <Folder class="directory" size={15} />;
   if (entry.image) return <Image class="image" size={15} />;
+  if (entry.pdf) return <FileText class="pdf" size={15} />;
   if (entry.editable) return <FileCode2 class="code" size={15} />;
   return <File size={15} />;
 }

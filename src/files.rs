@@ -13,7 +13,6 @@ use tempfile::NamedTempFile;
 use thiserror::Error;
 
 pub const MAX_EDIT_BYTES: u64 = 2 * 1024 * 1024;
-pub const MAX_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
 pub const MAX_REQUEST_BYTES: usize = 6 * 1024 * 1024;
 const MAX_DIRECTORY_ENTRIES: usize = 1_000;
 const DEFAULT_SEARCH_RESULTS: usize = 100;
@@ -37,8 +36,8 @@ pub enum FileError {
     TooLarge,
     #[error("file is binary or is not valid UTF-8")]
     NotText,
-    #[error("file is not a supported image")]
-    NotImage,
+    #[error("file does not support an inline preview")]
+    NotPreviewable,
     #[error("file changed on disk; reload it before saving")]
     Conflict,
     #[error("filesystem operation failed")]
@@ -64,6 +63,7 @@ pub struct FileEntry {
     pub modified_at: u64,
     pub mime: String,
     pub image: bool,
+    pub pdf: bool,
     pub editable: bool,
 }
 
@@ -95,8 +95,9 @@ pub struct FileDocument {
     pub content: String,
 }
 
-pub struct ImageFile {
-    pub bytes: Vec<u8>,
+pub struct FileAsset {
+    pub path: PathBuf,
+    pub name: String,
     pub mime: String,
 }
 
@@ -199,6 +200,7 @@ fn entry(path: &Path) -> Result<FileEntry, FileError> {
         mime_for(path)
     };
     let image = !is_directory && supported_image(&mime);
+    let pdf = !is_directory && mime == "application/pdf";
     Ok(FileEntry {
         path: path.to_string_lossy().into_owned(),
         name: display_name(path),
@@ -207,7 +209,8 @@ fn entry(path: &Path) -> Result<FileEntry, FileError> {
         modified_at: modified_at(&metadata),
         mime,
         image,
-        editable: metadata.is_file() && !image && metadata.len() <= MAX_EDIT_BYTES,
+        pdf,
+        editable: metadata.is_file() && !image && !pdf && metadata.len() <= MAX_EDIT_BYTES,
     })
 }
 
@@ -342,16 +345,25 @@ pub fn read_document(raw: &str, cwd: Option<&str>) -> Result<FileDocument, FileE
     })
 }
 
-pub fn read_image(raw: &str, cwd: Option<&str>) -> Result<ImageFile, FileError> {
+pub fn file_asset(raw: &str, cwd: Option<&str>) -> Result<FileAsset, FileError> {
     let path = resolve_existing(raw, cwd)?;
-    let mime = mime_for(&path);
-    if !supported_image(&mime) {
-        return Err(FileError::NotImage);
+    if !path.is_file() {
+        return Err(FileError::NotAFile);
     }
-    Ok(ImageFile {
-        bytes: read_limited(&path, MAX_IMAGE_BYTES)?,
+    let mime = mime_for(&path);
+    Ok(FileAsset {
+        name: display_name(&path),
+        path,
         mime,
     })
+}
+
+pub fn preview_asset(raw: &str, cwd: Option<&str>) -> Result<FileAsset, FileError> {
+    let asset = file_asset(raw, cwd)?;
+    if !supported_image(&asset.mime) && asset.mime != "application/pdf" {
+        return Err(FileError::NotPreviewable);
+    }
+    Ok(asset)
 }
 
 pub fn save_document(
@@ -440,5 +452,20 @@ mod tests {
         let result = search(directory.path().to_str().unwrap(), None, "needle", None).unwrap();
         assert_eq!(result.entries.len(), 1);
         assert!(result.entries[0].path.ends_with("src/needle.rs"));
+    }
+
+    #[test]
+    fn pdf_files_are_previewable_but_not_editable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("document.pdf");
+        fs::write(&path, b"%PDF-1.7\n").unwrap();
+
+        let metadata = metadata(path.to_str().unwrap(), None).unwrap();
+        assert!(metadata.pdf);
+        assert!(!metadata.editable);
+        assert_eq!(
+            preview_asset(path.to_str().unwrap(), None).unwrap().mime,
+            "application/pdf"
+        );
     }
 }

@@ -2,7 +2,9 @@ import {
   Bell,
   BellOff,
   BellRing,
+  Download,
   LayoutDashboard,
+  LoaderCircle,
   LogOut,
   MessageSquareText,
   Moon,
@@ -11,8 +13,14 @@ import {
   Sparkles,
   SplitSquareHorizontal,
   Sun,
+  RefreshCw,
 } from "lucide-preact";
-import type { PiConfig } from "../../shared/types";
+import type {
+  BuildInfo,
+  PiConfig,
+  UpdateConfig,
+  UpdateStatus,
+} from "../../shared/types";
 import type { NotificationMode } from "../lib/notifications";
 import { ChangePassword } from "./ChangePassword";
 import type { ThemeName } from "./TerminalPane";
@@ -21,11 +29,18 @@ interface SettingsWorkspaceProps {
   active: boolean;
   theme: ThemeName;
   pi: PiConfig;
+  build: BuildInfo;
+  updateConfig: UpdateConfig;
+  updateStatus: UpdateStatus | null;
+  checkingForUpdate: boolean;
+  installingUpdate: boolean;
   passwordManagedExternally: boolean;
   notificationMode: NotificationMode;
   tileNewTerminals: boolean;
   onTheme: (theme: ThemeName) => void;
   onPiChange: (titlesEnabled: boolean, summariesEnabled: boolean, model: string) => void;
+  onCheckForUpdate: () => void;
+  onInstallUpdate: () => void;
   onNotificationModeChange: (mode: NotificationMode) => void;
   onTileNewTerminalsChange: (enabled: boolean) => void;
   onPasswordChanged: () => void;
@@ -68,11 +83,18 @@ export function SettingsWorkspace({
   active,
   theme,
   pi,
+  build,
+  updateConfig,
+  updateStatus,
+  checkingForUpdate,
+  installingUpdate,
   passwordManagedExternally,
   notificationMode,
   tileNewTerminals,
   onTheme,
   onPiChange,
+  onCheckForUpdate,
+  onInstallUpdate,
   onNotificationModeChange,
   onTileNewTerminalsChange,
   onPasswordChanged,
@@ -196,6 +218,58 @@ export function SettingsWorkspace({
             ) : (
               <p class="settings-hint">Pi is unavailable. Install it for this user, then restart term-server.</p>
             )}
+          </section>
+
+          <section class="settings-card">
+            <header><Download size={16} /><h2>Updates</h2></header>
+            <p>Install releases authenticated by the embedded signing key.</p>
+            <div class="settings-update">
+              <div class="settings-update-version">
+                <span>term-server v{build.version}</span>
+                <code title={build.commit}>{build.commit.slice(0, 12)}</code>
+              </div>
+              {updateStatus?.state === "available" && updateStatus.latest ? (
+                <>
+                  <p class="settings-update-available">
+                    v{updateStatus.latest.version} is available
+                    <code title={updateStatus.latest.commit}>
+                      {updateStatus.latest.commit.slice(0, 12)}
+                    </code>
+                  </p>
+                  <button
+                    class="settings-update-action primary"
+                    onClick={onInstallUpdate}
+                    disabled={installingUpdate}
+                  >
+                    {installingUpdate
+                      ? <LoaderCircle class="spin" size={14} />
+                      : <Download size={14} />}
+                    {installingUpdate ? "Installing…" : "Install and reconnect"}
+                  </button>
+                </>
+              ) : (
+                <button
+                  class="settings-update-action"
+                  onClick={onCheckForUpdate}
+                  disabled={!updateConfig.enabled || checkingForUpdate}
+                >
+                  <RefreshCw class={checkingForUpdate ? "spin" : ""} size={14} />
+                  {checkingForUpdate
+                    ? "Checking…"
+                    : updateStatus?.state === "current"
+                      ? "Up to date · Check again"
+                      : "Check for updates"}
+                </button>
+              )}
+              {!updateConfig.enabled && (
+                <p class="settings-hint">{updateConfig.reason ?? "Automatic updates are unavailable."}</p>
+              )}
+              {updateConfig.enabled && (
+                <p class="settings-hint">
+                  Channel: {updateConfig.channel}. Running terminals stay active while the server reconnects.
+                </p>
+              )}
+            </div>
           </section>
 
           <section class="settings-card">
