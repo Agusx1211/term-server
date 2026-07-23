@@ -199,7 +199,7 @@ systemctl --user enable --now term-server
 
 The daemon finds Pi on its inherited `PATH` and in common per-user install locations, including npm, pnpm, Volta, Bun, asdf, mise, and installed NVM Node versions. Restart the service after installing or upgrading Pi.
 
-Pi-generated titles and notification summaries have independent settings. A title is generated when an idle agent receives a new task; approvals and other input submitted while it is already working do not trigger another title request.
+Pi-generated titles and notification summaries have independent settings. A title is generated from the first task submitted to an idle agent and remains stable for that agent session. Follow-up tasks, approvals, and other later input do not replace it.
 
 ## Build from source
 
