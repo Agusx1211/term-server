@@ -28,6 +28,7 @@ import {
   VIEWED_AGENT_REVISIONS_STORAGE_KEY,
 } from "./lib/agent-attention";
 import { documentTitle } from "./lib/document-title";
+import { installVisualViewportCssVars } from "./lib/visual-viewport";
 import {
   includesInAppNotifications,
   includesSystemNotifications,
@@ -173,6 +174,8 @@ export function App() {
   const activeIdRef = useRef(activeId);
   activeIdRef.current = activeId;
   const paneIds = useMemo(() => idsFromLayout(layout), [layout]);
+
+  useEffect(() => installVisualViewportCssVars(), []);
 
   const showNotice = (message: string) => {
     setNotice(message);
