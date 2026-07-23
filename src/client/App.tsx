@@ -729,7 +729,7 @@ export function App() {
       ? " You also have unsaved file edits."
       : "";
     if (!confirm(
-      `Update to term-server v${release.version}? The server will restart and all terminal sessions will end.${dirtyWarning}`,
+      `Update to term-server v${release.version}? The server will reconnect while running terminal sessions stay active.${dirtyWarning}`,
     )) return;
     setInstallingUpdate(true);
     try {
@@ -1050,7 +1050,7 @@ export function App() {
         <div class="update-restarting" role="status" aria-live="assertive">
           <LoaderCircle class="spin" size={22} />
           <strong>Installing term-server v{restartingForUpdate.version}</strong>
-          <span>Verified update installed. Waiting for the server to restart…</span>
+          <span>Verified update installed. Terminals are still running while the server reconnects…</span>
         </div>
       )}
       {(agentToasts.length > 0 || notice) && (

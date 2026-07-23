@@ -10,10 +10,7 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{
-        ConnectInfo, DefaultBodyLimit, Path, Query, State,
-        ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
-    },
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State, ws::WebSocketUpgrade},
     http::{HeaderMap, HeaderValue, StatusCode, Uri, header},
     response::{IntoResponse, Response},
     routing::{any, get, patch, post},
@@ -23,11 +20,9 @@ use axum_extra::extract::{
     cookie::{Cookie, SameSite},
 };
 use axum_server::Handle;
-use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::Duration;
-use tokio::sync::broadcast;
 use tower_http::{
     catch_panic::CatchPanicLayer,
     compression::CompressionLayer,
@@ -37,25 +32,28 @@ use tower_http::{
 };
 use uuid::Uuid;
 
+#[cfg(unix)]
+use crate::broker::BrokerWebSocket;
 use crate::{
-    ai::{PiClientConfig, PiService, UpdatePiSettings},
+    ai::{PiClientConfig, UpdatePiSettings},
     auth::{AuthError, AuthService, LoginLimiter},
     build,
     files::{self, FileError},
-    terminal::{
-        CreateTerminal, RenameTerminal, TerminalError, TerminalEvent, TerminalManager,
-        TerminalSession,
-    },
+    terminal::{CreateTerminal, RenameTerminal, TerminalError},
     update::{UpdateConfig, UpdateError, UpdateService, UpdateStatus},
+    workspace::{SessionConnection, WorkspaceBackend, WorkspaceError, serve_terminal_socket},
 };
+#[cfg(unix)]
+use axum::extract::ws::{Message, WebSocket};
+#[cfg(unix)]
+use futures_util::{SinkExt, StreamExt};
 
 const SESSION_COOKIE: &str = "term_server_session";
 
 #[derive(Clone)]
 pub struct AppState {
     pub auth: AuthService,
-    pub terminals: Arc<TerminalManager>,
-    pub pi: Arc<PiService>,
+    pub workspace: WorkspaceBackend,
     pub login_limiter: Arc<LoginLimiter>,
     pub allowed_origins: Arc<[String]>,
     pub secure: bool,
@@ -70,15 +68,13 @@ pub struct AppState {
 #[derive(Clone)]
 pub struct ServerControl {
     handle: Handle<SocketAddr>,
-    terminals: Arc<TerminalManager>,
     restart_requested: Arc<AtomicBool>,
 }
 
 impl ServerControl {
-    pub fn new(handle: Handle<SocketAddr>, terminals: Arc<TerminalManager>) -> Self {
+    pub fn new(handle: Handle<SocketAddr>) -> Self {
         Self {
             handle,
-            terminals,
             restart_requested: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -87,7 +83,6 @@ impl ServerControl {
         if restart {
             self.restart_requested.store(true, Ordering::SeqCst);
         }
-        self.terminals.shutdown();
         self.handle
             .graceful_shutdown(Some(std::time::Duration::from_secs(5)));
     }
@@ -155,6 +150,17 @@ impl IntoResponse for ApiError {
 impl From<TerminalError> for ApiError {
     fn from(error: TerminalError) -> Self {
         Self::BadRequest(error.to_string())
+    }
+}
+
+impl From<WorkspaceError> for ApiError {
+    fn from(error: WorkspaceError) -> Self {
+        match error.status() {
+            Some(StatusCode::NOT_FOUND) => Self::NotFound,
+            Some(StatusCode::BAD_REQUEST) => Self::BadRequest(error.to_string()),
+            Some(StatusCode::CONFLICT) => Self::Conflict(error.to_string()),
+            _ => Self::BadGateway(error.to_string()),
+        }
     }
 }
 
@@ -245,30 +251,6 @@ struct SaveFileRequest {
     cwd: Option<String>,
     content: String,
     version: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-enum ClientMessage {
-    Input { data: String },
-    Resize { cols: u16, rows: u16 },
-    Ping,
-}
-
-#[derive(Serialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-enum ServerMessage<'a> {
-    Ready {
-        terminal: Box<crate::terminal::TerminalInfo>,
-    },
-    Exit {
-        #[serde(rename = "exitCode")]
-        exit_code: u32,
-    },
-    Pong,
-    Error {
-        message: &'a str,
-    },
 }
 
 fn authenticated(jar: &CookieJar, state: &AppState) -> bool {
@@ -422,7 +404,7 @@ async fn config(
         secure: state.secure,
         hostname: state.hostname.clone(),
         password_managed_externally: state.auth.password_is_externally_managed(),
-        pi: state.pi.client_config(),
+        pi: state.workspace.pi_config().await?,
         build: build::info(),
         updates: state.updates.config(),
     }))
@@ -464,10 +446,11 @@ async fn update_pi_config(
     require_origin(&headers, &uri, &state)?;
     require_auth(&jar, &state)?;
     state
-        .pi
-        .update(body)
+        .workspace
+        .update_pi(body)
+        .await
         .map(Json)
-        .map_err(ApiError::BadRequest)
+        .map_err(Into::into)
 }
 
 async fn list_terminals(
@@ -475,7 +458,7 @@ async fn list_terminals(
     jar: CookieJar,
 ) -> Result<Json<Vec<crate::terminal::TerminalInfo>>, ApiError> {
     require_auth(&jar, &state)?;
-    Ok(Json(state.terminals.list()))
+    state.workspace.list().await.map(Json).map_err(Into::into)
 }
 
 async fn create_terminal(
@@ -487,13 +470,7 @@ async fn create_terminal(
 ) -> Result<(StatusCode, Json<crate::terminal::TerminalInfo>), ApiError> {
     require_origin(&headers, &uri, &state)?;
     require_auth(&jar, &state)?;
-    let terminals = state.terminals.clone();
-    let terminal = tokio::task::spawn_blocking(move || terminals.create(body))
-        .await
-        .map_err(|error| {
-            tracing::error!(%error, "terminal creation task failed");
-            ApiError::Internal
-        })??;
+    let terminal = state.workspace.create(body).await?;
     Ok((StatusCode::CREATED, Json(terminal)))
 }
 
@@ -508,10 +485,11 @@ async fn rename_terminal(
     require_origin(&headers, &uri, &state)?;
     require_auth(&jar, &state)?;
     state
-        .terminals
-        .rename(id, &body.path)?
+        .workspace
+        .rename(id, body)
+        .await
         .map(Json)
-        .ok_or(ApiError::NotFound)
+        .map_err(Into::into)
 }
 
 async fn remove_terminal(
@@ -523,11 +501,8 @@ async fn remove_terminal(
 ) -> Result<StatusCode, ApiError> {
     require_origin(&headers, &uri, &state)?;
     require_auth(&jar, &state)?;
-    state
-        .terminals
-        .remove(id)
-        .then_some(StatusCode::NO_CONTENT)
-        .ok_or(ApiError::NotFound)
+    state.workspace.remove(id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn terminal_processes(
@@ -537,10 +512,11 @@ async fn terminal_processes(
 ) -> Result<Json<crate::terminal::ProcessInspectorSnapshot>, ApiError> {
     require_auth(&jar, &state)?;
     state
-        .terminals
-        .get(id)
-        .map(|terminal| Json(terminal.process_inspector()))
-        .ok_or(ApiError::NotFound)
+        .workspace
+        .process_inspector(id)
+        .await
+        .map(Json)
+        .map_err(Into::into)
 }
 
 async fn file_metadata(
@@ -665,92 +641,60 @@ async fn terminal_socket(
 ) -> Result<Response, ApiError> {
     require_origin(&headers, &uri, &state)?;
     require_auth(&jar, &state)?;
-    let terminal = state.terminals.get(id).ok_or(ApiError::NotFound)?;
+    let terminal = state.workspace.connect_terminal(id).await?;
     Ok(websocket
         .max_message_size(64 * 1024)
         .max_frame_size(64 * 1024)
         .write_buffer_size(128 * 1024)
         .max_write_buffer_size(4 * 1024 * 1024)
-        .on_upgrade(move |socket| handle_terminal_socket(socket, terminal)))
-}
-
-struct Attachment(Arc<TerminalSession>);
-
-impl Drop for Attachment {
-    fn drop(&mut self) {
-        self.0.detach();
-    }
-}
-
-async fn handle_terminal_socket(mut socket: WebSocket, terminal: Arc<TerminalSession>) {
-    terminal.attach();
-    let _attachment = Attachment(terminal.clone());
-    let (mut events, replay) = terminal.subscribe();
-    let ready = serde_json::to_string(&ServerMessage::Ready {
-        terminal: Box::new(terminal.info()),
-    })
-    .expect("serializable terminal");
-    if socket.send(Message::Text(ready.into())).await.is_err() {
-        return;
-    }
-    for chunk in replay {
-        if socket.send(Message::Binary(chunk)).await.is_err() {
-            return;
-        }
-    }
-
-    let (mut sender, mut receiver) = socket.split();
-    loop {
-        tokio::select! {
-            event = events.recv() => {
-                match event {
-                    Ok(TerminalEvent::Output(chunk)) => {
-                        if sender.send(Message::Binary(chunk)).await.is_err() { break; }
-                    }
-                    Ok(TerminalEvent::Exit(exit_code)) => {
-                        let message = serde_json::to_string(&ServerMessage::Exit { exit_code }).expect("serializable exit");
-                        let _ = sender.send(Message::Text(message.into())).await;
-                        break;
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let _ = sender.send(Message::Close(Some(CloseFrame {
-                            code: 1013,
-                            reason: "terminal client fell behind".into(),
-                        }))).await;
-                        break;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
+        .on_upgrade(move |socket| async move {
+            match terminal {
+                SessionConnection::Local(terminal) => {
+                    serve_terminal_socket(socket, terminal).await;
+                }
+                #[cfg(unix)]
+                SessionConnection::Broker(broker) => {
+                    proxy_terminal_socket(socket, *broker).await;
                 }
             }
-            incoming = receiver.next() => {
-                let Some(Ok(message)) = incoming else { break; };
-                match message {
-                    Message::Text(text) => match serde_json::from_str::<ClientMessage>(&text) {
-                        Ok(ClientMessage::Input { data }) if data.len() <= 64 * 1024 => {
-                            if let Err(error) = terminal.write(data.as_bytes()) {
-                                tracing::debug!(%error, "terminal input failed");
-                                break;
-                            }
-                        }
-                        Ok(ClientMessage::Resize { cols, rows }) => {
-                            if terminal.resize(cols, rows).is_err() { break; }
-                        }
-                        Ok(ClientMessage::Ping) => {
-                            let pong = serde_json::to_string(&ServerMessage::Pong).expect("serializable pong");
-                            if sender.send(Message::Text(pong.into())).await.is_err() { break; }
-                        }
-                        _ => {
-                            let error = serde_json::to_string(&ServerMessage::Error { message: "invalid terminal message" })
-                                .expect("serializable error");
-                            if sender.send(Message::Text(error.into())).await.is_err() { break; }
-                        }
-                    },
-                    Message::Close(_) => break,
-                    Message::Ping(payload) => {
-                        if sender.send(Message::Pong(payload)).await.is_err() { break; }
+        }))
+}
+
+#[cfg(unix)]
+async fn proxy_terminal_socket(socket: WebSocket, broker: BrokerWebSocket) {
+    use tokio_tungstenite::tungstenite::Message as BrokerMessage;
+
+    let (mut browser_sender, mut browser_receiver) = socket.split();
+    let (mut broker_sender, mut broker_receiver) = broker.split();
+    loop {
+        tokio::select! {
+            message = broker_receiver.next() => {
+                let Some(Ok(message)) = message else { break; };
+                let outgoing = match message {
+                    BrokerMessage::Text(text) => Message::Text(text.to_string().into()),
+                    BrokerMessage::Binary(bytes) => Message::Binary(bytes.to_vec().into()),
+                    BrokerMessage::Close(_) => Message::Close(None),
+                    BrokerMessage::Ping(payload) => {
+                        if broker_sender.send(BrokerMessage::Pong(payload)).await.is_err() { break; }
+                        continue;
                     }
-                    _ => {}
-                }
+                    BrokerMessage::Pong(_) | BrokerMessage::Frame(_) => continue,
+                };
+                if browser_sender.send(outgoing).await.is_err() { break; }
+            }
+            message = browser_receiver.next() => {
+                let Some(Ok(message)) = message else { break; };
+                let outgoing = match message {
+                    Message::Text(text) => BrokerMessage::Text(text.to_string().into()),
+                    Message::Binary(bytes) => BrokerMessage::Binary(bytes.to_vec().into()),
+                    Message::Close(_) => BrokerMessage::Close(None),
+                    Message::Ping(payload) => {
+                        if browser_sender.send(Message::Pong(payload)).await.is_err() { break; }
+                        continue;
+                    }
+                    Message::Pong(_) => continue,
+                };
+                if broker_sender.send(outgoing).await.is_err() { break; }
             }
         }
     }
@@ -831,7 +775,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::auth::load_auth;
+    use crate::{ai::PiService, auth::load_auth, terminal::TerminalManager};
 
     async fn test_state() -> AppState {
         let directory = tempfile::tempdir().unwrap();
@@ -842,10 +786,11 @@ mod tests {
             .await
             .unwrap()
             .service;
+        let terminals = Arc::new(TerminalManager::new(Some("/bin/sh".into()), 1024 * 1024));
+        let pi = Arc::new(PiService::new(directory.path()));
         AppState {
             auth,
-            terminals: Arc::new(TerminalManager::new(Some("/bin/sh".into()), 1024 * 1024)),
-            pi: Arc::new(PiService::new(directory.path())),
+            workspace: WorkspaceBackend::local(terminals, pi),
             login_limiter: Arc::new(LoginLimiter::default()),
             allowed_origins: Arc::from([]),
             secure: false,
@@ -859,10 +804,7 @@ mod tests {
                 "https://example.invalid/releases/download".to_owned(),
                 true,
             )),
-            server_control: ServerControl::new(
-                Handle::new(),
-                Arc::new(TerminalManager::new(Some("/bin/sh".into()), 1024 * 1024)),
-            ),
+            server_control: ServerControl::new(Handle::new()),
         }
     }
 

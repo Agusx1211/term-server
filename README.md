@@ -12,9 +12,9 @@
 
 ![term-server workspace with three live terminal panes](docs/screenshots/hero.png)
 
-term-server is a small Rust daemon that keeps native PTYs alive and makes them available through a focused web interface. Terminals automatically follow their live working directories, so the sidebar becomes a workspace tree without any manual project setup. Split panes, reconnect history, a lightweight file editor, and a Linux process inspector are available when you need them; the product still feels like a terminal, not a browser IDE.
+term-server is a small Rust service that keeps native PTYs alive and makes them available through a focused web interface. A private session broker owns the PTYs, while the HTTPS process can restart and reconnect to them. Terminals automatically follow their live working directories, so the sidebar becomes a workspace tree without any manual project setup. Split panes, reconnect history, a lightweight file editor, and a Linux process inspector are available when you need them; the product still feels like a terminal, not a browser IDE.
 
-Sessions remain attached when a browser reloads or disconnects. They intentionally end when the term-server daemon stops.
+Sessions remain attached when a browser reloads, disconnects, or the HTTPS process applies a signed update. They intentionally end when the term-server service is explicitly stopped.
 
 ## Install the latest build from `main`
 
@@ -35,7 +35,9 @@ sh install.sh
 
 `main` is a moving development channel. Pin a versioned release instead when stable releases become available.
 
-Installed releases check their configured channel for signed updates after login and every six hours. When an update is available, the sidebar and **Settings → Updates** show an **Update** action. Updating verifies the signed release manifest, target architecture, archive size and SHA-256 checksum, and the new binary's embedded version and source commit before replacing any files. The daemon then restarts itself; because terminal sessions belong to the daemon, active terminals end during that restart.
+Installed releases check their configured channel for signed updates after login and every six hours. When an update is available, the sidebar and **Settings → Updates** show an **Update** action. Updating verifies the signed release manifest, target architecture, archive size and SHA-256 checksum, and the new binary's embedded version and source commit before replacing any files. The HTTPS process then restarts itself and reconnects to the private session broker, so active terminals and their replay buffers remain available.
+
+The broker is a hidden mode of the same executable. It listens on `session-broker.sock` inside the data directory with user-only permissions and accepts no network connections. An explicit service stop also stops the broker and its terminals; an in-process signed update leaves it running. The broker protocol is versioned so future web processes can reject an incompatible handoff instead of silently corrupting a session.
 
 Automatic installation is intentionally disabled for source builds, containers, and system packages whose binary and `client/` directory are not writable siblings. Those builds still expose their version and commit through `term-server --version`, the status bar, and the authenticated configuration API.
 
@@ -51,7 +53,7 @@ On first boot, open `https://127.0.0.1:8090`. term-server prints a random passwo
 - **Process visibility:** a lightweight Linux `/proc` sampler shows the live descendant process tree and foreground job with secret-aware command-line redaction. It does not capture command input or output or retain exited processes.
 - **Agent awareness:** Codex, Claude, and Pi sessions show working, idle, and closed states. An unseen return to idle gets a distinct bell until you focus that terminal. Completion alerts can appear in-app, as desktop notifications, in both places, or remain off.
 - **Secure defaults:** loopback binding, HTTPS, Argon2 password hashing, signed HTTP-only SameSite cookies, origin enforcement, CSP, HSTS, login throttling, and bounded memory use.
-- **Deployment choices:** one native daemon plus static browser assets, with Docker Compose and a systemd user service included.
+- **Deployment choices:** one native executable plus static browser assets, with Docker Compose and a systemd user service included.
 
 ## A closer look
 

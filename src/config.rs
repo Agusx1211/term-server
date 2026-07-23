@@ -119,6 +119,10 @@ pub struct Cli {
     #[arg(long, hide = true)]
     pub no_client: bool,
 
+    /// Run the private terminal session broker.
+    #[arg(long, hide = true)]
+    pub session_broker: bool,
+
     /// Disable signed update checks and installation.
     #[arg(long, env = "TERM_SERVER_DISABLE_UPDATES", action = ArgAction::SetTrue)]
     pub disable_updates: bool,

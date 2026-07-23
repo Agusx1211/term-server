@@ -19,6 +19,9 @@ ed25519-dalek = { version = "2.2.0", features = ["pem", "pkcs8"] }
 flate2 = "1.1.9"
 futures-util = "0.3.32"
 hmac = "0.12.1"
+http-body-util = "0.1.4"
+hyper = { version = "1.11.0", features = ["client", "http1"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
 ignore = "0.4.31"
 mime_guess = "2.0.5"
 parking_lot = "0.12.5"
@@ -35,7 +38,8 @@ tar = "0.4.46"
 thiserror = "2.0.18"
 time = "0.3.54"
 tempfile = "3.27.0"
-tokio = { version = "1.53.1", features = ["fs", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["fs", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-tungstenite = "0.29.0"
 tower-http = { version = "0.7.0", features = ["catch-panic", "compression-full", "fs", "request-id", "set-header", "trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
