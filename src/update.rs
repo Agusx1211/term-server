@@ -104,6 +104,7 @@ impl UpdateService {
         release_base_url: String,
         disabled: bool,
     ) -> Self {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let verifying_key =
             VerifyingKey::from_public_key_pem(PUBLIC_KEY).expect("valid release public key");
         let client = reqwest::Client::builder()
