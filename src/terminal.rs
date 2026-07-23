@@ -208,17 +208,6 @@ struct PromptInput {
     prompt: Option<String>,
 }
 
-fn title_prompt_for_submission(
-    agent_status: &AgentStatus,
-    prompt: Option<String>,
-) -> Option<String> {
-    if *agent_status == AgentStatus::Idle {
-        prompt
-    } else {
-        None
-    }
-}
-
 impl PromptCapture {
     fn observe(&mut self, bytes: &[u8]) -> PromptInput {
         let mut input = PromptInput::default();
@@ -355,6 +344,7 @@ fn csi_count(sequence: &str) -> usize {
 struct SessionActivity {
     automatic_name: bool,
     generated_title: Option<String>,
+    initial_title_prompt: Option<String>,
     agent_pid: Option<u32>,
     last_cpu_ticks: u64,
     last_sample_output_bytes: u64,
@@ -373,6 +363,7 @@ impl Default for SessionActivity {
         Self {
             automatic_name: true,
             generated_title: None,
+            initial_title_prompt: None,
             agent_pid: None,
             last_cpu_ticks: 0,
             last_sample_output_bytes: 0,
@@ -385,6 +376,31 @@ impl Default for SessionActivity {
             title_in_flight_revision: None,
             summary_in_flight_revision: None,
         }
+    }
+}
+
+impl SessionActivity {
+    fn queue_title_for_submission(
+        &mut self,
+        agent_status: &AgentStatus,
+        submitted_prompt: Option<String>,
+    ) {
+        if *agent_status != AgentStatus::Idle
+            || !self.automatic_name
+            || self.generated_title.is_some()
+            || self.pending_title_prompt.is_some()
+            || self.title_in_flight_revision.is_some()
+        {
+            return;
+        }
+        if self.initial_title_prompt.is_none() {
+            self.initial_title_prompt = submitted_prompt;
+        }
+        let Some(prompt) = self.initial_title_prompt.clone() else {
+            return;
+        };
+        self.title_revision = self.title_revision.saturating_add(1);
+        self.pending_title_prompt = Some((self.title_revision, prompt));
     }
 }
 
@@ -619,16 +635,9 @@ impl TerminalSession {
                 if let Some(agent) = info.agent.as_mut()
                     && agent.status != AgentStatus::Closed
                 {
-                    // A submitted line while the agent is already working is usually an
-                    // approval or answer, not a new dashboard task. Only retitle when an
-                    // idle agent starts a fresh work cycle.
-                    if let Some(prompt) = title_prompt_for_submission(&agent.status, input.prompt)
-                        && activity.automatic_name
-                    {
-                        activity.title_revision = activity.title_revision.saturating_add(1);
-                        let revision = activity.title_revision;
-                        activity.pending_title_prompt = Some((revision, prompt));
-                    }
+                    // Anchor the chat title to its first task. Follow-up work cycles keep
+                    // that title, and a failed generation retries with the original task.
+                    activity.queue_title_for_submission(&agent.status, input.prompt);
                     activity.input_submitted_at = now;
                     activity.active_samples = 0;
                     activity.quiet_samples = 0;
@@ -755,6 +764,7 @@ impl TerminalSession {
                 activity.title_revision = 0;
                 activity.title_in_flight_revision = None;
                 activity.generated_title = None;
+                activity.initial_title_prompt = None;
                 activity.summary_in_flight_revision = None;
                 let revision = info
                     .agent
@@ -2016,16 +2026,41 @@ mod tests {
     }
 
     #[test]
-    fn only_titles_submissions_that_start_a_new_work_cycle() {
-        assert_eq!(
-            title_prompt_for_submission(&AgentStatus::Idle, Some("new task".to_owned())),
-            Some("new task".to_owned())
+    fn keeps_generated_titles_anchored_to_the_initial_task() {
+        let mut activity = SessionActivity::default();
+        activity.queue_title_for_submission(
+            &AgentStatus::Working,
+            Some("approve the command".to_owned()),
+        );
+        assert_eq!(activity.pending_title_prompt, None);
+
+        activity.queue_title_for_submission(
+            &AgentStatus::Idle,
+            Some("fix checkout latency".to_owned()),
         );
         assert_eq!(
-            title_prompt_for_submission(&AgentStatus::Working, Some("approve".to_owned())),
-            None
+            activity.pending_title_prompt,
+            Some((1, "fix checkout latency".to_owned()))
         );
-        assert_eq!(title_prompt_for_submission(&AgentStatus::Idle, None), None);
+
+        activity.queue_title_for_submission(&AgentStatus::Idle, Some("update".to_owned()));
+        assert_eq!(
+            activity.pending_title_prompt,
+            Some((1, "fix checkout latency".to_owned()))
+        );
+
+        activity.pending_title_prompt = None;
+        activity.queue_title_for_submission(&AgentStatus::Idle, Some("update".to_owned()));
+        assert_eq!(
+            activity.pending_title_prompt,
+            Some((2, "fix checkout latency".to_owned()))
+        );
+
+        activity.pending_title_prompt = None;
+        activity.generated_title = Some("checkout latency fix".to_owned());
+        activity
+            .queue_title_for_submission(&AgentStatus::Idle, Some("add payment retries".to_owned()));
+        assert_eq!(activity.pending_title_prompt, None);
     }
 
     #[test]
