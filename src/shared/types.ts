@@ -96,6 +96,11 @@ export interface FileEntry {
   editable: boolean;
 }
 
+export interface ArtifactEntry extends FileEntry {
+  id: string;
+  sessionId: string;
+}
+
 export interface DirectoryListing {
   path: string;
   parent: string | null;

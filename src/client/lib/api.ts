@@ -1,4 +1,5 @@
 import type {
+  ArtifactEntry,
   ClientConfig,
   CreateTerminalRequest,
   RenameTerminalRequest,
@@ -66,6 +67,7 @@ export const api = {
   removeTerminal: (id: string) => request<void>(`/api/terminals/${id}`, { method: "DELETE" }),
   terminalProcesses: (id: string) =>
     request<ProcessInspectorSnapshot>(`/api/terminals/${id}/processes`),
+  artifacts: () => request<ArtifactEntry[]>("/api/artifacts"),
   fileMetadata: (target: FileTarget) => request<FileEntry>(`/api/files/meta?${fileQuery(target)}`),
   listFiles: (target: FileTarget) => request<DirectoryListing>(`/api/files/list?${fileQuery(target)}`),
   searchFiles: (root: string, query: string, cwd?: string) => {

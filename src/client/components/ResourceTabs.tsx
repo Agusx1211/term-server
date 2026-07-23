@@ -1,11 +1,16 @@
-import { FileCode2, Image, TerminalSquare, X } from "lucide-preact";
+import { FileCode2, Image, PackageOpen, TerminalSquare, X } from "lucide-preact";
 
 export interface ResourceTab {
   path: string;
   name: string;
   type: "text" | "image";
   mime: string;
+  modifiedAt: number;
   dirty: boolean;
+  artifact?: {
+    id: string;
+    sessionId: string;
+  };
 }
 
 interface ResourceTabBarProps {
@@ -24,16 +29,16 @@ export function ResourceTabBar({ tabs, activePath, onTerminal, onActivate, onClo
         <span>Terminals</span>
       </button>
       {tabs.map((tab) => {
-        const Icon = tab.type === "image" ? Image : FileCode2;
+        const Icon = tab.artifact ? PackageOpen : tab.type === "image" ? Image : FileCode2;
         return (
           <button
             key={tab.path}
-            class={`resource-tab ${activePath === tab.path ? "active" : ""}`}
+            class={`resource-tab ${tab.artifact ? "artifact" : ""} ${activePath === tab.path ? "active" : ""}`}
             onClick={() => onActivate(tab.path)}
             onAuxClick={(event) => {
               if (event.button === 1) onClose(tab.path);
             }}
-            title={tab.path}
+            title={`${tab.artifact ? "Artifact · " : ""}${tab.path}`}
           >
             <Icon size={13} />
             <span>{tab.name}</span>

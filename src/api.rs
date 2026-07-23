@@ -35,6 +35,7 @@ use uuid::Uuid;
 
 use crate::{
     ai::{PiClientConfig, PiService, UpdatePiSettings},
+    artifacts,
     auth::{AuthError, AuthService, LoginLimiter},
     files::{self, FileError},
     terminal::{
@@ -455,6 +456,26 @@ async fn terminal_processes(
         .ok_or(ApiError::NotFound)
 }
 
+async fn list_artifacts(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> Result<Json<Vec<artifacts::ArtifactEntry>>, ApiError> {
+    require_auth(&jar, &state)?;
+    let session_ids = state
+        .terminals
+        .list()
+        .into_iter()
+        .map(|terminal| terminal.id)
+        .collect::<Vec<_>>();
+    let entries = tokio::task::spawn_blocking(move || artifacts::list_for_sessions(&session_ids))
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "artifact listing task failed");
+            ApiError::Internal
+        })?;
+    Ok(Json(entries))
+}
+
 async fn file_metadata(
     State(state): State<AppState>,
     Query(query): Query<FilePathQuery>,
@@ -687,6 +708,7 @@ pub fn build_router(state: AppState, client_directory: Option<PathBuf>) -> Route
         )
         .route("/terminals/{id}/processes", get(terminal_processes))
         .route("/terminals/{id}/socket", any(terminal_socket))
+        .route("/artifacts", get(list_artifacts))
         .route("/files/meta", get(file_metadata))
         .route("/files/list", get(list_files))
         .route("/files/search", get(search_files))

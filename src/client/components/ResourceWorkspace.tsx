@@ -4,7 +4,7 @@ import { Compartment, EditorState, StateEffect } from "@codemirror/state";
 import { LanguageDescription } from "@codemirror/language";
 import { languages } from "@codemirror/language-data";
 import { oneDark } from "@codemirror/theme-one-dark";
-import { FileCode2, Image, LoaderCircle, Save, WrapText } from "lucide-preact";
+import { Copy, FileCode2, Image, LoaderCircle, PackageOpen, Save, WrapText } from "lucide-preact";
 import type { FileDocument } from "../../shared/types";
 import { api } from "../lib/api";
 import type { ThemeName } from "./TerminalPane";
@@ -58,18 +58,24 @@ export default ResourceDocuments;
 
 function ImageDocument({ tab }: { tab: ResourceTab }) {
   const [failed, setFailed] = useState(false);
+  const Icon = tab.artifact ? PackageOpen : Image;
+  useEffect(() => setFailed(false), [tab.modifiedAt]);
   return (
     <section class="image-document">
       <header class="resource-document-header">
-        <Image size={14} />
+        <Icon size={14} />
         <span>{tab.path}</span>
-        <em>{tab.mime}</em>
+        <em>{tab.artifact ? "Artifact" : tab.mime}</em>
       </header>
       <div class="image-canvas">
         {failed ? (
           <div class="resource-error">Unable to render this image.</div>
         ) : (
-          <img src={api.rawFileUrl({ path: tab.path })} alt={tab.name} onError={() => setFailed(true)} />
+          <img
+            src={`${api.rawFileUrl({ path: tab.path })}&version=${tab.modifiedAt}`}
+            alt={tab.name}
+            onError={() => setFailed(true)}
+          />
         )}
       </div>
     </section>
@@ -107,6 +113,7 @@ function TextDocument({
   const [error, setError] = useState("");
 
   useEffect(() => {
+    if (tab.dirty) return;
     let cancelled = false;
     setLoading(true);
     setError("");
@@ -125,7 +132,7 @@ function TextDocument({
     return () => {
       cancelled = true;
     };
-  }, [tab.path]);
+  }, [tab.path, tab.modifiedAt, tab.dirty]);
 
   const save = async () => {
     if (!document || saving) return;
@@ -151,6 +158,15 @@ function TextDocument({
     }
   };
   saveCurrent.current = save;
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(content.current);
+      onNotice(`Copied ${tab.name}`);
+    } catch {
+      onNotice("Clipboard access was denied");
+    }
+  };
 
   useEffect(() => {
     if (!host.current || !document) return;
@@ -211,9 +227,19 @@ function TextDocument({
   return (
     <section class="text-document">
       <header class="resource-document-header">
-        <FileCode2 size={14} />
+        {tab.artifact ? <PackageOpen size={14} /> : <FileCode2 size={14} />}
         <span>{tab.path}</span>
-        <em>{language}</em>
+        <em>{tab.artifact ? `Artifact · ${language}` : language}</em>
+        <button
+          class="resource-editor-action resource-copy"
+          onClick={() => void copy()}
+          disabled={loading}
+          aria-label={`Copy ${tab.name}`}
+          title={`Copy ${tab.name}`}
+        >
+          <Copy size={13} />
+          <span>Copy</span>
+        </button>
         <button
           class={`resource-editor-action resource-wrap ${lineWrapping ? "active" : ""}`}
           onClick={onToggleLineWrapping}

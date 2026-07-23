@@ -276,6 +276,7 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
 }
 .resource-tab:hover { background: var(--hover); color: var(--foreground); }
 .resource-tab.active { background: var(--editor); color: var(--foreground); box-shadow: inset 0 2px var(--accent); }
+.resource-tab.artifact > svg { color: var(--accent); }
 .resource-tab > span:not(.resource-tab-close) { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; font-size: 11px; }
 .resource-tab.terminal { min-width: 102px; max-width: 120px; flex-basis: 112px; }
 .resource-tab-close { width: 20px; height: 20px; flex: none; display: grid; place-items: center; border-radius: 3px; opacity: 0; }
@@ -644,6 +645,8 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
   .resource-editor-action { height: 36px; justify-content: center; font-size: 11px; }
   .resource-wrap { width: 36px; padding: 0; }
   .resource-wrap > span { display: none; }
+  .resource-copy { width: 36px; padding: 0; }
+  .resource-copy > span { display: none; }
   .resource-save { min-width: 72px; }
   .code-editor .cm-scroller { font-size: 16px !important; }
   .image-canvas { padding: 12px; }
