@@ -19,6 +19,7 @@ First automated release of term-server.
 
 - Mobile terminal gestures now scroll xterm history without moving the browser viewport.
 - The internal session broker protocol is version 2 so terminal sizing and focus state pass through the broker consistently.
+- Pi chat titles now stay anchored to the initial task instead of changing during follow-up work.
 
 ### Security
 
