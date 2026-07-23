@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.2.0 - 2026-07-23
+
+Artifacts now stay connected to the terminal and agent that created them instead of behaving like files that must remain open.
+
+### Added
+
+- A per-terminal artifact sidebar with inline text, image, and PDF previews, copy and download actions, and an explicit full-editor action.
+- Artifact counts in workspace rows and terminal headers, plus navigation from a full artifact editor back to its originating agent.
+- Stable creation timestamps and validated producer metadata for new artifacts, so their exact origin survives later terminal reuse.
+
+### Fixed
+
+- Closing an artifact editor tab now remains closed. Artifact polling updates the inventory and open documents independently, so it cannot reopen a dismissed tab.
+- Closing the inline sidebar remains the user's choice; only a genuinely new artifact opens it again.
+- Artifact discovery now ignores incomplete staging directories and ambiguous payloads. The helper publishes a complete artifact atomically.
+
+### Changed
+
+- Existing artifacts are discovered as session inventory items and opened in full tabs only on request.
+- The bundled `term-server-artifacts` skill records `codex` as the producer while keeping artifacts from older skill versions compatible.
+
+### Security
+
+- No security behavior or trust boundary changed in this release.
+
+### Upgrade notes
+
+- There are no breaking changes or data migrations.
+- Existing temporary artifacts remain compatible. New producer metadata is added only to artifacts created after upgrading.
+- The release is safe for automatic installation over `0.1.1`.
+
 ## 0.1.1 - 2026-07-23
 
 First automated release of term-server.
