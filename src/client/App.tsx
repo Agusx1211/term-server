@@ -28,6 +28,11 @@ import {
   VIEWED_AGENT_REVISIONS_STORAGE_KEY,
 } from "./lib/agent-attention";
 import { documentTitle } from "./lib/document-title";
+import {
+  CONFIRM_TERMINAL_KILLS_STORAGE_KEY,
+  parseConfirmTerminalKills,
+  terminalKillAllowed,
+} from "./lib/terminal-kill";
 import { installVisualViewportCssVars } from "./lib/visual-viewport";
 import {
   includesInAppNotifications,
@@ -142,6 +147,9 @@ const initialNotificationMode = () => parseNotificationMode(
 const initialTileNewTerminals = () =>
   localStorage.getItem(TILE_NEW_TERMINALS_STORAGE_KEY) === "true";
 
+const initialConfirmTerminalKills = () =>
+  parseConfirmTerminalKills(localStorage.getItem(CONFIRM_TERMINAL_KILLS_STORAGE_KEY));
+
 const initialViewedAgentRevisions = () =>
   parseViewedAgentRevisions(localStorage.getItem(VIEWED_AGENT_REVISIONS_STORAGE_KEY));
 
@@ -166,6 +174,7 @@ export function App() {
   const [mobileSidebar, setMobileSidebar] = useState(false);
   const [notificationMode, setNotificationMode] = useState(initialNotificationMode);
   const [tileNewTerminals, setTileNewTerminals] = useState(initialTileNewTerminals);
+  const [confirmTerminalKills, setConfirmTerminalKills] = useState(initialConfirmTerminalKills);
   const [viewedAgentRevisions, setViewedAgentRevisions] = useState(initialViewedAgentRevisions);
   const [artifacts, setArtifacts] = useState<ArtifactEntry[]>([]);
   const [resources, setResources] = useState<ResourceTab[]>([]);
@@ -725,7 +734,7 @@ export function App() {
   };
 
   const removeTerminal = async (terminal: TerminalInfo) => {
-    if (!confirm(`Kill and remove “${terminal.path}”? The process and its scrollback will be lost.`)) return;
+    if (!terminalKillAllowed(terminal.path, confirmTerminalKills)) return;
     try {
       await api.removeTerminal(terminal.id);
       forgetTerminal(terminal.id);
@@ -787,6 +796,11 @@ export function App() {
   const updateTileNewTerminals = (enabled: boolean) => {
     setTileNewTerminals(enabled);
     localStorage.setItem(TILE_NEW_TERMINALS_STORAGE_KEY, String(enabled));
+  };
+
+  const updateConfirmTerminalKills = (enabled: boolean) => {
+    setConfirmTerminalKills(enabled);
+    localStorage.setItem(CONFIRM_TERMINAL_KILLS_STORAGE_KEY, String(enabled));
   };
 
   const waitForUpdatedServer = async (expectedCommit: string) => {
@@ -904,6 +918,7 @@ export function App() {
           onOpen={(id) => openTerminal(id)}
           onSplit={(id) => openTerminal(id, true)}
           onRename={(terminal) => void renameTerminal(terminal)}
+          onRemove={(terminal) => void removeTerminal(terminal)}
           onSettings={openSettings}
           onOpenFile={(entry) => void openResource({ path: entry.path }, entry)}
           onDragStart={(id) => {
@@ -1099,6 +1114,7 @@ export function App() {
                 passwordManagedExternally={config.passwordManagedExternally}
                 notificationMode={notificationMode}
                 tileNewTerminals={tileNewTerminals}
+                confirmTerminalKills={confirmTerminalKills}
                 onTheme={setTheme}
                 onPiChange={(titlesEnabled, summariesEnabled, model) => (
                   void updatePiConfig(titlesEnabled, summariesEnabled, model)
@@ -1107,6 +1123,7 @@ export function App() {
                 onInstallUpdate={() => void installUpdate()}
                 onNotificationModeChange={(mode) => void updateNotificationMode(mode)}
                 onTileNewTerminalsChange={updateTileNewTerminals}
+                onConfirmTerminalKillsChange={updateConfirmTerminalKills}
                 onPasswordChanged={() => showNotice("Password changed; other sessions were signed out")}
                 onLogout={() => void logout()}
               />
