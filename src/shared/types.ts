@@ -93,6 +93,7 @@ export interface FileEntry {
   modifiedAt: number;
   mime: string;
   image: boolean;
+  pdf: boolean;
   editable: boolean;
 }
 

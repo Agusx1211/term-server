@@ -4,7 +4,7 @@ import { Compartment, EditorState, StateEffect } from "@codemirror/state";
 import { LanguageDescription } from "@codemirror/language";
 import { languages } from "@codemirror/language-data";
 import { oneDark } from "@codemirror/theme-one-dark";
-import { FileCode2, Image, LoaderCircle, Save, WrapText } from "lucide-preact";
+import { Download, FileCode2, FileText, Image, LoaderCircle, Save, WrapText } from "lucide-preact";
 import type { FileDocument } from "../../shared/types";
 import { api } from "../lib/api";
 import type { ThemeName } from "./TerminalPane";
@@ -38,6 +38,8 @@ export function ResourceDocuments({ tabs, activePath, theme, onDirty, onNotice }
         <div key={tab.path} class={`resource-document ${activePath === tab.path ? "active" : "cached"}`}>
           {tab.type === "image" ? (
             <ImageDocument tab={tab} />
+          ) : tab.type === "pdf" ? (
+            <PdfDocument tab={tab} />
           ) : (
             <TextDocument
               tab={tab}
@@ -64,15 +66,49 @@ function ImageDocument({ tab }: { tab: ResourceTab }) {
         <Image size={14} />
         <span>{tab.path}</span>
         <em>{tab.mime}</em>
+        <DownloadAction tab={tab} />
       </header>
       <div class="image-canvas">
         {failed ? (
           <div class="resource-error">Unable to render this image.</div>
         ) : (
-          <img src={api.rawFileUrl({ path: tab.path })} alt={tab.name} onError={() => setFailed(true)} />
+          <img src={api.previewFileUrl({ path: tab.path })} alt={tab.name} onError={() => setFailed(true)} />
         )}
       </div>
     </section>
+  );
+}
+
+function PdfDocument({ tab }: { tab: ResourceTab }) {
+  return (
+    <section class="pdf-document">
+      <header class="resource-document-header">
+        <FileText size={14} />
+        <span>{tab.path}</span>
+        <em>{tab.mime}</em>
+        <DownloadAction tab={tab} />
+      </header>
+      <iframe
+        class="pdf-preview"
+        src={api.previewFileUrl({ path: tab.path })}
+        title={`PDF preview of ${tab.name}`}
+      />
+    </section>
+  );
+}
+
+function DownloadAction({ tab }: { tab: ResourceTab }) {
+  return (
+    <a
+      class="resource-editor-action resource-download"
+      href={api.downloadFileUrl({ path: tab.path })}
+      download={tab.name}
+      aria-label={`Download ${tab.name}`}
+      title={`Download ${tab.name}`}
+    >
+      <Download size={13} />
+      <span>Download</span>
+    </a>
   );
 }
 
@@ -214,6 +250,7 @@ function TextDocument({
         <FileCode2 size={14} />
         <span>{tab.path}</span>
         <em>{language}</em>
+        <DownloadAction tab={tab} />
         <button
           class={`resource-editor-action resource-wrap ${lineWrapping ? "active" : ""}`}
           onClick={onToggleLineWrapping}

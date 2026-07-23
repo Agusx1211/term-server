@@ -1,9 +1,9 @@
-import { FileCode2, Image, TerminalSquare, X } from "lucide-preact";
+import { FileCode2, FileText, Image, TerminalSquare, X } from "lucide-preact";
 
 export interface ResourceTab {
   path: string;
   name: string;
-  type: "text" | "image";
+  type: "text" | "image" | "pdf";
   mime: string;
   dirty: boolean;
 }
@@ -24,7 +24,7 @@ export function ResourceTabBar({ tabs, activePath, onTerminal, onActivate, onClo
         <span>Terminals</span>
       </button>
       {tabs.map((tab) => {
-        const Icon = tab.type === "image" ? Image : FileCode2;
+        const Icon = tab.type === "image" ? Image : tab.type === "pdf" ? FileText : FileCode2;
         return (
           <button
             key={tab.path}

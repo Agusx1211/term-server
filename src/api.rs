@@ -7,8 +7,9 @@ use std::{
 
 use axum::{
     Json, Router,
+    body::Body,
     extract::{
-        ConnectInfo, DefaultBodyLimit, Path, Query, State,
+        ConnectInfo, DefaultBodyLimit, Path, Query, Request, State,
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, HeaderValue, StatusCode, Uri, header},
@@ -20,6 +21,7 @@ use axum_extra::extract::{
     cookie::{Cookie, SameSite},
 };
 use futures_util::{SinkExt, StreamExt};
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::Duration;
@@ -522,29 +524,94 @@ async fn read_file(
     Ok(Json(document))
 }
 
-async fn raw_file(
+async fn preview_file(
     State(state): State<AppState>,
     Query(query): Query<FilePathQuery>,
     jar: CookieJar,
+    request: Request,
 ) -> Result<Response, ApiError> {
     require_auth(&jar, &state)?;
-    let image =
-        tokio::task::spawn_blocking(move || files::read_image(&query.path, query.cwd.as_deref()))
-            .await
-            .map_err(|error| {
-                tracing::error!(%error, "image read task failed");
-                ApiError::Internal
-            })??;
-    let content_type = HeaderValue::from_str(&image.mime).map_err(|_| ApiError::Internal)?;
-    let mut response = image.bytes.into_response();
-    response
-        .headers_mut()
-        .insert(header::CONTENT_TYPE, content_type);
+    stream_file(query, request, false).await
+}
+
+async fn download_file(
+    State(state): State<AppState>,
+    Query(query): Query<FilePathQuery>,
+    jar: CookieJar,
+    request: Request,
+) -> Result<Response, ApiError> {
+    require_auth(&jar, &state)?;
+    stream_file(query, request, true).await
+}
+
+async fn stream_file(
+    query: FilePathQuery,
+    request: Request,
+    download: bool,
+) -> Result<Response, ApiError> {
+    let asset = tokio::task::spawn_blocking(move || {
+        if download {
+            files::file_asset(&query.path, query.cwd.as_deref())
+        } else {
+            files::preview_asset(&query.path, query.cwd.as_deref())
+        }
+    })
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, "file stream task failed");
+        ApiError::Internal
+    })??;
+
+    let mut response = ServeFile::new(&asset.path)
+        .try_call(request)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, path = %asset.path.display(), "file stream failed");
+            ApiError::Internal
+        })?
+        .map(Body::new);
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(&asset.mime).map_err(|_| ApiError::Internal)?,
+    );
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        content_disposition(if download { "attachment" } else { "inline" }, &asset.name)?,
+    );
     response.headers_mut().insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("private, no-store"),
     );
+    if !download && asset.mime == "application/pdf" {
+        response.headers_mut().insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("frame-ancestors 'self'"),
+        );
+    }
     Ok(response)
+}
+
+fn content_disposition(kind: &str, name: &str) -> Result<HeaderValue, ApiError> {
+    let fallback = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let fallback = if fallback.is_empty() {
+        "download"
+    } else {
+        &fallback
+    };
+    HeaderValue::from_str(&format!(
+        "{kind}; filename=\"{fallback}\"; filename*=UTF-8''{}",
+        utf8_percent_encode(name, NON_ALPHANUMERIC)
+    ))
+    .map_err(|_| ApiError::Internal)
 }
 
 async fn save_file(
@@ -691,7 +758,8 @@ pub fn build_router(state: AppState, client_directory: Option<PathBuf>) -> Route
         .route("/files/list", get(list_files))
         .route("/files/search", get(search_files))
         .route("/files/content", get(read_file).put(save_file))
-        .route("/files/raw", get(raw_file))
+        .route("/files/raw", get(preview_file))
+        .route("/files/download", get(download_file))
         .fallback(api_not_found);
     let secure = state.secure;
     let mut router = Router::new()
@@ -765,6 +833,34 @@ mod tests {
             max_panes: 4,
             hostname: "test-machine".to_string(),
         }
+    }
+
+    async fn authenticated_app() -> (Router, String) {
+        let app = build_router(test_state().await, None);
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))))
+                    .body(Body::from(r#"{"password":"testing-password"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cookie = login
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        (app, cookie)
     }
 
     #[tokio::test]
@@ -884,6 +980,83 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(new_session.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn pdf_preview_supports_range_requests_inside_the_application() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("preview.pdf");
+        std::fs::write(&path, b"%PDF-1.7\npreview content").unwrap();
+        let (app, cookie) = authenticated_app().await;
+        let encoded_path = utf8_percent_encode(path.to_str().unwrap(), NON_ALPHANUMERIC);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/files/raw?path={encoded_path}"))
+                    .header(header::COOKIE, cookie)
+                    .header(header::RANGE, "bytes=0-7")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/pdf"
+        );
+        assert!(
+            response
+                .headers()
+                .get(header::CONTENT_DISPOSITION)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("inline;")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_SECURITY_POLICY)
+                .unwrap(),
+            "frame-ancestors 'self'"
+        );
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], b"%PDF-1.7");
+    }
+
+    #[tokio::test]
+    async fn file_download_uses_an_attachment_with_the_original_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("notes résumé.txt");
+        std::fs::write(&path, b"download me").unwrap();
+        let (app, cookie) = authenticated_app().await;
+        let encoded_path = utf8_percent_encode(path.to_str().unwrap(), NON_ALPHANUMERIC);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/files/download?path={encoded_path}"))
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let disposition = response
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(disposition.starts_with("attachment;"));
+        assert!(disposition.contains("filename*=UTF-8''notes%20r%C3%A9sum%C3%A9%2Etxt"));
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], b"download me");
     }
 
     #[tokio::test]
