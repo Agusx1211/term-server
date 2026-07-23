@@ -58,14 +58,15 @@ export default ResourceDocuments;
 
 function ImageDocument({ tab }: { tab: ResourceTab }) {
   const [failed, setFailed] = useState(false);
-  const Icon = tab.artifact ? PackageOpen : Image;
+  const isArtifact = Boolean(tab.artifact);
+  const Icon = isArtifact ? PackageOpen : Image;
   useEffect(() => setFailed(false), [tab.modifiedAt]);
   return (
-    <section class="image-document">
+    <section class={`image-document ${isArtifact ? "artifact-document" : ""}`}>
       <header class="resource-document-header">
         <Icon size={14} />
         <span>{tab.path}</span>
-        <em>{tab.artifact ? "Artifact" : tab.mime}</em>
+        <em>{isArtifact ? "Artifact" : tab.mime}</em>
       </header>
       <div class="image-canvas">
         {failed ? (
@@ -111,6 +112,7 @@ function TextDocument({
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const isArtifact = Boolean(tab.artifact);
 
   useEffect(() => {
     if (tab.dirty) return;
@@ -182,10 +184,20 @@ function TextDocument({
           ...(theme === "dark" ? [oneDark] : []),
           lineWrappingConfig.current.of(lineWrapping ? EditorView.lineWrapping : []),
           EditorView.theme({
-            "&": { height: "100%", backgroundColor: "var(--editor)", color: "var(--foreground)" },
+            "&": {
+              height: "100%",
+              backgroundColor: isArtifact ? "var(--artifact-surface)" : "var(--editor)",
+              color: "var(--foreground)",
+            },
             ".cm-scroller": { fontFamily: "SFMono-Regular, Consolas, Liberation Mono, Menlo, monospace", fontSize: "12.5px", lineHeight: "1.48" },
-            ".cm-gutters": { backgroundColor: "var(--panel)", color: "var(--subtle)", borderRight: "1px solid var(--border)" },
-            ".cm-activeLine, .cm-activeLineGutter": { backgroundColor: "color-mix(in srgb, var(--accent) 6%, transparent)" },
+            ".cm-gutters": {
+              backgroundColor: isArtifact ? "var(--artifact-surface-raised)" : "var(--panel)",
+              color: "var(--subtle)",
+              borderRight: `1px solid ${isArtifact ? "color-mix(in srgb, var(--artifact) 35%, var(--border))" : "var(--border)"}`,
+            },
+            ".cm-activeLine, .cm-activeLineGutter": {
+              backgroundColor: `color-mix(in srgb, ${isArtifact ? "var(--artifact)" : "var(--accent)"} 7%, transparent)`,
+            },
           }),
           EditorView.updateListener.of((update) => {
             if (!update.docChanged) return;
@@ -216,7 +228,7 @@ function TextDocument({
       view.destroy();
       if (editor.current === view) editor.current = undefined;
     };
-  }, [document?.path, tab.name, tab.path, theme]);
+  }, [document?.path, tab.name, tab.path, isArtifact, theme]);
 
   useEffect(() => {
     editor.current?.dispatch({
@@ -225,11 +237,11 @@ function TextDocument({
   }, [lineWrapping]);
 
   return (
-    <section class="text-document">
+    <section class={`text-document ${isArtifact ? "artifact-document" : ""}`}>
       <header class="resource-document-header">
-        {tab.artifact ? <PackageOpen size={14} /> : <FileCode2 size={14} />}
+        {isArtifact ? <PackageOpen size={14} /> : <FileCode2 size={14} />}
         <span>{tab.path}</span>
-        <em>{tab.artifact ? `Artifact · ${language}` : language}</em>
+        <em>{isArtifact ? `Artifact · ${language}` : language}</em>
         <button
           class="resource-editor-action resource-copy"
           onClick={() => void copy()}
