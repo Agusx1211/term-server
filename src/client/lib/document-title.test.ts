@@ -18,6 +18,7 @@ const terminal = (agentStatus?: AgentStatus): TerminalInfo => ({
         statusChangedAt: 0,
         startedAt: 0,
         revision: 1,
+        completedAt: null,
         summary: null,
       }
     : null,

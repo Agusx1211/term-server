@@ -28,6 +28,7 @@ export function agentNeedsAttention(
   return Boolean(
     agent
     && agent.status === "idle"
+    && agent.completedAt != null
     && agent.revision > 1
     && agent.revision > (viewedRevision ?? 0),
   );

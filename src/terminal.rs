@@ -71,6 +71,8 @@ pub struct AgentInfo {
     pub status_changed_at: u64,
     pub started_at: u64,
     pub revision: u64,
+    #[serde(default)]
+    pub completed_at: Option<u64>,
     pub summary: Option<String>,
 }
 
@@ -619,6 +621,9 @@ fn select_agent_status(
     active_samples: u8,
     quiet_samples: u8,
 ) -> AgentStatus {
+    if input_submitted_at == 0 {
+        return AgentStatus::Idle;
+    }
     let (submission_working_millis, quiet_samples_to_idle) = if agent_kind == "pi" {
         (PI_SUBMISSION_WORKING_MILLIS, PI_QUIET_SAMPLES_TO_IDLE)
     } else {
@@ -769,15 +774,19 @@ impl TerminalSession {
                 {
                     // Anchor the chat title to its first task. Follow-up work cycles keep
                     // that title, and a failed generation retries with the original task.
+                    let has_prompt = input.prompt.is_some();
                     activity.queue_title_for_submission(&agent.status, input.prompt);
-                    activity.input_submitted_at = now;
-                    activity.active_samples = 0;
-                    activity.quiet_samples = 0;
-                    if agent.status != AgentStatus::Working {
-                        agent.status = AgentStatus::Working;
-                        agent.status_changed_at = now;
-                        agent.revision = agent.revision.saturating_add(1);
-                        agent.summary = None;
+                    if has_prompt || activity.input_submitted_at > 0 {
+                        activity.input_submitted_at = now;
+                        activity.active_samples = 0;
+                        activity.quiet_samples = 0;
+                        if agent.status != AgentStatus::Working {
+                            agent.status = AgentStatus::Working;
+                            agent.status_changed_at = now;
+                            agent.revision = agent.revision.saturating_add(1);
+                            agent.completed_at = None;
+                            agent.summary = None;
+                        }
                     }
                 }
             }
@@ -933,6 +942,7 @@ impl TerminalSession {
                     status_changed_at: now,
                     started_at: now,
                     revision,
+                    completed_at: None,
                     summary: None,
                 });
             } else {
@@ -968,10 +978,17 @@ impl TerminalSession {
                     current.status = next_status.clone();
                     current.status_changed_at = now;
                     current.revision = current.revision.saturating_add(1);
-                    current.summary = None;
-                    if was_working && next_status == AgentStatus::Idle && pi_summaries_enabled {
+                    if was_working
+                        && next_status == AgentStatus::Idle
+                        && activity.input_submitted_at > 0
+                    {
+                        activity.input_submitted_at = 0;
+                        current.completed_at = Some(now);
+                        current.summary = None;
                         let revision = current.revision;
-                        if activity.summary_in_flight_revision != Some(revision) {
+                        if pi_summaries_enabled
+                            && activity.summary_in_flight_revision != Some(revision)
+                        {
                             activity.summary_in_flight_revision = Some(revision);
                             outcome.summary = Some((
                                 revision,
@@ -1000,18 +1017,23 @@ impl TerminalSession {
             if let Some(current) = info.agent.as_mut()
                 && current.status != AgentStatus::Closed
             {
+                let completed_task = activity.input_submitted_at > 0;
                 current.status = AgentStatus::Closed;
                 current.status_changed_at = now;
                 current.revision = current.revision.saturating_add(1);
-                current.summary = None;
-                let revision = current.revision;
-                let kind = current.kind.clone();
-                if pi_summaries_enabled && activity.summary_in_flight_revision != Some(revision) {
-                    activity.summary_in_flight_revision = Some(revision);
-                    outcome.summary = Some((
-                        revision,
-                        self.pi_request(PiTaskKind::Summary, &info, &kind, None),
-                    ));
+                if completed_task {
+                    current.completed_at = Some(now);
+                    current.summary = None;
+                    let revision = current.revision;
+                    let kind = current.kind.clone();
+                    if pi_summaries_enabled && activity.summary_in_flight_revision != Some(revision)
+                    {
+                        activity.summary_in_flight_revision = Some(revision);
+                        outcome.summary = Some((
+                            revision,
+                            self.pi_request(PiTaskKind::Summary, &info, &kind, None),
+                        ));
+                    }
                 }
             }
             activity.agent_pid = None;
@@ -2174,25 +2196,41 @@ mod tests {
     }
 
     #[test]
+    fn ignores_agent_startup_activity_until_a_task_is_submitted() {
+        assert_eq!(
+            select_agent_status(
+                "codex",
+                AgentStatus::Idle,
+                Some((ReportedAgentState::Working, 1_000)),
+                1_000,
+                0,
+                3,
+                0,
+            ),
+            AgentStatus::Idle
+        );
+    }
+
+    #[test]
     fn debounces_fallback_activity_and_invalidates_stale_idle_signals() {
         assert_eq!(
-            select_agent_status("codex", AgentStatus::Idle, None, 1_000, 0, 1, 0),
+            select_agent_status("codex", AgentStatus::Idle, None, 20_000, 1_000, 1, 0),
             AgentStatus::Idle
         );
         assert_eq!(
-            select_agent_status("codex", AgentStatus::Idle, None, 1_000, 0, 2, 0),
+            select_agent_status("codex", AgentStatus::Idle, None, 20_000, 1_000, 2, 0),
             AgentStatus::Idle
         );
         assert_eq!(
-            select_agent_status("codex", AgentStatus::Idle, None, 1_000, 0, 3, 0),
+            select_agent_status("codex", AgentStatus::Idle, None, 20_000, 1_000, 3, 0),
             AgentStatus::Working
         );
         assert_eq!(
-            select_agent_status("codex", AgentStatus::Working, None, 1_000, 0, 0, 4),
+            select_agent_status("codex", AgentStatus::Working, None, 20_000, 1_000, 0, 4),
             AgentStatus::Working
         );
         assert_eq!(
-            select_agent_status("codex", AgentStatus::Working, None, 1_000, 0, 0, 5),
+            select_agent_status("codex", AgentStatus::Working, None, 20_000, 1_000, 0, 5),
             AgentStatus::Idle
         );
         assert_eq!(

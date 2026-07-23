@@ -1,9 +1,22 @@
 import { describe, expect, it } from "vitest";
 import {
+  agentCompletionEvent,
   includesInAppNotifications,
   includesSystemNotifications,
   parseNotificationMode,
 } from "./notifications";
+import type { AgentInfo } from "../../shared/types";
+
+const agent = (overrides: Partial<AgentInfo> = {}): AgentInfo => ({
+  kind: "codex",
+  status: "idle",
+  statusChangedAt: 2,
+  startedAt: 1,
+  revision: 2,
+  completedAt: 2,
+  summary: null,
+  ...overrides,
+});
 
 describe("notification preferences", () => {
   it("defaults new installations to in-app notifications", () => {
@@ -29,5 +42,12 @@ describe("notification preferences", () => {
     expect(includesSystemNotifications("in-app")).toBe(false);
     expect(includesSystemNotifications("system")).toBe(true);
     expect(includesSystemNotifications("both")).toBe(true);
+  });
+
+  it("only exposes notification events for completed submitted tasks", () => {
+    expect(agentCompletionEvent(null)).toBeNull();
+    expect(agentCompletionEvent(agent({ status: "working", completedAt: null }))).toBeNull();
+    expect(agentCompletionEvent(agent({ completedAt: null }))).toBeNull();
+    expect(agentCompletionEvent(agent())).toBe(2);
   });
 });
