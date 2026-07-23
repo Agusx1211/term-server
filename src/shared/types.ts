@@ -7,6 +7,7 @@ export interface AgentInfo {
   statusChangedAt: number;
   startedAt: number;
   revision: number;
+  completedAt: number | null;
   summary: string | null;
 }
 

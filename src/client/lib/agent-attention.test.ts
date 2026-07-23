@@ -13,6 +13,7 @@ const agent = (status: AgentInfo["status"], revision: number): AgentInfo => ({
   statusChangedAt: 1000 + revision,
   startedAt: 1000,
   revision,
+  completedAt: status === "idle" ? 1000 + revision : null,
   summary: null,
 });
 
@@ -23,6 +24,10 @@ describe("agent attention", () => {
     expect(agentNeedsAttention(agent("idle", 1), undefined)).toBe(false);
     expect(agentNeedsAttention(agent("idle", 3), 2)).toBe(true);
     expect(agentNeedsAttention(agent("idle", 3), 3)).toBe(false);
+  });
+
+  it("does not flag startup idleness before a task completes", () => {
+    expect(agentNeedsAttention({ ...agent("idle", 2), completedAt: null }, undefined)).toBe(false);
   });
 
   it("marks revisions monotonically", () => {

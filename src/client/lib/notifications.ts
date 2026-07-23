@@ -1,3 +1,5 @@
+import type { AgentInfo } from "../../shared/types";
+
 export const NOTIFICATION_MODE_STORAGE_KEY = "term-server:notification-mode";
 export const LEGACY_NOTIFICATIONS_STORAGE_KEY = "term-server:notifications";
 
@@ -21,4 +23,9 @@ export function includesInAppNotifications(mode: NotificationMode): boolean {
 
 export function includesSystemNotifications(mode: NotificationMode): boolean {
   return mode === "system" || mode === "both";
+}
+
+export function agentCompletionEvent(agent: AgentInfo | null): number | null {
+  if (!agent || agent.status === "working") return null;
+  return agent.completedAt;
 }

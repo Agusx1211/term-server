@@ -30,6 +30,7 @@ import {
 import { documentTitle } from "./lib/document-title";
 import { installVisualViewportCssVars } from "./lib/visual-viewport";
 import {
+  agentCompletionEvent,
   includesInAppNotifications,
   includesSystemNotifications,
   LEGACY_NOTIFICATIONS_STORAGE_KEY,
@@ -383,7 +384,10 @@ export function App() {
     }
     if (!agentEventsInitialized.current) {
       for (const terminal of terminals) {
-        if (terminal.agent) deliveredAgentEvents.current.set(terminal.id, terminal.agent.statusChangedAt);
+        const event = agentCompletionEvent(terminal.agent);
+        if (event != null) {
+          deliveredAgentEvents.current.set(terminal.id, event);
+        }
       }
       agentEventsInitialized.current = true;
       return;
@@ -391,14 +395,15 @@ export function App() {
 
     const deliver = (terminalId: string, event: number) => {
       const terminal = terminalsRef.current.find((candidate) => candidate.id === terminalId);
-      if (!terminal?.agent || terminal.agent.statusChangedAt !== event) return;
+      const agent = terminal?.agent;
+      if (!terminal || !agent || agentCompletionEvent(agent) !== event) return;
       const pending = pendingAgentNotifications.current.get(terminalId);
       if (pending) clearTimeout(pending.timer);
       pendingAgentNotifications.current.delete(terminalId);
-      const body = terminal.agent.summary ?? (
-        terminal.agent.status === "idle"
-          ? `${terminal.agent.kind} is idle and ready for input in ${terminal.workspace}`
-          : `${terminal.agent.kind} closed in ${terminal.workspace}`
+      const body = agent.summary ?? (
+        agent.status === "idle"
+          ? `${agent.kind} is idle and ready for input in ${terminal.workspace}`
+          : `${agent.kind} closed in ${terminal.workspace}`
       );
       const mode = notificationModeRef.current;
       const toast = {
@@ -444,23 +449,20 @@ export function App() {
     }
     for (const terminal of terminals) {
       const agent = terminal.agent;
-      if (!agent || agent.status === "working") {
-        if (agent) deliveredAgentEvents.current.set(terminal.id, agent.statusChangedAt);
-        continue;
-      }
-      if (deliveredAgentEvents.current.get(terminal.id) === agent.statusChangedAt) continue;
+      const event = agentCompletionEvent(agent);
+      if (!agent || event == null) continue;
+      if (deliveredAgentEvents.current.get(terminal.id) === event) continue;
       const pending = pendingAgentNotifications.current.get(terminal.id);
-      if (pending?.event === agent.statusChangedAt) {
-        if (agent.summary) deliver(terminal.id, agent.statusChangedAt);
+      if (pending?.event === event) {
+        if (agent.summary) deliver(terminal.id, event);
         continue;
       }
       if (pending) clearTimeout(pending.timer);
       if (config.pi.summariesEnabled && !agent.summary) {
-        const event = agent.statusChangedAt;
         const timer = window.setTimeout(() => deliver(terminal.id, event), 12_000);
         pendingAgentNotifications.current.set(terminal.id, { event, timer });
       } else {
-        deliver(terminal.id, agent.statusChangedAt);
+        deliver(terminal.id, event);
       }
     }
   }, [authenticated, terminals, config.pi.summariesEnabled]);

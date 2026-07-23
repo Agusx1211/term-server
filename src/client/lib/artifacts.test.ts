@@ -43,6 +43,7 @@ const terminal = (overrides: Partial<TerminalInfo> = {}): TerminalInfo => ({
     statusChangedAt: 1,
     startedAt: 1,
     revision: 1,
+    completedAt: null,
     summary: null,
   },
   createdAt: 1,
