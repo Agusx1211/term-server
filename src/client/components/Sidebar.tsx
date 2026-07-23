@@ -2,7 +2,6 @@ import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import {
   Activity,
   Bell,
-  BellOff,
   Bot,
   ChevronDown,
   ChevronRight,
@@ -14,28 +13,15 @@ import {
   FolderSearch,
   FolderOpen,
   LoaderCircle,
-  LogOut,
-  Moon,
   Pencil,
   Plus,
-  RefreshCw,
   Search,
   Settings,
   SplitSquareHorizontal,
-  Sun,
-  Sparkles,
   TerminalSquare,
   X,
 } from "lucide-preact";
-import type {
-  AgentInfo,
-  BuildInfo,
-  FileEntry,
-  PiConfig,
-  TerminalInfo,
-  UpdateConfig,
-  UpdateStatus,
-} from "../../shared/types";
+import type { AgentInfo, FileEntry, TerminalInfo } from "../../shared/types";
 import { configureTerminalDrag } from "../lib/layout";
 import {
   clampSidebarWidth,
@@ -46,8 +32,6 @@ import {
   SIDEBAR_WIDTH_STORAGE_KEY,
 } from "../lib/sidebar-width";
 import { buildTerminalTree, type TerminalTreeNode } from "../lib/tree";
-import type { ThemeName } from "./TerminalPane";
-import { ChangePassword } from "./ChangePassword";
 import { FileExplorer } from "./FileExplorer";
 import { WorkingDuration } from "./WorkingDuration";
 
@@ -57,31 +41,16 @@ interface SidebarProps {
   attentionAgentIds: Set<string>;
   mobileOpen: boolean;
   creating: boolean;
-  theme: ThemeName;
-  pi: PiConfig;
-  build: BuildInfo;
-  updateConfig: UpdateConfig;
-  updateStatus: UpdateStatus | null;
-  checkingForUpdate: boolean;
-  installingUpdate: boolean;
-  passwordManagedExternally: boolean;
-  notificationsEnabled: boolean;
-  tileNewTerminals: boolean;
+  settingsActive: boolean;
+  updateAvailable: boolean;
   fileRoot: string;
   onMobileClose: () => void;
   onNew: (cwd?: string) => void;
   onOpen: (id: string) => void;
   onSplit: (id: string) => void;
   onRename: (terminal: TerminalInfo) => void;
-  onTheme: (theme: ThemeName) => void;
-  onPiChange: (titlesEnabled: boolean, summariesEnabled: boolean, model: string) => void;
-  onCheckForUpdate: () => void;
-  onInstallUpdate: () => void;
-  onNotificationsChange: (enabled: boolean) => void;
-  onTileNewTerminalsChange: (enabled: boolean) => void;
-  onPasswordChanged: () => void;
+  onSettings: () => void;
   onOpenFile: (entry: FileEntry) => void;
-  onLogout: () => void;
   onDragStart: (id: string) => void;
   onDragEnd: () => void;
 }
@@ -232,37 +201,21 @@ export function Sidebar({
   attentionAgentIds,
   mobileOpen,
   creating,
-  theme,
-  pi,
-  build,
-  updateConfig,
-  updateStatus,
-  checkingForUpdate,
-  installingUpdate,
-  passwordManagedExternally,
-  notificationsEnabled,
-  tileNewTerminals,
+  settingsActive,
+  updateAvailable,
   fileRoot,
   onMobileClose,
   onNew,
   onOpen,
   onSplit,
   onRename,
-  onTheme,
-  onPiChange,
-  onCheckForUpdate,
-  onInstallUpdate,
-  onNotificationsChange,
-  onTileNewTerminalsChange,
-  onPasswordChanged,
+  onSettings,
   onOpenFile,
-  onLogout,
   onDragStart,
   onDragEnd,
 }: SidebarProps) {
   const [query, setQuery] = useState("");
   const [collapsed, setCollapsed] = useState(loadCollapsed);
-  const [settingsOpen, setSettingsOpen] = useState(false);
   const [filesOpen, setFilesOpen] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth);
   const sidebarWidthRef = useRef(sidebarWidth);
@@ -365,10 +318,7 @@ export function Sidebar({
           <button ref={mobileCloseButton} class="icon-button mobile-only" onClick={onMobileClose} aria-label="Close sidebar"><X size={18} /></button>
           <button
             class={`icon-button ${filesOpen ? "active" : ""}`}
-            onClick={() => {
-              setFilesOpen((current) => !current);
-              setSettingsOpen(false);
-            }}
+            onClick={() => setFilesOpen((current) => !current)}
             aria-label={filesOpen ? "Show terminal workspaces" : "Open file explorer"}
             title={filesOpen ? "Terminal workspaces" : "File explorer"}
           >
@@ -427,145 +377,17 @@ export function Sidebar({
         </>
       )}
 
-      {settingsOpen && (
-        <section class="settings-popover" aria-label="Settings">
-          <div class="settings-title">Appearance</div>
-          <div class="theme-switch" role="group" aria-label="Color theme">
-            <button class={theme === "dark" ? "active" : ""} onClick={() => onTheme("dark")}><Moon size={14} /> Dark</button>
-            <button class={theme === "light" ? "active" : ""} onClick={() => onTheme("light")}><Sun size={14} /> Light</button>
-          </div>
-          <div class="settings-title settings-section-title">Terminal layout</div>
-          <label class={`settings-toggle ${tileNewTerminals ? "active" : ""}`}>
-            <SplitSquareHorizontal size={14} />
-            <span>Tile new terminals</span>
-            <input
-              type="checkbox"
-              checked={tileNewTerminals}
-              onChange={(event) => onTileNewTerminalsChange(event.currentTarget.checked)}
-            />
-          </label>
-          <p class="settings-hint">When off, a new terminal replaces the active pane.</p>
-          <div class="settings-title settings-section-title">Agent awareness</div>
-          <button
-            class={`settings-toggle ${notificationsEnabled ? "active" : ""}`}
-            onClick={() => onNotificationsChange(!notificationsEnabled)}
-          >
-            {notificationsEnabled ? <Bell size={14} /> : <BellOff size={14} />}
-            Browser notifications
-          </button>
-          <label class={`settings-toggle ${pi.titlesEnabled ? "active" : ""} ${pi.available ? "" : "disabled"}`}>
-            <Sparkles size={14} />
-            <span>Pi-generated titles</span>
-            <input
-              type="checkbox"
-              checked={pi.titlesEnabled}
-              disabled={!pi.available}
-              onChange={(event) => onPiChange(
-                event.currentTarget.checked,
-                pi.summariesEnabled,
-                pi.model,
-              )}
-            />
-          </label>
-          <label class={`settings-toggle ${pi.summariesEnabled ? "active" : ""} ${pi.available ? "" : "disabled"}`}>
-            <Sparkles size={14} />
-            <span>Pi notification summaries</span>
-            <input
-              type="checkbox"
-              checked={pi.summariesEnabled}
-              disabled={!pi.available}
-              onChange={(event) => onPiChange(
-                pi.titlesEnabled,
-                event.currentTarget.checked,
-                pi.model,
-              )}
-            />
-          </label>
-          {pi.available ? (
-            <label class="pi-model-field">
-              <span>Pi model</span>
-              <select
-                value={pi.model}
-                disabled={!pi.titlesEnabled && !pi.summariesEnabled}
-                onChange={(event) => onPiChange(
-                  pi.titlesEnabled,
-                  pi.summariesEnabled,
-                  event.currentTarget.value,
-                )}
-              >
-                <option value="">Pi configured default</option>
-                {pi.models.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}
-              </select>
-            </label>
-          ) : (
-            <p class="settings-hint">Pi is unavailable to the daemon. Install it for this user, then restart term-server.</p>
-          )}
-          <p class="settings-hint">Title and notification-summary generation can be enabled independently.</p>
-          <div class="settings-title settings-section-title">Updates</div>
-          <div class="settings-update">
-            <div class="settings-update-version">
-              <span>term-server v{build.version}</span>
-              <code title={build.commit}>{build.commit.slice(0, 12)}</code>
-            </div>
-            {updateStatus?.state === "available" && updateStatus.latest ? (
-              <>
-                <p class="settings-update-available">
-                  v{updateStatus.latest.version} is available
-                  <code title={updateStatus.latest.commit}>
-                    {updateStatus.latest.commit.slice(0, 12)}
-                  </code>
-                </p>
-                <button
-                  class="settings-update-action primary"
-                  onClick={onInstallUpdate}
-                  disabled={installingUpdate}
-                >
-                  {installingUpdate
-                    ? <LoaderCircle class="spin" size={14} />
-                    : <Download size={14} />}
-                  {installingUpdate ? "Installing…" : "Update and restart"}
-                </button>
-              </>
-            ) : (
-              <button
-                class="settings-update-action"
-                onClick={onCheckForUpdate}
-                disabled={!updateConfig.enabled || checkingForUpdate}
-              >
-                <RefreshCw class={checkingForUpdate ? "spin" : ""} size={14} />
-                {checkingForUpdate
-                  ? "Checking…"
-                  : updateStatus?.state === "current"
-                    ? "Up to date · Check again"
-                    : "Check for updates"}
-              </button>
-            )}
-            {!updateConfig.enabled && (
-              <p class="settings-hint">{updateConfig.reason ?? "Automatic updates are unavailable."}</p>
-            )}
-            {updateConfig.enabled && (
-              <p class="settings-hint">
-                Channel: {updateConfig.channel}. Downloads require a valid release signature and SHA-256 checksum.
-              </p>
-            )}
-          </div>
-          <div class="settings-title settings-section-title">Security</div>
-          <ChangePassword
-            managedExternally={passwordManagedExternally}
-            onChanged={onPasswordChanged}
-          />
-          <button class="settings-logout" onClick={onLogout}><LogOut size={14} /> Sign out</button>
-        </section>
-      )}
       <footer class="sidebar-footer">
-        <button class="sidebar-settings" onClick={() => setSettingsOpen((current) => !current)} aria-expanded={settingsOpen}>
+        <button
+          class={`sidebar-settings ${settingsActive ? "active" : ""}`}
+          onClick={onSettings}
+          aria-pressed={settingsActive}
+        >
           <Settings size={14} /> Settings
         </button>
-        {updateStatus?.state === "available" && (
-          <button class="sidebar-update" onClick={onInstallUpdate} disabled={installingUpdate}>
-            {installingUpdate
-              ? <LoaderCircle class="spin" size={13} />
-              : <Download size={13} />}
+        {updateAvailable && (
+          <button class="sidebar-update" onClick={onSettings}>
+            <Download size={13} />
             Update
           </button>
         )}
