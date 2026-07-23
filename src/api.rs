@@ -14,7 +14,7 @@ use axum::{
     extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State, ws::WebSocketUpgrade},
     http::{HeaderMap, HeaderValue, StatusCode, Uri, header},
     response::{IntoResponse, Response},
-    routing::{any, get, patch, post},
+    routing::{any, delete, get, patch, post},
 };
 use axum_extra::extract::{
     CookieJar,
@@ -546,6 +546,28 @@ async fn list_artifacts(
     Ok(Json(entries))
 }
 
+async fn remove_artifact(
+    State(state): State<AppState>,
+    Path((session_id, artifact_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+) -> Result<StatusCode, ApiError> {
+    require_origin(&headers, &uri, &state)?;
+    require_auth(&jar, &state)?;
+    tokio::task::spawn_blocking(move || artifacts::remove(session_id, artifact_id))
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, %session_id, %artifact_id, "artifact deletion task failed");
+            ApiError::Internal
+        })?
+        .map_err(|error| {
+            tracing::error!(%error, %session_id, %artifact_id, "artifact deletion failed");
+            ApiError::Internal
+        })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn file_metadata(
     State(state): State<AppState>,
     Query(query): Query<FilePathQuery>,
@@ -815,6 +837,10 @@ pub fn build_router(state: AppState, client_directory: Option<PathBuf>) -> Route
         .route("/terminals/{id}/processes", get(terminal_processes))
         .route("/terminals/{id}/socket", any(terminal_socket))
         .route("/artifacts", get(list_artifacts))
+        .route(
+            "/artifacts/{session_id}/{artifact_id}",
+            delete(remove_artifact),
+        )
         .route("/files/meta", get(file_metadata))
         .route("/files/list", get(list_files))
         .route("/files/search", get(search_files))
@@ -944,6 +970,67 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn protects_artifact_deletion() {
+        let response = build_router(test_state().await, None)
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!(
+                        "/api/artifacts/{}/{}",
+                        Uuid::new_v4(),
+                        Uuid::new_v4()
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn authenticated_artifact_deletion_removes_its_directory() {
+        let session_id = Uuid::new_v4();
+        let artifact_id = Uuid::new_v4();
+        let session_directory = artifacts::root_directory().join(session_id.to_string());
+        let artifact_directory = session_directory.join(artifact_id.to_string());
+        std::fs::create_dir_all(&artifact_directory).unwrap();
+        std::fs::write(artifact_directory.join("message.md"), "delete me").unwrap();
+        let (app, cookie) = authenticated_app().await;
+        let uri = format!("/api/artifacts/{session_id}/{artifact_id}");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(&uri)
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(!artifact_directory.exists());
+
+        let repeated = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(uri)
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(repeated.status(), StatusCode::NO_CONTENT);
+        std::fs::remove_dir(session_directory).unwrap();
     }
 
     #[tokio::test]

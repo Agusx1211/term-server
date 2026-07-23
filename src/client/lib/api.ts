@@ -76,6 +76,8 @@ export const api = {
   terminalProcesses: (id: string) =>
     request<ProcessInspectorSnapshot>(`/api/terminals/${id}/processes`),
   artifacts: () => request<ArtifactEntry[]>("/api/artifacts"),
+  removeArtifact: (sessionId: string, artifactId: string) =>
+    request<void>(`/api/artifacts/${sessionId}/${artifactId}`, { method: "DELETE" }),
   fileMetadata: (target: FileTarget) => request<FileEntry>(`/api/files/meta?${fileQuery(target)}`),
   listFiles: (target: FileTarget) => request<DirectoryListing>(`/api/files/list?${fileQuery(target)}`),
   searchFiles: (root: string, query: string, cwd?: string) => {

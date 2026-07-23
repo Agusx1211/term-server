@@ -66,6 +66,7 @@ interface TerminalPaneProps {
   onNotice: (message: string) => void;
   onOpenFile: (target: FileTarget) => void;
   onOpenArtifact: (artifact: ArtifactEntry) => void;
+  onDeleteArtifact: (artifact: ArtifactEntry) => Promise<void>;
 }
 
 const terminalThemes: Record<ThemeName, ITheme> = {
@@ -189,6 +190,7 @@ export function TerminalPane({
   onNotice,
   onOpenFile,
   onOpenArtifact,
+  onDeleteArtifact,
 }: TerminalPaneProps) {
   const container = useRef<HTMLDivElement>(null);
   const pane = useRef<HTMLElement>(null);
@@ -763,6 +765,7 @@ export function TerminalPane({
             artifacts={artifacts}
             onClose={() => setArtifactsOpen(false)}
             onOpen={onOpenArtifact}
+            onDelete={onDeleteArtifact}
             onNotice={onNotice}
           />
         )}

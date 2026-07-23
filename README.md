@@ -115,8 +115,10 @@ The sidebar shows the selected artifact's contents next to the live terminal, in
 text, image, and PDF previews. Open an artifact when the full conflict-safe editor, syntax
 highlighting, line wrapping, or a larger canvas is useful. The editor links back to the originating
 agent, and closing its tab leaves the artifact available in the sidebar without reopening it.
-Edits remain visible to the agent at the same path on later turns. Artifacts are temporary: the
-operating system may clear `/tmp`, and they are not added to a project or committed automatically.
+Edits remain visible to the agent at the same path on later turns. Delete actions in the sidebar and
+full editor permanently remove the artifact and close any open tab after confirmation. Artifacts are
+temporary: the operating system may clear `/tmp`, and they are not added to a project or committed
+automatically.
 
 For a source checkout, install the skill by linking it into Codex:
 

@@ -54,9 +54,11 @@ import {
   artifactOwnerLabel,
   discoverArtifacts,
   reconcileArtifactResources,
+  removeArtifactResources,
   resourceForArtifact,
   sortArtifactsNewestFirst,
   stableArtifactInventory,
+  type ArtifactDeleteTarget,
 } from "./lib/artifacts";
 import {
   arrangeLayout,
@@ -691,6 +693,34 @@ export function App() {
     setMobileSidebar(false);
   };
 
+  const deleteArtifact = async (artifact: ArtifactDeleteTarget) => {
+    const openResource = resources.find((resource) => (
+      resource.path === artifact.path
+      || (
+        resource.artifact?.id === artifact.id
+        && resource.artifact.sessionId === artifact.sessionId
+      )
+    ));
+    const warning = openResource?.dirty
+      ? `Delete “${artifact.name}” permanently? Its unsaved changes will also be lost.`
+      : `Delete “${artifact.name}” permanently? This cannot be undone.`;
+    if (!confirm(warning)) return;
+
+    try {
+      await api.removeArtifact(artifact.sessionId, artifact.id);
+      setArtifacts((current) => current.filter((candidate) => (
+        candidate.id !== artifact.id || candidate.sessionId !== artifact.sessionId
+      )));
+      setResources((current) => removeArtifactResources(current, artifact));
+      setActiveResource((current) => (
+        current === (openResource?.path ?? artifact.path) ? undefined : current
+      ));
+      showNotice(`Deleted ${artifact.name}`);
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : "Unable to delete artifact");
+    }
+  };
+
   const returnToArtifactSession = (sessionId: string) => {
     if (!terminalsRef.current.some((terminal) => terminal.id === sessionId)) {
       showNotice("The terminal that created this artifact is no longer running");
@@ -1059,6 +1089,7 @@ export function App() {
                     onNotice={showNotice}
                     onOpenFile={(target) => void openResource(target)}
                     onOpenArtifact={openArtifact}
+                    onDeleteArtifact={deleteArtifact}
                   />
                 </div>
               );
@@ -1152,6 +1183,7 @@ export function App() {
                   )))}
                   onNotice={showNotice}
                   onOpenArtifactSession={returnToArtifactSession}
+                  onDeleteArtifact={deleteArtifact}
                 />
               </Suspense>
             )}
