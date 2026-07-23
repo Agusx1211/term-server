@@ -1,4 +1,4 @@
-import { FileCode2, FileText, Image, TerminalSquare, X } from "lucide-preact";
+import { FileCode2, FileText, Image, Settings, TerminalSquare, X } from "lucide-preact";
 
 export interface ResourceTab {
   path: string;
@@ -11,18 +11,55 @@ export interface ResourceTab {
 interface ResourceTabBarProps {
   tabs: ResourceTab[];
   activePath?: string;
+  settingsOpen: boolean;
+  settingsActive: boolean;
   onTerminal: () => void;
+  onSettings: () => void;
+  onCloseSettings: () => void;
   onActivate: (path: string) => void;
   onClose: (path: string) => void;
 }
 
-export function ResourceTabBar({ tabs, activePath, onTerminal, onActivate, onClose }: ResourceTabBarProps) {
+export function ResourceTabBar({
+  tabs,
+  activePath,
+  settingsOpen,
+  settingsActive,
+  onTerminal,
+  onSettings,
+  onCloseSettings,
+  onActivate,
+  onClose,
+}: ResourceTabBarProps) {
   return (
     <nav class="resource-tabbar" aria-label="Open resources">
-      <button class={`resource-tab terminal ${activePath ? "" : "active"}`} onClick={onTerminal}>
+      <button class={`resource-tab terminal ${activePath || settingsActive ? "" : "active"}`} onClick={onTerminal}>
         <TerminalSquare size={13} />
         <span>Terminals</span>
       </button>
+      {settingsOpen && (
+        <button
+          class={`resource-tab settings ${settingsActive ? "active" : ""}`}
+          onClick={onSettings}
+          onAuxClick={(event) => {
+            if (event.button === 1) onCloseSettings();
+          }}
+        >
+          <Settings size={13} />
+          <span>Settings</span>
+          <span
+            class="resource-tab-close"
+            role="button"
+            aria-label="Close Settings"
+            onClick={(event) => {
+              event.stopPropagation();
+              onCloseSettings();
+            }}
+          >
+            <X size={12} />
+          </span>
+        </button>
+      )}
       {tabs.map((tab) => {
         const Icon = tab.type === "image" ? Image : tab.type === "pdf" ? FileText : FileCode2;
         return (
