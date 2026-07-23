@@ -11,6 +11,7 @@ import {
   VIEWED_AGENT_REVISIONS_STORAGE_KEY,
 } from "./lib/agent-attention";
 import { documentTitle } from "./lib/document-title";
+import { installVisualViewportCssVars } from "./lib/visual-viewport";
 import {
   arrangeLayout,
   isPaneLayout,
@@ -118,6 +119,8 @@ export function App() {
   const terminalsRef = useRef(terminals);
   terminalsRef.current = terminals;
   const paneIds = useMemo(() => idsFromLayout(layout), [layout]);
+
+  useEffect(() => installVisualViewportCssVars(), []);
 
   const showNotice = (message: string) => {
     setNotice(message);
