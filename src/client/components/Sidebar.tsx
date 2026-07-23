@@ -20,6 +20,7 @@ import {
   Settings,
   SplitSquareHorizontal,
   TerminalSquare,
+  Trash2,
   X,
 } from "lucide-preact";
 import type { AgentInfo, FileEntry, TerminalInfo } from "../../shared/types";
@@ -51,6 +52,7 @@ interface SidebarProps {
   onOpen: (id: string) => void;
   onSplit: (id: string) => void;
   onRename: (terminal: TerminalInfo) => void;
+  onRemove: (terminal: TerminalInfo) => void;
   onSettings: () => void;
   onOpenFile: (entry: FileEntry) => void;
   onDragStart: (id: string) => void;
@@ -69,6 +71,7 @@ interface NodeProps {
   onOpen: (id: string) => void;
   onSplit: (id: string) => void;
   onRename: (terminal: TerminalInfo) => void;
+  onRemove: (terminal: TerminalInfo) => void;
   onDragStart: (id: string) => void;
   onDragEnd: () => void;
 }
@@ -85,6 +88,7 @@ function TreeNode({
   onOpen,
   onSplit,
   onRename,
+  onRemove,
   onDragStart,
   onDragEnd,
 }: NodeProps) {
@@ -140,6 +144,14 @@ function TreeNode({
           <button class="row-action" onClick={() => onSplit(terminal.id)} aria-label={`Open ${terminal.name} in split`}>
             <SplitSquareHorizontal size={13} />
           </button>
+          <button
+            class="row-action danger"
+            onClick={() => onRemove(terminal)}
+            aria-label={`Kill ${terminal.name}`}
+            title={`Kill ${terminal.name}`}
+          >
+            <Trash2 size={13} />
+          </button>
         </span>
       </div>
     );
@@ -183,6 +195,7 @@ function TreeNode({
               onOpen={onOpen}
               onSplit={onSplit}
               onRename={onRename}
+              onRemove={onRemove}
               onDragStart={onDragStart}
               onDragEnd={onDragEnd}
             />
@@ -224,6 +237,7 @@ export function Sidebar({
   onOpen,
   onSplit,
   onRename,
+  onRemove,
   onSettings,
   onOpenFile,
   onDragStart,
@@ -378,6 +392,7 @@ export function Sidebar({
                 onOpen={onOpen}
                 onSplit={onSplit}
                 onRename={onRename}
+                onRemove={onRemove}
                 onDragStart={onDragStart}
                 onDragEnd={onDragEnd}
               />

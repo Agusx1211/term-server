@@ -1,5 +1,5 @@
 use std::{
-    fs,
+    fs, io,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -39,6 +39,28 @@ pub fn root_directory() -> PathBuf {
 
 pub fn list_for_sessions(session_ids: &[Uuid]) -> Vec<ArtifactEntry> {
     list_in(&root_directory(), session_ids)
+}
+
+pub fn remove(session_id: Uuid, artifact_id: Uuid) -> io::Result<()> {
+    remove_in(&root_directory(), session_id, artifact_id)
+}
+
+fn remove_in(root: &Path, session_id: Uuid, artifact_id: Uuid) -> io::Result<()> {
+    let directory = root
+        .join(session_id.to_string())
+        .join(artifact_id.to_string());
+    let metadata = match fs::symlink_metadata(&directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "artifact storage entry is not a directory",
+        ));
+    }
+    fs::remove_dir_all(directory)
 }
 
 fn list_in(root: &Path, session_ids: &[Uuid]) -> Vec<ArtifactEntry> {
@@ -216,5 +238,53 @@ mod tests {
         assert_eq!(artifacts[0].file.name, "ready.md");
         assert_eq!(artifacts[0].created_at, 1234);
         assert_eq!(artifacts[0].producer.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn removes_only_the_requested_artifact() {
+        let root = tempfile::tempdir().unwrap();
+        let session = Uuid::new_v4();
+        let removed_id = Uuid::new_v4();
+        let retained_id = Uuid::new_v4();
+        let session_directory = root.path().join(session.to_string());
+        let removed_directory = session_directory.join(removed_id.to_string());
+        let retained_directory = session_directory.join(retained_id.to_string());
+        fs::create_dir_all(&removed_directory).unwrap();
+        fs::create_dir_all(&retained_directory).unwrap();
+        fs::write(removed_directory.join("removed.md"), "remove me").unwrap();
+        fs::write(retained_directory.join("retained.md"), "keep me").unwrap();
+
+        remove_in(root.path(), session, removed_id).unwrap();
+
+        assert!(!removed_directory.exists());
+        assert!(retained_directory.join("retained.md").exists());
+        assert_eq!(list_in(root.path(), &[session]).len(), 1);
+    }
+
+    #[test]
+    fn removing_a_missing_artifact_is_idempotent() {
+        let root = tempfile::tempdir().unwrap();
+
+        remove_in(root.path(), Uuid::new_v4(), Uuid::new_v4()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_to_follow_an_artifact_directory_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let session = Uuid::new_v4();
+        let artifact_id = Uuid::new_v4();
+        let target = root.path().join("outside");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("retained.md"), "keep me").unwrap();
+        let session_directory = root.path().join(session.to_string());
+        fs::create_dir(&session_directory).unwrap();
+        std::os::unix::fs::symlink(&target, session_directory.join(artifact_id.to_string()))
+            .unwrap();
+
+        let error = remove_in(root.path(), session, artifact_id).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(target.join("retained.md").exists());
     }
 }

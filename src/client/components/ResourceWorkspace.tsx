@@ -14,10 +14,12 @@ import {
   LoaderCircle,
   PackageOpen,
   Save,
+  Trash2,
   WrapText,
 } from "lucide-preact";
 import type { FileDocument } from "../../shared/types";
 import { api } from "../lib/api";
+import type { ArtifactDeleteTarget } from "../lib/artifacts";
 import type { ResourceTab } from "../lib/resources";
 import type { ThemeName } from "./TerminalPane";
 
@@ -30,6 +32,7 @@ interface ResourceDocumentsProps {
   onDirty: (path: string, dirty: boolean) => void;
   onNotice: (message: string) => void;
   onOpenArtifactSession: (sessionId: string) => void;
+  onDeleteArtifact: (artifact: ArtifactDeleteTarget) => Promise<void>;
 }
 
 export function ResourceDocuments({
@@ -39,6 +42,7 @@ export function ResourceDocuments({
   onDirty,
   onNotice,
   onOpenArtifactSession,
+  onDeleteArtifact,
 }: ResourceDocumentsProps) {
   const [lineWrapping, setLineWrapping] = useState(
     () => localStorage.getItem(LINE_WRAPPING_STORAGE_KEY) !== "false",
@@ -56,9 +60,17 @@ export function ResourceDocuments({
       {tabs.map((tab) => (
         <div key={tab.path} class={`resource-document ${activePath === tab.path ? "active" : "cached"}`}>
           {tab.type === "image" ? (
-            <ImageDocument tab={tab} onOpenArtifactSession={onOpenArtifactSession} />
+            <ImageDocument
+              tab={tab}
+              onOpenArtifactSession={onOpenArtifactSession}
+              onDeleteArtifact={onDeleteArtifact}
+            />
           ) : tab.type === "pdf" ? (
-            <PdfDocument tab={tab} onOpenArtifactSession={onOpenArtifactSession} />
+            <PdfDocument
+              tab={tab}
+              onOpenArtifactSession={onOpenArtifactSession}
+              onDeleteArtifact={onDeleteArtifact}
+            />
           ) : (
             <TextDocument
               tab={tab}
@@ -68,6 +80,7 @@ export function ResourceDocuments({
               onDirty={onDirty}
               onNotice={onNotice}
               onOpenArtifactSession={onOpenArtifactSession}
+              onDeleteArtifact={onDeleteArtifact}
             />
           )}
         </div>
@@ -81,9 +94,11 @@ export default ResourceDocuments;
 function ImageDocument({
   tab,
   onOpenArtifactSession,
+  onDeleteArtifact,
 }: {
   tab: ResourceTab;
   onOpenArtifactSession: (sessionId: string) => void;
+  onDeleteArtifact: (artifact: ArtifactDeleteTarget) => Promise<void>;
 }) {
   const [failed, setFailed] = useState(false);
   const isArtifact = Boolean(tab.artifact);
@@ -97,6 +112,7 @@ function ImageDocument({
         <ArtifactOriginAction tab={tab} onOpen={onOpenArtifactSession} />
         <em>{isArtifact ? "Artifact" : tab.mime}</em>
         <DownloadAction tab={tab} />
+        <ArtifactDeleteAction tab={tab} onDelete={onDeleteArtifact} />
       </header>
       <div class="image-canvas">
         {failed ? (
@@ -116,9 +132,11 @@ function ImageDocument({
 function PdfDocument({
   tab,
   onOpenArtifactSession,
+  onDeleteArtifact,
 }: {
   tab: ResourceTab;
   onOpenArtifactSession: (sessionId: string) => void;
+  onDeleteArtifact: (artifact: ArtifactDeleteTarget) => Promise<void>;
 }) {
   const isArtifact = Boolean(tab.artifact);
   return (
@@ -129,6 +147,7 @@ function PdfDocument({
         <ArtifactOriginAction tab={tab} onOpen={onOpenArtifactSession} />
         <em>{isArtifact ? "Artifact · PDF" : tab.mime}</em>
         <DownloadAction tab={tab} />
+        <ArtifactDeleteAction tab={tab} onDelete={onDeleteArtifact} />
       </header>
       <iframe
         class="pdf-preview"
@@ -162,6 +181,7 @@ interface TextDocumentProps {
   onDirty: (path: string, dirty: boolean) => void;
   onNotice: (message: string) => void;
   onOpenArtifactSession: (sessionId: string) => void;
+  onDeleteArtifact: (artifact: ArtifactDeleteTarget) => Promise<void>;
 }
 
 function TextDocument({
@@ -172,6 +192,7 @@ function TextDocument({
   onDirty,
   onNotice,
   onOpenArtifactSession,
+  onDeleteArtifact,
 }: TextDocumentProps) {
   const host = useRef<HTMLDivElement>(null);
   const editor = useRef<EditorView>();
@@ -345,6 +366,7 @@ function TextDocument({
           {saving ? <LoaderCircle class="spin" size={13} /> : <Save size={13} />}
           Save
         </button>
+        <ArtifactDeleteAction tab={tab} onDelete={onDeleteArtifact} />
       </header>
       <div class="text-document-body">
         {error && <div key="error" class="resource-error">{error}</div>}
@@ -377,6 +399,46 @@ function ArtifactOriginAction({
     >
       <Bot size={12} />
       <span>{label}</span>
+    </button>
+  );
+}
+
+function ArtifactDeleteAction({
+  tab,
+  onDelete,
+}: {
+  tab: ResourceTab;
+  onDelete: (artifact: ArtifactDeleteTarget) => Promise<void>;
+}) {
+  const [deleting, setDeleting] = useState(false);
+  const artifact = tab.artifact;
+  if (!artifact) return null;
+
+  const remove = async () => {
+    if (deleting) return;
+    setDeleting(true);
+    try {
+      await onDelete({
+        id: artifact.id,
+        sessionId: artifact.sessionId,
+        name: tab.name,
+        path: tab.path,
+      });
+    } finally {
+      setDeleting(false);
+    }
+  };
+
+  return (
+    <button
+      class="resource-editor-action resource-delete"
+      onClick={() => void remove()}
+      disabled={deleting}
+      aria-label={`Delete ${tab.name}`}
+      title={`Delete ${tab.name}`}
+    >
+      {deleting ? <LoaderCircle class="spin" size={13} /> : <Trash2 size={13} />}
+      <span>Delete</span>
     </button>
   );
 }

@@ -22,3 +22,19 @@ export function buildProcessTree(processes: ProcessRecord[]): ProcessTreeItem[] 
   sort(roots);
   return roots;
 }
+
+export function formatCpuUsage(percent: number): string {
+  if (!Number.isFinite(percent) || percent <= 0) return "0%";
+  if (percent < 0.1) return "<0.1%";
+  if (percent >= 100) return `${Math.round(percent)}%`;
+  return `${percent.toFixed(1)}%`;
+}
+
+export function formatMemory(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const exponent = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  const value = bytes / 1024 ** exponent;
+  const precision = exponent >= 2 && value < 100 ? 1 : 0;
+  return `${value.toFixed(precision)} ${units[exponent]}`;
+}

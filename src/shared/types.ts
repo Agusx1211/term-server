@@ -7,6 +7,7 @@ export interface AgentInfo {
   statusChangedAt: number;
   startedAt: number;
   revision: number;
+  completedAt: number | null;
   summary: string | null;
 }
 
@@ -46,6 +47,8 @@ export interface ProcessRecord {
   arguments: string[];
   cwd: string | null;
   foreground: boolean;
+  cpuPercent: number;
+  memoryBytes: number;
 }
 
 export interface ProcessInspectorSnapshot {

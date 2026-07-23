@@ -51,8 +51,8 @@ On first boot, open `https://127.0.0.1:8090`. term-server prints a random passwo
 - **Resilient sessions:** bounded server-side replay, slow-client protection, coherent WebSocket reconnects, browser renderer caching, and a separate pane layout in each browser tab. A closed pane detaches the view without killing its process.
 - **Files when needed:** searchable explorer, local image and PDF previews, direct downloads, and a lazy-loaded CodeMirror editor with syntax highlighting, atomic saves, and stale-file conflict detection.
 - **Agent-connected artifacts:** multiline handoffs stay attached to the terminal and agent that created them, with inline text, image, and PDF previews plus an optional full editor.
-- **Process visibility:** a lightweight Linux `/proc` sampler shows the live descendant process tree and foreground job with secret-aware command-line redaction. It does not capture command input or output or retain exited processes.
-- **Agent awareness:** Codex, Claude, and Pi sessions show working, idle, and closed states. An unseen return to idle gets a distinct bell until you focus that terminal. Completion alerts can appear in-app, as desktop notifications, in both places, or remain off.
+- **Process visibility and control:** a lightweight Linux `/proc` sampler shows the complete live descendant process tree, foreground job, CPU and memory usage, and lets you send SIGTERM to a selected process. Command lines are secret-aware and redacted; input, output, and exited processes are not retained.
+- **Agent awareness:** Codex, Claude, and Pi sessions show working, idle, and closed states. An unseen return to idle gets a distinct bell until you focus that terminal. Completion alerts can appear in-app, as desktop notifications, in both places, or remain off. In-app cards inherit their terminal color and can be placed in any corner with a configurable dismissal time.
 - **Secure defaults:** loopback binding, HTTPS, Argon2 password hashing, signed HTTP-only SameSite cookies, origin enforcement, CSP, HSTS, login throttling, and bounded memory use.
 - **Deployment choices:** one native executable plus static browser assets, with Docker Compose and a systemd user service included.
 
@@ -73,9 +73,9 @@ The unframed workspace capture used for the hero is also available at [docs/scre
 
 ## Everyday use
 
-Click the main `+` to open a shell in your home directory, or use a workspace row’s `+` to start in that directory. A terminal’s name follows its foreground process until you pin a custom name. Click a terminal to open it in the active pane; use its split action or drag it onto the left, right, top, or bottom of another pane to build a nested layout.
+Click the main `+` to open a shell in your home directory, or use a workspace row’s `+` to start in that directory. A terminal’s name follows its foreground process until you pin a custom name. Click a terminal to open it in the active pane; use its row actions to rename, split, or kill it directly, or drag it onto the left, right, top, or bottom of another pane to build a nested layout. Kill actions ask for confirmation by default; turn off **Settings → Terminal behavior → Confirm before killing terminals** to make them immediate.
 
-On a phone, term-server keeps that pane layout but shows one terminal at a time. Use the arrows in the mobile toolbar to move between visible panes, the workspace drawer to open another session, and the terminal action menu for search, clipboard, process inspection, clone, kill, and close controls.
+On a phone, term-server keeps that pane layout but shows one terminal at a time. Use the arrows in the mobile toolbar to move between visible panes, the workspace drawer to open another session, and the terminal action menu for search, clipboard, process inspection, clone, kill, and close controls. The touch keybar starts with terminal zoom controls; the percentage resets the text to its default size, and the selected size is remembered on that device.
 
 Closing a pane keeps the PTY running. The trash action kills it. A normal shell exit removes the terminal automatically.
 
@@ -115,8 +115,10 @@ The sidebar shows the selected artifact's contents next to the live terminal, in
 text, image, and PDF previews. Open an artifact when the full conflict-safe editor, syntax
 highlighting, line wrapping, or a larger canvas is useful. The editor links back to the originating
 agent, and closing its tab leaves the artifact available in the sidebar without reopening it.
-Edits remain visible to the agent at the same path on later turns. Artifacts are temporary: the
-operating system may clear `/tmp`, and they are not added to a project or committed automatically.
+Edits remain visible to the agent at the same path on later turns. Delete actions in the sidebar and
+full editor permanently remove the artifact and close any open tab after confirmation. Artifacts are
+temporary: the operating system may clear `/tmp`, and they are not added to a project or committed
+automatically.
 
 For a source checkout, install the skill by linking it into Codex:
 
@@ -249,7 +251,7 @@ The signing private key lives only in the `RELEASE_SIGNING_KEY` GitHub Actions s
 
 Each terminal owns a native PTY, a bounded raw-output ring, and a Tokio broadcast channel. Dedicated blocking-reader threads keep PTY I/O away from the async Axum runtime. WebSocket subscribers receive a coherent replay before live output; lagging clients reconnect instead of allowing unbounded queues.
 
-On Linux, one sampler reads `/proc` for all terminals every 1.5 seconds. It tracks the PTY foreground process group and recognizes supported agent process trees without parsing or delaying terminal bytes. Other operating systems retain normal terminal behavior but do not expose process and agent metadata.
+On Linux, one sampler reads `/proc` for all terminals every 1.5 seconds. It follows parent PID relationships across the complete process table, tracks the PTY foreground process group and per-process CPU and resident memory, and recognizes supported agent process trees without parsing or delaying terminal bytes. Process termination revalidates the terminal ancestry and process start time before sending SIGTERM. Other operating systems retain normal terminal behavior but do not expose process and agent metadata.
 
 The browser delegates terminal parsing and rendering to xterm.js. Recently viewed renderers remain mounted in a bounded cache so switching panes preserves the screen and scroll position without keeping every historical renderer alive.
 

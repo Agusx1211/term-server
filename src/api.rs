@@ -14,7 +14,7 @@ use axum::{
     extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State, ws::WebSocketUpgrade},
     http::{HeaderMap, HeaderValue, StatusCode, Uri, header},
     response::{IntoResponse, Response},
-    routing::{any, get, patch, post},
+    routing::{any, delete, get, patch, post},
 };
 use axum_extra::extract::{
     CookieJar,
@@ -108,6 +108,8 @@ pub enum ApiError {
     ForbiddenOrigin,
     #[error("terminal not found")]
     NotFound,
+    #[error("process is no longer running in this terminal")]
+    ProcessNotFound,
     #[error("file or directory not found")]
     FileNotFound,
     #[error("{0}")]
@@ -134,7 +136,9 @@ impl IntoResponse for ApiError {
         let (status, retry_after) = match self {
             Self::Unauthorized | Self::InvalidLogin => (StatusCode::UNAUTHORIZED, None),
             Self::ForbiddenOrigin => (StatusCode::FORBIDDEN, None),
-            Self::NotFound | Self::FileNotFound => (StatusCode::NOT_FOUND, None),
+            Self::NotFound | Self::ProcessNotFound | Self::FileNotFound => {
+                (StatusCode::NOT_FOUND, None)
+            }
             Self::BadRequest(_) => (StatusCode::BAD_REQUEST, None),
             Self::Conflict(_) => (StatusCode::CONFLICT, None),
             Self::PayloadTooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, None),
@@ -525,6 +529,25 @@ async fn terminal_processes(
         .map_err(Into::into)
 }
 
+async fn terminate_terminal_process(
+    State(state): State<AppState>,
+    Path((id, process_id)): Path<(Uuid, String)>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+) -> Result<StatusCode, ApiError> {
+    require_origin(&headers, &uri, &state)?;
+    require_auth(&jar, &state)?;
+    match state.workspace.terminate_process(id, &process_id).await {
+        Ok(()) => {}
+        Err(error) if error.status() == Some(StatusCode::NOT_FOUND) => {
+            return Err(ApiError::ProcessNotFound);
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn list_artifacts(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -544,6 +567,28 @@ async fn list_artifacts(
             ApiError::Internal
         })?;
     Ok(Json(entries))
+}
+
+async fn remove_artifact(
+    State(state): State<AppState>,
+    Path((session_id, artifact_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+) -> Result<StatusCode, ApiError> {
+    require_origin(&headers, &uri, &state)?;
+    require_auth(&jar, &state)?;
+    tokio::task::spawn_blocking(move || artifacts::remove(session_id, artifact_id))
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, %session_id, %artifact_id, "artifact deletion task failed");
+            ApiError::Internal
+        })?
+        .map_err(|error| {
+            tracing::error!(%error, %session_id, %artifact_id, "artifact deletion failed");
+            ApiError::Internal
+        })?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn file_metadata(
@@ -813,8 +858,16 @@ pub fn build_router(state: AppState, client_directory: Option<PathBuf>) -> Route
             patch(rename_terminal).delete(remove_terminal),
         )
         .route("/terminals/{id}/processes", get(terminal_processes))
+        .route(
+            "/terminals/{id}/processes/{process_id}",
+            delete(terminate_terminal_process),
+        )
         .route("/terminals/{id}/socket", any(terminal_socket))
         .route("/artifacts", get(list_artifacts))
+        .route(
+            "/artifacts/{session_id}/{artifact_id}",
+            delete(remove_artifact),
+        )
         .route("/files/meta", get(file_metadata))
         .route("/files/list", get(list_files))
         .route("/files/search", get(search_files))
@@ -947,6 +1000,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn protects_artifact_deletion() {
+        let response = build_router(test_state().await, None)
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!(
+                        "/api/artifacts/{}/{}",
+                        Uuid::new_v4(),
+                        Uuid::new_v4()
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn authenticated_artifact_deletion_removes_its_directory() {
+        let session_id = Uuid::new_v4();
+        let artifact_id = Uuid::new_v4();
+        let session_directory = artifacts::root_directory().join(session_id.to_string());
+        let artifact_directory = session_directory.join(artifact_id.to_string());
+        std::fs::create_dir_all(&artifact_directory).unwrap();
+        std::fs::write(artifact_directory.join("message.md"), "delete me").unwrap();
+        let (app, cookie) = authenticated_app().await;
+        let uri = format!("/api/artifacts/{session_id}/{artifact_id}");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(&uri)
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(!artifact_directory.exists());
+
+        let repeated = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(uri)
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(repeated.status(), StatusCode::NO_CONTENT);
+        std::fs::remove_dir(session_directory).unwrap();
+    }
+
+    #[tokio::test]
     async fn protects_update_checks() {
         let response = build_router(test_state().await, None)
             .oneshot(
@@ -958,6 +1072,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn process_termination_reports_a_stale_process() {
+        let (app, cookie) = authenticated_app().await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!(
+                        "/api/terminals/{}/processes/10%3A20",
+                        Uuid::new_v4()
+                    ))
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("process is no longer running"));
     }
 
     #[tokio::test]

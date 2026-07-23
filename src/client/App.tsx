@@ -28,23 +28,42 @@ import {
   VIEWED_AGENT_REVISIONS_STORAGE_KEY,
 } from "./lib/agent-attention";
 import { documentTitle } from "./lib/document-title";
+import {
+  CONFIRM_TERMINAL_KILLS_STORAGE_KEY,
+  parseConfirmTerminalKills,
+  terminalKillAllowed,
+} from "./lib/terminal-kill";
 import { installVisualViewportCssVars } from "./lib/visual-viewport";
 import {
+  agentCompletionEvent,
   includesInAppNotifications,
   includesSystemNotifications,
   LEGACY_NOTIFICATIONS_STORAGE_KEY,
+  NOTIFICATION_DURATION_STORAGE_KEY,
   NOTIFICATION_MODE_STORAGE_KEY,
+  NOTIFICATION_POSITION_STORAGE_KEY,
+  parseNotificationDuration,
   parseNotificationMode,
+  parseNotificationPosition,
+  type NotificationDuration,
   type NotificationMode,
+  type NotificationPosition,
 } from "./lib/notifications";
+import {
+  clampTerminalFontSize,
+  parseTerminalFontSize,
+  TERMINAL_FONT_SIZE_STORAGE_KEY,
+} from "./lib/terminal-zoom";
 import {
   artifactCountsBySession,
   artifactOwnerLabel,
   discoverArtifacts,
   reconcileArtifactResources,
+  removeArtifactResources,
   resourceForArtifact,
   sortArtifactsNewestFirst,
   stableArtifactInventory,
+  type ArtifactDeleteTarget,
 } from "./lib/artifacts";
 import {
   arrangeLayout,
@@ -107,6 +126,7 @@ interface AgentToast {
   terminalId: string;
   title: string;
   body: string;
+  color: string;
 }
 
 const initialTheme = (): ThemeName => {
@@ -139,8 +159,22 @@ const initialNotificationMode = () => parseNotificationMode(
   localStorage.getItem(LEGACY_NOTIFICATIONS_STORAGE_KEY),
 );
 
+const initialNotificationPosition = () => parseNotificationPosition(
+  localStorage.getItem(NOTIFICATION_POSITION_STORAGE_KEY),
+);
+
+const initialNotificationDuration = () => parseNotificationDuration(
+  localStorage.getItem(NOTIFICATION_DURATION_STORAGE_KEY),
+);
+
 const initialTileNewTerminals = () =>
   localStorage.getItem(TILE_NEW_TERMINALS_STORAGE_KEY) === "true";
+
+const initialConfirmTerminalKills = () =>
+  parseConfirmTerminalKills(localStorage.getItem(CONFIRM_TERMINAL_KILLS_STORAGE_KEY));
+
+const initialTerminalFontSize = () =>
+  parseTerminalFontSize(localStorage.getItem(TERMINAL_FONT_SIZE_STORAGE_KEY));
 
 const initialViewedAgentRevisions = () =>
   parseViewedAgentRevisions(localStorage.getItem(VIEWED_AGENT_REVISIONS_STORAGE_KEY));
@@ -165,7 +199,11 @@ export function App() {
   const [agentToasts, setAgentToasts] = useState<AgentToast[]>([]);
   const [mobileSidebar, setMobileSidebar] = useState(false);
   const [notificationMode, setNotificationMode] = useState(initialNotificationMode);
+  const [notificationPosition, setNotificationPosition] = useState(initialNotificationPosition);
+  const [notificationDuration, setNotificationDuration] = useState(initialNotificationDuration);
   const [tileNewTerminals, setTileNewTerminals] = useState(initialTileNewTerminals);
+  const [confirmTerminalKills, setConfirmTerminalKills] = useState(initialConfirmTerminalKills);
+  const [terminalFontSize, setTerminalFontSize] = useState(initialTerminalFontSize);
   const [viewedAgentRevisions, setViewedAgentRevisions] = useState(initialViewedAgentRevisions);
   const [artifacts, setArtifacts] = useState<ArtifactEntry[]>([]);
   const [resources, setResources] = useState<ResourceTab[]>([]);
@@ -180,6 +218,8 @@ export function App() {
   const agentToastTimers = useRef(new Map<string, number>());
   const notificationModeRef = useRef(notificationMode);
   notificationModeRef.current = notificationMode;
+  const notificationDurationRef = useRef(notificationDuration);
+  notificationDurationRef.current = notificationDuration;
   const mobileMenuButton = useRef<HTMLButtonElement>(null);
   const terminalsRef = useRef(terminals);
   terminalsRef.current = terminals;
@@ -192,6 +232,12 @@ export function App() {
   const showNotice = (message: string) => {
     setNotice(message);
     window.setTimeout(() => setNotice((current) => (current === message ? "" : current)), 2400);
+  };
+
+  const updateTerminalFontSize = (value: number) => {
+    const next = clampTerminalFontSize(value);
+    localStorage.setItem(TERMINAL_FONT_SIZE_STORAGE_KEY, String(next));
+    setTerminalFontSize(next);
   };
 
   const syncArtifacts = (
@@ -249,7 +295,12 @@ export function App() {
     const existingTimer = agentToastTimers.current.get(toast.id);
     if (existingTimer) clearTimeout(existingTimer);
     setAgentToasts((current) => [...current.filter((item) => item.id !== toast.id), toast].slice(-3));
-    const timer = window.setTimeout(() => dismissAgentToast(toast.id), 7000);
+    const duration = notificationDurationRef.current;
+    if (duration === 0) {
+      agentToastTimers.current.delete(toast.id);
+      return;
+    }
+    const timer = window.setTimeout(() => dismissAgentToast(toast.id), duration);
     agentToastTimers.current.set(toast.id, timer);
   };
 
@@ -321,12 +372,25 @@ export function App() {
   }, [notificationMode]);
 
   useEffect(() => {
-    const syncNotificationMode = (event: StorageEvent) => {
-      if (event.key !== NOTIFICATION_MODE_STORAGE_KEY) return;
-      setNotificationMode(parseNotificationMode(event.newValue, null));
+    localStorage.setItem(NOTIFICATION_POSITION_STORAGE_KEY, notificationPosition);
+  }, [notificationPosition]);
+
+  useEffect(() => {
+    localStorage.setItem(NOTIFICATION_DURATION_STORAGE_KEY, String(notificationDuration));
+  }, [notificationDuration]);
+
+  useEffect(() => {
+    const syncNotificationPreferences = (event: StorageEvent) => {
+      if (event.key === NOTIFICATION_MODE_STORAGE_KEY) {
+        setNotificationMode(parseNotificationMode(event.newValue, null));
+      } else if (event.key === NOTIFICATION_POSITION_STORAGE_KEY) {
+        setNotificationPosition(parseNotificationPosition(event.newValue));
+      } else if (event.key === NOTIFICATION_DURATION_STORAGE_KEY) {
+        setNotificationDuration(parseNotificationDuration(event.newValue));
+      }
     };
-    window.addEventListener("storage", syncNotificationMode);
-    return () => window.removeEventListener("storage", syncNotificationMode);
+    window.addEventListener("storage", syncNotificationPreferences);
+    return () => window.removeEventListener("storage", syncNotificationPreferences);
   }, []);
 
   useEffect(() => {
@@ -383,7 +447,10 @@ export function App() {
     }
     if (!agentEventsInitialized.current) {
       for (const terminal of terminals) {
-        if (terminal.agent) deliveredAgentEvents.current.set(terminal.id, terminal.agent.statusChangedAt);
+        const event = agentCompletionEvent(terminal.agent);
+        if (event != null) {
+          deliveredAgentEvents.current.set(terminal.id, event);
+        }
       }
       agentEventsInitialized.current = true;
       return;
@@ -391,14 +458,15 @@ export function App() {
 
     const deliver = (terminalId: string, event: number) => {
       const terminal = terminalsRef.current.find((candidate) => candidate.id === terminalId);
-      if (!terminal?.agent || terminal.agent.statusChangedAt !== event) return;
+      const agent = terminal?.agent;
+      if (!terminal || !agent || agentCompletionEvent(agent) !== event) return;
       const pending = pendingAgentNotifications.current.get(terminalId);
       if (pending) clearTimeout(pending.timer);
       pendingAgentNotifications.current.delete(terminalId);
-      const body = terminal.agent.summary ?? (
-        terminal.agent.status === "idle"
-          ? `${terminal.agent.kind} is idle and ready for input in ${terminal.workspace}`
-          : `${terminal.agent.kind} closed in ${terminal.workspace}`
+      const body = agent.summary ?? (
+        agent.status === "idle"
+          ? `${agent.kind} is idle and ready for input in ${terminal.workspace}`
+          : `${agent.kind} closed in ${terminal.workspace}`
       );
       const mode = notificationModeRef.current;
       const toast = {
@@ -406,6 +474,7 @@ export function App() {
         terminalId: terminal.id,
         title: terminal.name,
         body,
+        color: terminal.color,
       };
       const showFallback = () => {
         if (!includesInAppNotifications(mode)) showAgentToast(toast);
@@ -444,23 +513,20 @@ export function App() {
     }
     for (const terminal of terminals) {
       const agent = terminal.agent;
-      if (!agent || agent.status === "working") {
-        if (agent) deliveredAgentEvents.current.set(terminal.id, agent.statusChangedAt);
-        continue;
-      }
-      if (deliveredAgentEvents.current.get(terminal.id) === agent.statusChangedAt) continue;
+      const event = agentCompletionEvent(agent);
+      if (!agent || event == null) continue;
+      if (deliveredAgentEvents.current.get(terminal.id) === event) continue;
       const pending = pendingAgentNotifications.current.get(terminal.id);
-      if (pending?.event === agent.statusChangedAt) {
-        if (agent.summary) deliver(terminal.id, agent.statusChangedAt);
+      if (pending?.event === event) {
+        if (agent.summary) deliver(terminal.id, event);
         continue;
       }
       if (pending) clearTimeout(pending.timer);
       if (config.pi.summariesEnabled && !agent.summary) {
-        const event = agent.statusChangedAt;
         const timer = window.setTimeout(() => deliver(terminal.id, event), 12_000);
         pendingAgentNotifications.current.set(terminal.id, { event, timer });
       } else {
-        deliver(terminal.id, agent.statusChangedAt);
+        deliver(terminal.id, event);
       }
     }
   }, [authenticated, terminals, config.pi.summariesEnabled]);
@@ -642,6 +708,34 @@ export function App() {
     setMobileSidebar(false);
   };
 
+  const deleteArtifact = async (artifact: ArtifactDeleteTarget) => {
+    const openResource = resources.find((resource) => (
+      resource.path === artifact.path
+      || (
+        resource.artifact?.id === artifact.id
+        && resource.artifact.sessionId === artifact.sessionId
+      )
+    ));
+    const warning = openResource?.dirty
+      ? `Delete “${artifact.name}” permanently? Its unsaved changes will also be lost.`
+      : `Delete “${artifact.name}” permanently? This cannot be undone.`;
+    if (!confirm(warning)) return;
+
+    try {
+      await api.removeArtifact(artifact.sessionId, artifact.id);
+      setArtifacts((current) => current.filter((candidate) => (
+        candidate.id !== artifact.id || candidate.sessionId !== artifact.sessionId
+      )));
+      setResources((current) => removeArtifactResources(current, artifact));
+      setActiveResource((current) => (
+        current === (openResource?.path ?? artifact.path) ? undefined : current
+      ));
+      showNotice(`Deleted ${artifact.name}`);
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : "Unable to delete artifact");
+    }
+  };
+
   const returnToArtifactSession = (sessionId: string) => {
     if (!terminalsRef.current.some((terminal) => terminal.id === sessionId)) {
       showNotice("The terminal that created this artifact is no longer running");
@@ -725,7 +819,7 @@ export function App() {
   };
 
   const removeTerminal = async (terminal: TerminalInfo) => {
-    if (!confirm(`Kill and remove “${terminal.path}”? The process and its scrollback will be lost.`)) return;
+    if (!terminalKillAllowed(terminal.path, confirmTerminalKills)) return;
     try {
       await api.removeTerminal(terminal.id);
       forgetTerminal(terminal.id);
@@ -784,9 +878,28 @@ export function App() {
     );
   };
 
+  const updateNotificationPosition = (position: NotificationPosition) => {
+    setNotificationPosition(position);
+    showNotice(`In-app notifications will appear at the ${position.replace("-", " ")}`);
+  };
+
+  const updateNotificationDuration = (duration: NotificationDuration) => {
+    setNotificationDuration(duration);
+    showNotice(
+      duration === 0
+        ? "In-app notifications will stay until dismissed"
+        : `In-app notifications will dismiss after ${duration / 1_000} seconds`,
+    );
+  };
+
   const updateTileNewTerminals = (enabled: boolean) => {
     setTileNewTerminals(enabled);
     localStorage.setItem(TILE_NEW_TERMINALS_STORAGE_KEY, String(enabled));
+  };
+
+  const updateConfirmTerminalKills = (enabled: boolean) => {
+    setConfirmTerminalKills(enabled);
+    localStorage.setItem(CONFIRM_TERMINAL_KILLS_STORAGE_KEY, String(enabled));
   };
 
   const waitForUpdatedServer = async (expectedCommit: string) => {
@@ -904,6 +1017,7 @@ export function App() {
           onOpen={(id) => openTerminal(id)}
           onSplit={(id) => openTerminal(id, true)}
           onRename={(terminal) => void renameTerminal(terminal)}
+          onRemove={(terminal) => void removeTerminal(terminal)}
           onSettings={openSettings}
           onOpenFile={(entry) => void openResource({ path: entry.path }, entry)}
           onDragStart={(id) => {
@@ -975,6 +1089,7 @@ export function App() {
                     artifacts={artifactsBySession.get(terminal.id) ?? []}
                     config={config}
                     theme={theme}
+                    fontSize={terminalFontSize}
                     active={visible && terminal.id === activeId && !activeResource && !settingsActive}
                     onActivate={() => setActiveId(terminal.id)}
                     onClose={() => closePane(terminal.id)}
@@ -988,8 +1103,10 @@ export function App() {
                     onExit={() => forgetTerminal(terminal.id)}
                     onUpdate={updateTerminal}
                     onNotice={showNotice}
+                    onFontSizeChange={updateTerminalFontSize}
                     onOpenFile={(target) => void openResource(target)}
                     onOpenArtifact={openArtifact}
+                    onDeleteArtifact={deleteArtifact}
                   />
                 </div>
               );
@@ -1083,6 +1200,7 @@ export function App() {
                   )))}
                   onNotice={showNotice}
                   onOpenArtifactSession={returnToArtifactSession}
+                  onDeleteArtifact={deleteArtifact}
                 />
               </Suspense>
             )}
@@ -1098,7 +1216,10 @@ export function App() {
                 installingUpdate={installingUpdate}
                 passwordManagedExternally={config.passwordManagedExternally}
                 notificationMode={notificationMode}
+                notificationPosition={notificationPosition}
+                notificationDuration={notificationDuration}
                 tileNewTerminals={tileNewTerminals}
+                confirmTerminalKills={confirmTerminalKills}
                 onTheme={setTheme}
                 onPiChange={(titlesEnabled, summariesEnabled, model) => (
                   void updatePiConfig(titlesEnabled, summariesEnabled, model)
@@ -1106,7 +1227,10 @@ export function App() {
                 onCheckForUpdate={() => void checkForUpdates(true)}
                 onInstallUpdate={() => void installUpdate()}
                 onNotificationModeChange={(mode) => void updateNotificationMode(mode)}
+                onNotificationPositionChange={updateNotificationPosition}
+                onNotificationDurationChange={updateNotificationDuration}
                 onTileNewTerminalsChange={updateTileNewTerminals}
+                onConfirmTerminalKillsChange={updateConfirmTerminalKills}
                 onPasswordChanged={() => showNotice("Password changed; other sessions were signed out")}
                 onLogout={() => void logout()}
               />
@@ -1145,9 +1269,13 @@ export function App() {
         </div>
       )}
       {(agentToasts.length > 0 || notice) && (
-        <div class="toast-stack" aria-live="polite">
+        <div class={`toast-stack ${notificationPosition}`} aria-live="polite">
           {agentToasts.map((toast) => (
-            <div key={toast.id} class="toast agent-toast">
+            <div
+              key={toast.id}
+              class="toast agent-toast"
+              style={{ "--notification-color": toast.color }}
+            >
               <button
                 class="agent-toast-main"
                 onClick={() => {

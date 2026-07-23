@@ -6,6 +6,7 @@ import {
   discoverArtifacts,
   formatArtifactSize,
   reconcileArtifactResources,
+  removeArtifactResources,
   resourceForArtifact,
   sortArtifactsNewestFirst,
   stableArtifactInventory,
@@ -43,6 +44,7 @@ const terminal = (overrides: Partial<TerminalInfo> = {}): TerminalInfo => ({
     statusChangedAt: 1,
     startedAt: 1,
     revision: 1,
+    completedAt: null,
     summary: null,
   },
   createdAt: 1,
@@ -89,6 +91,20 @@ describe("artifact resources", () => {
       sessionId: "session-1",
       agentKind: "codex",
     }));
+  });
+
+  it("closes only the resource for a deleted artifact", () => {
+    const removed = resourceForArtifact(artifact(), terminal());
+    const retained = resourceForArtifact(
+      artifact({
+        id: "artifact-2",
+        path: "/tmp/artifacts/session-1/artifact-2/retained.md",
+        name: "retained.md",
+      }),
+      terminal(),
+    );
+
+    expect(removeArtifactResources([removed, retained], artifact())).toEqual([retained]);
   });
 
   it("preserves the recorded producer when the terminal later runs another agent", () => {

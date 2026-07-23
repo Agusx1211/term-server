@@ -1,6 +1,13 @@
 import type { ArtifactEntry, TerminalInfo } from "../../shared/types";
 import type { ResourceTab } from "./resources";
 
+export interface ArtifactDeleteTarget {
+  id: string;
+  sessionId: string;
+  name: string;
+  path: string;
+}
+
 const sameArtifactOrigin = (
   left: ResourceTab["artifact"],
   right: ResourceTab["artifact"],
@@ -69,6 +76,20 @@ export function reconcileArtifactResources(
     return { ...updated, dirty: resource.dirty };
   });
   return changed ? next : resources;
+}
+
+export function removeArtifactResources(
+  resources: ResourceTab[],
+  artifact: ArtifactDeleteTarget,
+): ResourceTab[] {
+  const next = resources.filter((resource) => (
+    resource.path !== artifact.path
+    && (
+      resource.artifact?.id !== artifact.id
+      || resource.artifact.sessionId !== artifact.sessionId
+    )
+  ));
+  return next.length === resources.length ? resources : next;
 }
 
 export function discoverArtifacts(
