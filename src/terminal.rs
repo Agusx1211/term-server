@@ -123,6 +123,16 @@ pub enum TerminalError {
     Io(String),
 }
 
+#[derive(Debug, Error)]
+pub enum ProcessSignalError {
+    #[error("process signaling is only available on Linux hosts")]
+    Unsupported,
+    #[error("process is no longer running in this terminal")]
+    NotFound,
+    #[error("unable to signal process: {0}")]
+    Io(String),
+}
+
 #[derive(Debug, Clone)]
 pub enum TerminalEvent {
     Output(Bytes),
@@ -234,6 +244,10 @@ pub struct ProcessRecord {
     pub arguments: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub foreground: bool,
+    #[serde(default)]
+    pub cpu_percent: f32,
+    #[serde(default)]
+    pub memory_bytes: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -710,6 +724,28 @@ impl TerminalSession {
         self.process_tracker.lock().snapshot()
     }
 
+    pub fn terminate_process(&self, process_id: &str) -> Result<(), ProcessSignalError> {
+        #[cfg(target_os = "linux")]
+        {
+            let tracked = self
+                .process_tracker
+                .lock()
+                .records
+                .iter()
+                .any(|process| process.id == process_id);
+            if !tracked {
+                return Err(ProcessSignalError::NotFound);
+            }
+            let shell_pid = self.info.read().pid.ok_or(ProcessSignalError::NotFound)?;
+            terminate_descendant_process(shell_pid, process_id)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = process_id;
+            Err(ProcessSignalError::Unsupported)
+        }
+    }
+
     pub fn attach(
         &self,
         client_id: Uuid,
@@ -882,9 +918,11 @@ impl TerminalSession {
         let Some(shell_pid) = shell_pid else {
             return RefreshOutcome::default();
         };
-        self.process_tracker
-            .lock()
-            .update(shell_pid, &processes.descendants(shell_pid));
+        self.process_tracker.lock().update(
+            shell_pid,
+            &processes.descendants(shell_pid),
+            processes.cpu_sample,
+        );
         let shell_name = executable_name(&self.info.read().shell);
         let observation = processes.observe(shell_pid, &shell_name);
         let output_bytes = self.output_bytes.load(Ordering::Relaxed);
@@ -1374,6 +1412,27 @@ impl TerminalManager {
     }
 }
 
+pub(crate) fn terminate_descendant_process(
+    shell_pid: u32,
+    process_id: &str,
+) -> Result<(), ProcessSignalError> {
+    #[cfg(target_os = "linux")]
+    {
+        let processes = ProcessSnapshot::read(&[shell_pid]);
+        let process = processes
+            .descendants(shell_pid)
+            .into_iter()
+            .find(|process| process.identity().label() == process_id)
+            .ok_or(ProcessSignalError::NotFound)?;
+        signal_process(process.pid, process_id)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (shell_pid, process_id);
+        Err(ProcessSignalError::Unsupported)
+    }
+}
+
 fn read_output(mut reader: Box<dyn Read + Send>, session: Arc<TerminalSession>) {
     let mut buffer = vec![0_u8; 64 * 1024];
     loop {
@@ -1399,21 +1458,20 @@ impl ProcessIdentity {
 #[derive(Debug, Default)]
 struct ProcessTracker {
     records: Vec<ProcessRecord>,
+    previous_cpu_ticks: HashMap<ProcessIdentity, u64>,
+    previous_total_cpu_ticks: Option<u64>,
 }
 
 impl ProcessTracker {
-    fn update(&mut self, shell_pid: u32, processes: &[&ProcessInfo]) {
+    fn update(
+        &mut self,
+        shell_pid: u32,
+        processes: &[&ProcessInfo],
+        cpu_sample: Option<CpuSample>,
+    ) {
         let identities = processes
             .iter()
-            .map(|process| {
-                (
-                    process.pid,
-                    ProcessIdentity {
-                        pid: process.pid,
-                        start_ticks: process.start_ticks,
-                    },
-                )
-            })
+            .map(|process| (process.pid, process.identity()))
             .collect::<HashMap<_, _>>();
         let foreground_group = processes
             .iter()
@@ -1425,6 +1483,19 @@ impl ProcessTracker {
             .iter()
             .map(|process| {
                 let identity = identities[&process.pid];
+                let cpu_percent = cpu_sample
+                    .zip(self.previous_total_cpu_ticks)
+                    .and_then(|(current, previous_total)| {
+                        let total_delta = current.total_ticks.checked_sub(previous_total)?;
+                        let process_delta = process
+                            .cpu_ticks
+                            .checked_sub(*self.previous_cpu_ticks.get(&identity)?)?;
+                        (total_delta > 0).then(|| {
+                            process_delta as f64 * f64::from(current.cpu_count) * 100.0
+                                / total_delta as f64
+                        })
+                    })
+                    .unwrap_or_default();
                 ProcessRecord {
                     id: identity.label(),
                     pid: process.pid,
@@ -1436,9 +1507,16 @@ impl ProcessTracker {
                     arguments: process.arguments.clone(),
                     cwd: process.cwd.clone(),
                     foreground: foreground_group == Some(process.group),
+                    cpu_percent: (cpu_percent * 10.0).round() as f32 / 10.0,
+                    memory_bytes: process.memory_bytes,
                 }
             })
             .collect();
+        self.previous_cpu_ticks = processes
+            .iter()
+            .map(|process| (process.identity(), process.cpu_ticks))
+            .collect();
+        self.previous_total_cpu_ticks = cpu_sample.map(|sample| sample.total_ticks);
     }
 
     fn snapshot(&self) -> ProcessInspectorSnapshot {
@@ -1479,47 +1557,80 @@ struct ProcessInfo {
     cwd: Option<PathBuf>,
     start_ticks: u64,
     cpu_ticks: u64,
+    memory_bytes: u64,
+}
+
+impl ProcessInfo {
+    fn identity(&self) -> ProcessIdentity {
+        ProcessIdentity {
+            pid: self.pid,
+            start_ticks: self.start_ticks,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CpuSample {
+    total_ticks: u64,
+    cpu_count: u32,
 }
 
 #[derive(Debug, Default)]
 struct ProcessSnapshot {
     processes: HashMap<u32, ProcessInfo>,
     children: HashMap<u32, Vec<u32>>,
+    cpu_sample: Option<CpuSample>,
 }
 
 impl ProcessSnapshot {
     fn read(shell_pids: &[u32]) -> Self {
         #[cfg(target_os = "linux")]
         {
-            let mut processes = HashMap::new();
-            let mut process_children = HashMap::new();
-            let mut visited = HashSet::new();
-            let mut pending = shell_pids.to_vec();
-            while let Some(pid) = pending.pop() {
-                if !visited.insert(pid) {
+            let Ok(entries) = std::fs::read_dir("/proc") else {
+                return Self::default();
+            };
+            let mut candidates = HashMap::new();
+            let mut children = HashMap::<u32, Vec<u32>>::new();
+            for entry in entries.flatten() {
+                let Some(pid) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.parse::<u32>().ok())
+                else {
                     continue;
-                }
-                let directory = PathBuf::from(format!("/proc/{pid}"));
+                };
+                let directory = entry.path();
                 let Ok(stat) = std::fs::read_to_string(directory.join("stat")) else {
                     continue;
                 };
-                let Some(process) = parse_process_stat(pid, &stat, &directory) else {
+                let Some(parent) = parse_process_parent(&stat) else {
                     continue;
                 };
-                processes.insert(pid, process);
-                let children =
-                    std::fs::read_to_string(directory.join(format!("task/{pid}/children")))
-                        .unwrap_or_default();
-                let children = children
-                    .split_whitespace()
-                    .filter_map(|child| child.parse::<u32>().ok())
-                    .collect::<Vec<_>>();
-                pending.extend(children.iter().copied());
-                process_children.insert(pid, children);
+                children.entry(parent).or_default().push(pid);
+                candidates.insert(pid, (directory, stat));
             }
+
+            let descendant_pids = collect_descendant_pids(shell_pids, &children);
+            let processes = descendant_pids
+                .iter()
+                .filter_map(|pid| {
+                    let (directory, stat) = candidates.get(pid)?;
+                    parse_process_stat(*pid, stat, directory).map(|process| (*pid, process))
+                })
+                .collect();
+            children.retain(|parent, values| {
+                if !descendant_pids.contains(parent) {
+                    return false;
+                }
+                values.retain(|pid| descendant_pids.contains(pid));
+                true
+            });
             Self {
                 processes,
-                children: process_children,
+                children,
+                cpu_sample: std::fs::read_to_string("/proc/stat")
+                    .ok()
+                    .and_then(|stat| parse_cpu_sample(&stat)),
             }
         }
         #[cfg(not(target_os = "linux"))]
@@ -1593,16 +1704,43 @@ impl ProcessSnapshot {
             if !visited.insert(pid) {
                 continue;
             }
-            let Some(process) = self.processes.get(&pid) else {
-                continue;
-            };
-            descendants.push(process);
             if let Some(children) = self.children.get(&pid) {
                 pending.extend(children.iter().copied());
+            }
+            if let Some(process) = self.processes.get(&pid) {
+                descendants.push(process);
             }
         }
         descendants
     }
+}
+
+#[cfg(target_os = "linux")]
+fn collect_descendant_pids(roots: &[u32], children: &HashMap<u32, Vec<u32>>) -> HashSet<u32> {
+    let mut descendants = HashSet::new();
+    let mut pending = roots.to_vec();
+    while let Some(pid) = pending.pop() {
+        if !descendants.insert(pid) {
+            continue;
+        }
+        if let Some(children) = children.get(&pid) {
+            pending.extend(children.iter().copied());
+        }
+    }
+    descendants
+}
+
+#[cfg(target_os = "linux")]
+fn parse_process_parent(stat: &str) -> Option<u32> {
+    let close = stat.rfind(')')?;
+    stat[close + 1..].split_whitespace().nth(1)?.parse().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn parse_process_identity(pid: u32, stat: &str) -> Option<ProcessIdentity> {
+    let close = stat.rfind(')')?;
+    let start_ticks = stat[close + 1..].split_whitespace().nth(19)?.parse().ok()?;
+    Some(ProcessIdentity { pid, start_ticks })
 }
 
 #[cfg(target_os = "linux")]
@@ -1631,6 +1769,10 @@ fn parse_process_stat(pid: u32, stat: &str, directory: &Path) -> Option<ProcessI
         })
         .unwrap_or_default();
     let cwd = std::fs::read_link(directory.join("cwd")).ok();
+    let memory_bytes = std::fs::read_to_string(directory.join("status"))
+        .ok()
+        .and_then(|status| parse_resident_memory_bytes(&status))
+        .unwrap_or_default();
     Some(ProcessInfo {
         pid,
         parent,
@@ -1641,7 +1783,76 @@ fn parse_process_stat(pid: u32, stat: &str, directory: &Path) -> Option<ProcessI
         cwd,
         start_ticks,
         cpu_ticks: user_ticks.saturating_add(system_ticks),
+        memory_bytes,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn parse_resident_memory_bytes(status: &str) -> Option<u64> {
+    let kibibytes = status.lines().find_map(|line| {
+        line.strip_prefix("VmRSS:")?
+            .split_whitespace()
+            .next()?
+            .parse::<u64>()
+            .ok()
+    })?;
+    Some(kibibytes.saturating_mul(1024))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_cpu_sample(stat: &str) -> Option<CpuSample> {
+    let mut lines = stat.lines();
+    let total_ticks = lines
+        .next()?
+        .strip_prefix("cpu ")?
+        .split_whitespace()
+        .take(8)
+        .try_fold(0_u64, |total, value| {
+            value
+                .parse::<u64>()
+                .ok()
+                .map(|ticks| total.saturating_add(ticks))
+        })?;
+    let cpu_count = lines
+        .filter_map(|line| line.split_whitespace().next())
+        .filter_map(|label| label.strip_prefix("cpu"))
+        .filter(|suffix| !suffix.is_empty() && suffix.chars().all(|value| value.is_ascii_digit()))
+        .count()
+        .max(1) as u32;
+    Some(CpuSample {
+        total_ticks,
+        cpu_count,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn signal_process(pid: u32, process_id: &str) -> Result<(), ProcessSignalError> {
+    use rustix::process::{Pid, PidfdFlags, Signal, kill_process, pidfd_open, pidfd_send_signal};
+
+    let pid = i32::try_from(pid)
+        .ok()
+        .and_then(Pid::from_raw)
+        .ok_or(ProcessSignalError::NotFound)?;
+    let pidfd = pidfd_open(pid, PidfdFlags::empty()).ok();
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .map_err(|_| ProcessSignalError::NotFound)?;
+    let current_id = parse_process_identity(pid.as_raw_pid() as u32, &stat)
+        .map(ProcessIdentity::label)
+        .ok_or(ProcessSignalError::NotFound)?;
+    if current_id != process_id {
+        return Err(ProcessSignalError::NotFound);
+    }
+
+    let result = if let Some(pidfd) = pidfd {
+        pidfd_send_signal(pidfd, Signal::TERM)
+    } else {
+        kill_process(pid, Signal::TERM)
+    };
+    if result == Err(rustix::io::Errno::SRCH) {
+        Err(ProcessSignalError::NotFound)
+    } else {
+        result.map_err(|error| ProcessSignalError::Io(error.to_string()))
+    }
 }
 
 fn redact_process_arguments(arguments: Vec<String>) -> Vec<String> {
@@ -1976,16 +2187,17 @@ mod tests {
                 cwd: Some(PathBuf::from("/tmp")),
                 start_ticks,
                 cpu_ticks: 1,
+                memory_bytes: 4096,
             };
         let shell = process(10, 1, 10, 20, "bash", 100);
         let child = process(20, 10, 20, 20, "codex", 200);
         let mut tracker = ProcessTracker::default();
-        tracker.update(10, &[&shell, &child]);
+        tracker.update(10, &[&shell, &child], None);
 
         let idle_shell = process(10, 1, 10, 10, "bash", 100);
-        tracker.update(10, &[&idle_shell]);
+        tracker.update(10, &[&idle_shell], None);
         let reused = process(20, 10, 20, 20, "btop", 300);
-        tracker.update(10, &[&shell, &reused]);
+        tracker.update(10, &[&shell, &reused], None);
 
         let snapshot = tracker.snapshot();
         let reused_records = snapshot
@@ -1996,6 +2208,96 @@ mod tests {
         assert_eq!(reused_records.len(), 1);
         assert_eq!(reused_records[0].command, "btop");
         assert!(reused_records[0].foreground);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_parent_table_finds_all_nested_descendants() {
+        let children = HashMap::from([(10, vec![20, 21]), (20, vec![30]), (30, vec![40])]);
+        assert_eq!(
+            collect_descendant_pids(&[10], &children),
+            HashSet::from([10, 20, 21, 30, 40])
+        );
+        assert_eq!(
+            parse_process_parent("42 (worker with spaces) S 10 42 42 0 -1"),
+            Some(10)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_tracker_calculates_cpu_usage_between_samples() {
+        let process = |cpu_ticks| ProcessInfo {
+            pid: 20,
+            parent: 10,
+            group: 20,
+            foreground_group: 20,
+            command: "worker".to_owned(),
+            arguments: vec!["worker".to_owned()],
+            cwd: Some(PathBuf::from("/tmp")),
+            start_ticks: 200,
+            cpu_ticks,
+            memory_bytes: 12 * 1024,
+        };
+        let first = process(25);
+        let second = process(50);
+        let mut tracker = ProcessTracker::default();
+        tracker.update(
+            20,
+            &[&first],
+            Some(CpuSample {
+                total_ticks: 1_000,
+                cpu_count: 4,
+            }),
+        );
+        tracker.update(
+            20,
+            &[&second],
+            Some(CpuSample {
+                total_ticks: 1_100,
+                cpu_count: 4,
+            }),
+        );
+
+        let record = &tracker.snapshot().processes[0];
+        assert_eq!(record.cpu_percent, 100.0);
+        assert_eq!(record.memory_bytes, 12 * 1024);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_linux_process_resource_samples() {
+        assert_eq!(
+            parse_resident_memory_bytes("Name:\tworker\nVmRSS:\t1536 kB\n"),
+            Some(1536 * 1024)
+        );
+        let sample = parse_cpu_sample(
+            "cpu  100 2 30 400 5 6 7 8 9 10\ncpu0 1 0 1 1\ncpu1 1 0 1 1\nintr 0\n",
+        )
+        .unwrap();
+        assert_eq!(sample.total_ticks, 558);
+        assert_eq!(sample.cpu_count, 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_signal_revalidates_the_live_identity() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let snapshot = ProcessSnapshot::read(&[pid]);
+        let process_id = snapshot.processes[&pid].identity().label();
+
+        assert!(matches!(
+            terminate_descendant_process(pid, &format!("{pid}:0")),
+            Err(ProcessSignalError::NotFound)
+        ));
+        assert!(child.try_wait().unwrap().is_none());
+
+        terminate_descendant_process(pid, &process_id).unwrap();
+        assert!(!child.wait().unwrap().success());
     }
 
     #[test]
@@ -2114,6 +2416,7 @@ mod tests {
             cwd: Some(PathBuf::from("/tmp")),
             start_ticks: 100,
             cpu_ticks: 0,
+            memory_bytes: 0,
         };
         assert_eq!(
             agent_kind(&process("codex", &["codex"])).as_deref(),

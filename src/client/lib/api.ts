@@ -75,6 +75,10 @@ export const api = {
   removeTerminal: (id: string) => request<void>(`/api/terminals/${id}`, { method: "DELETE" }),
   terminalProcesses: (id: string) =>
     request<ProcessInspectorSnapshot>(`/api/terminals/${id}/processes`),
+  terminateTerminalProcess: (id: string, processId: string) =>
+    request<void>(`/api/terminals/${id}/processes/${encodeURIComponent(processId)}`, {
+      method: "DELETE",
+    }),
   artifacts: () => request<ArtifactEntry[]>("/api/artifacts"),
   fileMetadata: (target: FileTarget) => request<FileEntry>(`/api/files/meta?${fileQuery(target)}`),
   listFiles: (target: FileTarget) => request<DirectoryListing>(`/api/files/list?${fileQuery(target)}`),
