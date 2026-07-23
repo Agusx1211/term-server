@@ -7,8 +7,8 @@ import {
   ChevronDown,
   ChevronRight,
   ChevronsDownUp,
-  CircleCheckBig,
   CirclePause,
+  CircleX,
   Folder,
   FolderSearch,
   FolderOpen,
@@ -44,6 +44,7 @@ import { WorkingDuration } from "./WorkingDuration";
 interface SidebarProps {
   terminals: TerminalInfo[];
   activeIds: string[];
+  attentionAgentIds: Set<string>;
   mobileOpen: boolean;
   creating: boolean;
   theme: ThemeName;
@@ -73,6 +74,7 @@ interface NodeProps {
   depth: number;
   collapsed: Set<string>;
   activeIds: string[];
+  attentionAgentIds: Set<string>;
   onToggle: (path: string) => void;
   onNew: (cwd?: string) => void;
   onOpen: (id: string) => void;
@@ -87,6 +89,7 @@ function TreeNode({
   depth,
   collapsed,
   activeIds,
+  attentionAgentIds,
   onToggle,
   onNew,
   onOpen,
@@ -100,9 +103,10 @@ function TreeNode({
   const terminal = node.terminal;
 
   if (!hasChildren && terminal) {
+    const needsAttention = attentionAgentIds.has(terminal.id);
     return (
       <div
-        class={`tree-row terminal-row ${terminal.agent ? `agent-row agent-${terminal.agent.status}` : "shell-row"} ${activeIds.includes(terminal.id) ? "active" : ""}`}
+        class={`tree-row terminal-row ${terminal.agent ? `agent-row agent-${terminal.agent.status}` : "shell-row"} ${needsAttention ? "agent-attention" : ""} ${activeIds.includes(terminal.id) ? "active" : ""}`}
         style={{ "--depth": depth, "--workspace-color": terminal.color }}
       >
         <button
@@ -127,7 +131,7 @@ function TreeNode({
               {terminal.agent ? `${terminal.agent.kind} agent` : terminal.program}
             </span>
           </span>
-          {terminal.agent && <AgentState agent={terminal.agent} />}
+          {terminal.agent && <AgentState agent={terminal.agent} needsAttention={needsAttention} />}
           {terminal.status === "exited" && <span class="tree-status">{terminal.exitCode ?? "exit"}</span>}
         </button>
         <span class="row-actions">
@@ -173,6 +177,7 @@ function TreeNode({
               depth={depth + 1}
               collapsed={collapsed}
               activeIds={activeIds}
+              attentionAgentIds={attentionAgentIds}
               onToggle={onToggle}
               onNew={onNew}
               onOpen={onOpen}
@@ -207,6 +212,7 @@ const loadSidebarWidth = () => {
 export function Sidebar({
   terminals,
   activeIds,
+  attentionAgentIds,
   mobileOpen,
   creating,
   theme,
@@ -376,6 +382,7 @@ export function Sidebar({
                 depth={0}
                 collapsed={query ? new Set() : collapsed}
                 activeIds={activeIds}
+                attentionAgentIds={attentionAgentIds}
                 onToggle={toggle}
                 onNew={onNew}
                 onOpen={onOpen}
@@ -507,12 +514,24 @@ export function Sidebar({
   );
 }
 
-function AgentState({ agent }: { agent: AgentInfo }) {
-  const label = agent.status === "working" ? "Working" : agent.status === "idle" ? "Idle" : "Done";
-  const Icon = agent.status === "working" ? Activity : agent.status === "idle" ? CirclePause : CircleCheckBig;
+function AgentState({ agent, needsAttention }: { agent: AgentInfo; needsAttention: boolean }) {
+  const label = needsAttention
+    ? "Ready"
+    : agent.status === "working"
+      ? "Working"
+      : agent.status === "idle"
+        ? "Idle"
+        : "Closed";
+  const Icon = needsAttention
+    ? Bell
+    : agent.status === "working"
+      ? Activity
+      : agent.status === "idle"
+        ? CirclePause
+        : CircleX;
   return (
     <span
-      class={`agent-status-badge ${agent.status}`}
+      class={`agent-status-badge ${needsAttention ? "attention" : agent.status}`}
       title={agent.summary ?? `${agent.kind} is ${label.toLocaleLowerCase()}`}
       aria-label={agent.status === "working" ? undefined : `${agent.kind} is ${label.toLocaleLowerCase()}`}
     >

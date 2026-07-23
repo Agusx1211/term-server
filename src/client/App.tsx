@@ -3,6 +3,13 @@ import { lazy, Suspense } from "preact/compat";
 import { ChevronLeft, ChevronRight, Menu, Plus, ShieldCheck } from "lucide-preact";
 import type { ClientConfig, FileEntry, FileTarget, TerminalInfo } from "../shared/types";
 import { api, ApiError } from "./lib/api";
+import {
+  agentNeedsAttention,
+  markAgentRevisionViewed,
+  parseViewedAgentRevisions,
+  pruneViewedAgentRevisions,
+  VIEWED_AGENT_REVISIONS_STORAGE_KEY,
+} from "./lib/agent-attention";
 import { documentTitle } from "./lib/document-title";
 import {
   arrangeLayout,
@@ -82,8 +89,12 @@ const initialNotifications = () =>
 const initialTileNewTerminals = () =>
   localStorage.getItem(TILE_NEW_TERMINALS_STORAGE_KEY) === "true";
 
+const initialViewedAgentRevisions = () =>
+  parseViewedAgentRevisions(localStorage.getItem(VIEWED_AGENT_REVISIONS_STORAGE_KEY));
+
 export function App() {
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
+  const [workspaceLoaded, setWorkspaceLoaded] = useState(false);
   const [terminals, setTerminals] = useState<TerminalInfo[]>([]);
   const [config, setConfig] = useState(defaultConfig);
   const [layout, setLayout] = useState<PaneLayout | null>(initialPaneLayout);
@@ -97,6 +108,7 @@ export function App() {
   const [mobileSidebar, setMobileSidebar] = useState(false);
   const [notificationsEnabled, setNotificationsEnabled] = useState(initialNotifications);
   const [tileNewTerminals, setTileNewTerminals] = useState(initialTileNewTerminals);
+  const [viewedAgentRevisions, setViewedAgentRevisions] = useState(initialViewedAgentRevisions);
   const [resources, setResources] = useState<ResourceTab[]>([]);
   const [activeResource, setActiveResource] = useState<string>();
   const agentEventsInitialized = useRef(false);
@@ -118,6 +130,7 @@ export function App() {
       const runningTerminals = nextTerminals.filter((terminal) => terminal.status === "running");
       setConfig(nextConfig);
       setTerminals(runningTerminals);
+      setWorkspaceLoaded(true);
       setLayout((current) => {
         const available = new Set(runningTerminals.map((terminal) => terminal.id));
         const kept = pruneLayout(current, available);
@@ -153,6 +166,28 @@ export function App() {
   useEffect(() => {
     document.title = documentTitle(terminals);
   }, [terminals]);
+
+  useEffect(() => {
+    localStorage.setItem(
+      VIEWED_AGENT_REVISIONS_STORAGE_KEY,
+      JSON.stringify(viewedAgentRevisions),
+    );
+  }, [viewedAgentRevisions]);
+
+  useEffect(() => {
+    const syncViewedAgentRevisions = (event: StorageEvent) => {
+      if (event.key !== VIEWED_AGENT_REVISIONS_STORAGE_KEY) return;
+      setViewedAgentRevisions(parseViewedAgentRevisions(event.newValue));
+    };
+    window.addEventListener("storage", syncViewedAgentRevisions);
+    return () => window.removeEventListener("storage", syncViewedAgentRevisions);
+  }, []);
+
+  useEffect(() => {
+    if (!workspaceLoaded) return;
+    const terminalIds = new Set(terminals.map((terminal) => terminal.id));
+    setViewedAgentRevisions((current) => pruneViewedAgentRevisions(current, terminalIds));
+  }, [workspaceLoaded, terminals]);
 
   useEffect(() => {
     sessionStorage.setItem("term-server:panes", JSON.stringify(paneIds));
@@ -203,7 +238,7 @@ export function App() {
       const body = terminal.agent.summary ?? (
         terminal.agent.status === "idle"
           ? `${terminal.agent.kind} is idle and ready for input in ${terminal.workspace}`
-          : `${terminal.agent.kind} finished in ${terminal.workspace}`
+          : `${terminal.agent.kind} closed in ${terminal.workspace}`
       );
       const notification = new Notification(terminal.name, {
         body,
@@ -276,6 +311,12 @@ export function App() {
   }, [mobileSidebar]);
 
   const terminalById = useMemo(() => new Map(terminals.map((terminal) => [terminal.id, terminal])), [terminals]);
+  const attentionAgentIds = useMemo(
+    () => new Set(terminals.flatMap((terminal) => (
+      agentNeedsAttention(terminal.agent, viewedAgentRevisions[terminal.id]) ? [terminal.id] : []
+    ))),
+    [terminals, viewedAgentRevisions],
+  );
   const visibleTerminals = paneIds.map((id) => terminalById.get(id)).filter(Boolean) as TerminalInfo[];
   const renderedIds = [...mountedIds, ...paneIds.filter((id) => !mountedIds.includes(id))];
   const mountedTerminals = renderedIds.map((id) => terminalById.get(id)).filter(Boolean) as TerminalInfo[];
@@ -302,6 +343,39 @@ export function App() {
       return next.length === current.length && next.every((id, index) => id === current[index]) ? current : next;
     });
   }, [paneIds, terminals, config.maxPanes]);
+
+  const markAgentViewed = (id: string) => {
+    const agent = terminalsRef.current.find((terminal) => terminal.id === id)?.agent;
+    if (!agent || agent.status !== "idle") return;
+    setViewedAgentRevisions((current) => (
+      markAgentRevisionViewed(current, id, agent.revision)
+    ));
+  };
+
+  useEffect(() => {
+    if (
+      !activeId
+      || activeResource
+      || mobileSidebar
+      || document.visibilityState !== "visible"
+      || !document.hasFocus()
+    ) return;
+    markAgentViewed(activeId);
+  }, [activeId, activeResource, mobileSidebar, terminals]);
+
+  useEffect(() => {
+    const markActiveAgentViewed = () => {
+      if (document.visibilityState !== "visible" || !document.hasFocus()) return;
+      const id = activeId;
+      if (id && !activeResource && !mobileSidebar) markAgentViewed(id);
+    };
+    window.addEventListener("focus", markActiveAgentViewed);
+    document.addEventListener("visibilitychange", markActiveAgentViewed);
+    return () => {
+      window.removeEventListener("focus", markActiveAgentViewed);
+      document.removeEventListener("visibilitychange", markActiveAgentViewed);
+    };
+  }, [activeId, activeResource, mobileSidebar]);
 
   const openTerminal = (id: string, split = false) => {
     setLayout((current) => {
@@ -479,6 +553,7 @@ export function App() {
       await api.logout();
     } finally {
       setAuthenticated(false);
+      setWorkspaceLoaded(false);
       setTerminals([]);
       setLayout(null);
       setMountedIds([]);
@@ -531,6 +606,7 @@ export function App() {
         <Sidebar
           terminals={terminals}
           activeIds={paneIds}
+          attentionAgentIds={attentionAgentIds}
           mobileOpen={mobileSidebar}
           creating={creating}
           theme={theme}
@@ -608,6 +684,7 @@ export function App() {
                 >
                   <TerminalPane
                     terminal={terminal}
+                    needsAttention={attentionAgentIds.has(terminal.id)}
                     config={config}
                     theme={theme}
                     active={visible && terminal.id === activeId && !activeResource}

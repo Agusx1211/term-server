@@ -12,7 +12,7 @@ export const asciiArt: string[][] = [
     "╭────────╮ ╭────────╮ ╭────────╮",
     "│ CODEX  │ │ CLAUDE │ │   PI   │",
     "│ [o_o]  │ │ [•_•]  │ │ [^_^]  │",
-    "│working │ │  idle  │ │  done  │",
+    "│working │ │  idle  │ │ closed │",
     "╰───┬────╯ ╰───┬────╯ ╰───┬────╯",
     "    ╰───────────┴───────────╯     ",
     "        definitely supervised     ",

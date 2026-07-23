@@ -34,7 +34,7 @@ describe("document title", () => {
       terminal("working"),
       terminal("working"),
       terminal("idle"),
-      terminal("finished"),
+      terminal("closed"),
       terminal(),
     ])).toBe("(2) term-server");
   });

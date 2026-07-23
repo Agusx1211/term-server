@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from "preact/hooks";
 import {
   Activity,
+  Bell,
   Bot,
   ChevronDown,
   ChevronUp,
-  CircleCheckBig,
   CirclePause,
+  CircleX,
   ClipboardCopy,
   ClipboardPaste,
   CopyPlus,
@@ -35,6 +36,7 @@ interface TerminalPaneProps {
   config: ClientConfig;
   theme: ThemeName;
   active: boolean;
+  needsAttention: boolean;
   onActivate: () => void;
   onClose: () => void;
   onRemove: () => void;
@@ -155,6 +157,7 @@ export function TerminalPane({
   config,
   theme,
   active,
+  needsAttention,
   onActivate,
   onClose,
   onRemove,
@@ -540,7 +543,7 @@ export function TerminalPane({
         <span class="terminal-color" style={{ background: terminal.color }} />
         <TerminalPath path={terminal.path} />
         {terminal.agent && (
-          <PaneAgentState agent={terminal.agent} />
+          <PaneAgentState agent={terminal.agent} needsAttention={needsAttention} />
         )}
         <span class={`connection ${connection}`} title={connection} />
         <span class="pane-spacer" />
@@ -668,11 +671,32 @@ export function TerminalPane({
   );
 }
 
-function PaneAgentState({ agent }: { agent: NonNullable<TerminalInfo["agent"]> }) {
-  const label = agent.status === "working" ? "Working" : agent.status === "idle" ? "Idle" : "Done";
-  const Icon = agent.status === "working" ? Activity : agent.status === "idle" ? CirclePause : CircleCheckBig;
+function PaneAgentState({
+  agent,
+  needsAttention,
+}: {
+  agent: NonNullable<TerminalInfo["agent"]>;
+  needsAttention: boolean;
+}) {
+  const label = needsAttention
+    ? "Ready"
+    : agent.status === "working"
+      ? "Working"
+      : agent.status === "idle"
+        ? "Idle"
+        : "Closed";
+  const Icon = needsAttention
+    ? Bell
+    : agent.status === "working"
+      ? Activity
+      : agent.status === "idle"
+        ? CirclePause
+        : CircleX;
   return (
-    <span class={`pane-agent ${agent.status}`} title={agent.summary ?? `${agent.kind} is ${label.toLocaleLowerCase()}`}>
+    <span
+      class={`pane-agent ${needsAttention ? "attention" : agent.status}`}
+      title={agent.summary ?? `${agent.kind} is ${label.toLocaleLowerCase()}`}
+    >
       <Bot size={12} aria-hidden="true" />
       <span class="pane-agent-kind">{agent.kind}</span>
       <span class="pane-agent-state">

@@ -53,7 +53,7 @@ pub enum TerminalStatus {
 pub enum AgentStatus {
     Working,
     Idle,
-    Finished,
+    Closed,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -610,14 +610,14 @@ impl TerminalSession {
             .read()
             .agent
             .as_ref()
-            .is_some_and(|agent| agent.status != AgentStatus::Finished);
+            .is_some_and(|agent| agent.status != AgentStatus::Closed);
         if agent_active {
             let mut activity = self.activity.lock();
             let input = activity.prompt_capture.observe(data);
             if input.submitted {
                 let mut info = self.info.write();
                 if let Some(agent) = info.agent.as_mut()
-                    && agent.status != AgentStatus::Finished
+                    && agent.status != AgentStatus::Closed
                 {
                     // A submitted line while the agent is already working is usually an
                     // approval or answer, not a new dashboard task. Only retitle when an
@@ -839,9 +839,9 @@ impl TerminalSession {
             }
         } else {
             if let Some(current) = info.agent.as_mut()
-                && current.status != AgentStatus::Finished
+                && current.status != AgentStatus::Closed
             {
-                current.status = AgentStatus::Finished;
+                current.status = AgentStatus::Closed;
                 current.status_changed_at = now;
                 current.revision = current.revision.saturating_add(1);
                 current.summary = None;
@@ -871,7 +871,7 @@ impl TerminalSession {
                 info.name = if observation.shell_foreground {
                     info.agent
                         .as_ref()
-                        .filter(|agent| agent.status == AgentStatus::Finished)
+                        .filter(|agent| agent.status == AgentStatus::Closed)
                         .map(|agent| agent.kind.clone())
                         .unwrap_or(observation.program)
                 } else {

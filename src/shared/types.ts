@@ -1,5 +1,5 @@
 export type TerminalStatus = "running" | "exited";
-export type AgentStatus = "working" | "idle" | "finished";
+export type AgentStatus = "working" | "idle" | "closed";
 
 export interface AgentInfo {
   kind: "codex" | "claude" | "pi" | string;
