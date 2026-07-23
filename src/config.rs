@@ -65,6 +65,14 @@ pub struct Cli {
     #[arg(long, env = "TERM_SERVER_CERT_KEY", requires = "cert")]
     pub cert_key: Option<PathBuf>,
 
+    /// Additional hostname for the generated TLS certificate. May be repeated or comma-separated.
+    #[arg(
+        long = "tls-hostname",
+        env = "TERM_SERVER_TLS_HOSTNAMES",
+        value_delimiter = ','
+    )]
+    pub tls_hostnames: Vec<String>,
+
     /// Read the login password from a file. TERM_SERVER_PASSWORD takes precedence.
     #[arg(long, env = "TERM_SERVER_PASSWORD_FILE")]
     pub password_file: Option<PathBuf>,
@@ -147,14 +155,17 @@ mod tests {
         assert_eq!(cli.host, "127.0.0.1");
         assert_eq!(cli.port, 8090);
         assert!(cli.is_https());
+        assert!(cli.tls_hostnames.is_empty());
         assert_eq!(cli.scrollback_lines, 200_000);
     }
 
     #[test]
-    fn accepts_no_https_and_resource_limits() {
+    fn accepts_no_https_tls_hostnames_and_resource_limits() {
         let cli = Cli::try_parse_from([
             "term-server",
             "--no-https",
+            "--tls-hostname",
+            "vscode4,vscode11",
             "--replay-mb",
             "32",
             "--max-panes",
@@ -162,6 +173,7 @@ mod tests {
         ])
         .unwrap();
         assert!(!cli.is_https());
+        assert_eq!(cli.tls_hostnames, ["vscode4", "vscode11"]);
         assert_eq!(cli.replay_bytes(), 32 * 1024 * 1024);
         assert_eq!(cli.max_panes, 2);
     }

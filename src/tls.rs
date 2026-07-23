@@ -25,20 +25,25 @@ async fn write_private(path: &Path, contents: &[u8]) -> Result<(), std::io::Erro
     Ok(())
 }
 
-fn generated_names(host: &str) -> Vec<String> {
+fn generated_names(host: &str, tls_hostnames: &[String]) -> Vec<String> {
     let mut names = vec![
         "localhost".to_owned(),
-        "vscode11".to_owned(),
         "127.0.0.1".to_owned(),
         "::1".to_owned(),
     ];
-    if !["0.0.0.0", "::"].contains(&host) && !names.iter().any(|name| name == host) {
-        names.push(host.to_owned());
+    for hostname in std::iter::once(host).chain(tls_hostnames.iter().map(String::as_str)) {
+        if !["0.0.0.0", "::"].contains(&hostname) && !names.iter().any(|name| name == hostname) {
+            names.push(hostname.to_owned());
+        }
     }
     names
 }
 
-async fn generated_paths(data_dir: &Path, host: &str) -> Result<(PathBuf, PathBuf), TlsError> {
+async fn generated_paths(
+    data_dir: &Path,
+    host: &str,
+    tls_hostnames: &[String],
+) -> Result<(PathBuf, PathBuf), TlsError> {
     let directory = data_dir.join("tls");
     let cert_path = directory.join("cert.pem");
     let key_path = directory.join("key.pem");
@@ -53,7 +58,7 @@ async fn generated_paths(data_dir: &Path, host: &str) -> Result<(PathBuf, PathBu
         fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).await?;
     }
 
-    let names = generated_names(host);
+    let names = generated_names(host, tls_hostnames);
     let CertifiedKey { cert, signing_key } = generate_simple_self_signed(names)?;
     fs::write(&cert_path, cert.pem()).await?;
     write_private(&key_path, signing_key.serialize_pem().as_bytes()).await?;
@@ -66,7 +71,7 @@ pub async fn load_tls(cli: &Cli) -> Result<Option<RustlsConfig>, TlsError> {
     }
     let (cert_path, key_path) = match (&cli.cert, &cli.cert_key) {
         (Some(cert), Some(key)) => (cert.clone(), key.clone()),
-        _ => generated_paths(&cli.data_dir, &cli.host).await?,
+        _ => generated_paths(&cli.data_dir, &cli.host, &cli.tls_hostnames).await?,
     };
     Ok(Some(
         RustlsConfig::from_pem_file(cert_path, key_path).await?,
@@ -80,24 +85,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn generated_tls_names_include_vscode11() {
+    fn generated_tls_names_include_configured_hosts() {
         assert_eq!(
-            generated_names("0.0.0.0"),
-            ["localhost", "vscode11", "127.0.0.1", "::1"]
+            generated_names("0.0.0.0", &[]),
+            ["localhost", "127.0.0.1", "::1"]
         );
         assert_eq!(
-            generated_names("vscode11"),
-            ["localhost", "vscode11", "127.0.0.1", "::1"]
-        );
-        assert_eq!(
-            generated_names("terminal.example.com"),
+            generated_names(
+                "terminal.example.com",
+                &["vscode4".to_owned(), "vscode11".to_owned()]
+            ),
             [
                 "localhost",
-                "vscode11",
                 "127.0.0.1",
                 "::1",
                 "terminal.example.com",
+                "vscode4",
+                "vscode11",
             ]
+        );
+        assert_eq!(
+            generated_names("vscode4", &["vscode4".to_owned()]),
+            ["localhost", "127.0.0.1", "::1", "vscode4"]
         );
     }
 

@@ -104,6 +104,7 @@ Run `term-server --help` for generated CLI help. CLI flags take precedence over 
 | `--no-https` | `TERM_SERVER_NO_HTTPS` | off | Disable built-in TLS |
 | `--secure-cookie` | `TERM_SERVER_SECURE_COOKIE` | off | Mark cookies secure behind a TLS proxy |
 | `--cert`, `--cert-key` | `TERM_SERVER_CERT`, `TERM_SERVER_CERT_KEY` | generated | Custom PEM certificate and key |
+| `--tls-hostname` | `TERM_SERVER_TLS_HOSTNAMES` | local and bind hosts | Extra names for the generated certificate |
 | `--password-file` | `TERM_SERVER_PASSWORD_FILE` | generated password | Read the password from a secret file |
 | — | `TERM_SERVER_PASSWORD` | — | Password; takes precedence over the file |
 | `--data-dir` | `TERM_SERVER_DATA_DIR` | `$XDG_DATA_HOME/term-server` | Credentials, TLS files, and settings |
