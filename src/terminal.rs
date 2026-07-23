@@ -44,14 +44,14 @@ const PI_SUBMISSION_WORKING_MILLIS: u64 = 3_000;
 const REPORTED_WORKING_FRESH_MILLIS: u64 = 5_000;
 const MAX_CAPTURED_PROMPT_CHARS: usize = 16_000;
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum TerminalStatus {
     Running,
     Exited,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentStatus {
     Working,
@@ -59,7 +59,7 @@ pub enum AgentStatus {
     Closed,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentInfo {
     pub kind: String,
@@ -70,7 +70,7 @@ pub struct AgentInfo {
     pub summary: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalInfo {
     pub id: Uuid,
@@ -89,7 +89,7 @@ pub struct TerminalInfo {
     pub clients: usize,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateTerminal {
     pub path: Option<String>,
@@ -98,7 +98,7 @@ pub struct CreateTerminal {
     pub clone_from: Option<Uuid>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RenameTerminal {
     pub path: String,
 }
@@ -125,7 +125,7 @@ pub enum TerminalEvent {
     Exit(u32),
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProcessRecord {
     pub id: String,
@@ -137,7 +137,7 @@ pub struct ProcessRecord {
     pub foreground: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProcessInspectorSnapshot {
     pub supported: bool,
@@ -955,8 +955,8 @@ impl TerminalSession {
 
 pub struct TerminalManager {
     sessions: Arc<RwLock<HashMap<Uuid, Arc<TerminalSession>>>>,
-    default_shell: Option<String>,
-    replay_bytes: usize,
+    default_shell: RwLock<Option<String>>,
+    replay_bytes: AtomicUsize,
     home_directory: PathBuf,
 }
 
@@ -967,10 +967,15 @@ impl TerminalManager {
             .unwrap_or_else(|| PathBuf::from("/"));
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
-            default_shell,
-            replay_bytes,
+            default_shell: RwLock::new(default_shell),
+            replay_bytes: AtomicUsize::new(replay_bytes),
             home_directory,
         }
+    }
+
+    pub fn configure(&self, default_shell: Option<String>, replay_bytes: usize) {
+        *self.default_shell.write() = default_shell;
+        self.replay_bytes.store(replay_bytes, Ordering::Relaxed);
     }
 
     pub fn list(&self) -> Vec<TerminalInfo> {
@@ -1057,7 +1062,12 @@ impl TerminalManager {
         let shell = request
             .shell
             .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| self.default_shell.clone().unwrap_or_else(default_shell));
+            .unwrap_or_else(|| {
+                self.default_shell
+                    .read()
+                    .clone()
+                    .unwrap_or_else(default_shell)
+            });
 
         let mut sessions = self.sessions.write();
         let (name, automatic_name) = if let Some(name) = requested_name {
@@ -1134,7 +1144,7 @@ impl TerminalManager {
             master: Mutex::new(pair.master),
             writer: Mutex::new(writer),
             killer: Mutex::new(killer),
-            replay: Mutex::new(ReplayBuffer::new(self.replay_bytes)),
+            replay: Mutex::new(ReplayBuffer::new(self.replay_bytes.load(Ordering::Relaxed))),
             events,
             clients: AtomicUsize::new(0),
             output_bytes: AtomicU64::new(0),
@@ -1816,8 +1826,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let manager = TerminalManager {
             sessions: Arc::new(RwLock::new(HashMap::new())),
-            default_shell: Some("/bin/sh".into()),
-            replay_bytes: 1024 * 1024,
+            default_shell: RwLock::new(Some("/bin/sh".into())),
+            replay_bytes: AtomicUsize::new(1024 * 1024),
             home_directory: directory.path().to_path_buf(),
         };
         let info = manager

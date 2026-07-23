@@ -13,6 +13,8 @@ import type {
   FileSearchResults,
   FileTarget,
   SaveFileRequest,
+  UpdateStatus,
+  ReleaseInfo,
 } from "../../shared/types";
 
 export class ApiError extends Error {
@@ -57,6 +59,12 @@ export const api = {
       body: JSON.stringify({ currentPassword, newPassword }),
     }),
   config: () => request<ClientConfig>("/api/config"),
+  updateStatus: () => request<UpdateStatus>("/api/update"),
+  installUpdate: (commit: string) =>
+    request<ReleaseInfo>("/api/update", {
+      method: "POST",
+      body: JSON.stringify({ commit }),
+    }),
   updatePiConfig: (config: UpdatePiConfig) =>
     request<PiConfig>("/api/config/pi", { method: "PATCH", body: JSON.stringify(config) }),
   terminals: () => request<TerminalInfo[]>("/api/terminals"),
@@ -78,5 +86,6 @@ export const api = {
   readFile: (target: FileTarget) => request<FileDocument>(`/api/files/content?${fileQuery(target)}`),
   saveFile: (file: SaveFileRequest) =>
     request<FileDocument>("/api/files/content", { method: "PUT", body: JSON.stringify(file) }),
-  rawFileUrl: (target: FileTarget) => `/api/files/raw?${fileQuery(target)}`,
+  previewFileUrl: (target: FileTarget) => `/api/files/raw?${fileQuery(target)}`,
+  downloadFileUrl: (target: FileTarget) => `/api/files/download?${fileQuery(target)}`,
 };

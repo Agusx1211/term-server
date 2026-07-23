@@ -661,7 +661,7 @@ export function TerminalPane({
             <span>{imagePreview.file.name}</span>
             <small>Ctrl+click to open</small>
           </header>
-          <img src={api.rawFileUrl({ path: imagePreview.file.path })} alt={imagePreview.file.name} />
+          <img src={api.previewFileUrl({ path: imagePreview.file.path })} alt={imagePreview.file.name} />
         </div>
       )}
       {processesOpen && <ProcessInspector terminalId={terminal.id} onClose={() => setProcessesOpen(false)} />}

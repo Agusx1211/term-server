@@ -61,9 +61,28 @@ download() {
   fi
 }
 
+if ! command -v openssl >/dev/null 2>&1; then
+  echo "openssl is required to verify the release signature" >&2
+  exit 1
+fi
+
 echo "Downloading term-server ${channel} for Linux ${architecture}..."
 download "$release_base/$archive" "$temporary/$archive"
 download "$release_base/SHA256SUMS" "$temporary/SHA256SUMS"
+download "$release_base/SHA256SUMS.sig" "$temporary/SHA256SUMS.sig"
+
+cat > "$temporary/release-public-key.pem" <<'EOF'
+-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAbF71WJF0crKIprqulVKqQDc/i9k036TCa4NMw6/9vT4=
+-----END PUBLIC KEY-----
+EOF
+if ! openssl pkeyutl -verify -pubin -rawin \
+  -inkey "$temporary/release-public-key.pem" \
+  -in "$temporary/SHA256SUMS" \
+  -sigfile "$temporary/SHA256SUMS.sig" >/dev/null 2>&1; then
+  echo "release signature verification failed" >&2
+  exit 1
+fi
 
 expected="$(awk -v name="$archive" '$2 == name { print $1; exit }' "$temporary/SHA256SUMS")"
 if [ -z "$expected" ]; then

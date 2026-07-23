@@ -1,16 +1,17 @@
 use std::{
     net::SocketAddr,
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
     Json, Router,
-    extract::{
-        ConnectInfo, DefaultBodyLimit, Path, Query, State,
-        ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
-    },
+    body::Body,
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State, ws::WebSocketUpgrade},
     http::{HeaderMap, HeaderValue, StatusCode, Uri, header},
     response::{IntoResponse, Response},
     routing::{any, get, patch, post},
@@ -19,11 +20,11 @@ use axum_extra::extract::{
     CookieJar,
     cookie::{Cookie, SameSite},
 };
-use futures_util::{SinkExt, StreamExt};
+use axum_server::Handle;
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::Duration;
-use tokio::sync::broadcast;
 use tower_http::{
     catch_panic::CatchPanicLayer,
     compression::CompressionLayer,
@@ -33,24 +34,29 @@ use tower_http::{
 };
 use uuid::Uuid;
 
+#[cfg(unix)]
+use crate::broker::BrokerWebSocket;
 use crate::{
-    ai::{PiClientConfig, PiService, UpdatePiSettings},
+    ai::{PiClientConfig, UpdatePiSettings},
     artifacts,
     auth::{AuthError, AuthService, LoginLimiter},
+    build,
     files::{self, FileError},
-    terminal::{
-        CreateTerminal, RenameTerminal, TerminalError, TerminalEvent, TerminalManager,
-        TerminalSession,
-    },
+    terminal::{CreateTerminal, RenameTerminal, TerminalError},
+    update::{UpdateConfig, UpdateError, UpdateService, UpdateStatus},
+    workspace::{SessionConnection, WorkspaceBackend, WorkspaceError, serve_terminal_socket},
 };
+#[cfg(unix)]
+use axum::extract::ws::{Message, WebSocket};
+#[cfg(unix)]
+use futures_util::{SinkExt, StreamExt};
 
 const SESSION_COOKIE: &str = "term_server_session";
 
 #[derive(Clone)]
 pub struct AppState {
     pub auth: AuthService,
-    pub terminals: Arc<TerminalManager>,
-    pub pi: Arc<PiService>,
+    pub workspace: WorkspaceBackend,
     pub login_limiter: Arc<LoginLimiter>,
     pub allowed_origins: Arc<[String]>,
     pub secure: bool,
@@ -58,6 +64,35 @@ pub struct AppState {
     pub scrollback_lines: u32,
     pub max_panes: u8,
     pub hostname: String,
+    pub updates: Arc<UpdateService>,
+    pub server_control: ServerControl,
+}
+
+#[derive(Clone)]
+pub struct ServerControl {
+    handle: Handle<SocketAddr>,
+    restart_requested: Arc<AtomicBool>,
+}
+
+impl ServerControl {
+    pub fn new(handle: Handle<SocketAddr>) -> Self {
+        Self {
+            handle,
+            restart_requested: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn shutdown(&self, restart: bool) {
+        if restart {
+            self.restart_requested.store(true, Ordering::SeqCst);
+        }
+        self.handle
+            .graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+    }
+
+    pub fn restart_requested(&self) -> bool {
+        self.restart_requested.load(Ordering::SeqCst)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -78,6 +113,8 @@ pub enum ApiError {
     Conflict(String),
     #[error("{0}")]
     PayloadTooLarge(String),
+    #[error("{0}")]
+    BadGateway(String),
     #[error("too many login attempts; try again in {0} seconds")]
     RateLimited(u64),
     #[error("internal server error")]
@@ -98,6 +135,7 @@ impl IntoResponse for ApiError {
             Self::BadRequest(_) => (StatusCode::BAD_REQUEST, None),
             Self::Conflict(_) => (StatusCode::CONFLICT, None),
             Self::PayloadTooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, None),
+            Self::BadGateway(_) => (StatusCode::BAD_GATEWAY, None),
             Self::RateLimited(seconds) => (StatusCode::TOO_MANY_REQUESTS, Some(seconds)),
             Self::Internal => (StatusCode::INTERNAL_SERVER_ERROR, None),
         };
@@ -118,6 +156,17 @@ impl From<TerminalError> for ApiError {
     }
 }
 
+impl From<WorkspaceError> for ApiError {
+    fn from(error: WorkspaceError) -> Self {
+        match error.status() {
+            Some(StatusCode::NOT_FOUND) => Self::NotFound,
+            Some(StatusCode::BAD_REQUEST) => Self::BadRequest(error.to_string()),
+            Some(StatusCode::CONFLICT) => Self::Conflict(error.to_string()),
+            _ => Self::BadGateway(error.to_string()),
+        }
+    }
+}
+
 impl From<AuthError> for ApiError {
     fn from(_error: AuthError) -> Self {
         Self::Internal
@@ -133,6 +182,18 @@ impl From<FileError> for ApiError {
             FileError::TooLarge => Self::PayloadTooLarge(message),
             FileError::Io(_) => Self::Internal,
             _ => Self::BadRequest(message),
+        }
+    }
+}
+
+impl From<UpdateError> for ApiError {
+    fn from(error: UpdateError) -> Self {
+        match error {
+            UpdateError::Unsupported(_)
+            | UpdateError::Busy
+            | UpdateError::Stale
+            | UpdateError::AlreadyCurrent => Self::Conflict(error.to_string()),
+            _ => Self::BadGateway(error.to_string()),
         }
     }
 }
@@ -163,6 +224,13 @@ struct ClientConfig {
     hostname: String,
     password_managed_externally: bool,
     pi: PiClientConfig,
+    build: build::BuildInfo,
+    updates: UpdateConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct InstallUpdateRequest {
+    commit: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -186,30 +254,6 @@ struct SaveFileRequest {
     cwd: Option<String>,
     content: String,
     version: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-enum ClientMessage {
-    Input { data: String },
-    Resize { cols: u16, rows: u16 },
-    Ping,
-}
-
-#[derive(Serialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-enum ServerMessage<'a> {
-    Ready {
-        terminal: Box<crate::terminal::TerminalInfo>,
-    },
-    Exit {
-        #[serde(rename = "exitCode")]
-        exit_code: u32,
-    },
-    Pong,
-    Error {
-        message: &'a str,
-    },
 }
 
 fn authenticated(jar: &CookieJar, state: &AppState) -> bool {
@@ -363,8 +407,36 @@ async fn config(
         secure: state.secure,
         hostname: state.hostname.clone(),
         password_managed_externally: state.auth.password_is_externally_managed(),
-        pi: state.pi.client_config(),
+        pi: state.workspace.pi_config().await?,
+        build: build::info(),
+        updates: state.updates.config(),
     }))
+}
+
+async fn update_status(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> Result<Json<UpdateStatus>, ApiError> {
+    require_auth(&jar, &state)?;
+    state.updates.check().await.map(Json).map_err(Into::into)
+}
+
+async fn install_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+    Json(body): Json<InstallUpdateRequest>,
+) -> Result<Json<crate::update::ReleaseInfo>, ApiError> {
+    require_origin(&headers, &uri, &state)?;
+    require_auth(&jar, &state)?;
+    let release = state.updates.install(&body.commit).await?;
+    let control = state.server_control.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+        control.shutdown(true);
+    });
+    Ok(Json(release))
 }
 
 async fn update_pi_config(
@@ -377,10 +449,11 @@ async fn update_pi_config(
     require_origin(&headers, &uri, &state)?;
     require_auth(&jar, &state)?;
     state
-        .pi
-        .update(body)
+        .workspace
+        .update_pi(body)
+        .await
         .map(Json)
-        .map_err(ApiError::BadRequest)
+        .map_err(Into::into)
 }
 
 async fn list_terminals(
@@ -388,7 +461,7 @@ async fn list_terminals(
     jar: CookieJar,
 ) -> Result<Json<Vec<crate::terminal::TerminalInfo>>, ApiError> {
     require_auth(&jar, &state)?;
-    Ok(Json(state.terminals.list()))
+    state.workspace.list().await.map(Json).map_err(Into::into)
 }
 
 async fn create_terminal(
@@ -400,13 +473,7 @@ async fn create_terminal(
 ) -> Result<(StatusCode, Json<crate::terminal::TerminalInfo>), ApiError> {
     require_origin(&headers, &uri, &state)?;
     require_auth(&jar, &state)?;
-    let terminals = state.terminals.clone();
-    let terminal = tokio::task::spawn_blocking(move || terminals.create(body))
-        .await
-        .map_err(|error| {
-            tracing::error!(%error, "terminal creation task failed");
-            ApiError::Internal
-        })??;
+    let terminal = state.workspace.create(body).await?;
     Ok((StatusCode::CREATED, Json(terminal)))
 }
 
@@ -421,10 +488,11 @@ async fn rename_terminal(
     require_origin(&headers, &uri, &state)?;
     require_auth(&jar, &state)?;
     state
-        .terminals
-        .rename(id, &body.path)?
+        .workspace
+        .rename(id, body)
+        .await
         .map(Json)
-        .ok_or(ApiError::NotFound)
+        .map_err(Into::into)
 }
 
 async fn remove_terminal(
@@ -436,11 +504,8 @@ async fn remove_terminal(
 ) -> Result<StatusCode, ApiError> {
     require_origin(&headers, &uri, &state)?;
     require_auth(&jar, &state)?;
-    state
-        .terminals
-        .remove(id)
-        .then_some(StatusCode::NO_CONTENT)
-        .ok_or(ApiError::NotFound)
+    state.workspace.remove(id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn terminal_processes(
@@ -450,10 +515,11 @@ async fn terminal_processes(
 ) -> Result<Json<crate::terminal::ProcessInspectorSnapshot>, ApiError> {
     require_auth(&jar, &state)?;
     state
-        .terminals
-        .get(id)
-        .map(|terminal| Json(terminal.process_inspector()))
-        .ok_or(ApiError::NotFound)
+        .workspace
+        .process_inspector(id)
+        .await
+        .map(Json)
+        .map_err(Into::into)
 }
 
 async fn list_artifacts(
@@ -462,8 +528,9 @@ async fn list_artifacts(
 ) -> Result<Json<Vec<artifacts::ArtifactEntry>>, ApiError> {
     require_auth(&jar, &state)?;
     let session_ids = state
-        .terminals
+        .workspace
         .list()
+        .await?
         .into_iter()
         .map(|terminal| terminal.id)
         .collect::<Vec<_>>();
@@ -543,29 +610,94 @@ async fn read_file(
     Ok(Json(document))
 }
 
-async fn raw_file(
+async fn preview_file(
     State(state): State<AppState>,
     Query(query): Query<FilePathQuery>,
     jar: CookieJar,
+    request: Request,
 ) -> Result<Response, ApiError> {
     require_auth(&jar, &state)?;
-    let image =
-        tokio::task::spawn_blocking(move || files::read_image(&query.path, query.cwd.as_deref()))
-            .await
-            .map_err(|error| {
-                tracing::error!(%error, "image read task failed");
-                ApiError::Internal
-            })??;
-    let content_type = HeaderValue::from_str(&image.mime).map_err(|_| ApiError::Internal)?;
-    let mut response = image.bytes.into_response();
-    response
-        .headers_mut()
-        .insert(header::CONTENT_TYPE, content_type);
+    stream_file(query, request, false).await
+}
+
+async fn download_file(
+    State(state): State<AppState>,
+    Query(query): Query<FilePathQuery>,
+    jar: CookieJar,
+    request: Request,
+) -> Result<Response, ApiError> {
+    require_auth(&jar, &state)?;
+    stream_file(query, request, true).await
+}
+
+async fn stream_file(
+    query: FilePathQuery,
+    request: Request,
+    download: bool,
+) -> Result<Response, ApiError> {
+    let asset = tokio::task::spawn_blocking(move || {
+        if download {
+            files::file_asset(&query.path, query.cwd.as_deref())
+        } else {
+            files::preview_asset(&query.path, query.cwd.as_deref())
+        }
+    })
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, "file stream task failed");
+        ApiError::Internal
+    })??;
+
+    let mut response = ServeFile::new(&asset.path)
+        .try_call(request)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, path = %asset.path.display(), "file stream failed");
+            ApiError::Internal
+        })?
+        .map(Body::new);
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(&asset.mime).map_err(|_| ApiError::Internal)?,
+    );
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        content_disposition(if download { "attachment" } else { "inline" }, &asset.name)?,
+    );
     response.headers_mut().insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("private, no-store"),
     );
+    if !download && asset.mime == "application/pdf" {
+        response.headers_mut().insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("frame-ancestors 'self'"),
+        );
+    }
     Ok(response)
+}
+
+fn content_disposition(kind: &str, name: &str) -> Result<HeaderValue, ApiError> {
+    let fallback = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let fallback = if fallback.is_empty() {
+        "download"
+    } else {
+        &fallback
+    };
+    HeaderValue::from_str(&format!(
+        "{kind}; filename=\"{fallback}\"; filename*=UTF-8''{}",
+        utf8_percent_encode(name, NON_ALPHANUMERIC)
+    ))
+    .map_err(|_| ApiError::Internal)
 }
 
 async fn save_file(
@@ -598,92 +730,60 @@ async fn terminal_socket(
 ) -> Result<Response, ApiError> {
     require_origin(&headers, &uri, &state)?;
     require_auth(&jar, &state)?;
-    let terminal = state.terminals.get(id).ok_or(ApiError::NotFound)?;
+    let terminal = state.workspace.connect_terminal(id).await?;
     Ok(websocket
         .max_message_size(64 * 1024)
         .max_frame_size(64 * 1024)
         .write_buffer_size(128 * 1024)
         .max_write_buffer_size(4 * 1024 * 1024)
-        .on_upgrade(move |socket| handle_terminal_socket(socket, terminal)))
-}
-
-struct Attachment(Arc<TerminalSession>);
-
-impl Drop for Attachment {
-    fn drop(&mut self) {
-        self.0.detach();
-    }
-}
-
-async fn handle_terminal_socket(mut socket: WebSocket, terminal: Arc<TerminalSession>) {
-    terminal.attach();
-    let _attachment = Attachment(terminal.clone());
-    let (mut events, replay) = terminal.subscribe();
-    let ready = serde_json::to_string(&ServerMessage::Ready {
-        terminal: Box::new(terminal.info()),
-    })
-    .expect("serializable terminal");
-    if socket.send(Message::Text(ready.into())).await.is_err() {
-        return;
-    }
-    for chunk in replay {
-        if socket.send(Message::Binary(chunk)).await.is_err() {
-            return;
-        }
-    }
-
-    let (mut sender, mut receiver) = socket.split();
-    loop {
-        tokio::select! {
-            event = events.recv() => {
-                match event {
-                    Ok(TerminalEvent::Output(chunk)) => {
-                        if sender.send(Message::Binary(chunk)).await.is_err() { break; }
-                    }
-                    Ok(TerminalEvent::Exit(exit_code)) => {
-                        let message = serde_json::to_string(&ServerMessage::Exit { exit_code }).expect("serializable exit");
-                        let _ = sender.send(Message::Text(message.into())).await;
-                        break;
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let _ = sender.send(Message::Close(Some(CloseFrame {
-                            code: 1013,
-                            reason: "terminal client fell behind".into(),
-                        }))).await;
-                        break;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
+        .on_upgrade(move |socket| async move {
+            match terminal {
+                SessionConnection::Local(terminal) => {
+                    serve_terminal_socket(socket, terminal).await;
+                }
+                #[cfg(unix)]
+                SessionConnection::Broker(broker) => {
+                    proxy_terminal_socket(socket, *broker).await;
                 }
             }
-            incoming = receiver.next() => {
-                let Some(Ok(message)) = incoming else { break; };
-                match message {
-                    Message::Text(text) => match serde_json::from_str::<ClientMessage>(&text) {
-                        Ok(ClientMessage::Input { data }) if data.len() <= 64 * 1024 => {
-                            if let Err(error) = terminal.write(data.as_bytes()) {
-                                tracing::debug!(%error, "terminal input failed");
-                                break;
-                            }
-                        }
-                        Ok(ClientMessage::Resize { cols, rows }) => {
-                            if terminal.resize(cols, rows).is_err() { break; }
-                        }
-                        Ok(ClientMessage::Ping) => {
-                            let pong = serde_json::to_string(&ServerMessage::Pong).expect("serializable pong");
-                            if sender.send(Message::Text(pong.into())).await.is_err() { break; }
-                        }
-                        _ => {
-                            let error = serde_json::to_string(&ServerMessage::Error { message: "invalid terminal message" })
-                                .expect("serializable error");
-                            if sender.send(Message::Text(error.into())).await.is_err() { break; }
-                        }
-                    },
-                    Message::Close(_) => break,
-                    Message::Ping(payload) => {
-                        if sender.send(Message::Pong(payload)).await.is_err() { break; }
+        }))
+}
+
+#[cfg(unix)]
+async fn proxy_terminal_socket(socket: WebSocket, broker: BrokerWebSocket) {
+    use tokio_tungstenite::tungstenite::Message as BrokerMessage;
+
+    let (mut browser_sender, mut browser_receiver) = socket.split();
+    let (mut broker_sender, mut broker_receiver) = broker.split();
+    loop {
+        tokio::select! {
+            message = broker_receiver.next() => {
+                let Some(Ok(message)) = message else { break; };
+                let outgoing = match message {
+                    BrokerMessage::Text(text) => Message::Text(text.to_string().into()),
+                    BrokerMessage::Binary(bytes) => Message::Binary(bytes.to_vec().into()),
+                    BrokerMessage::Close(_) => Message::Close(None),
+                    BrokerMessage::Ping(payload) => {
+                        if broker_sender.send(BrokerMessage::Pong(payload)).await.is_err() { break; }
+                        continue;
                     }
-                    _ => {}
-                }
+                    BrokerMessage::Pong(_) | BrokerMessage::Frame(_) => continue,
+                };
+                if browser_sender.send(outgoing).await.is_err() { break; }
+            }
+            message = browser_receiver.next() => {
+                let Some(Ok(message)) = message else { break; };
+                let outgoing = match message {
+                    Message::Text(text) => BrokerMessage::Text(text.to_string().into()),
+                    Message::Binary(bytes) => BrokerMessage::Binary(bytes.to_vec().into()),
+                    Message::Close(_) => BrokerMessage::Close(None),
+                    Message::Ping(payload) => {
+                        if browser_sender.send(Message::Pong(payload)).await.is_err() { break; }
+                        continue;
+                    }
+                    Message::Pong(_) => continue,
+                };
+                if broker_sender.send(outgoing).await.is_err() { break; }
             }
         }
     }
@@ -701,6 +801,7 @@ pub fn build_router(state: AppState, client_directory: Option<PathBuf>) -> Route
         .route("/password", patch(change_password))
         .route("/config", get(config))
         .route("/config/pi", patch(update_pi_config))
+        .route("/update", get(update_status).post(install_update))
         .route("/terminals", get(list_terminals).post(create_terminal))
         .route(
             "/terminals/{id}",
@@ -713,7 +814,8 @@ pub fn build_router(state: AppState, client_directory: Option<PathBuf>) -> Route
         .route("/files/list", get(list_files))
         .route("/files/search", get(search_files))
         .route("/files/content", get(read_file).put(save_file))
-        .route("/files/raw", get(raw_file))
+        .route("/files/raw", get(preview_file))
+        .route("/files/download", get(download_file))
         .fallback(api_not_found);
     let secure = state.secure;
     let mut router = Router::new()
@@ -764,7 +866,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::auth::load_auth;
+    use crate::{ai::PiService, auth::load_auth, terminal::TerminalManager};
 
     async fn test_state() -> AppState {
         let directory = tempfile::tempdir().unwrap();
@@ -775,10 +877,11 @@ mod tests {
             .await
             .unwrap()
             .service;
+        let terminals = Arc::new(TerminalManager::new(Some("/bin/sh".into()), 1024 * 1024));
+        let pi = Arc::new(PiService::new(directory.path()));
         AppState {
             auth,
-            terminals: Arc::new(TerminalManager::new(Some("/bin/sh".into()), 1024 * 1024)),
-            pi: Arc::new(PiService::new(directory.path())),
+            workspace: WorkspaceBackend::local(terminals, pi),
             login_limiter: Arc::new(LoginLimiter::default()),
             allowed_origins: Arc::from([]),
             secure: false,
@@ -786,7 +889,42 @@ mod tests {
             scrollback_lines: 200_000,
             max_panes: 4,
             hostname: "test-machine".to_string(),
+            updates: Arc::new(UpdateService::new(
+                None,
+                "main".to_owned(),
+                "https://example.invalid/releases/download".to_owned(),
+                true,
+            )),
+            server_control: ServerControl::new(Handle::new()),
         }
+    }
+
+    async fn authenticated_app() -> (Router, String) {
+        let app = build_router(test_state().await, None);
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))))
+                    .body(Body::from(r#"{"password":"testing-password"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cookie = login
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        (app, cookie)
     }
 
     #[tokio::test]
@@ -795,6 +933,20 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/api/terminals")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn protects_update_checks() {
+        let response = build_router(test_state().await, None)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/update")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -906,6 +1058,83 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(new_session.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn pdf_preview_supports_range_requests_inside_the_application() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("preview.pdf");
+        std::fs::write(&path, b"%PDF-1.7\npreview content").unwrap();
+        let (app, cookie) = authenticated_app().await;
+        let encoded_path = utf8_percent_encode(path.to_str().unwrap(), NON_ALPHANUMERIC);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/files/raw?path={encoded_path}"))
+                    .header(header::COOKIE, cookie)
+                    .header(header::RANGE, "bytes=0-7")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/pdf"
+        );
+        assert!(
+            response
+                .headers()
+                .get(header::CONTENT_DISPOSITION)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("inline;")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_SECURITY_POLICY)
+                .unwrap(),
+            "frame-ancestors 'self'"
+        );
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], b"%PDF-1.7");
+    }
+
+    #[tokio::test]
+    async fn file_download_uses_an_attachment_with_the_original_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("notes résumé.txt");
+        std::fs::write(&path, b"download me").unwrap();
+        let (app, cookie) = authenticated_app().await;
+        let encoded_path = utf8_percent_encode(path.to_str().unwrap(), NON_ALPHANUMERIC);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/files/download?path={encoded_path}"))
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let disposition = response
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(disposition.starts_with("attachment;"));
+        assert!(disposition.contains("filename*=UTF-8''notes%20r%C3%A9sum%C3%A9%2Etxt"));
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], b"download me");
     }
 
     #[tokio::test]
