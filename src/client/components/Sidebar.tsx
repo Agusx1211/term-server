@@ -13,6 +13,7 @@ import {
   FolderSearch,
   FolderOpen,
   LoaderCircle,
+  PackageOpen,
   Pencil,
   Plus,
   Search,
@@ -39,6 +40,7 @@ interface SidebarProps {
   terminals: TerminalInfo[];
   activeIds: string[];
   attentionAgentIds: Set<string>;
+  artifactCounts: ReadonlyMap<string, number>;
   mobileOpen: boolean;
   creating: boolean;
   settingsActive: boolean;
@@ -61,6 +63,7 @@ interface NodeProps {
   collapsed: Set<string>;
   activeIds: string[];
   attentionAgentIds: Set<string>;
+  artifactCounts: ReadonlyMap<string, number>;
   onToggle: (path: string) => void;
   onNew: (cwd?: string) => void;
   onOpen: (id: string) => void;
@@ -76,6 +79,7 @@ function TreeNode({
   collapsed,
   activeIds,
   attentionAgentIds,
+  artifactCounts,
   onToggle,
   onNew,
   onOpen,
@@ -90,6 +94,7 @@ function TreeNode({
 
   if (!hasChildren && terminal) {
     const needsAttention = attentionAgentIds.has(terminal.id);
+    const artifactCount = artifactCounts.get(terminal.id) ?? 0;
     return (
       <div
         class={`tree-row terminal-row ${terminal.agent ? `agent-row agent-${terminal.agent.status}` : "shell-row"} ${needsAttention ? "agent-attention" : ""} ${activeIds.includes(terminal.id) ? "active" : ""}`}
@@ -114,7 +119,15 @@ function TreeNode({
           <span class="terminal-copy">
             <span class="terminal-title">{terminal.name}</span>
             <span class="terminal-meta">
-              {terminal.agent ? `${terminal.agent.kind} agent` : terminal.program}
+              <span>{terminal.agent ? `${terminal.agent.kind} agent` : terminal.program}</span>
+              {artifactCount > 0 && (
+                <span
+                  class="terminal-artifact-count"
+                  title={`${artifactCount} session ${artifactCount === 1 ? "artifact" : "artifacts"}`}
+                >
+                  <PackageOpen size={9} /> {artifactCount}
+                </span>
+              )}
             </span>
           </span>
           {terminal.agent && <AgentState agent={terminal.agent} needsAttention={needsAttention} />}
@@ -164,6 +177,7 @@ function TreeNode({
               collapsed={collapsed}
               activeIds={activeIds}
               attentionAgentIds={attentionAgentIds}
+              artifactCounts={artifactCounts}
               onToggle={onToggle}
               onNew={onNew}
               onOpen={onOpen}
@@ -199,6 +213,7 @@ export function Sidebar({
   terminals,
   activeIds,
   attentionAgentIds,
+  artifactCounts,
   mobileOpen,
   creating,
   settingsActive,
@@ -357,6 +372,7 @@ export function Sidebar({
                 collapsed={query ? new Set() : collapsed}
                 activeIds={activeIds}
                 attentionAgentIds={attentionAgentIds}
+                artifactCounts={artifactCounts}
                 onToggle={toggle}
                 onNew={onNew}
                 onOpen={onOpen}

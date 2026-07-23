@@ -38,6 +38,15 @@ import {
   type NotificationMode,
 } from "./lib/notifications";
 import {
+  artifactCountsBySession,
+  artifactOwnerLabel,
+  discoverArtifacts,
+  reconcileArtifactResources,
+  resourceForArtifact,
+  sortArtifactsNewestFirst,
+  stableArtifactInventory,
+} from "./lib/artifacts";
+import {
   arrangeLayout,
   isPaneLayout,
   layoutFromIds,
@@ -57,7 +66,8 @@ import { Sidebar } from "./components/Sidebar";
 import { SettingsWorkspace } from "./components/SettingsWorkspace";
 import { TermServerLogo } from "./components/TermServerLogo";
 import { WelcomeSection } from "./components/WelcomeSection";
-import { ResourceTabBar, type ResourceTab } from "./components/ResourceTabs";
+import { ResourceTabBar } from "./components/ResourceTabs";
+import type { ResourceTab } from "./lib/resources";
 import type { ThemeName } from "./components/TerminalPane";
 
 const TerminalPane = lazy(() =>
@@ -157,9 +167,11 @@ export function App() {
   const [notificationMode, setNotificationMode] = useState(initialNotificationMode);
   const [tileNewTerminals, setTileNewTerminals] = useState(initialTileNewTerminals);
   const [viewedAgentRevisions, setViewedAgentRevisions] = useState(initialViewedAgentRevisions);
+  const [artifacts, setArtifacts] = useState<ArtifactEntry[]>([]);
   const [resources, setResources] = useState<ResourceTab[]>([]);
   const [activeResource, setActiveResource] = useState<string>();
-  const knownArtifactPaths = useRef(new Set<string>());
+  const knownArtifactIds = useRef(new Set<string>());
+  const artifactsInitialized = useRef(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsActive, setSettingsActive] = useState(false);
   const agentEventsInitialized = useRef(false);
@@ -182,53 +194,25 @@ export function App() {
     window.setTimeout(() => setNotice((current) => (current === message ? "" : current)), 2400);
   };
 
-  const syncArtifacts = (artifacts: ArtifactEntry[], focusedSession = activeIdRef.current) => {
-    const currentPaths = new Set(artifacts.map((artifact) => artifact.path));
-    const discovered = artifacts.filter((artifact) => !knownArtifactPaths.current.has(artifact.path));
-    knownArtifactPaths.current = currentPaths;
+  const syncArtifacts = (
+    nextArtifacts: ArtifactEntry[],
+    focusedSession = activeIdRef.current,
+    artifactTerminals = terminalsRef.current,
+  ) => {
+    const ordered = sortArtifactsNewestFirst(nextArtifacts);
+    const discovered = discoverArtifacts(knownArtifactIds.current, ordered);
+    const initialized = artifactsInitialized.current;
+    artifactsInitialized.current = true;
 
-    setResources((current) => {
-      const next = [...current];
-      let changed = false;
-      for (const artifact of artifacts) {
-        const tab: ResourceTab = {
-          path: artifact.path,
-          name: artifact.name,
-          type: artifact.image ? "image" : artifact.pdf ? "pdf" : "text",
-          mime: artifact.mime,
-          modifiedAt: artifact.modifiedAt,
-          dirty: false,
-          artifact: {
-            id: artifact.id,
-            sessionId: artifact.sessionId,
-          },
-        };
-        const existing = next.findIndex((resource) => resource.path === artifact.path);
-        if (existing >= 0) {
-          const previous = next[existing]!;
-          if (
-            previous.modifiedAt !== tab.modifiedAt
-            || previous.artifact?.id !== tab.artifact?.id
-            || previous.artifact?.sessionId !== tab.artifact?.sessionId
-          ) {
-            next[existing] = { ...previous, ...tab, dirty: previous.dirty };
-            changed = true;
-          }
-        } else {
-          next.push(tab);
-          changed = true;
-        }
-      }
-      return changed ? next : current;
-    });
+    setArtifacts((current) => stableArtifactInventory(current, ordered));
+    setResources((current) => reconcileArtifactResources(current, ordered, artifactTerminals));
 
-    if (!discovered.length) return;
-    const focusedArtifact = discovered.findLast((artifact) => artifact.sessionId === focusedSession);
-    if (focusedArtifact) {
-      setActiveResource(focusedArtifact.path);
-      setMobileSidebar(false);
-      showNotice(`Artifact ready: ${focusedArtifact.name}`);
-    }
+    if (!initialized || !discovered.length) return;
+    const announced = discovered.find((artifact) => artifact.sessionId === focusedSession)
+      ?? sortArtifactsNewestFirst(discovered)[0];
+    if (!announced) return;
+    const owner = artifactTerminals.find((terminal) => terminal.id === announced.sessionId);
+    showNotice(`Artifact ready from ${artifactOwnerLabel(owner, announced.producer)}: ${announced.name}`);
   };
 
   const checkForUpdates = async (notify = false) => {
@@ -294,7 +278,7 @@ export function App() {
           ? current
           : runningTerminals[0]?.id,
       );
-      syncArtifacts(artifacts, focusedSession);
+      syncArtifacts(artifacts, focusedSession, runningTerminals);
       setAuthenticated(true);
     } catch (error) {
       if (error instanceof ApiError && error.status === 401) setAuthenticated(false);
@@ -381,7 +365,7 @@ export function App() {
           setTerminals(running);
           const available = new Set(running.map((terminal) => terminal.id));
           setLayout((current) => pruneLayout(current, available));
-          syncArtifacts(artifacts);
+          syncArtifacts(artifacts, activeIdRef.current, running);
         })
         .catch((error) => {
           if (error instanceof ApiError && error.status === 401) setAuthenticated(false);
@@ -512,6 +496,16 @@ export function App() {
   }, [mobileSidebar]);
 
   const terminalById = useMemo(() => new Map(terminals.map((terminal) => [terminal.id, terminal])), [terminals]);
+  const artifactCounts = useMemo(() => artifactCountsBySession(artifacts), [artifacts]);
+  const artifactsBySession = useMemo(() => {
+    const grouped = new Map<string, ArtifactEntry[]>();
+    for (const artifact of artifacts) {
+      const current = grouped.get(artifact.sessionId);
+      if (current) current.push(artifact);
+      else grouped.set(artifact.sessionId, [artifact]);
+    }
+    return grouped;
+  }, [artifacts]);
   const attentionAgentIds = useMemo(
     () => new Set(terminals.flatMap((terminal) => (
       agentNeedsAttention(terminal.agent, viewedAgentRevisions[terminal.id]) ? [terminal.id] : []
@@ -630,6 +624,30 @@ export function App() {
     } catch (error) {
       showNotice(error instanceof Error ? error.message : "Unable to open file");
     }
+  };
+
+  const openArtifact = (artifact: ArtifactEntry) => {
+    const tab = resourceForArtifact(artifact, terminalsRef.current.find(
+      (terminal) => terminal.id === artifact.sessionId,
+    ));
+    setResources((current) => {
+      const existing = current.findIndex((resource) => resource.path === tab.path);
+      if (existing < 0) return [...current, tab];
+      return current.map((resource, index) => (
+        index === existing ? { ...tab, dirty: resource.dirty } : resource
+      ));
+    });
+    setActiveResource(tab.path);
+    setSettingsActive(false);
+    setMobileSidebar(false);
+  };
+
+  const returnToArtifactSession = (sessionId: string) => {
+    if (!terminalsRef.current.some((terminal) => terminal.id === sessionId)) {
+      showNotice("The terminal that created this artifact is no longer running");
+      return;
+    }
+    openTerminal(sessionId);
   };
 
   const closeResource = (path: string) => {
@@ -817,9 +835,11 @@ export function App() {
       setTerminals([]);
       setLayout(null);
       setMountedIds([]);
+      setArtifacts([]);
       setResources([]);
       setActiveResource(undefined);
-      knownArtifactPaths.current.clear();
+      knownArtifactIds.current.clear();
+      artifactsInitialized.current = false;
       setUpdateStatus(null);
       setSettingsOpen(false);
       setSettingsActive(false);
@@ -873,6 +893,7 @@ export function App() {
           terminals={terminals}
           activeIds={paneIds}
           attentionAgentIds={attentionAgentIds}
+          artifactCounts={artifactCounts}
           mobileOpen={mobileSidebar}
           creating={creating}
           settingsActive={settingsActive}
@@ -951,6 +972,7 @@ export function App() {
                   <TerminalPane
                     terminal={terminal}
                     needsAttention={attentionAgentIds.has(terminal.id)}
+                    artifacts={artifactsBySession.get(terminal.id) ?? []}
                     config={config}
                     theme={theme}
                     active={visible && terminal.id === activeId && !activeResource && !settingsActive}
@@ -967,6 +989,7 @@ export function App() {
                     onUpdate={updateTerminal}
                     onNotice={showNotice}
                     onOpenFile={(target) => void openResource(target)}
+                    onOpenArtifact={openArtifact}
                   />
                 </div>
               );
@@ -1059,6 +1082,7 @@ export function App() {
                     resource.path === path ? { ...resource, dirty } : resource
                   )))}
                   onNotice={showNotice}
+                  onOpenArtifactSession={returnToArtifactSession}
                 />
               </Suspense>
             )}
