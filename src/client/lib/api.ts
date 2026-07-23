@@ -75,6 +75,10 @@ export const api = {
   removeTerminal: (id: string) => request<void>(`/api/terminals/${id}`, { method: "DELETE" }),
   terminalProcesses: (id: string) =>
     request<ProcessInspectorSnapshot>(`/api/terminals/${id}/processes`),
+  terminateTerminalProcess: (id: string, processId: string) =>
+    request<void>(`/api/terminals/${id}/processes/${encodeURIComponent(processId)}`, {
+      method: "DELETE",
+    }),
   artifacts: () => request<ArtifactEntry[]>("/api/artifacts"),
   removeArtifact: (sessionId: string, artifactId: string) =>
     request<void>(`/api/artifacts/${sessionId}/${artifactId}`, { method: "DELETE" }),

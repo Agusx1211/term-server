@@ -108,6 +108,8 @@ pub enum ApiError {
     ForbiddenOrigin,
     #[error("terminal not found")]
     NotFound,
+    #[error("process is no longer running in this terminal")]
+    ProcessNotFound,
     #[error("file or directory not found")]
     FileNotFound,
     #[error("{0}")]
@@ -134,7 +136,9 @@ impl IntoResponse for ApiError {
         let (status, retry_after) = match self {
             Self::Unauthorized | Self::InvalidLogin => (StatusCode::UNAUTHORIZED, None),
             Self::ForbiddenOrigin => (StatusCode::FORBIDDEN, None),
-            Self::NotFound | Self::FileNotFound => (StatusCode::NOT_FOUND, None),
+            Self::NotFound | Self::ProcessNotFound | Self::FileNotFound => {
+                (StatusCode::NOT_FOUND, None)
+            }
             Self::BadRequest(_) => (StatusCode::BAD_REQUEST, None),
             Self::Conflict(_) => (StatusCode::CONFLICT, None),
             Self::PayloadTooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, None),
@@ -525,6 +529,25 @@ async fn terminal_processes(
         .map_err(Into::into)
 }
 
+async fn terminate_terminal_process(
+    State(state): State<AppState>,
+    Path((id, process_id)): Path<(Uuid, String)>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+) -> Result<StatusCode, ApiError> {
+    require_origin(&headers, &uri, &state)?;
+    require_auth(&jar, &state)?;
+    match state.workspace.terminate_process(id, &process_id).await {
+        Ok(()) => {}
+        Err(error) if error.status() == Some(StatusCode::NOT_FOUND) => {
+            return Err(ApiError::ProcessNotFound);
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn list_artifacts(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -835,6 +858,10 @@ pub fn build_router(state: AppState, client_directory: Option<PathBuf>) -> Route
             patch(rename_terminal).delete(remove_terminal),
         )
         .route("/terminals/{id}/processes", get(terminal_processes))
+        .route(
+            "/terminals/{id}/processes/{process_id}",
+            delete(terminate_terminal_process),
+        )
         .route("/terminals/{id}/socket", any(terminal_socket))
         .route("/artifacts", get(list_artifacts))
         .route(
@@ -1045,6 +1072,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn process_termination_reports_a_stale_process() {
+        let (app, cookie) = authenticated_app().await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!(
+                        "/api/terminals/{}/processes/10%3A20",
+                        Uuid::new_v4()
+                    ))
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("process is no longer running"));
     }
 
     #[tokio::test]

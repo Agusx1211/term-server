@@ -47,6 +47,8 @@ export interface ProcessRecord {
   arguments: string[];
   cwd: string | null;
   foreground: boolean;
+  cpuPercent: number;
+  memoryBytes: number;
 }
 
 export interface ProcessInspectorSnapshot {

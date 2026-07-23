@@ -12,8 +12,9 @@ use uuid::Uuid;
 use crate::{
     ai::{PiClientConfig, PiService, UpdatePiSettings},
     terminal::{
-        CreateTerminal, ProcessInspectorSnapshot, RenameTerminal, TerminalEvent, TerminalInfo,
-        TerminalManager, TerminalSession, TerminalSizeState,
+        CreateTerminal, ProcessInspectorSnapshot, ProcessSignalError, RenameTerminal,
+        TerminalEvent, TerminalInfo, TerminalManager, TerminalSession, TerminalSizeState,
+        terminate_descendant_process,
     },
 };
 
@@ -143,6 +144,42 @@ impl WorkspaceBackend {
         }
     }
 
+    pub async fn terminate_process(
+        &self,
+        id: Uuid,
+        process_id: &str,
+    ) -> Result<(), WorkspaceError> {
+        match self {
+            Self::Local { terminals, .. } => terminals
+                .get(id)
+                .ok_or_else(|| WorkspaceError::Remote {
+                    status: StatusCode::NOT_FOUND,
+                    message: "terminal not found".to_owned(),
+                })?
+                .terminate_process(process_id)
+                .map_err(process_signal_error),
+            #[cfg(unix)]
+            Self::Broker(client) => {
+                let snapshot = client.process_inspector(id).await?;
+                if !snapshot
+                    .processes
+                    .iter()
+                    .any(|process| process.id == process_id)
+                {
+                    return Err(process_signal_error(ProcessSignalError::NotFound));
+                }
+                let shell_pid = client
+                    .list()
+                    .await?
+                    .into_iter()
+                    .find(|terminal| terminal.id == id)
+                    .and_then(|terminal| terminal.pid)
+                    .ok_or_else(|| process_signal_error(ProcessSignalError::NotFound))?;
+                terminate_descendant_process(shell_pid, process_id).map_err(process_signal_error)
+            }
+        }
+    }
+
     pub async fn pi_config(&self) -> Result<PiClientConfig, WorkspaceError> {
         match self {
             Self::Local { pi, .. } => Ok(pi.client_config()),
@@ -200,6 +237,18 @@ impl WorkspaceBackend {
                 }
             }
         }
+    }
+}
+
+fn process_signal_error(error: ProcessSignalError) -> WorkspaceError {
+    let status = match error {
+        ProcessSignalError::Unsupported => StatusCode::BAD_REQUEST,
+        ProcessSignalError::NotFound => StatusCode::NOT_FOUND,
+        ProcessSignalError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    WorkspaceError::Remote {
+        status,
+        message: error.to_string(),
     }
 }
 
