@@ -39,9 +39,15 @@ import {
   includesInAppNotifications,
   includesSystemNotifications,
   LEGACY_NOTIFICATIONS_STORAGE_KEY,
+  NOTIFICATION_DURATION_STORAGE_KEY,
   NOTIFICATION_MODE_STORAGE_KEY,
+  NOTIFICATION_POSITION_STORAGE_KEY,
+  parseNotificationDuration,
   parseNotificationMode,
+  parseNotificationPosition,
+  type NotificationDuration,
   type NotificationMode,
+  type NotificationPosition,
 } from "./lib/notifications";
 import {
   artifactCountsBySession,
@@ -113,6 +119,7 @@ interface AgentToast {
   terminalId: string;
   title: string;
   body: string;
+  color: string;
 }
 
 const initialTheme = (): ThemeName => {
@@ -145,6 +152,14 @@ const initialNotificationMode = () => parseNotificationMode(
   localStorage.getItem(LEGACY_NOTIFICATIONS_STORAGE_KEY),
 );
 
+const initialNotificationPosition = () => parseNotificationPosition(
+  localStorage.getItem(NOTIFICATION_POSITION_STORAGE_KEY),
+);
+
+const initialNotificationDuration = () => parseNotificationDuration(
+  localStorage.getItem(NOTIFICATION_DURATION_STORAGE_KEY),
+);
+
 const initialTileNewTerminals = () =>
   localStorage.getItem(TILE_NEW_TERMINALS_STORAGE_KEY) === "true";
 
@@ -174,6 +189,8 @@ export function App() {
   const [agentToasts, setAgentToasts] = useState<AgentToast[]>([]);
   const [mobileSidebar, setMobileSidebar] = useState(false);
   const [notificationMode, setNotificationMode] = useState(initialNotificationMode);
+  const [notificationPosition, setNotificationPosition] = useState(initialNotificationPosition);
+  const [notificationDuration, setNotificationDuration] = useState(initialNotificationDuration);
   const [tileNewTerminals, setTileNewTerminals] = useState(initialTileNewTerminals);
   const [confirmTerminalKills, setConfirmTerminalKills] = useState(initialConfirmTerminalKills);
   const [viewedAgentRevisions, setViewedAgentRevisions] = useState(initialViewedAgentRevisions);
@@ -190,6 +207,8 @@ export function App() {
   const agentToastTimers = useRef(new Map<string, number>());
   const notificationModeRef = useRef(notificationMode);
   notificationModeRef.current = notificationMode;
+  const notificationDurationRef = useRef(notificationDuration);
+  notificationDurationRef.current = notificationDuration;
   const mobileMenuButton = useRef<HTMLButtonElement>(null);
   const terminalsRef = useRef(terminals);
   terminalsRef.current = terminals;
@@ -259,7 +278,12 @@ export function App() {
     const existingTimer = agentToastTimers.current.get(toast.id);
     if (existingTimer) clearTimeout(existingTimer);
     setAgentToasts((current) => [...current.filter((item) => item.id !== toast.id), toast].slice(-3));
-    const timer = window.setTimeout(() => dismissAgentToast(toast.id), 7000);
+    const duration = notificationDurationRef.current;
+    if (duration === 0) {
+      agentToastTimers.current.delete(toast.id);
+      return;
+    }
+    const timer = window.setTimeout(() => dismissAgentToast(toast.id), duration);
     agentToastTimers.current.set(toast.id, timer);
   };
 
@@ -331,12 +355,25 @@ export function App() {
   }, [notificationMode]);
 
   useEffect(() => {
-    const syncNotificationMode = (event: StorageEvent) => {
-      if (event.key !== NOTIFICATION_MODE_STORAGE_KEY) return;
-      setNotificationMode(parseNotificationMode(event.newValue, null));
+    localStorage.setItem(NOTIFICATION_POSITION_STORAGE_KEY, notificationPosition);
+  }, [notificationPosition]);
+
+  useEffect(() => {
+    localStorage.setItem(NOTIFICATION_DURATION_STORAGE_KEY, String(notificationDuration));
+  }, [notificationDuration]);
+
+  useEffect(() => {
+    const syncNotificationPreferences = (event: StorageEvent) => {
+      if (event.key === NOTIFICATION_MODE_STORAGE_KEY) {
+        setNotificationMode(parseNotificationMode(event.newValue, null));
+      } else if (event.key === NOTIFICATION_POSITION_STORAGE_KEY) {
+        setNotificationPosition(parseNotificationPosition(event.newValue));
+      } else if (event.key === NOTIFICATION_DURATION_STORAGE_KEY) {
+        setNotificationDuration(parseNotificationDuration(event.newValue));
+      }
     };
-    window.addEventListener("storage", syncNotificationMode);
-    return () => window.removeEventListener("storage", syncNotificationMode);
+    window.addEventListener("storage", syncNotificationPreferences);
+    return () => window.removeEventListener("storage", syncNotificationPreferences);
   }, []);
 
   useEffect(() => {
@@ -420,6 +457,7 @@ export function App() {
         terminalId: terminal.id,
         title: terminal.name,
         body,
+        color: terminal.color,
       };
       const showFallback = () => {
         if (!includesInAppNotifications(mode)) showAgentToast(toast);
@@ -795,6 +833,20 @@ export function App() {
     );
   };
 
+  const updateNotificationPosition = (position: NotificationPosition) => {
+    setNotificationPosition(position);
+    showNotice(`In-app notifications will appear at the ${position.replace("-", " ")}`);
+  };
+
+  const updateNotificationDuration = (duration: NotificationDuration) => {
+    setNotificationDuration(duration);
+    showNotice(
+      duration === 0
+        ? "In-app notifications will stay until dismissed"
+        : `In-app notifications will dismiss after ${duration / 1_000} seconds`,
+    );
+  };
+
   const updateTileNewTerminals = (enabled: boolean) => {
     setTileNewTerminals(enabled);
     localStorage.setItem(TILE_NEW_TERMINALS_STORAGE_KEY, String(enabled));
@@ -1115,6 +1167,8 @@ export function App() {
                 installingUpdate={installingUpdate}
                 passwordManagedExternally={config.passwordManagedExternally}
                 notificationMode={notificationMode}
+                notificationPosition={notificationPosition}
+                notificationDuration={notificationDuration}
                 tileNewTerminals={tileNewTerminals}
                 confirmTerminalKills={confirmTerminalKills}
                 onTheme={setTheme}
@@ -1124,6 +1178,8 @@ export function App() {
                 onCheckForUpdate={() => void checkForUpdates(true)}
                 onInstallUpdate={() => void installUpdate()}
                 onNotificationModeChange={(mode) => void updateNotificationMode(mode)}
+                onNotificationPositionChange={updateNotificationPosition}
+                onNotificationDurationChange={updateNotificationDuration}
                 onTileNewTerminalsChange={updateTileNewTerminals}
                 onConfirmTerminalKillsChange={updateConfirmTerminalKills}
                 onPasswordChanged={() => showNotice("Password changed; other sessions were signed out")}
@@ -1164,9 +1220,13 @@ export function App() {
         </div>
       )}
       {(agentToasts.length > 0 || notice) && (
-        <div class="toast-stack" aria-live="polite">
+        <div class={`toast-stack ${notificationPosition}`} aria-live="polite">
           {agentToasts.map((toast) => (
-            <div key={toast.id} class="toast agent-toast">
+            <div
+              key={toast.id}
+              class="toast agent-toast"
+              style={{ "--notification-color": toast.color }}
+            >
               <button
                 class="agent-toast-main"
                 onClick={() => {

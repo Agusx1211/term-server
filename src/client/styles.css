@@ -293,6 +293,38 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
 .notification-mode > span { min-width: 0; display: grid; gap: 3px; }
 .notification-mode b { color: var(--foreground); font-size: 11px; font-weight: 650; }
 .notification-mode small { color: var(--muted); font-size: 9px; line-height: 1.35; }
+.notification-preferences {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-top: 14px; padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+.notification-preference { min-width: 0; margin: 0; padding: 0; border: 0; }
+.notification-preference legend { margin-bottom: 7px; padding: 0; color: var(--muted); font-size: 10px; font-weight: 650; }
+.notification-position-grid, .notification-duration-grid {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px;
+}
+.notification-position, .notification-duration {
+  position: relative; min-width: 0; min-height: 36px; display: flex; align-items: center; justify-content: center; gap: 7px;
+  padding: 5px 8px; border: 1px solid var(--border); border-radius: 4px; color: var(--muted); cursor: pointer;
+}
+.notification-position:hover, .notification-duration:hover { border-color: var(--border-strong); background: var(--hover); color: var(--foreground); }
+.notification-position.active, .notification-duration.active {
+  border-color: var(--accent); background: color-mix(in srgb, var(--accent) 9%, var(--panel)); color: var(--foreground);
+}
+.notification-position:has(input:focus-visible), .notification-duration:has(input:focus-visible) {
+  outline: 2px solid var(--focus); outline-offset: 1px;
+}
+.notification-position > input, .notification-duration > input { position: absolute; opacity: 0; pointer-events: none; }
+.notification-position > span:last-child, .notification-duration > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 9.5px; }
+.notification-position-preview {
+  position: relative; width: 24px; height: 17px; flex: none; border: 1px solid currentColor; border-radius: 2px; opacity: .75;
+}
+.notification-position-preview::after {
+  content: ""; position: absolute; width: 7px; height: 4px; border-radius: 1px; background: var(--accent);
+}
+.notification-position-preview.top-left::after { top: 2px; left: 2px; }
+.notification-position-preview.top-right::after { top: 2px; right: 2px; }
+.notification-position-preview.bottom-left::after { bottom: 2px; left: 2px; }
+.notification-position-preview.bottom-right::after { right: 2px; bottom: 2px; }
 .pi-model-field { display: grid; gap: 5px; margin-top: 9px; color: var(--muted); font-size: 10px; }
 .pi-model-field select {
   width: 100%; height: 36px; min-width: 0; padding: 0 8px; border: 1px solid var(--border-strong); border-radius: 3px;
@@ -748,23 +780,33 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
 .update-restarting strong { font-size: 16px; font-weight: 600; }
 .update-restarting span { color: var(--muted); font-size: 12px; }
 .toast-stack {
-  position: fixed; right: 16px; bottom: 35px; z-index: 100; width: min(390px, calc(100vw - 32px));
+  position: fixed; z-index: 100; width: min(390px, calc(100vw - 32px));
   display: grid; gap: 8px; pointer-events: none;
 }
+.toast-stack.top-left { top: max(16px, env(safe-area-inset-top)); left: max(16px, env(safe-area-inset-left)); }
+.toast-stack.top-right { top: max(16px, env(safe-area-inset-top)); right: max(16px, env(safe-area-inset-right)); }
+.toast-stack.bottom-left { bottom: max(35px, env(safe-area-inset-bottom)); left: max(16px, env(safe-area-inset-left)); }
+.toast-stack.bottom-right { right: max(16px, env(safe-area-inset-right)); bottom: max(35px, env(safe-area-inset-bottom)); }
 .toast {
   position: relative; width: 100%; padding: 9px 13px; border: 1px solid var(--border-strong); border-radius: 5px;
   background: var(--panel); color: var(--foreground); box-shadow: 0 8px 25px var(--shadow); font-size: 12px;
   animation: toast-in .15s ease-out; pointer-events: auto;
 }
-.agent-toast { display: flex; overflow: hidden; padding: 0; border-color: color-mix(in srgb, var(--accent) 45%, var(--border-strong)); }
+.agent-toast {
+  --notification-color: var(--accent);
+  display: flex; overflow: hidden; padding: 0;
+  border-color: color-mix(in srgb, var(--notification-color) 52%, var(--border-strong));
+  background: color-mix(in srgb, var(--notification-color) 7%, var(--panel));
+  box-shadow: inset 3px 0 var(--notification-color), 0 8px 25px var(--shadow);
+}
 .agent-toast-main {
   min-width: 0; flex: 1; display: flex; align-items: center; gap: 10px; padding: 10px 8px 10px 11px;
   border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer;
 }
-.agent-toast-main:hover { background: var(--hover); }
+.agent-toast-main:hover { background: color-mix(in srgb, var(--notification-color) 9%, var(--hover)); }
 .agent-toast-icon {
   width: 30px; height: 30px; flex: none; display: grid; place-items: center; border-radius: 50%;
-  background: color-mix(in srgb, var(--accent) 14%, var(--panel)); color: var(--accent);
+  background: color-mix(in srgb, var(--notification-color) 16%, var(--panel)); color: var(--notification-color);
 }
 .agent-toast-copy { min-width: 0; display: grid; gap: 3px; }
 .agent-toast-copy b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11.5px; font-weight: 650; }
@@ -773,7 +815,7 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
   width: 34px; flex: none; display: grid; place-items: center; align-self: stretch;
   border: 0; background: transparent; color: var(--subtle); cursor: pointer;
 }
-.agent-toast-close:hover { background: var(--hover); color: var(--foreground); }
+.agent-toast-close:hover { background: color-mix(in srgb, var(--notification-color) 9%, var(--hover)); color: var(--foreground); }
 @keyframes toast-in { from { opacity: 0; transform: translateY(5px); } }
 @keyframes spin { to { transform: rotate(360deg); } }
 .spin { animation: spin .75s linear infinite; }
@@ -965,7 +1007,19 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
   .how-to-panel { margin-top: 6px; padding: 12px 14px; }
   .how-to-panel li { padding: 7px 0; }
   .statusbar { display: none; }
-  .toast-stack { right: 10px; bottom: calc(55px + env(safe-area-inset-bottom)); width: calc(100vw - 20px); }
+  .toast-stack { width: calc(100vw - 20px); }
+  .toast-stack.top-left {
+    top: calc(var(--mobile-toolbar-height) + env(safe-area-inset-top) + 10px); right: auto; left: max(10px, env(safe-area-inset-left));
+  }
+  .toast-stack.top-right {
+    top: calc(var(--mobile-toolbar-height) + env(safe-area-inset-top) + 10px); right: max(10px, env(safe-area-inset-right)); left: auto;
+  }
+  .toast-stack.bottom-left {
+    right: auto; bottom: calc(55px + env(safe-area-inset-bottom)); left: max(10px, env(safe-area-inset-left));
+  }
+  .toast-stack.bottom-right {
+    right: max(10px, env(safe-area-inset-right)); bottom: calc(55px + env(safe-area-inset-bottom)); left: auto;
+  }
 
   .login-shell {
     min-height: 100%; place-items: center; padding: max(24px, env(safe-area-inset-top)) max(20px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom)) max(20px, env(safe-area-inset-left));

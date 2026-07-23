@@ -22,7 +22,11 @@ import type {
   UpdateConfig,
   UpdateStatus,
 } from "../../shared/types";
-import type { NotificationMode } from "../lib/notifications";
+import type {
+  NotificationDuration,
+  NotificationMode,
+  NotificationPosition,
+} from "../lib/notifications";
 import { ChangePassword } from "./ChangePassword";
 import type { ThemeName } from "./TerminalPane";
 
@@ -37,6 +41,8 @@ interface SettingsWorkspaceProps {
   installingUpdate: boolean;
   passwordManagedExternally: boolean;
   notificationMode: NotificationMode;
+  notificationPosition: NotificationPosition;
+  notificationDuration: NotificationDuration;
   tileNewTerminals: boolean;
   confirmTerminalKills: boolean;
   onTheme: (theme: ThemeName) => void;
@@ -44,6 +50,8 @@ interface SettingsWorkspaceProps {
   onCheckForUpdate: () => void;
   onInstallUpdate: () => void;
   onNotificationModeChange: (mode: NotificationMode) => void;
+  onNotificationPositionChange: (position: NotificationPosition) => void;
+  onNotificationDurationChange: (duration: NotificationDuration) => void;
   onTileNewTerminalsChange: (enabled: boolean) => void;
   onConfirmTerminalKillsChange: (enabled: boolean) => void;
   onPasswordChanged: () => void;
@@ -82,6 +90,26 @@ const notificationModes: Array<{
   },
 ];
 
+const notificationPositions: Array<{
+  position: NotificationPosition;
+  label: string;
+}> = [
+  { position: "top-left", label: "Top left" },
+  { position: "top-right", label: "Top right" },
+  { position: "bottom-left", label: "Bottom left" },
+  { position: "bottom-right", label: "Bottom right" },
+];
+
+const notificationDurations: Array<{
+  duration: NotificationDuration;
+  label: string;
+}> = [
+  { duration: 4_000, label: "4 sec" },
+  { duration: 7_000, label: "7 sec" },
+  { duration: 12_000, label: "12 sec" },
+  { duration: 0, label: "Keep open" },
+];
+
 export function SettingsWorkspace({
   active,
   theme,
@@ -93,6 +121,8 @@ export function SettingsWorkspace({
   installingUpdate,
   passwordManagedExternally,
   notificationMode,
+  notificationPosition,
+  notificationDuration,
   tileNewTerminals,
   confirmTerminalKills,
   onTheme,
@@ -100,6 +130,8 @@ export function SettingsWorkspace({
   onCheckForUpdate,
   onInstallUpdate,
   onNotificationModeChange,
+  onNotificationPositionChange,
+  onNotificationDurationChange,
   onTileNewTerminalsChange,
   onConfirmTerminalKillsChange,
   onPasswordChanged,
@@ -159,7 +191,7 @@ export function SettingsWorkspace({
 
           <section class="settings-card settings-card-wide">
             <header><Bell size={16} /><h2>Completion notifications</h2></header>
-            <p>Choose where agent completion alerts appear for this browser.</p>
+            <p>Choose how agent completion alerts look and behave in this browser.</p>
             <div class="notification-mode-grid" role="radiogroup" aria-label="Completion notification delivery">
               {notificationModes.map(({ mode, label, description, Icon }) => (
                 <label key={mode} class={`notification-mode ${notificationMode === mode ? "active" : ""}`}>
@@ -178,8 +210,52 @@ export function SettingsWorkspace({
                 </label>
               ))}
             </div>
+            <div class="notification-preferences">
+              <fieldset class="notification-preference">
+                <legend>In-app position</legend>
+                <div class="notification-position-grid">
+                  {notificationPositions.map(({ position, label }) => (
+                    <label
+                      key={position}
+                      class={`notification-position ${notificationPosition === position ? "active" : ""}`}
+                    >
+                      <input
+                        type="radio"
+                        name="notification-position"
+                        value={position}
+                        checked={notificationPosition === position}
+                        onChange={() => onNotificationPositionChange(position)}
+                      />
+                      <span class={`notification-position-preview ${position}`} aria-hidden="true" />
+                      <span>{label}</span>
+                    </label>
+                  ))}
+                </div>
+              </fieldset>
+              <fieldset class="notification-preference">
+                <legend>Auto-dismiss</legend>
+                <div class="notification-duration-grid">
+                  {notificationDurations.map(({ duration, label }) => (
+                    <label
+                      key={duration}
+                      class={`notification-duration ${notificationDuration === duration ? "active" : ""}`}
+                    >
+                      <input
+                        type="radio"
+                        name="notification-duration"
+                        value={duration}
+                        checked={notificationDuration === duration}
+                        onChange={() => onNotificationDurationChange(duration)}
+                      />
+                      <span>{label}</span>
+                    </label>
+                  ))}
+                </div>
+              </fieldset>
+            </div>
             <p class="settings-hint">
-              Desktop permission: <strong>{systemPermission}</strong>. In-app cards require the page to remain open.
+              Desktop permission: <strong>{systemPermission}</strong>. Placement and timing apply to in-app cards and
+              desktop fallbacks.
             </p>
           </section>
 

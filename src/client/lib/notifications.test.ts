@@ -3,7 +3,9 @@ import {
   agentCompletionEvent,
   includesInAppNotifications,
   includesSystemNotifications,
+  parseNotificationDuration,
   parseNotificationMode,
+  parseNotificationPosition,
 } from "./notifications";
 import type { AgentInfo } from "../../shared/types";
 
@@ -49,5 +51,27 @@ describe("notification preferences", () => {
     expect(agentCompletionEvent(agent({ status: "working", completedAt: null }))).toBeNull();
     expect(agentCompletionEvent(agent({ completedAt: null }))).toBeNull();
     expect(agentCompletionEvent(agent())).toBe(2);
+  });
+
+  it("defaults in-app notifications to the top-right corner", () => {
+    expect(parseNotificationPosition(null)).toBe("top-right");
+    expect(parseNotificationPosition("unknown")).toBe("top-right");
+  });
+
+  it("restores each supported in-app notification position", () => {
+    expect(parseNotificationPosition("top-left")).toBe("top-left");
+    expect(parseNotificationPosition("top-right")).toBe("top-right");
+    expect(parseNotificationPosition("bottom-left")).toBe("bottom-left");
+    expect(parseNotificationPosition("bottom-right")).toBe("bottom-right");
+  });
+
+  it("defaults auto-dismiss to seven seconds and accepts supported durations", () => {
+    expect(parseNotificationDuration(null)).toBe(7_000);
+    expect(parseNotificationDuration("unknown")).toBe(7_000);
+    expect(parseNotificationDuration("")).toBe(7_000);
+    expect(parseNotificationDuration("4000")).toBe(4_000);
+    expect(parseNotificationDuration("7000")).toBe(7_000);
+    expect(parseNotificationDuration("12000")).toBe(12_000);
+    expect(parseNotificationDuration("0")).toBe(0);
   });
 });
