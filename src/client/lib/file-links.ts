@@ -14,16 +14,26 @@ interface HoverPreviewOptions<TTarget extends HoverPreviewTarget, TValue> {
   hide: () => void;
 }
 
-const fileLinkPattern = /file:\/\/(?:localhost\/|\/)[^\s'"<>()[\]{}]+|(?:~\/|\.\.?\/|\/)[^\s'"<>()[\]{}]+/g;
+const fileLinkCandidatePattern = /[^\s'"`<>()[\]{}=]+/g;
+const localFileUriPattern = /^file:\/\/(?:localhost\/|\/).+/;
+const uriPattern = /^[a-z][a-z0-9+.-]*:\/\//i;
+const explicitFilePathPattern = /^(?:\/|~\/|\.\.?\/).+/;
+const bareFilenamePattern = /^(?:\.[a-z0-9_-]+(?:\.[a-z0-9_-]+)*|[^./][^/]*\.(?=[a-z0-9_-]*[a-z])[a-z0-9_-]+)$/i;
 const trailingPunctuation = /[.,;:!?]+$/;
+
+function looksLikeFileLink(text: string): boolean {
+  if (localFileUriPattern.test(text)) return true;
+  if (uriPattern.test(text) || text.startsWith("//")) return false;
+  if (explicitFilePathPattern.test(text)) return true;
+  return bareFilenamePattern.test(text.slice(text.lastIndexOf("/") + 1));
+}
 
 export function findFileLinks(line: string): FileLinkMatch[] {
   const matches: FileLinkMatch[] = [];
-  for (const match of line.matchAll(fileLinkPattern)) {
+  for (const match of line.matchAll(fileLinkCandidatePattern)) {
     const raw = match[0];
     const text = raw.replace(trailingPunctuation, "");
-    if (text.startsWith("//")) continue;
-    if (!text || text === "/" || text === "./" || text === "../" || text === "~/") continue;
+    if (!looksLikeFileLink(text)) continue;
     const start = match.index ?? 0;
     matches.push({ text, start, end: start + text.length });
   }

@@ -399,6 +399,18 @@ mod tests {
     }
 
     #[test]
+    fn resolves_relative_paths_from_the_supplied_working_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("note.txt");
+        fs::write(&path, "hello").unwrap();
+        let cwd = directory.path().to_str().unwrap();
+        let expected = path.canonicalize().unwrap();
+
+        assert_eq!(resolve_existing("note.txt", Some(cwd)).unwrap(), expected);
+        assert_eq!(resolve_existing("./note.txt", Some(cwd)).unwrap(), expected);
+    }
+
+    #[test]
     fn saves_atomically_and_rejects_a_stale_version() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("note.rs");

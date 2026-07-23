@@ -2,17 +2,35 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createHoverPreviewController, findFileLinks } from "./file-links";
 
 describe("findFileLinks", () => {
-  it("finds local file URIs and terminal-style paths", () => {
-    expect(findFileLinks("open file:///tmp/a.png or ./src/main.rs and ~/notes.md").map((match) => match.text)).toEqual([
+  it("finds absolute and relative local file paths", () => {
+    expect(
+      findFileLinks(
+        "open file:///tmp/a.png, /tmp/b.png, ./src/main.rs, ../notes.md, ~/photo.jpg, src/App.tsx, `README.md`, or path=.env",
+      ).map((match) => match.text),
+    ).toEqual([
       "file:///tmp/a.png",
+      "/tmp/b.png",
       "./src/main.rs",
-      "~/notes.md",
+      "../notes.md",
+      "~/photo.jpg",
+      "src/App.tsx",
+      "README.md",
+      ".env",
     ]);
   });
 
-  it("does not turn web URLs or punctuation into file links", () => {
-    expect(findFileLinks("https://example.com/a.png /tmp/image.png, / ../").map((match) => match.text)).toEqual([
-      "/tmp/image.png",
+  it("does not turn web URLs, remote file URIs, versions, or punctuation into file links", () => {
+    expect(
+      findFileLinks(
+        "https://example.com/a.png file://server/share/a.png v1.2.3 origin/main and/or /tmp/image.png, / ./ ../ ~/ //server/share",
+      ).map((match) => match.text),
+    ).toEqual(["/tmp/image.png"]);
+  });
+
+  it("reports the original columns after trimming punctuation", () => {
+    expect(findFileLinks("see README.md, then src/main.rs!")).toEqual([
+      { text: "README.md", start: 4, end: 13 },
+      { text: "src/main.rs", start: 20, end: 31 },
     ]);
   });
 });
