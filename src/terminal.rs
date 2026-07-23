@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     thread,
     time::{SystemTime, UNIX_EPOCH},
@@ -40,6 +40,10 @@ const PI_QUIET_SAMPLES_TO_IDLE: u8 = 2;
 const PI_SUBMISSION_WORKING_MILLIS: u64 = 3_000;
 const REPORTED_WORKING_FRESH_MILLIS: u64 = 5_000;
 const MAX_CAPTURED_PROMPT_CHARS: usize = 16_000;
+const DEFAULT_VIEWPORT_SIZE: ViewportSize = ViewportSize {
+    cols: 100,
+    rows: 30,
+};
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -120,6 +124,101 @@ pub enum TerminalError {
 pub enum TerminalEvent {
     Output(Bytes),
     Exit(u32),
+    Size(TerminalSizeState),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalSizeState {
+    pub cols: u16,
+    pub rows: u16,
+    pub focused_client: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ViewportSize {
+    cols: u16,
+    rows: u16,
+}
+
+impl ViewportSize {
+    fn new(cols: u16, rows: u16) -> Self {
+        Self {
+            cols: cols.clamp(2, 500),
+            rows: rows.clamp(1, 300),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ClientViewports {
+    sizes: HashMap<Uuid, Option<ViewportSize>>,
+    focused_client: Option<Uuid>,
+    published: TerminalSizeState,
+}
+
+impl Default for ClientViewports {
+    fn default() -> Self {
+        Self {
+            sizes: HashMap::new(),
+            focused_client: None,
+            published: TerminalSizeState {
+                cols: DEFAULT_VIEWPORT_SIZE.cols,
+                rows: DEFAULT_VIEWPORT_SIZE.rows,
+                focused_client: None,
+            },
+        }
+    }
+}
+
+impl ClientViewports {
+    fn attach(&mut self, client_id: Uuid, size: Option<ViewportSize>) {
+        self.sizes.insert(client_id, size);
+    }
+
+    fn detach(&mut self, client_id: Uuid) {
+        self.sizes.remove(&client_id);
+        if self.focused_client == Some(client_id) {
+            self.focused_client = None;
+        }
+    }
+
+    fn resize(&mut self, client_id: Uuid, size: ViewportSize) {
+        if let Some(current) = self.sizes.get_mut(&client_id) {
+            *current = Some(size);
+        }
+    }
+
+    fn focus(&mut self, client_id: Uuid, focused: bool) {
+        if focused && self.sizes.get(&client_id).is_some_and(Option::is_some) {
+            self.focused_client = Some(client_id);
+        } else if !focused && self.focused_client == Some(client_id) {
+            self.focused_client = None;
+        }
+    }
+
+    fn state(&self) -> TerminalSizeState {
+        let size = self
+            .focused_client
+            .and_then(|client_id| self.sizes.get(&client_id).copied().flatten())
+            .or_else(|| {
+                self.sizes
+                    .values()
+                    .filter_map(|size| *size)
+                    .reduce(|smallest, size| ViewportSize {
+                        cols: smallest.cols.min(size.cols),
+                        rows: smallest.rows.min(size.rows),
+                    })
+            })
+            .unwrap_or(ViewportSize {
+                cols: self.published.cols,
+                rows: self.published.rows,
+            });
+        TerminalSizeState {
+            cols: size.cols,
+            rows: size.rows,
+            focused_client: self.focused_client,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -563,7 +662,7 @@ pub struct TerminalSession {
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     replay: Mutex<ReplayBuffer>,
     events: broadcast::Sender<TerminalEvent>,
-    clients: AtomicUsize,
+    viewports: Mutex<ClientViewports>,
     output_bytes: AtomicU64,
     activity: Mutex<SessionActivity>,
     signals: Mutex<TerminalSignals>,
@@ -575,7 +674,7 @@ impl TerminalSession {
     pub fn info(&self) -> TerminalInfo {
         self.refresh_working_directory();
         let mut info = self.info.read().clone();
-        info.clients = self.clients.load(Ordering::Relaxed);
+        info.clients = self.viewports.lock().sizes.len();
         info
     }
 
@@ -592,12 +691,42 @@ impl TerminalSession {
         self.process_tracker.lock().snapshot()
     }
 
-    pub fn attach(&self) {
-        self.clients.fetch_add(1, Ordering::Relaxed);
+    pub fn attach(
+        &self,
+        client_id: Uuid,
+        size: Option<(u16, u16)>,
+    ) -> Result<TerminalSizeState, TerminalError> {
+        self.update_viewports(|viewports| {
+            viewports.attach(
+                client_id,
+                size.map(|(cols, rows)| ViewportSize::new(cols, rows)),
+            );
+        })
     }
 
-    pub fn detach(&self) {
-        self.clients.fetch_sub(1, Ordering::Relaxed);
+    pub fn detach(&self, client_id: Uuid) {
+        if let Err(error) = self.update_viewports(|viewports| viewports.detach(client_id)) {
+            tracing::debug!(%error, "terminal resize after client detach failed");
+        }
+    }
+
+    pub fn resize_client(
+        &self,
+        client_id: Uuid,
+        cols: u16,
+        rows: u16,
+    ) -> Result<TerminalSizeState, TerminalError> {
+        self.update_viewports(|viewports| {
+            viewports.resize(client_id, ViewportSize::new(cols, rows));
+        })
+    }
+
+    pub fn focus_client(
+        &self,
+        client_id: Uuid,
+        focused: bool,
+    ) -> Result<TerminalSizeState, TerminalError> {
+        self.update_viewports(|viewports| viewports.focus(client_id, focused))
     }
 
     pub fn write(&self, data: &[u8]) -> Result<(), TerminalError> {
@@ -648,19 +777,36 @@ impl TerminalSession {
             .map_err(|error| TerminalError::Io(error.to_string()))
     }
 
-    pub fn resize(&self, cols: u16, rows: u16) -> Result<(), TerminalError> {
-        if self.info.read().status != TerminalStatus::Running {
-            return Ok(());
+    fn update_viewports(
+        &self,
+        update: impl FnOnce(&mut ClientViewports),
+    ) -> Result<TerminalSizeState, TerminalError> {
+        let mut viewports = self.viewports.lock();
+        update(&mut viewports);
+        let state = viewports.state();
+        let size_changed =
+            (state.cols, state.rows) != (viewports.published.cols, viewports.published.rows);
+        // Keep resize redraws behind the size control frame so every browser
+        // applies the shared grid before it processes output for that grid.
+        let replay = size_changed.then(|| self.replay.lock());
+        if size_changed && self.info.read().status == TerminalStatus::Running {
+            self.master
+                .lock()
+                .resize(PtySize {
+                    cols: state.cols,
+                    rows: state.rows,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .map_err(|error| TerminalError::Io(error.to_string()))?;
         }
-        self.master
-            .lock()
-            .resize(PtySize {
-                cols: cols.clamp(2, 500),
-                rows: rows.clamp(1, 300),
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|error| TerminalError::Io(error.to_string()))
+        let publish = state != viewports.published;
+        viewports.published = state;
+        if publish {
+            let _ = self.events.send(TerminalEvent::Size(state));
+        }
+        drop(replay);
+        Ok(state)
     }
 
     pub fn kill(&self) {
@@ -1075,8 +1221,8 @@ impl TerminalManager {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
-                rows: 30,
-                cols: 100,
+                rows: DEFAULT_VIEWPORT_SIZE.rows,
+                cols: DEFAULT_VIEWPORT_SIZE.cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
@@ -1133,7 +1279,7 @@ impl TerminalManager {
             killer: Mutex::new(killer),
             replay: Mutex::new(ReplayBuffer::new(self.replay_bytes)),
             events,
-            clients: AtomicUsize::new(0),
+            viewports: Mutex::new(ClientViewports::default()),
             output_bytes: AtomicU64::new(0),
             activity: Mutex::new(SessionActivity {
                 automatic_name,
@@ -1733,6 +1879,67 @@ mod tests {
     }
 
     #[test]
+    fn terminal_size_uses_the_smallest_viewport_until_one_client_is_focused() {
+        let desktop = Uuid::from_u128(1);
+        let mobile = Uuid::from_u128(2);
+        let mut viewports = ClientViewports::default();
+
+        viewports.attach(desktop, Some(ViewportSize::new(180, 50)));
+        viewports.attach(mobile, Some(ViewportSize::new(60, 22)));
+        assert_eq!(
+            viewports.state(),
+            TerminalSizeState {
+                cols: 60,
+                rows: 22,
+                focused_client: None,
+            }
+        );
+
+        viewports.focus(desktop, true);
+        assert_eq!(
+            viewports.state(),
+            TerminalSizeState {
+                cols: 180,
+                rows: 50,
+                focused_client: Some(desktop),
+            }
+        );
+
+        viewports.resize(mobile, ViewportSize::new(40, 16));
+        assert_eq!((viewports.state().cols, viewports.state().rows), (180, 50));
+
+        viewports.detach(desktop);
+        assert_eq!(
+            viewports.state(),
+            TerminalSizeState {
+                cols: 40,
+                rows: 16,
+                focused_client: None,
+            }
+        );
+
+        viewports.published = viewports.state();
+        viewports.detach(mobile);
+        assert_eq!(
+            viewports.state(),
+            TerminalSizeState {
+                cols: 40,
+                rows: 16,
+                focused_client: None,
+            }
+        );
+    }
+
+    #[test]
+    fn terminal_size_clamps_untrusted_client_dimensions() {
+        let client = Uuid::from_u128(1);
+        let mut viewports = ClientViewports::default();
+        viewports.attach(client, Some(ViewportSize::new(0, u16::MAX)));
+
+        assert_eq!((viewports.state().cols, viewports.state().rows), (2, 300));
+    }
+
+    #[test]
     fn process_tracker_only_exposes_the_latest_live_snapshot() {
         let process =
             |pid, parent, group, foreground_group, command: &str, start_ticks| ProcessInfo {
@@ -1824,7 +2031,8 @@ mod tests {
         assert_eq!(info.program, "sh");
         assert_eq!(info.workspace, "~");
         let session = manager.get(info.id).unwrap();
-        session.resize(80, 24).unwrap();
+        let client_id = Uuid::new_v4();
+        session.attach(client_id, Some((80, 24))).unwrap();
         session.write(b"printf 'hello-from-pty\\n'\n").unwrap();
         session.write(b"cd /tmp\n").unwrap();
         let moved = (0..100).find_map(|_| {

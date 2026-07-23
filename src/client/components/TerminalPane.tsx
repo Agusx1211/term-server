@@ -13,6 +13,7 @@ import {
   EllipsisVertical,
   GripVertical,
   ListTree,
+  Maximize2,
   Search,
   Trash2,
   WifiOff,
@@ -22,7 +23,14 @@ import { Terminal as XTerm, type ILink, type ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon, type ISearchOptions } from "@xterm/addon-search";
 import { WebLinksAddon } from "@xterm/addon-web-links";
-import type { ClientConfig, FileEntry, FileTarget, ServerTerminalMessage, TerminalInfo } from "../../shared/types";
+import type {
+  ClientConfig,
+  ClientTerminalMessage,
+  FileEntry,
+  FileTarget,
+  ServerTerminalMessage,
+  TerminalInfo,
+} from "../../shared/types";
 import { configureTerminalDrag } from "../lib/layout";
 import { api } from "../lib/api";
 import { createHoverPreviewController, findFileLinks, imagePreviewPosition } from "../lib/file-links";
@@ -188,6 +196,7 @@ export function TerminalPane({
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState({ index: -1, count: 0 });
   const [imagePreview, setImagePreview] = useState<{ file: FileEntry; left: number; top: number }>();
+  const [terminalSize, setTerminalSize] = useState({ focused: false, controller: false });
   const [connection, setConnection] = useState<"connecting" | "connected" | "disconnected" | "exited">(
     terminal.status === "exited" ? "exited" : "connecting",
   );
@@ -287,19 +296,22 @@ export function TerminalPane({
       }
     });
 
-    const send = (message: unknown) => {
+    const send = (message: ClientTerminalMessage) => {
       if (socket.current?.readyState === WebSocket.OPEN) socket.current.send(JSON.stringify(message));
     };
-    const fitAndResize = () => {
+    const proposedViewport = () => {
+      if (!container.current?.clientWidth || !container.current.clientHeight) return;
+      try {
+        return fit.proposeDimensions();
+      } catch {
+        // The pane may be between layout states.
+      }
+    };
+    const reportViewport = () => {
       cancelAnimationFrame(resizeFrame);
       resizeFrame = requestAnimationFrame(() => {
-        if (!container.current?.clientWidth || !container.current.clientHeight) return;
-        try {
-          fit.fit();
-          send({ type: "resize", cols: term.cols, rows: term.rows });
-        } catch {
-          // The pane may be between layout states.
-        }
+        const size = proposedViewport();
+        if (size) send({ type: "resize", cols: size.cols, rows: size.rows });
       });
     };
 
@@ -325,13 +337,19 @@ export function TerminalPane({
       if (attempts > 0) term.reset();
       setConnection("connecting");
       const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-      const next = new WebSocket(`${protocol}//${location.host}/api/terminals/${terminal.id}/socket`);
+      const url = new URL(`${protocol}//${location.host}/api/terminals/${terminal.id}/socket`);
+      const size = proposedViewport();
+      if (size) {
+        url.searchParams.set("cols", String(size.cols));
+        url.searchParams.set("rows", String(size.rows));
+      }
+      const next = new WebSocket(url);
       next.binaryType = "arraybuffer";
       socket.current = next;
       next.addEventListener("open", () => {
         attempts = 0;
         setConnection("connected");
-        fitAndResize();
+        reportViewport();
         term.focus();
       });
       next.addEventListener("message", (event) => {
@@ -346,6 +364,10 @@ export function TerminalPane({
         try {
           const message = JSON.parse(String(event.data)) as ServerTerminalMessage;
           if (message.type === "ready") onUpdate(message.terminal);
+          if (message.type === "size") {
+            term.resize(message.cols, message.rows);
+            setTerminalSize({ focused: message.focused, controller: message.controller });
+          }
           if (message.type === "exit") {
             exited.current = true;
             setConnection("exited");
@@ -358,6 +380,7 @@ export function TerminalPane({
       });
       next.addEventListener("close", () => {
         if (disposed || exited.current) return;
+        setTerminalSize({ focused: false, controller: false });
         setConnection("disconnected");
         attempts += 1;
         reconnectTimer.current = window.setTimeout(connect, Math.min(5000, 250 * 2 ** attempts));
@@ -365,10 +388,10 @@ export function TerminalPane({
       next.addEventListener("error", () => next.close());
     };
 
-    const observer = new ResizeObserver(fitAndResize);
+    const observer = new ResizeObserver(reportViewport);
     observer.observe(container.current);
     connect();
-    fitAndResize();
+    reportViewport();
 
     return () => {
       disposed = true;
@@ -510,6 +533,19 @@ export function TerminalPane({
       onNotice("Clipboard permission was denied");
     }
   };
+  const toggleSizeFocus = () => {
+    if (socket.current?.readyState !== WebSocket.OPEN) return;
+    const message: ClientTerminalMessage = {
+      type: "focus",
+      focused: !terminalSize.controller,
+    };
+    socket.current.send(JSON.stringify(message));
+  };
+  const sizeFocusTitle = terminalSize.controller
+    ? "Return to the smallest connected terminal size"
+    : terminalSize.focused
+      ? "Use this device's size instead"
+      : "Focus this terminal at this device's size";
 
   return (
     <section
@@ -549,6 +585,15 @@ export function TerminalPane({
         <span class="pane-spacer" />
         <span class="desktop-pane-actions">
           <button
+            class={`pane-action ${terminalSize.controller ? "active" : ""}`}
+            onClick={toggleSizeFocus}
+            aria-label={sizeFocusTitle}
+            aria-pressed={terminalSize.controller}
+            title={sizeFocusTitle}
+          >
+            <Maximize2 size={14} />
+          </button>
+          <button
             class={`pane-action ${processesOpen ? "active" : ""}`}
             onClick={() => setProcessesOpen((current) => !current)}
             aria-label="Inspect terminal processes"
@@ -578,6 +623,10 @@ export function TerminalPane({
           </button>
           {actionsOpen && (
             <div class="pane-action-menu" role="menu">
+              <button role="menuitem" onClick={() => { setActionsOpen(false); toggleSizeFocus(); }}>
+                <Maximize2 size={16} />
+                {terminalSize.controller ? "Use smallest terminal size" : "Focus terminal size here"}
+              </button>
               <button role="menuitem" onClick={() => { setActionsOpen(false); setSearchOpen(true); }}>
                 <Search size={16} /> Search scrollback
               </button>
