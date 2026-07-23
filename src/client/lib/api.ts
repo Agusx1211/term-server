@@ -84,5 +84,6 @@ export const api = {
   readFile: (target: FileTarget) => request<FileDocument>(`/api/files/content?${fileQuery(target)}`),
   saveFile: (file: SaveFileRequest) =>
     request<FileDocument>("/api/files/content", { method: "PUT", body: JSON.stringify(file) }),
-  rawFileUrl: (target: FileTarget) => `/api/files/raw?${fileQuery(target)}`,
+  previewFileUrl: (target: FileTarget) => `/api/files/raw?${fileQuery(target)}`,
+  downloadFileUrl: (target: FileTarget) => `/api/files/download?${fileQuery(target)}`,
 };

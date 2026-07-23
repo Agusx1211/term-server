@@ -553,7 +553,7 @@ export function App() {
       const next: ResourceTab = {
         path: file.path,
         name: file.name,
-        type: file.image ? "image" : "text",
+        type: file.image ? "image" : file.pdf ? "pdf" : "text",
         mime: file.mime,
         dirty: false,
       };
