@@ -1,10 +1,39 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 - 2026-07-23
+
+Terminal and artifact management now cover the common cleanup and inspection workflows directly from the workspace, with better mobile sizing and more useful completion notifications.
 
 ### Added
 
-- Artifacts can now be permanently deleted, with confirmation, from either the session sidebar or full editor.
+- Terminal kill actions in the left sidebar, with a setting to skip confirmation when immediate termination is preferred.
+- Permanent artifact deletion from the terminal sidebar and full editor, including confirmation when an open artifact has unsaved changes.
+- Complete descendant process discovery with live CPU and resident-memory usage, plus confirmed process termination from the inspector.
+- Mobile terminal zoom controls in the touch keybar. The selected font size is remembered in the browser and the percentage button resets it to the default.
+- Notification placement and dismissal settings, including four screen corners, timed dismissal, and a keep-open option.
+
+### Fixed
+
+- Starting Codex, Pi, or another supported agent no longer treats terminal initialization and color queries as completed work. Empty starts do not request a Pi summary, change attention state, or send a completion notification.
+- Process inspection now includes descendants that are not direct children of the terminal shell.
+
+### Changed
+
+- Completion notifications now default to the top-right corner and use the originating terminal color for their border, accent, icon, and surface tint.
+- Artifact deletion updates open tabs, inline previews, and workspace counts immediately.
+
+### Security
+
+- Process termination revalidates terminal ancestry, process start time, and PID identity before sending `SIGTERM`.
+- Artifact deletion remains authenticated and origin-checked, accepts only scoped artifact identifiers, and refuses to follow artifact-directory symlinks.
+- Development guidance now requires an isolated `TERM_SERVER_DATA_DIR` so test servers cannot attach to or stop the production session broker.
+
+### Upgrade notes
+
+- There are no breaking changes, data migrations, or broker protocol changes.
+- Existing notification preferences remain compatible. New placement defaults to top-right and new dismissal behavior defaults to seven seconds.
+- Existing artifacts remain compatible and can be deleted after upgrading.
+- The release is safe for automatic installation over `0.2.0`.
 
 ## 0.2.0 - 2026-07-23
 
