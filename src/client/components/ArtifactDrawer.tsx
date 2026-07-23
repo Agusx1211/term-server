@@ -9,6 +9,7 @@ import {
   Image,
   LoaderCircle,
   PackageOpen,
+  Trash2,
   X,
 } from "lucide-preact";
 import type { ArtifactEntry, FileDocument, TerminalInfo } from "../../shared/types";
@@ -20,6 +21,7 @@ interface ArtifactDrawerProps {
   artifacts: ArtifactEntry[];
   onClose: () => void;
   onOpen: (artifact: ArtifactEntry) => void;
+  onDelete: (artifact: ArtifactEntry) => Promise<void>;
   onNotice: (message: string) => void;
 }
 
@@ -45,6 +47,7 @@ export function ArtifactDrawer({
   artifacts,
   onClose,
   onOpen,
+  onDelete,
   onNotice,
 }: ArtifactDrawerProps) {
   const [selectedId, setSelectedId] = useState(artifacts[0]?.id);
@@ -115,6 +118,7 @@ export function ArtifactDrawer({
           key={selected.id}
           artifact={selected}
           onOpen={() => onOpen(selected)}
+          onDelete={() => onDelete(selected)}
           onNotice={onNotice}
         />
       )}
@@ -125,12 +129,19 @@ export function ArtifactDrawer({
 interface ArtifactInlinePreviewProps {
   artifact: ArtifactEntry;
   onOpen: () => void;
+  onDelete: () => Promise<void>;
   onNotice: (message: string) => void;
 }
 
-function ArtifactInlinePreview({ artifact, onOpen, onNotice }: ArtifactInlinePreviewProps) {
+function ArtifactInlinePreview({
+  artifact,
+  onOpen,
+  onDelete,
+  onNotice,
+}: ArtifactInlinePreviewProps) {
   const [document, setDocument] = useState<FileDocument>();
   const [loading, setLoading] = useState(artifact.editable);
+  const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState("");
   const Icon = artifactIcon(artifact);
 
@@ -170,6 +181,15 @@ function ArtifactInlinePreview({ artifact, onOpen, onNotice }: ArtifactInlinePre
 
   const previewContent = document?.content.slice(0, 20_000) ?? "";
   const previewTruncated = (document?.content.length ?? 0) > previewContent.length;
+  const remove = async () => {
+    if (deleting) return;
+    setDeleting(true);
+    try {
+      await onDelete();
+    } finally {
+      setDeleting(false);
+    }
+  };
 
   return (
     <section class="artifact-inline">
@@ -195,6 +215,16 @@ function ArtifactInlinePreview({ artifact, onOpen, onNotice }: ArtifactInlinePre
         >
           <Download size={13} /> <span>Download</span>
         </a>
+        <button
+          class="artifact-inline-action danger"
+          onClick={() => void remove()}
+          disabled={deleting}
+          aria-label={`Delete ${artifact.name}`}
+          title={`Delete ${artifact.name}`}
+        >
+          {deleting ? <LoaderCircle class="spin" size={13} /> : <Trash2 size={13} />}
+          <span>Delete</span>
+        </button>
       </header>
       <div class="artifact-inline-body">
         {loading ? (

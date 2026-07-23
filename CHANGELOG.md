@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Artifacts can now be permanently deleted, with confirmation, from either the session sidebar or full editor.
+
 ## 0.2.0 - 2026-07-23
 
 Artifacts now stay connected to the terminal and agent that created them instead of behaving like files that must remain open.

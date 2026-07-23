@@ -421,6 +421,12 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
   border-color: var(--artifact); background: var(--artifact); color: var(--artifact-ink); font-weight: 650;
 }
 .artifact-document .resource-copy:hover:not(:disabled) { background: color-mix(in srgb, white 18%, var(--artifact)); }
+.artifact-document .resource-delete {
+  border-color: color-mix(in srgb, var(--danger) 48%, var(--border)); color: var(--danger);
+}
+.artifact-document .resource-delete:hover:not(:disabled) {
+  border-color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, var(--input));
+}
 .resource-editor-action:disabled { opacity: .45; cursor: default; }
 .resource-error { padding: 7px 10px; border-bottom: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border)); background: color-mix(in srgb, var(--danger) 8%, var(--panel)); color: var(--danger); font-size: 10px; }
 .resource-loading { min-height: 0; display: flex; align-items: center; justify-content: center; gap: 7px; color: var(--muted); }
@@ -609,8 +615,15 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
   background: color-mix(in srgb, var(--artifact) 5%, var(--input)); color: var(--foreground); font-size: 8.5px;
   text-decoration: none; cursor: pointer;
 }
-.artifact-inline-action:hover { border-color: var(--artifact); background: color-mix(in srgb, var(--artifact) 13%, var(--input)); }
+.artifact-inline-action:hover:not(:disabled) { border-color: var(--artifact); background: color-mix(in srgb, var(--artifact) 13%, var(--input)); }
 .artifact-inline-action.primary { border-color: var(--artifact); background: var(--artifact); color: var(--artifact-ink); font-weight: 700; }
+.artifact-inline-action.danger {
+  border-color: color-mix(in srgb, var(--danger) 48%, var(--border)); color: var(--danger);
+}
+.artifact-inline-action.danger:hover:not(:disabled) {
+  border-color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, var(--input));
+}
+.artifact-inline-action:disabled { opacity: .45; cursor: default; }
 .artifact-inline-body { min-width: 0; min-height: 0; overflow: auto; background: var(--artifact-surface); }
 .artifact-inline-body pre {
   min-width: 100%; min-height: 100%; margin: 0; padding: 10px 11px; color: var(--foreground);
