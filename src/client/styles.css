@@ -232,6 +232,7 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
 .row-actions { display: none; align-items: center; padding-right: 4px; }
 .tree-row:hover .row-actions, .row-actions.always { display: flex; }
 .row-action { width: 22px; height: 22px; color: var(--muted); border-radius: 3px; }
+.row-action.danger:hover { color: var(--danger); }
 .workspace-add { display: grid; margin-right: 4px; }
 .terminal-here { width: auto; padding: 0 4px; display: flex; gap: 4px; }
 .sidebar-empty { height: 180px; padding: 46px 20px 0; display: flex; flex-direction: column; align-items: center; gap: 9px; text-align: center; color: var(--muted); font-size: 12px; }
@@ -299,6 +300,7 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
 }
 .pi-model-field select:disabled { opacity: .55; }
 .settings-hint { margin: 8px 2px 0; color: var(--subtle); font-size: 9.5px; line-height: 1.4; }
+.settings-hint + .settings-toggle { margin-top: 10px; }
 .settings-hint strong { color: var(--muted); font-weight: 650; text-transform: capitalize; }
 .settings-update { display: grid; gap: 7px; }
 .settings-update-version, .settings-update-available {

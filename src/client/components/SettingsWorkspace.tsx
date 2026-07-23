@@ -14,6 +14,7 @@ import {
   SplitSquareHorizontal,
   Sun,
   RefreshCw,
+  Trash2,
 } from "lucide-preact";
 import type {
   BuildInfo,
@@ -37,12 +38,14 @@ interface SettingsWorkspaceProps {
   passwordManagedExternally: boolean;
   notificationMode: NotificationMode;
   tileNewTerminals: boolean;
+  confirmTerminalKills: boolean;
   onTheme: (theme: ThemeName) => void;
   onPiChange: (titlesEnabled: boolean, summariesEnabled: boolean, model: string) => void;
   onCheckForUpdate: () => void;
   onInstallUpdate: () => void;
   onNotificationModeChange: (mode: NotificationMode) => void;
   onTileNewTerminalsChange: (enabled: boolean) => void;
+  onConfirmTerminalKillsChange: (enabled: boolean) => void;
   onPasswordChanged: () => void;
   onLogout: () => void;
 }
@@ -91,12 +94,14 @@ export function SettingsWorkspace({
   passwordManagedExternally,
   notificationMode,
   tileNewTerminals,
+  confirmTerminalKills,
   onTheme,
   onPiChange,
   onCheckForUpdate,
   onInstallUpdate,
   onNotificationModeChange,
   onTileNewTerminalsChange,
+  onConfirmTerminalKillsChange,
   onPasswordChanged,
   onLogout,
 }: SettingsWorkspaceProps) {
@@ -128,8 +133,8 @@ export function SettingsWorkspace({
           </section>
 
           <section class="settings-card">
-            <header><LayoutDashboard size={16} /><h2>Terminal layout</h2></header>
-            <p>Control how newly created terminals enter the current layout.</p>
+            <header><LayoutDashboard size={16} /><h2>Terminal behavior</h2></header>
+            <p>Control terminal creation and destructive actions in this browser.</p>
             <label class={`settings-toggle ${tileNewTerminals ? "active" : ""}`}>
               <SplitSquareHorizontal size={14} />
               <span>Tile new terminals</span>
@@ -140,6 +145,16 @@ export function SettingsWorkspace({
               />
             </label>
             <p class="settings-hint">When off, a new terminal replaces the active pane.</p>
+            <label class={`settings-toggle ${confirmTerminalKills ? "active" : ""}`}>
+              <Trash2 size={14} />
+              <span>Confirm before killing terminals</span>
+              <input
+                type="checkbox"
+                checked={confirmTerminalKills}
+                onChange={(event) => onConfirmTerminalKillsChange(event.currentTarget.checked)}
+              />
+            </label>
+            <p class="settings-hint">Turn this off to make every terminal kill action immediate.</p>
           </section>
 
           <section class="settings-card settings-card-wide">
