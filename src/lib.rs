@@ -1,5 +1,6 @@
 pub mod ai;
 pub mod api;
+pub mod artifacts;
 pub mod auth;
 #[cfg(unix)]
 pub mod broker;

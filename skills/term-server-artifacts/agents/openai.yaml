@@ -1,0 +1,4 @@
+interface:
+  display_name: "Term Server Artifacts"
+  short_description: "Create editable session artifact files"
+  default_prompt: "Use $term-server-artifacts to deliver this multiline text as an editable artifact."

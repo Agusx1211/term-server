@@ -11,6 +11,7 @@ import {
   X,
 } from "lucide-preact";
 import type {
+  ArtifactEntry,
   ClientConfig,
   FileEntry,
   FileTarget,
@@ -157,6 +158,7 @@ export function App() {
   const [viewedAgentRevisions, setViewedAgentRevisions] = useState(initialViewedAgentRevisions);
   const [resources, setResources] = useState<ResourceTab[]>([]);
   const [activeResource, setActiveResource] = useState<string>();
+  const knownArtifactPaths = useRef(new Set<string>());
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsActive, setSettingsActive] = useState(false);
   const agentEventsInitialized = useRef(false);
@@ -168,11 +170,62 @@ export function App() {
   const mobileMenuButton = useRef<HTMLButtonElement>(null);
   const terminalsRef = useRef(terminals);
   terminalsRef.current = terminals;
+  const activeIdRef = useRef(activeId);
+  activeIdRef.current = activeId;
   const paneIds = useMemo(() => idsFromLayout(layout), [layout]);
 
   const showNotice = (message: string) => {
     setNotice(message);
     window.setTimeout(() => setNotice((current) => (current === message ? "" : current)), 2400);
+  };
+
+  const syncArtifacts = (artifacts: ArtifactEntry[], focusedSession = activeIdRef.current) => {
+    const currentPaths = new Set(artifacts.map((artifact) => artifact.path));
+    const discovered = artifacts.filter((artifact) => !knownArtifactPaths.current.has(artifact.path));
+    knownArtifactPaths.current = currentPaths;
+
+    setResources((current) => {
+      const next = [...current];
+      let changed = false;
+      for (const artifact of artifacts) {
+        const tab: ResourceTab = {
+          path: artifact.path,
+          name: artifact.name,
+          type: artifact.image ? "image" : artifact.pdf ? "pdf" : "text",
+          mime: artifact.mime,
+          modifiedAt: artifact.modifiedAt,
+          dirty: false,
+          artifact: {
+            id: artifact.id,
+            sessionId: artifact.sessionId,
+          },
+        };
+        const existing = next.findIndex((resource) => resource.path === artifact.path);
+        if (existing >= 0) {
+          const previous = next[existing]!;
+          if (
+            previous.modifiedAt !== tab.modifiedAt
+            || previous.artifact?.id !== tab.artifact?.id
+            || previous.artifact?.sessionId !== tab.artifact?.sessionId
+          ) {
+            next[existing] = { ...previous, ...tab, dirty: previous.dirty };
+            changed = true;
+          }
+        } else {
+          next.push(tab);
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+
+    if (!discovered.length) return;
+    const focusedArtifact = discovered.findLast((artifact) => artifact.sessionId === focusedSession);
+    if (focusedArtifact) {
+      setActiveResource(focusedArtifact.path);
+      setMobileSidebar(false);
+      showNotice(`Artifact ready: ${focusedArtifact.name}`);
+    }
   };
 
   const checkForUpdates = async (notify = false) => {
@@ -215,8 +268,16 @@ export function App() {
 
   const loadWorkspace = async () => {
     try {
-      const [nextConfig, nextTerminals] = await Promise.all([api.config(), api.terminals()]);
+      const [nextConfig, nextTerminals, artifacts] = await Promise.all([
+        api.config(),
+        api.terminals(),
+        api.artifacts(),
+      ]);
       const runningTerminals = nextTerminals.filter((terminal) => terminal.status === "running");
+      const focusedSession = activeIdRef.current
+        && runningTerminals.some((terminal) => terminal.id === activeIdRef.current)
+        ? activeIdRef.current
+        : runningTerminals[0]?.id;
       setConfig(nextConfig);
       setTerminals(runningTerminals);
       setWorkspaceLoaded(true);
@@ -230,6 +291,7 @@ export function App() {
           ? current
           : runningTerminals[0]?.id,
       );
+      syncArtifacts(artifacts, focusedSession);
       setAuthenticated(true);
     } catch (error) {
       if (error instanceof ApiError && error.status === 401) setAuthenticated(false);
@@ -310,13 +372,13 @@ export function App() {
   useEffect(() => {
     if (!authenticated) return;
     const refresh = () => {
-      void api
-        .terminals()
-        .then((next) => {
+      void Promise.all([api.terminals(), api.artifacts()])
+        .then(([next, artifacts]) => {
           const running = next.filter((terminal) => terminal.status === "running");
           setTerminals(running);
           const available = new Set(running.map((terminal) => terminal.id));
           setLayout((current) => pruneLayout(current, available));
+          syncArtifacts(artifacts);
         })
         .catch((error) => {
           if (error instanceof ApiError && error.status === 401) setAuthenticated(false);
@@ -555,6 +617,7 @@ export function App() {
         name: file.name,
         type: file.image ? "image" : file.pdf ? "pdf" : "text",
         mime: file.mime,
+        modifiedAt: file.modifiedAt,
         dirty: false,
       };
       setResources((current) => current.some((resource) => resource.path === file.path) ? current : [...current, next]);
@@ -753,6 +816,7 @@ export function App() {
       setMountedIds([]);
       setResources([]);
       setActiveResource(undefined);
+      knownArtifactPaths.current.clear();
       setUpdateStatus(null);
       setSettingsOpen(false);
       setSettingsActive(false);

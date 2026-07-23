@@ -18,7 +18,10 @@ use thiserror::Error;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use crate::ai::{PiRequest, PiService, PiTaskKind};
+use crate::{
+    ai::{PiRequest, PiService, PiTaskKind},
+    artifacts,
+};
 
 // Neighboring buckets jump across the hue wheel and keep similar luminance across themes.
 const COLORS: [&str; 64] = [
@@ -1696,6 +1699,7 @@ fn configure_terminal_environment(command: &mut CommandBuilder) {
     command.env_remove("NO_COLOR");
     command.env("TERM_PROGRAM", "term-server");
     command.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+    command.env("TERM_SERVER_ARTIFACTS_DIR", artifacts::root_directory());
 }
 
 fn workspace_for(cwd: &Path, home: &Path) -> String {
@@ -1811,6 +1815,10 @@ mod tests {
         assert_eq!(command.get_env("COLORTERM"), Some(OsStr::new("truecolor")));
         assert_eq!(command.get_env("CLICOLOR"), Some(OsStr::new("1")));
         assert_eq!(command.get_env("NO_COLOR"), None);
+        assert_eq!(
+            command.get_env("TERM_SERVER_ARTIFACTS_DIR"),
+            Some(artifacts::root_directory().as_os_str())
+        );
     }
 
     #[test]
