@@ -75,7 +75,7 @@ The unframed workspace capture used for the hero is also available at [docs/scre
 
 Click the main `+` to open a shell in your home directory, or use a workspace row’s `+` to start in that directory. A terminal’s name follows its foreground process until you pin a custom name. Click a terminal to open it in the active pane; use its row actions to rename, split, or kill it directly, or drag it onto the left, right, top, or bottom of another pane to build a nested layout. Kill actions ask for confirmation by default; turn off **Settings → Terminal behavior → Confirm before killing terminals** to make them immediate.
 
-On a phone, term-server keeps that pane layout but shows one terminal at a time. Use the arrows in the mobile toolbar to move between visible panes, the workspace drawer to open another session, and the terminal action menu for search, clipboard, process inspection, clone, kill, and close controls.
+On a phone, term-server keeps that pane layout but shows one terminal at a time. Use the arrows in the mobile toolbar to move between visible panes, the workspace drawer to open another session, and the terminal action menu for search, clipboard, process inspection, clone, kill, and close controls. The touch keybar starts with terminal zoom controls; the percentage resets the text to its default size, and the selected size is remembered on that device.
 
 Closing a pane keeps the PTY running. The trash action kills it. A normal shell exit removes the terminal automatically.
 

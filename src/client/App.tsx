@@ -50,6 +50,11 @@ import {
   type NotificationPosition,
 } from "./lib/notifications";
 import {
+  clampTerminalFontSize,
+  parseTerminalFontSize,
+  TERMINAL_FONT_SIZE_STORAGE_KEY,
+} from "./lib/terminal-zoom";
+import {
   artifactCountsBySession,
   artifactOwnerLabel,
   discoverArtifacts,
@@ -168,6 +173,9 @@ const initialTileNewTerminals = () =>
 const initialConfirmTerminalKills = () =>
   parseConfirmTerminalKills(localStorage.getItem(CONFIRM_TERMINAL_KILLS_STORAGE_KEY));
 
+const initialTerminalFontSize = () =>
+  parseTerminalFontSize(localStorage.getItem(TERMINAL_FONT_SIZE_STORAGE_KEY));
+
 const initialViewedAgentRevisions = () =>
   parseViewedAgentRevisions(localStorage.getItem(VIEWED_AGENT_REVISIONS_STORAGE_KEY));
 
@@ -195,6 +203,7 @@ export function App() {
   const [notificationDuration, setNotificationDuration] = useState(initialNotificationDuration);
   const [tileNewTerminals, setTileNewTerminals] = useState(initialTileNewTerminals);
   const [confirmTerminalKills, setConfirmTerminalKills] = useState(initialConfirmTerminalKills);
+  const [terminalFontSize, setTerminalFontSize] = useState(initialTerminalFontSize);
   const [viewedAgentRevisions, setViewedAgentRevisions] = useState(initialViewedAgentRevisions);
   const [artifacts, setArtifacts] = useState<ArtifactEntry[]>([]);
   const [resources, setResources] = useState<ResourceTab[]>([]);
@@ -223,6 +232,12 @@ export function App() {
   const showNotice = (message: string) => {
     setNotice(message);
     window.setTimeout(() => setNotice((current) => (current === message ? "" : current)), 2400);
+  };
+
+  const updateTerminalFontSize = (value: number) => {
+    const next = clampTerminalFontSize(value);
+    localStorage.setItem(TERMINAL_FONT_SIZE_STORAGE_KEY, String(next));
+    setTerminalFontSize(next);
   };
 
   const syncArtifacts = (
@@ -1074,6 +1089,7 @@ export function App() {
                     artifacts={artifactsBySession.get(terminal.id) ?? []}
                     config={config}
                     theme={theme}
+                    fontSize={terminalFontSize}
                     active={visible && terminal.id === activeId && !activeResource && !settingsActive}
                     onActivate={() => setActiveId(terminal.id)}
                     onClose={() => closePane(terminal.id)}
@@ -1087,6 +1103,7 @@ export function App() {
                     onExit={() => forgetTerminal(terminal.id)}
                     onUpdate={updateTerminal}
                     onNotice={showNotice}
+                    onFontSizeChange={updateTerminalFontSize}
                     onOpenFile={(target) => void openResource(target)}
                     onOpenArtifact={openArtifact}
                     onDeleteArtifact={deleteArtifact}

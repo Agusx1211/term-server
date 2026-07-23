@@ -19,6 +19,8 @@ import {
   Trash2,
   WifiOff,
   X,
+  ZoomIn,
+  ZoomOut,
 } from "lucide-preact";
 import { Terminal as XTerm, type ILink, type ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
@@ -42,6 +44,12 @@ import {
   transformTerminalInput,
   type TerminalModifiers,
 } from "../lib/mobile-terminal";
+import {
+  DEFAULT_TERMINAL_FONT_SIZE,
+  MAX_TERMINAL_FONT_SIZE,
+  MIN_TERMINAL_FONT_SIZE,
+  terminalZoomPercent,
+} from "../lib/terminal-zoom";
 import { ProcessInspector } from "./ProcessInspector";
 import { ArtifactDrawer } from "./ArtifactDrawer";
 import { WorkingDuration } from "./WorkingDuration";
@@ -52,6 +60,7 @@ interface TerminalPaneProps {
   terminal: TerminalInfo;
   config: ClientConfig;
   theme: ThemeName;
+  fontSize: number;
   active: boolean;
   needsAttention: boolean;
   artifacts: ArtifactEntry[];
@@ -64,6 +73,7 @@ interface TerminalPaneProps {
   onExit: () => void;
   onUpdate: (terminal: TerminalInfo) => void;
   onNotice: (message: string) => void;
+  onFontSizeChange: (fontSize: number) => void;
   onOpenFile: (target: FileTarget) => void;
   onOpenArtifact: (artifact: ArtifactEntry) => void;
   onDeleteArtifact: (artifact: ArtifactEntry) => Promise<void>;
@@ -176,6 +186,7 @@ export function TerminalPane({
   terminal,
   config,
   theme,
+  fontSize,
   active,
   needsAttention,
   artifacts,
@@ -188,6 +199,7 @@ export function TerminalPane({
   onExit,
   onUpdate,
   onNotice,
+  onFontSizeChange,
   onOpenFile,
   onOpenArtifact,
   onDeleteArtifact,
@@ -201,6 +213,7 @@ export function TerminalPane({
   const socket = useRef<WebSocket>();
   const exited = useRef(terminal.status === "exited");
   const reconnectTimer = useRef<number>();
+  const reportTerminalViewport = useRef<() => void>();
   const terminalState = useRef(terminal);
   const openFile = useRef(onOpenFile);
   const modifiers = useRef<TerminalModifiers>(NO_TERMINAL_MODIFIERS);
@@ -249,7 +262,7 @@ export function TerminalPane({
       cursorBlink: true,
       cursorStyle: "block",
       fontFamily: "'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace",
-      fontSize: 13,
+      fontSize,
       letterSpacing: 0,
       lineHeight: 1.15,
       minimumContrastRatio: 1,
@@ -349,6 +362,7 @@ export function TerminalPane({
         if (size) send({ type: "resize", cols: size.cols, rows: size.rows });
       });
     };
+    reportTerminalViewport.current = reportViewport;
 
     const dataDisposable = term.onData((data) => {
       const currentModifiers = modifiers.current;
@@ -454,11 +468,19 @@ export function TerminalPane({
       searchResultsDisposable.dispose();
       socket.current?.close(1000, "Pane closed");
       socket.current = undefined;
+      reportTerminalViewport.current = undefined;
       term.dispose();
       xterm.current = undefined;
       searchAddon.current = undefined;
     };
   }, [terminal.id, config.scrollbackLines]);
+
+  useEffect(() => {
+    const term = xterm.current;
+    if (!term || term.options.fontSize === fontSize) return;
+    term.options.fontSize = fontSize;
+    reportTerminalViewport.current?.();
+  }, [fontSize]);
 
   useEffect(() => {
     if (xterm.current) xterm.current.options.theme = terminalTheme(theme, terminal.color);
@@ -608,7 +630,12 @@ export function TerminalPane({
     xterm.current?.input(data, true);
     xterm.current?.focus();
   };
+  const changeFontSize = (next: number) => {
+    onFontSizeChange(next);
+    xterm.current?.focus();
+  };
   const keepTerminalFocused = (event: PointerEvent) => event.preventDefault();
+  const zoomPercent = terminalZoomPercent(fontSize);
 
   return (
     <section
@@ -777,6 +804,31 @@ export function TerminalPane({
           if ((event.target as HTMLElement).closest("button")) keepTerminalFocused(event);
         }}
       >
+        <button
+          onClick={() => changeFontSize(fontSize - 1)}
+          disabled={fontSize <= MIN_TERMINAL_FONT_SIZE}
+          aria-label={`Zoom terminal out. Current zoom ${zoomPercent}%`}
+          title="Zoom terminal out"
+        >
+          <ZoomOut size={16} />
+        </button>
+        <button
+          class="terminal-zoom-level"
+          onClick={() => changeFontSize(DEFAULT_TERMINAL_FONT_SIZE)}
+          aria-label={`Reset terminal zoom to 100%. Current zoom ${zoomPercent}%`}
+          title="Reset terminal zoom"
+        >
+          {zoomPercent}%
+        </button>
+        <button
+          onClick={() => changeFontSize(fontSize + 1)}
+          disabled={fontSize >= MAX_TERMINAL_FONT_SIZE}
+          aria-label={`Zoom terminal in. Current zoom ${zoomPercent}%`}
+          title="Zoom terminal in"
+        >
+          <ZoomIn size={16} />
+        </button>
+        <span class="terminal-keybar-divider" aria-hidden="true" />
         <button
           class={mobileModifiers.ctrl ? "active" : ""}
           aria-pressed={mobileModifiers.ctrl}
