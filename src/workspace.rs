@@ -13,7 +13,7 @@ use crate::{
     ai::{PiClientConfig, PiService, UpdatePiSettings},
     terminal::{
         CreateTerminal, ProcessInspectorSnapshot, RenameTerminal, TerminalEvent, TerminalInfo,
-        TerminalManager, TerminalSession,
+        TerminalManager, TerminalSession, TerminalSizeState,
     },
 };
 
@@ -168,7 +168,11 @@ impl WorkspaceBackend {
         }
     }
 
-    pub async fn connect_terminal(&self, id: Uuid) -> Result<SessionConnection, WorkspaceError> {
+    pub async fn connect_terminal(
+        &self,
+        id: Uuid,
+        initial_size: Option<(u16, u16)>,
+    ) -> Result<SessionConnection, WorkspaceError> {
         match self {
             Self::Local { terminals, .. } => terminals
                 .get(id)
@@ -179,7 +183,7 @@ impl WorkspaceBackend {
                 }),
             #[cfg(unix)]
             Self::Broker(client) => client
-                .terminal_socket(id)
+                .terminal_socket(id, initial_size)
                 .await
                 .map(Box::new)
                 .map(SessionConnection::Broker),
@@ -200,10 +204,23 @@ impl WorkspaceBackend {
 }
 
 #[derive(Debug, Deserialize)]
+pub(crate) struct TerminalSocketQuery {
+    cols: Option<u16>,
+    rows: Option<u16>,
+}
+
+impl TerminalSocketQuery {
+    pub(crate) fn viewport(&self) -> Option<(u16, u16)> {
+        self.cols.zip(self.rows)
+    }
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum TerminalClientMessage {
     Input { data: String },
     Resize { cols: u16, rows: u16 },
+    Focus { focused: bool },
     Ping,
 }
 
@@ -217,29 +234,67 @@ enum TerminalServerMessage<'a> {
         #[serde(rename = "exitCode")]
         exit_code: u32,
     },
+    Size {
+        cols: u16,
+        rows: u16,
+        focused: bool,
+        controller: bool,
+    },
     Pong,
     Error {
         message: &'a str,
     },
 }
 
-struct Attachment(Arc<TerminalSession>);
+struct Attachment {
+    terminal: Arc<TerminalSession>,
+    client_id: Uuid,
+}
 
 impl Drop for Attachment {
     fn drop(&mut self) {
-        self.0.detach();
+        self.terminal.detach(self.client_id);
     }
 }
 
-pub(crate) async fn serve_terminal_socket(mut socket: WebSocket, terminal: Arc<TerminalSession>) {
-    terminal.attach();
-    let _attachment = Attachment(terminal.clone());
+fn size_message(state: TerminalSizeState, client_id: Uuid) -> TerminalServerMessage<'static> {
+    TerminalServerMessage::Size {
+        cols: state.cols,
+        rows: state.rows,
+        focused: state.focused_client.is_some(),
+        controller: state.focused_client == Some(client_id),
+    }
+}
+
+pub(crate) async fn serve_terminal_socket(
+    mut socket: WebSocket,
+    terminal: Arc<TerminalSession>,
+    initial_size: Option<(u16, u16)>,
+) {
+    let client_id = Uuid::new_v4();
+    let size = match terminal.attach(client_id, initial_size) {
+        Ok(size) => size,
+        Err(error) => {
+            terminal.detach(client_id);
+            tracing::debug!(%error, "initial terminal resize failed");
+            return;
+        }
+    };
+    let _attachment = Attachment {
+        terminal: terminal.clone(),
+        client_id,
+    };
     let (mut events, replay) = terminal.subscribe();
     let ready = serde_json::to_string(&TerminalServerMessage::Ready {
         terminal: Box::new(terminal.info()),
     })
     .expect("serializable terminal");
     if socket.send(Message::Text(ready.into())).await.is_err() {
+        return;
+    }
+    let size =
+        serde_json::to_string(&size_message(size, client_id)).expect("serializable terminal size");
+    if socket.send(Message::Text(size.into())).await.is_err() {
         return;
     }
     for chunk in replay {
@@ -262,6 +317,11 @@ pub(crate) async fn serve_terminal_socket(mut socket: WebSocket, terminal: Arc<T
                         let _ = sender.send(Message::Text(message.into())).await;
                         break;
                     }
+                    Ok(TerminalEvent::Size(size)) => {
+                        let message = serde_json::to_string(&size_message(size, client_id))
+                            .expect("serializable terminal size");
+                        if sender.send(Message::Text(message.into())).await.is_err() { break; }
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         let _ = sender.send(Message::Close(Some(CloseFrame {
                             code: 1013,
@@ -277,10 +337,16 @@ pub(crate) async fn serve_terminal_socket(mut socket: WebSocket, terminal: Arc<T
                 match message {
                     Message::Text(text) => match serde_json::from_str::<TerminalClientMessage>(&text) {
                         Ok(TerminalClientMessage::Input { data }) if data.len() <= 64 * 1024 => {
-                            if terminal.write(data.as_bytes()).is_err() { break; }
+                            if let Err(error) = terminal.write(data.as_bytes()) {
+                                tracing::debug!(%error, "terminal input failed");
+                                break;
+                            }
                         }
                         Ok(TerminalClientMessage::Resize { cols, rows }) => {
-                            if terminal.resize(cols, rows).is_err() { break; }
+                            if terminal.resize_client(client_id, cols, rows).is_err() { break; }
+                        }
+                        Ok(TerminalClientMessage::Focus { focused }) => {
+                            if terminal.focus_client(client_id, focused).is_err() { break; }
                         }
                         Ok(TerminalClientMessage::Ping) => {
                             let pong = serde_json::to_string(&TerminalServerMessage::Pong)

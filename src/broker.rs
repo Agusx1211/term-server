@@ -7,7 +7,7 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{Path as AxumPath, State, ws::WebSocketUpgrade},
+    extract::{Path as AxumPath, Query, State, ws::WebSocketUpgrade},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{any, get, patch},
@@ -32,10 +32,10 @@ use crate::{
     terminal::{
         CreateTerminal, ProcessInspectorSnapshot, RenameTerminal, TerminalInfo, TerminalManager,
     },
-    workspace::{WorkspaceError as BrokerError, serve_terminal_socket},
+    workspace::{TerminalSocketQuery, WorkspaceError as BrokerError, serve_terminal_socket},
 };
 
-const PROTOCOL_VERSION: u32 = 1;
+const PROTOCOL_VERSION: u32 = 2;
 const SOCKET_NAME: &str = "session-broker.sock";
 
 pub type BrokerWebSocket = WebSocketStream<UnixStream>;
@@ -179,11 +179,21 @@ impl BrokerClient {
         self.send_json(Method::PATCH, "/pi", Some(&settings)).await
     }
 
-    pub async fn terminal_socket(&self, id: Uuid) -> Result<BrokerWebSocket, BrokerError> {
+    pub async fn terminal_socket(
+        &self,
+        id: Uuid,
+        initial_size: Option<(u16, u16)>,
+    ) -> Result<BrokerWebSocket, BrokerError> {
         let stream = UnixStream::connect(self.socket_path.as_ref()).await?;
-        let (socket, _) = client_async(format!("ws://localhost/terminals/{id}/socket"), stream)
-            .await
-            .map_err(|error| BrokerError::Unavailable(error.to_string()))?;
+        let query = initial_size
+            .map(|(cols, rows)| format!("?cols={cols}&rows={rows}"))
+            .unwrap_or_default();
+        let (socket, _) = client_async(
+            format!("ws://localhost/terminals/{id}/socket{query}"),
+            stream,
+        )
+        .await
+        .map_err(|error| BrokerError::Unavailable(error.to_string()))?;
         Ok(socket)
     }
 
@@ -486,6 +496,7 @@ async fn broker_terminal_processes(
 async fn broker_terminal_socket(
     State(state): State<BrokerState>,
     AxumPath(id): AxumPath<Uuid>,
+    Query(query): Query<TerminalSocketQuery>,
     websocket: WebSocketUpgrade,
 ) -> Result<Response, BrokerApiError> {
     let terminal = state.terminals.get(id).ok_or(BrokerApiError::NotFound)?;
@@ -494,7 +505,7 @@ async fn broker_terminal_socket(
         .max_frame_size(64 * 1024)
         .write_buffer_size(128 * 1024)
         .max_write_buffer_size(4 * 1024 * 1024)
-        .on_upgrade(move |socket| serve_terminal_socket(socket, terminal)))
+        .on_upgrade(move |socket| serve_terminal_socket(socket, terminal, query.viewport())))
 }
 
 async fn shutdown_broker(State(state): State<BrokerState>) -> StatusCode {
@@ -515,6 +526,29 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 
     use super::*;
+
+    async fn wait_for_control(
+        socket: &mut BrokerWebSocket,
+        message_type: &str,
+    ) -> serde_json::Value {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(message) = socket.next().await {
+                match message.unwrap() {
+                    TungsteniteMessage::Text(text) => {
+                        let value = serde_json::from_str::<serde_json::Value>(&text).unwrap();
+                        if value["type"] == message_type {
+                            return value;
+                        }
+                    }
+                    TungsteniteMessage::Close(_) => panic!("terminal socket closed"),
+                    _ => {}
+                }
+            }
+            panic!("terminal socket ended before receiving {message_type}");
+        })
+        .await
+        .expect("terminal control message timeout")
+    }
 
     async fn wait_for_output(socket: &mut BrokerWebSocket, needle: &str) -> String {
         let mut output = String::new();
@@ -563,7 +597,23 @@ mod tests {
             })
             .await
             .unwrap();
-        let mut first = client.terminal_socket(terminal.id).await.unwrap();
+        let mut first = client
+            .terminal_socket(terminal.id, Some((80, 24)))
+            .await
+            .unwrap();
+        let size = wait_for_control(&mut first, "size").await;
+        assert_eq!(
+            (size["cols"].as_u64(), size["rows"].as_u64()),
+            (Some(80), Some(24))
+        );
+        first
+            .send(TungsteniteMessage::Text(
+                r#"{"type":"focus","focused":true}"#.into(),
+            ))
+            .await
+            .unwrap();
+        let focused = wait_for_control(&mut first, "size").await;
+        assert_eq!(focused["controller"], true);
         first
             .send(TungsteniteMessage::Text(
                 r#"{"type":"input","data":"printf 'before-restart\\n'\n"}"#.into(),
@@ -583,7 +633,7 @@ mod tests {
                 .any(|candidate| candidate.id == terminal.id)
         );
         let mut second = replacement_client
-            .terminal_socket(terminal.id)
+            .terminal_socket(terminal.id, Some((80, 24)))
             .await
             .unwrap();
         let replay = wait_for_output(&mut second, "before-restart").await;

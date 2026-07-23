@@ -116,7 +116,13 @@ export interface FileEntry {
   modifiedAt: number;
   mime: string;
   image: boolean;
+  pdf: boolean;
   editable: boolean;
+}
+
+export interface ArtifactEntry extends FileEntry {
+  id: string;
+  sessionId: string;
 }
 
 export interface DirectoryListing {
@@ -154,10 +160,12 @@ export interface SaveFileRequest extends FileTarget {
 export type ClientTerminalMessage =
   | { type: "input"; data: string }
   | { type: "resize"; cols: number; rows: number }
+  | { type: "focus"; focused: boolean }
   | { type: "ping" };
 
 export type ServerTerminalMessage =
   | { type: "ready"; terminal: TerminalInfo }
   | { type: "exit"; exitCode: number }
+  | { type: "size"; cols: number; rows: number; focused: boolean; controller: boolean }
   | { type: "pong" }
   | { type: "error"; message: string };

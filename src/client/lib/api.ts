@@ -1,4 +1,5 @@
 import type {
+  ArtifactEntry,
   ClientConfig,
   CreateTerminalRequest,
   RenameTerminalRequest,
@@ -74,6 +75,7 @@ export const api = {
   removeTerminal: (id: string) => request<void>(`/api/terminals/${id}`, { method: "DELETE" }),
   terminalProcesses: (id: string) =>
     request<ProcessInspectorSnapshot>(`/api/terminals/${id}/processes`),
+  artifacts: () => request<ArtifactEntry[]>("/api/artifacts"),
   fileMetadata: (target: FileTarget) => request<FileEntry>(`/api/files/meta?${fileQuery(target)}`),
   listFiles: (target: FileTarget) => request<DirectoryListing>(`/api/files/list?${fileQuery(target)}`),
   searchFiles: (root: string, query: string, cwd?: string) => {
@@ -84,5 +86,6 @@ export const api = {
   readFile: (target: FileTarget) => request<FileDocument>(`/api/files/content?${fileQuery(target)}`),
   saveFile: (file: SaveFileRequest) =>
     request<FileDocument>("/api/files/content", { method: "PUT", body: JSON.stringify(file) }),
-  rawFileUrl: (target: FileTarget) => `/api/files/raw?${fileQuery(target)}`,
+  previewFileUrl: (target: FileTarget) => `/api/files/raw?${fileQuery(target)}`,
+  downloadFileUrl: (target: FileTarget) => `/api/files/download?${fileQuery(target)}`,
 };

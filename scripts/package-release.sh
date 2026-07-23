@@ -34,9 +34,10 @@ fi
 staging="$(mktemp -d "${TMPDIR:-/tmp}/term-server-package.XXXXXX")"
 trap 'rm -rf -- "$staging"' EXIT
 
-install -d "$staging/$package/client" "$output_dir"
+install -d "$staging/$package/client" "$staging/$package/skills" "$output_dir"
 install -m 0755 "$binary" "$staging/$package/term-server"
 cp -R dist/client/. "$staging/$package/client/"
+cp -R skills/term-server-artifacts "$staging/$package/skills/"
 install -m 0644 LICENSE README.md "$staging/$package/"
 install -m 0644 deploy/term-server.service "$staging/$package/term-server.service"
 install -d "$staging/$package/docs" "$staging/$package/src/client/public"
