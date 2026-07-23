@@ -44,7 +44,10 @@ use crate::{
     files::{self, FileError},
     terminal::{CreateTerminal, RenameTerminal, TerminalError},
     update::{UpdateConfig, UpdateError, UpdateService, UpdateStatus},
-    workspace::{SessionConnection, WorkspaceBackend, WorkspaceError, serve_terminal_socket},
+    workspace::{
+        SessionConnection, TerminalSocketQuery, WorkspaceBackend, WorkspaceError,
+        serve_terminal_socket,
+    },
 };
 #[cfg(unix)]
 use axum::extract::ws::{Message, WebSocket};
@@ -723,6 +726,7 @@ async fn save_file(
 async fn terminal_socket(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Query(query): Query<TerminalSocketQuery>,
     headers: HeaderMap,
     uri: Uri,
     jar: CookieJar,
@@ -730,7 +734,8 @@ async fn terminal_socket(
 ) -> Result<Response, ApiError> {
     require_origin(&headers, &uri, &state)?;
     require_auth(&jar, &state)?;
-    let terminal = state.workspace.connect_terminal(id).await?;
+    let initial_size = query.viewport();
+    let terminal = state.workspace.connect_terminal(id, initial_size).await?;
     Ok(websocket
         .max_message_size(64 * 1024)
         .max_frame_size(64 * 1024)
@@ -739,7 +744,7 @@ async fn terminal_socket(
         .on_upgrade(move |socket| async move {
             match terminal {
                 SessionConnection::Local(terminal) => {
-                    serve_terminal_socket(socket, terminal).await;
+                    serve_terminal_socket(socket, terminal, initial_size).await;
                 }
                 #[cfg(unix)]
                 SessionConnection::Broker(broker) => {
