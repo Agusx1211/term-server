@@ -1,7 +1,24 @@
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { lazy, Suspense } from "preact/compat";
-import { ChevronLeft, ChevronRight, Menu, Plus, ShieldCheck } from "lucide-preact";
-import type { ClientConfig, FileEntry, FileTarget, TerminalInfo } from "../shared/types";
+import {
+  Bell,
+  ChevronLeft,
+  ChevronRight,
+  LoaderCircle,
+  Menu,
+  Plus,
+  ShieldCheck,
+  X,
+} from "lucide-preact";
+import type {
+  ArtifactEntry,
+  ClientConfig,
+  FileEntry,
+  FileTarget,
+  ReleaseInfo,
+  TerminalInfo,
+  UpdateStatus,
+} from "../shared/types";
 import { api, ApiError } from "./lib/api";
 import {
   agentNeedsAttention,
@@ -11,6 +28,15 @@ import {
   VIEWED_AGENT_REVISIONS_STORAGE_KEY,
 } from "./lib/agent-attention";
 import { documentTitle } from "./lib/document-title";
+import { installVisualViewportCssVars } from "./lib/visual-viewport";
+import {
+  includesInAppNotifications,
+  includesSystemNotifications,
+  LEGACY_NOTIFICATIONS_STORAGE_KEY,
+  NOTIFICATION_MODE_STORAGE_KEY,
+  parseNotificationMode,
+  type NotificationMode,
+} from "./lib/notifications";
 import {
   arrangeLayout,
   isPaneLayout,
@@ -28,6 +54,7 @@ import {
 } from "./lib/layout";
 import { Login } from "./components/Login";
 import { Sidebar } from "./components/Sidebar";
+import { SettingsWorkspace } from "./components/SettingsWorkspace";
 import { TermServerLogo } from "./components/TermServerLogo";
 import { WelcomeSection } from "./components/WelcomeSection";
 import { ResourceTabBar, type ResourceTab } from "./components/ResourceTabs";
@@ -52,9 +79,25 @@ const defaultConfig: ClientConfig = {
     model: "",
     models: [],
   },
+  build: {
+    version: "unknown",
+    commit: "unknown",
+  },
+  updates: {
+    enabled: false,
+    channel: "main",
+    reason: null,
+  },
 };
 const dropPositions: DropPosition[] = ["left", "top", "center", "bottom", "right"];
 const TILE_NEW_TERMINALS_STORAGE_KEY = "term-server:tile-new-terminals";
+
+interface AgentToast {
+  id: string;
+  terminalId: string;
+  title: string;
+  body: string;
+}
 
 const initialTheme = (): ThemeName => {
   const stored = localStorage.getItem("term-server:theme");
@@ -81,10 +124,10 @@ const initialPaneLayout = (): PaneLayout | null => {
   return layoutFromIds(initialPanes());
 };
 
-const initialNotifications = () =>
-  localStorage.getItem("term-server:notifications") === "true" &&
-  typeof Notification !== "undefined" &&
-  Notification.permission === "granted";
+const initialNotificationMode = () => parseNotificationMode(
+  localStorage.getItem(NOTIFICATION_MODE_STORAGE_KEY),
+  localStorage.getItem(LEGACY_NOTIFICATIONS_STORAGE_KEY),
+);
 
 const initialTileNewTerminals = () =>
   localStorage.getItem(TILE_NEW_TERMINALS_STORAGE_KEY) === "true";
@@ -104,30 +147,140 @@ export function App() {
   const [dropTarget, setDropTarget] = useState<{ id: string; position: DropPosition }>();
   const [theme, setTheme] = useState<ThemeName>(initialTheme);
   const [creating, setCreating] = useState(false);
+  const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
+  const [checkingForUpdate, setCheckingForUpdate] = useState(false);
+  const [installingUpdate, setInstallingUpdate] = useState(false);
+  const [restartingForUpdate, setRestartingForUpdate] = useState<ReleaseInfo>();
   const [notice, setNotice] = useState("");
+  const [agentToasts, setAgentToasts] = useState<AgentToast[]>([]);
   const [mobileSidebar, setMobileSidebar] = useState(false);
-  const [notificationsEnabled, setNotificationsEnabled] = useState(initialNotifications);
+  const [notificationMode, setNotificationMode] = useState(initialNotificationMode);
   const [tileNewTerminals, setTileNewTerminals] = useState(initialTileNewTerminals);
   const [viewedAgentRevisions, setViewedAgentRevisions] = useState(initialViewedAgentRevisions);
   const [resources, setResources] = useState<ResourceTab[]>([]);
   const [activeResource, setActiveResource] = useState<string>();
+  const knownArtifactPaths = useRef(new Set<string>());
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsActive, setSettingsActive] = useState(false);
   const agentEventsInitialized = useRef(false);
   const deliveredAgentEvents = useRef(new Map<string, number>());
   const pendingAgentNotifications = useRef(new Map<string, { event: number; timer: number }>());
+  const agentToastTimers = useRef(new Map<string, number>());
+  const notificationModeRef = useRef(notificationMode);
+  notificationModeRef.current = notificationMode;
   const mobileMenuButton = useRef<HTMLButtonElement>(null);
   const terminalsRef = useRef(terminals);
   terminalsRef.current = terminals;
+  const activeIdRef = useRef(activeId);
+  activeIdRef.current = activeId;
   const paneIds = useMemo(() => idsFromLayout(layout), [layout]);
+
+  useEffect(() => installVisualViewportCssVars(), []);
 
   const showNotice = (message: string) => {
     setNotice(message);
     window.setTimeout(() => setNotice((current) => (current === message ? "" : current)), 2400);
   };
 
+  const syncArtifacts = (artifacts: ArtifactEntry[], focusedSession = activeIdRef.current) => {
+    const currentPaths = new Set(artifacts.map((artifact) => artifact.path));
+    const discovered = artifacts.filter((artifact) => !knownArtifactPaths.current.has(artifact.path));
+    knownArtifactPaths.current = currentPaths;
+
+    setResources((current) => {
+      const next = [...current];
+      let changed = false;
+      for (const artifact of artifacts) {
+        const tab: ResourceTab = {
+          path: artifact.path,
+          name: artifact.name,
+          type: artifact.image ? "image" : artifact.pdf ? "pdf" : "text",
+          mime: artifact.mime,
+          modifiedAt: artifact.modifiedAt,
+          dirty: false,
+          artifact: {
+            id: artifact.id,
+            sessionId: artifact.sessionId,
+          },
+        };
+        const existing = next.findIndex((resource) => resource.path === artifact.path);
+        if (existing >= 0) {
+          const previous = next[existing]!;
+          if (
+            previous.modifiedAt !== tab.modifiedAt
+            || previous.artifact?.id !== tab.artifact?.id
+            || previous.artifact?.sessionId !== tab.artifact?.sessionId
+          ) {
+            next[existing] = { ...previous, ...tab, dirty: previous.dirty };
+            changed = true;
+          }
+        } else {
+          next.push(tab);
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+
+    if (!discovered.length) return;
+    const focusedArtifact = discovered.findLast((artifact) => artifact.sessionId === focusedSession);
+    if (focusedArtifact) {
+      setActiveResource(focusedArtifact.path);
+      setMobileSidebar(false);
+      showNotice(`Artifact ready: ${focusedArtifact.name}`);
+    }
+  };
+
+  const checkForUpdates = async (notify = false) => {
+    setCheckingForUpdate(true);
+    try {
+      const status = await api.updateStatus();
+      setUpdateStatus(status);
+      if (notify) {
+        showNotice(
+          status.state === "available" && status.latest
+            ? `term-server v${status.latest.version} is available`
+            : status.state === "current"
+              ? "term-server is up to date"
+              : "Automatic updates are unavailable for this installation",
+        );
+      }
+    } catch (error) {
+      if (notify) {
+        showNotice(error instanceof Error ? error.message : "Unable to check for updates");
+      }
+    } finally {
+      setCheckingForUpdate(false);
+    }
+  };
+
+  const dismissAgentToast = (id: string) => {
+    const timer = agentToastTimers.current.get(id);
+    if (timer) clearTimeout(timer);
+    agentToastTimers.current.delete(id);
+    setAgentToasts((current) => current.filter((toast) => toast.id !== id));
+  };
+
+  const showAgentToast = (toast: AgentToast) => {
+    const existingTimer = agentToastTimers.current.get(toast.id);
+    if (existingTimer) clearTimeout(existingTimer);
+    setAgentToasts((current) => [...current.filter((item) => item.id !== toast.id), toast].slice(-3));
+    const timer = window.setTimeout(() => dismissAgentToast(toast.id), 7000);
+    agentToastTimers.current.set(toast.id, timer);
+  };
+
   const loadWorkspace = async () => {
     try {
-      const [nextConfig, nextTerminals] = await Promise.all([api.config(), api.terminals()]);
+      const [nextConfig, nextTerminals, artifacts] = await Promise.all([
+        api.config(),
+        api.terminals(),
+        api.artifacts(),
+      ]);
       const runningTerminals = nextTerminals.filter((terminal) => terminal.status === "running");
+      const focusedSession = activeIdRef.current
+        && runningTerminals.some((terminal) => terminal.id === activeIdRef.current)
+        ? activeIdRef.current
+        : runningTerminals[0]?.id;
       setConfig(nextConfig);
       setTerminals(runningTerminals);
       setWorkspaceLoaded(true);
@@ -141,6 +294,7 @@ export function App() {
           ? current
           : runningTerminals[0]?.id,
       );
+      syncArtifacts(artifacts, focusedSession);
       setAuthenticated(true);
     } catch (error) {
       if (error instanceof ApiError && error.status === 401) setAuthenticated(false);
@@ -159,6 +313,13 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    if (!authenticated || !config.updates.enabled) return;
+    void checkForUpdates();
+    const timer = window.setInterval(() => void checkForUpdates(), 6 * 60 * 60 * 1000);
+    return () => clearInterval(timer);
+  }, [authenticated, config.updates.enabled, config.updates.channel]);
+
+  useEffect(() => {
     document.documentElement.dataset.theme = theme;
     localStorage.setItem("term-server:theme", theme);
   }, [theme]);
@@ -166,6 +327,23 @@ export function App() {
   useEffect(() => {
     document.title = documentTitle(terminals);
   }, [terminals]);
+
+  useEffect(() => {
+    localStorage.setItem(NOTIFICATION_MODE_STORAGE_KEY, notificationMode);
+    localStorage.setItem(
+      LEGACY_NOTIFICATIONS_STORAGE_KEY,
+      String(includesSystemNotifications(notificationMode)),
+    );
+  }, [notificationMode]);
+
+  useEffect(() => {
+    const syncNotificationMode = (event: StorageEvent) => {
+      if (event.key !== NOTIFICATION_MODE_STORAGE_KEY) return;
+      setNotificationMode(parseNotificationMode(event.newValue, null));
+    };
+    window.addEventListener("storage", syncNotificationMode);
+    return () => window.removeEventListener("storage", syncNotificationMode);
+  }, []);
 
   useEffect(() => {
     localStorage.setItem(
@@ -197,13 +375,13 @@ export function App() {
   useEffect(() => {
     if (!authenticated) return;
     const refresh = () => {
-      void api
-        .terminals()
-        .then((next) => {
+      void Promise.all([api.terminals(), api.artifacts()])
+        .then(([next, artifacts]) => {
           const running = next.filter((terminal) => terminal.status === "running");
           setTerminals(running);
           const available = new Set(running.map((terminal) => terminal.id));
           setLayout((current) => pruneLayout(current, available));
+          syncArtifacts(artifacts);
         })
         .catch((error) => {
           if (error instanceof ApiError && error.status === 401) setAuthenticated(false);
@@ -230,25 +408,47 @@ export function App() {
     const deliver = (terminalId: string, event: number) => {
       const terminal = terminalsRef.current.find((candidate) => candidate.id === terminalId);
       if (!terminal?.agent || terminal.agent.statusChangedAt !== event) return;
-      deliveredAgentEvents.current.set(terminalId, event);
       const pending = pendingAgentNotifications.current.get(terminalId);
       if (pending) clearTimeout(pending.timer);
       pendingAgentNotifications.current.delete(terminalId);
-      if (!notificationsEnabled || typeof Notification === "undefined" || Notification.permission !== "granted") return;
       const body = terminal.agent.summary ?? (
         terminal.agent.status === "idle"
           ? `${terminal.agent.kind} is idle and ready for input in ${terminal.workspace}`
           : `${terminal.agent.kind} closed in ${terminal.workspace}`
       );
-      const notification = new Notification(terminal.name, {
+      const mode = notificationModeRef.current;
+      const toast = {
+        id: `${terminal.id}:${event}`,
+        terminalId: terminal.id,
+        title: terminal.name,
         body,
-        tag: `term-server:${terminal.id}:${event}`,
-      });
-      notification.onclick = () => {
-        window.focus();
-        openTerminal(terminal.id);
-        notification.close();
       };
+      const showFallback = () => {
+        if (!includesInAppNotifications(mode)) showAgentToast(toast);
+      };
+
+      if (includesInAppNotifications(mode)) showAgentToast(toast);
+      if (includesSystemNotifications(mode)) {
+        if (typeof Notification === "undefined" || Notification.permission !== "granted") {
+          showFallback();
+        } else {
+          try {
+            const notification = new Notification(terminal.name, {
+              body,
+              tag: `term-server:${terminal.id}:${event}`,
+            });
+            notification.onerror = showFallback;
+            notification.onclick = () => {
+              window.focus();
+              openTerminal(terminal.id);
+              notification.close();
+            };
+          } catch {
+            showFallback();
+          }
+        }
+      }
+      deliveredAgentEvents.current.set(terminalId, event);
     };
 
     const activeIds = new Set(terminals.map((terminal) => terminal.id));
@@ -279,10 +479,11 @@ export function App() {
         deliver(terminal.id, agent.statusChangedAt);
       }
     }
-  }, [authenticated, terminals, notificationsEnabled, config.pi.summariesEnabled]);
+  }, [authenticated, terminals, config.pi.summariesEnabled]);
 
   useEffect(() => () => {
     for (const pending of pendingAgentNotifications.current.values()) clearTimeout(pending.timer);
+    for (const timer of agentToastTimers.current.values()) clearTimeout(timer);
   }, []);
 
   useEffect(() => {
@@ -356,18 +557,19 @@ export function App() {
     if (
       !activeId
       || activeResource
+      || settingsActive
       || mobileSidebar
       || document.visibilityState !== "visible"
       || !document.hasFocus()
     ) return;
     markAgentViewed(activeId);
-  }, [activeId, activeResource, mobileSidebar, terminals]);
+  }, [activeId, activeResource, settingsActive, mobileSidebar, terminals]);
 
   useEffect(() => {
     const markActiveAgentViewed = () => {
       if (document.visibilityState !== "visible" || !document.hasFocus()) return;
       const id = activeId;
-      if (id && !activeResource && !mobileSidebar) markAgentViewed(id);
+      if (id && !activeResource && !settingsActive && !mobileSidebar) markAgentViewed(id);
     };
     window.addEventListener("focus", markActiveAgentViewed);
     document.addEventListener("visibilitychange", markActiveAgentViewed);
@@ -375,7 +577,7 @@ export function App() {
       window.removeEventListener("focus", markActiveAgentViewed);
       document.removeEventListener("visibilitychange", markActiveAgentViewed);
     };
-  }, [activeId, activeResource, mobileSidebar]);
+  }, [activeId, activeResource, settingsActive, mobileSidebar]);
 
   const openTerminal = (id: string, split = false) => {
     setLayout((current) => {
@@ -390,7 +592,20 @@ export function App() {
     });
     setActiveId(id);
     setActiveResource(undefined);
+    setSettingsActive(false);
     setMobileSidebar(false);
+  };
+
+  const openSettings = () => {
+    setSettingsOpen(true);
+    setSettingsActive(true);
+    setActiveResource(undefined);
+    setMobileSidebar(false);
+  };
+
+  const closeSettings = () => {
+    setSettingsOpen(false);
+    setSettingsActive(false);
   };
 
   const openResource = async (target: FileTarget, known?: FileEntry) => {
@@ -403,12 +618,14 @@ export function App() {
       const next: ResourceTab = {
         path: file.path,
         name: file.name,
-        type: file.image ? "image" : "text",
+        type: file.image ? "image" : file.pdf ? "pdf" : "text",
         mime: file.mime,
+        modifiedAt: file.modifiedAt,
         dirty: false,
       };
       setResources((current) => current.some((resource) => resource.path === file.path) ? current : [...current, next]);
       setActiveResource(file.path);
+      setSettingsActive(false);
       setMobileSidebar(false);
     } catch (error) {
       showNotice(error instanceof Error ? error.message : "Unable to open file");
@@ -446,6 +663,7 @@ export function App() {
     const nextIndex = (currentIndex + offset + paneIds.length) % paneIds.length;
     setActiveId(paneIds[nextIndex]);
     setActiveResource(undefined);
+    setSettingsActive(false);
   };
 
   const closeMobileSidebar = () => {
@@ -479,6 +697,7 @@ export function App() {
       ));
       setActiveId(created.id);
       setActiveResource(undefined);
+      setSettingsActive(false);
       setMobileSidebar(false);
     } catch (error) {
       showNotice(error instanceof Error ? error.message : "Unable to create terminal");
@@ -523,29 +742,70 @@ export function App() {
     }
   };
 
-  const updateNotifications = async (enabled: boolean) => {
-    if (!enabled) {
-      setNotificationsEnabled(false);
-      localStorage.setItem("term-server:notifications", "false");
-      return;
+  const updateNotificationMode = async (mode: NotificationMode) => {
+    if (includesSystemNotifications(mode)) {
+      if (typeof Notification === "undefined") {
+        setNotificationMode("in-app");
+        showNotice("System notifications are unavailable; using in-app notifications");
+        return;
+      }
+      const permission = Notification.permission === "default"
+        ? await Notification.requestPermission()
+        : Notification.permission;
+      if (permission !== "granted") {
+        setNotificationMode("in-app");
+        showNotice("System notification permission was not granted; using in-app notifications");
+        return;
+      }
     }
-    if (typeof Notification === "undefined") {
-      showNotice("This browser does not support notifications");
-      return;
-    }
-    const permission = Notification.permission === "default" ? await Notification.requestPermission() : Notification.permission;
-    if (permission !== "granted") {
-      showNotice("Browser notification permission was not granted");
-      return;
-    }
-    setNotificationsEnabled(true);
-    localStorage.setItem("term-server:notifications", "true");
-    showNotice("Agent completion notifications enabled");
+    setNotificationMode(mode);
+    showNotice(
+      mode === "off"
+        ? "Completion notifications disabled"
+        : `Completion notifications set to ${mode === "in-app" ? "in-app" : mode}`,
+    );
   };
 
   const updateTileNewTerminals = (enabled: boolean) => {
     setTileNewTerminals(enabled);
     localStorage.setItem(TILE_NEW_TERMINALS_STORAGE_KEY, String(enabled));
+  };
+
+  const waitForUpdatedServer = async (expectedCommit: string) => {
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+      await new Promise((resolve) => window.setTimeout(resolve, 500));
+      try {
+        const nextConfig = await api.config();
+        if (nextConfig.build.commit === expectedCommit) {
+          location.reload();
+          return;
+        }
+      } catch {
+        // The server is expected to be briefly unavailable while it restarts.
+      }
+    }
+    setRestartingForUpdate(undefined);
+    showNotice("The update was installed, but the server did not restart; restart term-server manually");
+  };
+
+  const installUpdate = async () => {
+    const release = updateStatus?.latest;
+    if (!release) return;
+    const dirtyWarning = resources.some((resource) => resource.dirty)
+      ? " You also have unsaved file edits."
+      : "";
+    if (!confirm(
+      `Update to term-server v${release.version}? The server will reconnect while running terminal sessions stay active.${dirtyWarning}`,
+    )) return;
+    setInstallingUpdate(true);
+    try {
+      const installed = await api.installUpdate(release.commit);
+      setRestartingForUpdate(installed);
+      void waitForUpdatedServer(installed.commit);
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : "Unable to install the update");
+      setInstallingUpdate(false);
+    }
   };
 
   const logout = async () => {
@@ -559,6 +819,10 @@ export function App() {
       setMountedIds([]);
       setResources([]);
       setActiveResource(undefined);
+      knownArtifactPaths.current.clear();
+      setUpdateStatus(null);
+      setSettingsOpen(false);
+      setSettingsActive(false);
     }
   };
 
@@ -586,11 +850,13 @@ export function App() {
             <Menu size={19} />
           </button>
           <span class="mobile-workspace-title">
-            {activeResource
+            {settingsActive
+              ? "Settings"
+              : activeResource
               ? resources.find((resource) => resource.path === activeResource)?.name
               : terminalById.get(activeId ?? "")?.name ?? "Terminal workspace"}
           </span>
-          {!activeResource && paneIds.length > 1 && (
+          {!activeResource && !settingsActive && paneIds.length > 1 && (
             <nav class="mobile-pane-navigation" aria-label="Visible terminal panes">
               <button onClick={() => focusAdjacentPane(-1)} aria-label="Previous terminal pane">
                 <ChevronLeft size={18} />
@@ -609,26 +875,16 @@ export function App() {
           attentionAgentIds={attentionAgentIds}
           mobileOpen={mobileSidebar}
           creating={creating}
-          theme={theme}
-          pi={config.pi}
-          passwordManagedExternally={config.passwordManagedExternally}
-          notificationsEnabled={notificationsEnabled}
-          tileNewTerminals={tileNewTerminals}
+          settingsActive={settingsActive}
+          updateAvailable={updateStatus?.state === "available"}
           fileRoot={terminalById.get(activeId ?? "")?.cwd ?? "~"}
           onMobileClose={closeMobileSidebar}
           onNew={(cwd) => void createTerminal(cwd)}
           onOpen={(id) => openTerminal(id)}
           onSplit={(id) => openTerminal(id, true)}
           onRename={(terminal) => void renameTerminal(terminal)}
-          onTheme={setTheme}
-          onPiChange={(titlesEnabled, summariesEnabled, model) => (
-            void updatePiConfig(titlesEnabled, summariesEnabled, model)
-          )}
-          onNotificationsChange={(enabled) => void updateNotifications(enabled)}
-          onTileNewTerminalsChange={updateTileNewTerminals}
-          onPasswordChanged={() => showNotice("Password changed; other sessions were signed out")}
+          onSettings={openSettings}
           onOpenFile={(entry) => void openResource({ path: entry.path }, entry)}
-          onLogout={() => void logout()}
           onDragStart={(id) => {
             setDraggedId(id);
             setDropTarget(undefined);
@@ -636,22 +892,32 @@ export function App() {
           onDragEnd={finishDrag}
         />
         <div
-          class={`workspace-area ${resources.length ? "with-resource-tabs" : ""}`}
+          class={`workspace-area ${resources.length || settingsOpen ? "with-resource-tabs" : ""}`}
           aria-hidden={mobileSidebar || undefined}
         >
-          {resources.length > 0 && (
+          {(resources.length > 0 || settingsOpen) && (
             <ResourceTabBar
               tabs={resources}
               activePath={activeResource}
-              onTerminal={() => setActiveResource(undefined)}
-              onActivate={setActiveResource}
+              settingsOpen={settingsOpen}
+              settingsActive={settingsActive}
+              onTerminal={() => {
+                setActiveResource(undefined);
+                setSettingsActive(false);
+              }}
+              onSettings={openSettings}
+              onCloseSettings={closeSettings}
+              onActivate={(path) => {
+                setActiveResource(path);
+                setSettingsActive(false);
+              }}
               onClose={closeResource}
             />
           )}
           <div class="workspace-stage">
             <main
-          class={`editor-grid ${draggedId ? "dragging-terminal" : ""} ${activeResource ? "resource-hidden" : ""}`}
-          aria-hidden={Boolean(activeResource)}
+          class={`editor-grid ${draggedId ? "dragging-terminal" : ""} ${activeResource || settingsActive ? "resource-hidden" : ""}`}
+          aria-hidden={Boolean(activeResource || settingsActive)}
           onDragOver={(event) => {
             if (draggedId && !visibleTerminals.length) event.preventDefault();
           }}
@@ -687,7 +953,7 @@ export function App() {
                     needsAttention={attentionAgentIds.has(terminal.id)}
                     config={config}
                     theme={theme}
-                    active={visible && terminal.id === activeId && !activeResource}
+                    active={visible && terminal.id === activeId && !activeResource && !settingsActive}
                     onActivate={() => setActiveId(terminal.id)}
                     onClose={() => closePane(terminal.id)}
                     onRemove={() => void removeTerminal(terminal)}
@@ -796,6 +1062,31 @@ export function App() {
                 />
               </Suspense>
             )}
+            {settingsOpen && (
+              <SettingsWorkspace
+                active={settingsActive}
+                theme={theme}
+                pi={config.pi}
+                build={config.build}
+                updateConfig={config.updates}
+                updateStatus={updateStatus}
+                checkingForUpdate={checkingForUpdate}
+                installingUpdate={installingUpdate}
+                passwordManagedExternally={config.passwordManagedExternally}
+                notificationMode={notificationMode}
+                tileNewTerminals={tileNewTerminals}
+                onTheme={setTheme}
+                onPiChange={(titlesEnabled, summariesEnabled, model) => (
+                  void updatePiConfig(titlesEnabled, summariesEnabled, model)
+                )}
+                onCheckForUpdate={() => void checkForUpdates(true)}
+                onInstallUpdate={() => void installUpdate()}
+                onNotificationModeChange={(mode) => void updateNotificationMode(mode)}
+                onTileNewTerminalsChange={updateTileNewTerminals}
+                onPasswordChanged={() => showNotice("Password changed; other sessions were signed out")}
+                onLogout={() => void logout()}
+              />
+            )}
           </div>
         </div>
       </div>
@@ -809,6 +1100,12 @@ export function App() {
           )}
         </span>
         <span class="statusbar-group statusbar-right">
+          <span
+            class="statusbar-item statusbar-build"
+            title={`term-server v${config.build.version} · ${config.build.commit}`}
+          >
+            v{config.build.version} · {config.build.commit.slice(0, 7)}
+          </span>
           <span class="statusbar-item">{visibleTerminals.length}/{config.maxPanes} panes</span>
           <span class="statusbar-item statusbar-scrollback">{config.scrollbackLines.toLocaleString()} line scrollback</span>
           <span class="statusbar-item" title={config.secure ? "HTTPS enabled" : "HTTPS disabled"}>
@@ -816,7 +1113,42 @@ export function App() {
           </span>
         </span>
       </footer>
-      {notice && <div class="toast" role="status">{notice}</div>}
+      {restartingForUpdate && (
+        <div class="update-restarting" role="status" aria-live="assertive">
+          <LoaderCircle class="spin" size={22} />
+          <strong>Installing term-server v{restartingForUpdate.version}</strong>
+          <span>Verified update installed. Terminals are still running while the server reconnects…</span>
+        </div>
+      )}
+      {(agentToasts.length > 0 || notice) && (
+        <div class="toast-stack" aria-live="polite">
+          {agentToasts.map((toast) => (
+            <div key={toast.id} class="toast agent-toast">
+              <button
+                class="agent-toast-main"
+                onClick={() => {
+                  openTerminal(toast.terminalId);
+                  dismissAgentToast(toast.id);
+                }}
+              >
+                <span class="agent-toast-icon"><Bell size={16} /></span>
+                <span class="agent-toast-copy">
+                  <b>{toast.title}</b>
+                  <span>{toast.body}</span>
+                </span>
+              </button>
+              <button
+                class="agent-toast-close"
+                onClick={() => dismissAgentToast(toast.id)}
+                aria-label={`Dismiss ${toast.title} notification`}
+              >
+                <X size={14} />
+              </button>
+            </div>
+          ))}
+          {notice && <div class="toast" role="status">{notice}</div>}
+        </div>
+      )}
     </div>
   );
 }

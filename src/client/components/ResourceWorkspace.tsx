@@ -4,7 +4,17 @@ import { Compartment, EditorState, StateEffect } from "@codemirror/state";
 import { LanguageDescription } from "@codemirror/language";
 import { languages } from "@codemirror/language-data";
 import { oneDark } from "@codemirror/theme-one-dark";
-import { FileCode2, Image, LoaderCircle, Save, WrapText } from "lucide-preact";
+import {
+  Copy,
+  Download,
+  FileCode2,
+  FileText,
+  Image,
+  LoaderCircle,
+  PackageOpen,
+  Save,
+  WrapText,
+} from "lucide-preact";
 import type { FileDocument } from "../../shared/types";
 import { api } from "../lib/api";
 import type { ThemeName } from "./TerminalPane";
@@ -38,6 +48,8 @@ export function ResourceDocuments({ tabs, activePath, theme, onDirty, onNotice }
         <div key={tab.path} class={`resource-document ${activePath === tab.path ? "active" : "cached"}`}>
           {tab.type === "image" ? (
             <ImageDocument tab={tab} />
+          ) : tab.type === "pdf" ? (
+            <PdfDocument tab={tab} />
           ) : (
             <TextDocument
               tab={tab}
@@ -58,21 +70,62 @@ export default ResourceDocuments;
 
 function ImageDocument({ tab }: { tab: ResourceTab }) {
   const [failed, setFailed] = useState(false);
+  const isArtifact = Boolean(tab.artifact);
+  const Icon = isArtifact ? PackageOpen : Image;
+  useEffect(() => setFailed(false), [tab.modifiedAt]);
   return (
-    <section class="image-document">
+    <section class={`image-document ${isArtifact ? "artifact-document" : ""}`}>
       <header class="resource-document-header">
-        <Image size={14} />
+        <Icon size={14} />
         <span>{tab.path}</span>
-        <em>{tab.mime}</em>
+        <em>{isArtifact ? "Artifact" : tab.mime}</em>
+        <DownloadAction tab={tab} />
       </header>
       <div class="image-canvas">
         {failed ? (
           <div class="resource-error">Unable to render this image.</div>
         ) : (
-          <img src={api.rawFileUrl({ path: tab.path })} alt={tab.name} onError={() => setFailed(true)} />
+          <img
+            src={`${api.previewFileUrl({ path: tab.path })}&version=${tab.modifiedAt}`}
+            alt={tab.name}
+            onError={() => setFailed(true)}
+          />
         )}
       </div>
     </section>
+  );
+}
+
+function PdfDocument({ tab }: { tab: ResourceTab }) {
+  return (
+    <section class="pdf-document">
+      <header class="resource-document-header">
+        <FileText size={14} />
+        <span>{tab.path}</span>
+        <em>{tab.mime}</em>
+        <DownloadAction tab={tab} />
+      </header>
+      <iframe
+        class="pdf-preview"
+        src={api.previewFileUrl({ path: tab.path })}
+        title={`PDF preview of ${tab.name}`}
+      />
+    </section>
+  );
+}
+
+function DownloadAction({ tab }: { tab: ResourceTab }) {
+  return (
+    <a
+      class="resource-editor-action resource-download"
+      href={api.downloadFileUrl({ path: tab.path })}
+      download={tab.name}
+      aria-label={`Download ${tab.name}`}
+      title={`Download ${tab.name}`}
+    >
+      <Download size={13} />
+      <span>Download</span>
+    </a>
   );
 }
 
@@ -105,8 +158,10 @@ function TextDocument({
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const isArtifact = Boolean(tab.artifact);
 
   useEffect(() => {
+    if (tab.dirty) return;
     let cancelled = false;
     setLoading(true);
     setError("");
@@ -125,7 +180,7 @@ function TextDocument({
     return () => {
       cancelled = true;
     };
-  }, [tab.path]);
+  }, [tab.path, tab.modifiedAt, tab.dirty]);
 
   const save = async () => {
     if (!document || saving) return;
@@ -152,6 +207,15 @@ function TextDocument({
   };
   saveCurrent.current = save;
 
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(content.current);
+      onNotice(`Copied ${tab.name}`);
+    } catch {
+      onNotice("Clipboard access was denied");
+    }
+  };
+
   useEffect(() => {
     if (!host.current || !document) return;
     const startContent = content.current;
@@ -166,10 +230,20 @@ function TextDocument({
           ...(theme === "dark" ? [oneDark] : []),
           lineWrappingConfig.current.of(lineWrapping ? EditorView.lineWrapping : []),
           EditorView.theme({
-            "&": { height: "100%", backgroundColor: "var(--editor)", color: "var(--foreground)" },
+            "&": {
+              height: "100%",
+              backgroundColor: isArtifact ? "var(--artifact-surface)" : "var(--editor)",
+              color: "var(--foreground)",
+            },
             ".cm-scroller": { fontFamily: "SFMono-Regular, Consolas, Liberation Mono, Menlo, monospace", fontSize: "12.5px", lineHeight: "1.48" },
-            ".cm-gutters": { backgroundColor: "var(--panel)", color: "var(--subtle)", borderRight: "1px solid var(--border)" },
-            ".cm-activeLine, .cm-activeLineGutter": { backgroundColor: "color-mix(in srgb, var(--accent) 6%, transparent)" },
+            ".cm-gutters": {
+              backgroundColor: isArtifact ? "var(--artifact-surface-raised)" : "var(--panel)",
+              color: "var(--subtle)",
+              borderRight: `1px solid ${isArtifact ? "color-mix(in srgb, var(--artifact) 35%, var(--border))" : "var(--border)"}`,
+            },
+            ".cm-activeLine, .cm-activeLineGutter": {
+              backgroundColor: `color-mix(in srgb, ${isArtifact ? "var(--artifact)" : "var(--accent)"} 7%, transparent)`,
+            },
           }),
           EditorView.updateListener.of((update) => {
             if (!update.docChanged) return;
@@ -200,7 +274,7 @@ function TextDocument({
       view.destroy();
       if (editor.current === view) editor.current = undefined;
     };
-  }, [document?.path, tab.name, tab.path, theme]);
+  }, [document?.path, tab.name, tab.path, isArtifact, theme]);
 
   useEffect(() => {
     editor.current?.dispatch({
@@ -209,11 +283,22 @@ function TextDocument({
   }, [lineWrapping]);
 
   return (
-    <section class="text-document">
+    <section class={`text-document ${isArtifact ? "artifact-document" : ""}`}>
       <header class="resource-document-header">
-        <FileCode2 size={14} />
+        {isArtifact ? <PackageOpen size={14} /> : <FileCode2 size={14} />}
         <span>{tab.path}</span>
-        <em>{language}</em>
+        <em>{isArtifact ? `Artifact · ${language}` : language}</em>
+        <DownloadAction tab={tab} />
+        <button
+          class="resource-editor-action resource-copy"
+          onClick={() => void copy()}
+          disabled={loading}
+          aria-label={`Copy ${tab.name}`}
+          title={`Copy ${tab.name}`}
+        >
+          <Copy size={13} />
+          <span>Copy</span>
+        </button>
         <button
           class={`resource-editor-action resource-wrap ${lineWrapping ? "active" : ""}`}
           onClick={onToggleLineWrapping}

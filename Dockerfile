@@ -9,9 +9,12 @@ RUN npm run build:client
 
 FROM rust:1.93-bookworm AS backend
 WORKDIR /build
+ARG TERM_SERVER_BUILD_COMMIT=unknown
 COPY Cargo.toml Cargo.lock ./
+COPY build.rs ./
 COPY src ./src
-RUN cargo build --release --locked
+COPY release ./release
+RUN TERM_SERVER_BUILD_COMMIT="$TERM_SERVER_BUILD_COMMIT" cargo build --release --locked
 
 FROM debian:bookworm-slim
 RUN apt-get update \

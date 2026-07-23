@@ -6,6 +6,9 @@ channel="${TERM_SERVER_CHANNEL:-main}"
 bin_dir="${TERM_SERVER_BIN_DIR:-${HOME:?HOME is required}/.local/bin}"
 install_root="${TERM_SERVER_INSTALL_DIR:-$HOME/.local/lib/term-server}"
 client_dir="$install_root/client"
+skills_dir="$install_root/skills"
+codex_home="${CODEX_HOME:-$HOME/.codex}"
+codex_skill="$codex_home/skills/term-server-artifacts"
 
 case "$bin_dir:$install_root" in
   /*:/*) ;;
@@ -58,9 +61,28 @@ download() {
   fi
 }
 
+if ! command -v openssl >/dev/null 2>&1; then
+  echo "openssl is required to verify the release signature" >&2
+  exit 1
+fi
+
 echo "Downloading term-server ${channel} for Linux ${architecture}..."
 download "$release_base/$archive" "$temporary/$archive"
 download "$release_base/SHA256SUMS" "$temporary/SHA256SUMS"
+download "$release_base/SHA256SUMS.sig" "$temporary/SHA256SUMS.sig"
+
+cat > "$temporary/release-public-key.pem" <<'EOF'
+-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAbF71WJF0crKIprqulVKqQDc/i9k036TCa4NMw6/9vT4=
+-----END PUBLIC KEY-----
+EOF
+if ! openssl pkeyutl -verify -pubin -rawin \
+  -inkey "$temporary/release-public-key.pem" \
+  -in "$temporary/SHA256SUMS" \
+  -sigfile "$temporary/SHA256SUMS.sig" >/dev/null 2>&1; then
+  echo "release signature verification failed" >&2
+  exit 1
+fi
 
 expected="$(awk -v name="$archive" '$2 == name { print $1; exit }' "$temporary/SHA256SUMS")"
 if [ -z "$expected" ]; then
@@ -89,7 +111,10 @@ fi
 
 tar -xzf "$temporary/$archive" -C "$temporary"
 package_dir="$temporary/term-server-linux-${architecture}"
-if [ ! -x "$package_dir/term-server" ] || [ ! -f "$package_dir/client/index.html" ]; then
+if [ ! -x "$package_dir/term-server" ] ||
+  [ ! -f "$package_dir/client/index.html" ] ||
+  [ ! -f "$package_dir/skills/term-server-artifacts/SKILL.md" ] ||
+  [ ! -x "$package_dir/skills/term-server-artifacts/scripts/create_artifact.py" ]; then
   echo "release archive is incomplete" >&2
   exit 1
 fi
@@ -98,10 +123,13 @@ install -d "$bin_dir" "$install_root"
 binary_next="$install_root/.term-server.new.$$"
 client_next="$install_root/.client.new.$$"
 client_previous="$install_root/.client.previous.$$"
+skills_next="$install_root/.skills.new.$$"
+skills_previous="$install_root/.skills.previous.$$"
 link_next="$bin_dir/.term-server.link.$$"
 
 install -m 0755 "$package_dir/term-server" "$binary_next"
 cp -R "$package_dir/client" "$client_next"
+cp -R "$package_dir/skills" "$skills_next"
 
 if [ -e "$client_dir" ]; then
   mv "$client_dir" "$client_previous"
@@ -113,13 +141,40 @@ if ! mv "$client_next" "$client_dir"; then
   exit 1
 fi
 mv "$binary_next" "$install_root/term-server"
+if [ -e "$skills_dir" ]; then
+  mv "$skills_dir" "$skills_previous"
+fi
+if ! mv "$skills_next" "$skills_dir"; then
+  if [ -e "$skills_previous" ]; then
+    mv "$skills_previous" "$skills_dir"
+  fi
+  exit 1
+fi
 ln -s "$install_root/term-server" "$link_next"
 if [ -d "$bin_dir/term-server" ] && [ ! -L "$bin_dir/term-server" ]; then
   echo "$bin_dir/term-server is a directory; refusing to replace it" >&2
   exit 1
 fi
 mv "$link_next" "$bin_dir/term-server"
-rm -rf -- "$client_previous"
+rm -rf -- "$client_previous" "$skills_previous"
+
+case "$codex_home" in
+  /*)
+    install -d "$codex_home/skills"
+    if [ ! -e "$codex_skill" ] && [ ! -L "$codex_skill" ]; then
+      ln -s "$skills_dir/term-server-artifacts" "$codex_skill"
+      echo "Installed Codex skill: $codex_skill"
+    elif [ -L "$codex_skill" ] &&
+      [ "$(readlink "$codex_skill")" = "$skills_dir/term-server-artifacts" ]; then
+      echo "Updated Codex skill: $codex_skill"
+    else
+      echo "Codex skill already exists; bundled skill is available at $skills_dir/term-server-artifacts"
+    fi
+    ;;
+  *)
+    echo "CODEX_HOME is not absolute; bundled skill is available at $skills_dir/term-server-artifacts"
+    ;;
+esac
 
 "$bin_dir/term-server" --version
 echo "Installed binary: $bin_dir/term-server"

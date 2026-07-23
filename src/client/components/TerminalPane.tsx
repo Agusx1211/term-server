@@ -34,6 +34,12 @@ import type {
 import { configureTerminalDrag } from "../lib/layout";
 import { api } from "../lib/api";
 import { createHoverPreviewController, findFileLinks, imagePreviewPosition } from "../lib/file-links";
+import {
+  installTerminalTouchScroll,
+  NO_TERMINAL_MODIFIERS,
+  transformTerminalInput,
+  type TerminalModifiers,
+} from "../lib/mobile-terminal";
 import { ProcessInspector } from "./ProcessInspector";
 import { WorkingDuration } from "./WorkingDuration";
 
@@ -188,6 +194,7 @@ export function TerminalPane({
   const reconnectTimer = useRef<number>();
   const terminalState = useRef(terminal);
   const openFile = useRef(onOpenFile);
+  const modifiers = useRef<TerminalModifiers>(NO_TERMINAL_MODIFIERS);
   terminalState.current = terminal;
   openFile.current = onOpenFile;
   const [processesOpen, setProcessesOpen] = useState(false);
@@ -195,11 +202,18 @@ export function TerminalPane({
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState({ index: -1, count: 0 });
+  const [mobileModifiers, setMobileModifiers] = useState(NO_TERMINAL_MODIFIERS);
+  const [scrolledBack, setScrolledBack] = useState(false);
   const [imagePreview, setImagePreview] = useState<{ file: FileEntry; left: number; top: number }>();
   const [terminalSize, setTerminalSize] = useState({ focused: false, controller: false });
   const [connection, setConnection] = useState<"connecting" | "connected" | "disconnected" | "exited">(
     terminal.status === "exited" ? "exited" : "connecting",
   );
+
+  const updateMobileModifiers = (next: TerminalModifiers) => {
+    modifiers.current = next;
+    setMobileModifiers(next);
+  };
 
   useEffect(() => {
     if (!container.current) return;
@@ -315,7 +329,20 @@ export function TerminalPane({
       });
     };
 
-    term.onData((data) => send({ type: "input", data }));
+    const dataDisposable = term.onData((data) => {
+      const currentModifiers = modifiers.current;
+      send({ type: "input", data: transformTerminalInput(data, currentModifiers) });
+      if (currentModifiers.alt || currentModifiers.ctrl) {
+        updateMobileModifiers(NO_TERMINAL_MODIFIERS);
+      }
+    });
+    const scrollDisposable = term.onScroll((position) => {
+      setScrolledBack(position < term.buffer.active.baseY);
+    });
+    const disposeTouchScroll = installTerminalTouchScroll(container.current, term, () => {
+      const screen = container.current?.querySelector<HTMLElement>(".xterm-screen");
+      return screen && term.rows ? screen.getBoundingClientRect().height / term.rows : 15;
+    });
     term.attachCustomKeyEventHandler((event) => {
       const modifier = event.ctrlKey || event.metaKey;
       if (modifier && event.shiftKey && event.code === "KeyC" && event.type === "keydown") {
@@ -399,6 +426,9 @@ export function TerminalPane({
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
       observer.disconnect();
       imagePreviews.clear();
+      disposeTouchScroll();
+      dataDisposable.dispose();
+      scrollDisposable.dispose();
       fileLinksDisposable.dispose();
       searchResultsDisposable.dispose();
       socket.current?.close(1000, "Pane closed");
@@ -546,6 +576,18 @@ export function TerminalPane({
     : terminalSize.focused
       ? "Use this device's size instead"
       : "Focus this terminal at this device's size";
+  const toggleModifier = (modifier: keyof TerminalModifiers) => {
+    updateMobileModifiers({
+      ...modifiers.current,
+      [modifier]: !modifiers.current[modifier],
+    });
+    xterm.current?.focus();
+  };
+  const inputKey = (data: string) => {
+    xterm.current?.input(data, true);
+    xterm.current?.focus();
+  };
+  const keepTerminalFocused = (event: PointerEvent) => event.preventDefault();
 
   return (
     <section
@@ -661,6 +703,50 @@ export function TerminalPane({
           else void paste();
         }}
       />
+      <nav
+        class="terminal-keybar"
+        aria-label="Terminal keyboard shortcuts"
+        onPointerDown={(event) => {
+          if ((event.target as HTMLElement).closest("button")) keepTerminalFocused(event);
+        }}
+      >
+        <button
+          class={mobileModifiers.ctrl ? "active" : ""}
+          aria-pressed={mobileModifiers.ctrl}
+          onClick={() => toggleModifier("ctrl")}
+        >
+          Ctrl
+        </button>
+        <button
+          class={mobileModifiers.alt ? "active" : ""}
+          aria-pressed={mobileModifiers.alt}
+          onClick={() => toggleModifier("alt")}
+        >
+          Alt
+        </button>
+        <button onClick={() => inputKey("\u001b")}>Esc</button>
+        <button onClick={() => inputKey("\t")}>Tab</button>
+        <span class="terminal-keybar-divider" aria-hidden="true" />
+        <button onClick={() => inputKey("\u001b[D")} aria-label="Left arrow">←</button>
+        <button onClick={() => inputKey("\u001b[A")} aria-label="Up arrow">↑</button>
+        <button onClick={() => inputKey("\u001b[B")} aria-label="Down arrow">↓</button>
+        <button onClick={() => inputKey("\u001b[C")} aria-label="Right arrow">→</button>
+        <span class="terminal-keybar-divider" aria-hidden="true" />
+        <button onClick={() => inputKey("\u001b[5~")}>PgUp</button>
+        <button onClick={() => inputKey("\u001b[6~")}>PgDn</button>
+      </nav>
+      {scrolledBack && (
+        <button
+          class="terminal-scroll-latest"
+          onPointerDown={keepTerminalFocused}
+          onClick={() => {
+            xterm.current?.scrollToBottom();
+            xterm.current?.focus();
+          }}
+        >
+          <ChevronDown size={14} /> Latest
+        </button>
+      )}
       {searchOpen && (
         <div class="terminal-search" role="search" onPointerDown={(event) => event.stopPropagation()}>
           <Search size={13} aria-hidden="true" />
@@ -710,7 +796,7 @@ export function TerminalPane({
             <span>{imagePreview.file.name}</span>
             <small>Ctrl+click to open</small>
           </header>
-          <img src={api.rawFileUrl({ path: imagePreview.file.path })} alt={imagePreview.file.name} />
+          <img src={api.previewFileUrl({ path: imagePreview.file.path })} alt={imagePreview.file.name} />
         </div>
       )}
       {processesOpen && <ProcessInspector terminalId={terminal.id} onClose={() => setProcessesOpen(false)} />}

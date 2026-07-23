@@ -39,7 +39,7 @@ export default function (pi: ExtensionAPI) {
 }
 "#;
 
-#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PiSettings {
     pub titles_enabled: bool,
@@ -72,7 +72,7 @@ impl From<StoredPiSettings> for PiSettings {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdatePiSettings {
     #[serde(default)]
@@ -85,13 +85,13 @@ pub struct UpdatePiSettings {
     pub model: String,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PiModel {
     pub id: String,
     pub label: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PiClientConfig {
     pub available: bool,
