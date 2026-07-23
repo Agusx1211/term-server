@@ -266,9 +266,9 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
 .resource-document-header { min-width: 0; display: flex; align-items: center; gap: 7px; padding: 0 7px 0 10px; border-bottom: 1px solid var(--border); background: var(--panel); color: var(--muted); font-size: 10px; }
 .resource-document-header > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .resource-document-header > em { margin-left: auto; flex: none; color: var(--subtle); font-size: 8.5px; font-style: normal; text-transform: uppercase; }
-.resource-save { height: 23px; flex: none; display: flex; align-items: center; gap: 5px; margin-left: 5px; padding: 0 7px; border: 1px solid var(--border); border-radius: 3px; background: var(--input); color: var(--foreground); font-size: 9.5px; cursor: pointer; }
-.resource-save:hover:not(:disabled) { border-color: var(--border-strong); background: var(--hover); }
-.resource-save:disabled { opacity: .45; cursor: default; }
+.resource-editor-action { height: 23px; flex: none; display: flex; align-items: center; gap: 5px; padding: 0 7px; border: 1px solid var(--border); border-radius: 3px; background: var(--input); color: var(--foreground); font-size: 9.5px; cursor: pointer; }
+.resource-editor-action:hover:not(:disabled), .resource-editor-action.active { border-color: var(--border-strong); background: var(--hover); }
+.resource-editor-action:disabled { opacity: .45; cursor: default; }
 .resource-error { padding: 7px 10px; border-bottom: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border)); background: color-mix(in srgb, var(--danger) 8%, var(--panel)); color: var(--danger); font-size: 10px; }
 .resource-loading { min-height: 0; display: flex; align-items: center; justify-content: center; gap: 7px; color: var(--muted); }
 .code-editor { min-width: 0; min-height: 0; overflow: hidden; }
@@ -611,7 +611,10 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
   .text-document, .image-document { grid-template-rows: 44px minmax(0, 1fr); }
   .resource-document-header { padding: 0 6px 0 10px; }
   .resource-document-header > em { display: none; }
-  .resource-save { min-width: 72px; height: 36px; justify-content: center; font-size: 11px; }
+  .resource-editor-action { height: 36px; justify-content: center; font-size: 11px; }
+  .resource-wrap { width: 36px; padding: 0; }
+  .resource-wrap > span { display: none; }
+  .resource-save { min-width: 72px; }
   .code-editor .cm-scroller { font-size: 16px !important; }
   .image-canvas { padding: 12px; }
 
