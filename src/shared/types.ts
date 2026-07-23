@@ -60,6 +60,29 @@ export interface ClientConfig {
   hostname: string;
   passwordManagedExternally: boolean;
   pi: PiConfig;
+  build: BuildInfo;
+  updates: UpdateConfig;
+}
+
+export interface BuildInfo {
+  version: string;
+  commit: string;
+}
+
+export interface UpdateConfig {
+  enabled: boolean;
+  channel: string;
+  reason: string | null;
+}
+
+export interface ReleaseInfo extends BuildInfo {
+  publishedAt: string;
+}
+
+export interface UpdateStatus {
+  current: BuildInfo;
+  state: "current" | "available" | "unavailable";
+  latest: ReleaseInfo | null;
 }
 
 export interface PiModel {
@@ -93,7 +116,13 @@ export interface FileEntry {
   modifiedAt: number;
   mime: string;
   image: boolean;
+  pdf: boolean;
   editable: boolean;
+}
+
+export interface ArtifactEntry extends FileEntry {
+  id: string;
+  sessionId: string;
 }
 
 export interface DirectoryListing {

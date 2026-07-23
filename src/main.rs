@@ -1,24 +1,39 @@
-use std::{env, net::SocketAddr, sync::Arc, time::Duration};
+use std::{env, ffi::OsString, net::SocketAddr, path::Path, process::Command, sync::Arc};
 
 use axum_server::Handle;
 use clap::Parser;
+#[cfg(unix)]
+use term_server::broker::{BrokerClient, run_session_broker};
+#[cfg(not(unix))]
+use term_server::{ai::PiService, terminal::TerminalManager};
 use term_server::{
-    ai::PiService,
-    api::{AppState, build_router},
+    api::{AppState, ServerControl, build_router},
     auth::{LoginLimiter, load_auth},
     config::Cli,
-    terminal::TerminalManager,
     tls::load_tls,
+    update::UpdateService,
+    workspace::WorkspaceBackend,
 };
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    let executable = env::current_exe()?;
+    let restart_arguments = env::args_os().skip(1).collect::<Vec<_>>();
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_new(&cli.log)?)
         .compact()
         .init();
+
+    if cli.session_broker {
+        #[cfg(unix)]
+        {
+            return run_session_broker(&cli.data_dir, cli.shell.clone(), cli.replay_bytes()).await;
+        }
+        #[cfg(not(unix))]
+        return Err("the terminal session broker requires Unix sockets".into());
+    }
 
     let client_directory = if cli.no_client {
         None
@@ -43,9 +58,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     let tls = load_tls(&cli).await?;
     let address = cli.socket_addr()?;
-    let terminals = Arc::new(TerminalManager::new(cli.shell.clone(), cli.replay_bytes()));
-    let pi = Arc::new(PiService::new(&cli.data_dir));
-    terminals.start_monitor(pi.clone());
+    let workspace = load_workspace(&cli, &executable).await?;
+    let updates = Arc::new(UpdateService::new(
+        client_directory.as_deref(),
+        cli.update_channel.clone(),
+        cli.release_base_url.clone(),
+        cli.disable_updates,
+    ));
+    let handle = Handle::new();
+    let server_control = ServerControl::new(handle.clone());
     let hostname = env::var("HOSTNAME")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -55,8 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "unknown".to_owned());
     let state = AppState {
         auth: loaded_auth.service,
-        terminals: terminals.clone(),
-        pi,
+        workspace: workspace.clone(),
         login_limiter: Arc::new(LoginLimiter::default()),
         allowed_origins: cli.allowed_origins.clone().into(),
         secure: cli.is_https(),
@@ -64,10 +84,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         scrollback_lines: cli.scrollback_lines,
         max_panes: cli.max_panes,
         hostname,
+        updates,
+        server_control: server_control.clone(),
     };
     let app = build_router(state, client_directory);
-    let handle = Handle::new();
-    tokio::spawn(shutdown_signal(handle.clone(), terminals));
+    tokio::spawn(shutdown_signal(server_control.clone()));
 
     let scheme = if cli.is_https() { "https" } else { "http" };
     tracing::info!(url = %format!("{scheme}://{address}"), "term-server is ready");
@@ -79,21 +100,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let service = app.into_make_service_with_connect_info::<SocketAddr>();
-    if let Some(tls) = tls {
+    let serve_result = if let Some(tls) = tls {
         axum_server::bind_rustls(address, tls)
             .handle(handle)
             .serve(service)
-            .await?;
+            .await
     } else {
         axum_server::bind(address)
             .handle(handle)
             .serve(service)
-            .await?;
+            .await
+    };
+    let restarting = server_control.restart_requested() && serve_result.is_ok();
+    if !restarting {
+        tracing::info!("shutting down terminal sessions");
+        workspace.shutdown().await;
+    }
+    serve_result?;
+    if restarting {
+        restart_process(&executable, &restart_arguments)?;
     }
     Ok(())
 }
 
-async fn shutdown_signal(handle: Handle<SocketAddr>, terminals: Arc<TerminalManager>) {
+#[cfg(unix)]
+async fn load_workspace(
+    cli: &Cli,
+    executable: &Path,
+) -> Result<WorkspaceBackend, Box<dyn std::error::Error>> {
+    Ok(WorkspaceBackend::broker(
+        BrokerClient::connect_or_start(cli, executable).await?,
+    ))
+}
+
+#[cfg(not(unix))]
+async fn load_workspace(
+    cli: &Cli,
+    _executable: &Path,
+) -> Result<WorkspaceBackend, Box<dyn std::error::Error>> {
+    let terminals = Arc::new(TerminalManager::new(cli.shell.clone(), cli.replay_bytes()));
+    let pi = Arc::new(PiService::new(&cli.data_dir));
+    terminals.start_monitor(pi.clone());
+    Ok(WorkspaceBackend::local(terminals, pi))
+}
+
+async fn shutdown_signal(server_control: ServerControl) {
     #[cfg(unix)]
     {
         let mut terminate =
@@ -107,7 +158,23 @@ async fn shutdown_signal(handle: Handle<SocketAddr>, terminals: Arc<TerminalMana
     #[cfg(not(unix))]
     let _ = tokio::signal::ctrl_c().await;
 
-    tracing::info!("shutting down terminal sessions");
-    terminals.shutdown();
-    handle.graceful_shutdown(Some(Duration::from_secs(5)));
+    tracing::info!("shutting down web server");
+    server_control.shutdown(false);
+}
+
+#[cfg(unix)]
+fn restart_process(executable: &Path, arguments: &[OsString]) -> std::io::Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    tracing::info!("restarting into the installed update");
+    let error = Command::new(executable).args(arguments).exec();
+    Err(error)
+}
+
+#[cfg(not(unix))]
+fn restart_process(_executable: &Path, _arguments: &[OsString]) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "automatic restart is unsupported on this platform",
+    ))
 }

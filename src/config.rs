@@ -39,7 +39,13 @@ fn default_client_dir() -> PathBuf {
 }
 
 #[derive(Debug, Clone, Parser)]
-#[command(name = "term-server", version, about, long_about = None)]
+#[command(
+    name = "term-server",
+    version,
+    long_version = crate::build::LONG_VERSION,
+    about,
+    long_about = None
+)]
 pub struct Cli {
     /// Address to listen on.
     #[arg(long, env = "TERM_SERVER_HOST", default_value = "127.0.0.1")]
@@ -113,6 +119,31 @@ pub struct Cli {
     #[arg(long, hide = true)]
     pub no_client: bool,
 
+    /// Run the private terminal session broker.
+    #[arg(long, hide = true)]
+    pub session_broker: bool,
+
+    /// Disable signed update checks and installation.
+    #[arg(long, env = "TERM_SERVER_DISABLE_UPDATES", action = ArgAction::SetTrue)]
+    pub disable_updates: bool,
+
+    /// Signed release channel to follow.
+    #[arg(
+        long,
+        env = "TERM_SERVER_UPDATE_CHANNEL",
+        default_value = "main",
+        value_parser = valid_update_channel
+    )]
+    pub update_channel: String,
+
+    /// Base URL containing signed release channels.
+    #[arg(
+        long,
+        env = "TERM_SERVER_RELEASE_BASE_URL",
+        default_value = "https://github.com/Agusx1211/term-server/releases/download"
+    )]
+    pub release_base_url: String,
+
     /// Logging filter, for example info or term_server=debug.
     #[arg(
         long,
@@ -145,6 +176,17 @@ impl Cli {
 
 use std::net::ToSocketAddrs;
 
+fn valid_update_channel(value: &str) -> Result<String, String> {
+    if crate::update::valid_channel(value) {
+        Ok(value.to_owned())
+    } else {
+        Err(
+            "update channel may contain only letters, numbers, dots, underscores, and dashes"
+                .into(),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,6 +199,8 @@ mod tests {
         assert!(cli.is_https());
         assert!(cli.tls_hostnames.is_empty());
         assert_eq!(cli.scrollback_lines, 200_000);
+        assert_eq!(cli.update_channel, "main");
+        assert!(!cli.disable_updates);
     }
 
     #[test]

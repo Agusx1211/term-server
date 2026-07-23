@@ -1,6 +1,9 @@
 services:
   term-server:
-    build: .
+    build:
+      context: .
+      args:
+        TERM_SERVER_BUILD_COMMIT: ${TERM_SERVER_BUILD_COMMIT:-unknown}
     restart: unless-stopped
     ports:
       - "127.0.0.1:8090:8090"

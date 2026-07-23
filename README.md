@@ -12,13 +12,13 @@
 
 ![term-server workspace with three live terminal panes](docs/screenshots/hero.png)
 
-term-server is a small Rust daemon that keeps native PTYs alive and makes them available through a focused web interface. Terminals automatically follow their live working directories, so the sidebar becomes a workspace tree without any manual project setup. Split panes, reconnect history, a lightweight file editor, and a Linux process inspector are available when you need them; the product still feels like a terminal, not a browser IDE.
+term-server is a small Rust service that keeps native PTYs alive and makes them available through a focused web interface. A private session broker owns the PTYs, while the HTTPS process can restart and reconnect to them. Terminals automatically follow their live working directories, so the sidebar becomes a workspace tree without any manual project setup. Split panes, reconnect history, a lightweight file editor, and a Linux process inspector are available when you need them; the product still feels like a terminal, not a browser IDE.
 
-Sessions remain attached when a browser reloads or disconnects. They intentionally end when the term-server daemon stops.
+Sessions remain attached when a browser reloads, disconnects, or the HTTPS process applies a signed update. They intentionally end when the term-server service is explicitly stopped.
 
 ## Install the latest build from `main`
 
-Prebuilt Linux artifacts are available for x86-64 and ARM64. The installer detects the current architecture, downloads the rolling `main` release, verifies its SHA-256 checksum, and installs the binary and browser client for the current user.
+Prebuilt Linux artifacts are available for x86-64 and ARM64. The installer detects the current architecture, downloads the rolling `main` release, verifies the Ed25519 signature on its checksum list, verifies the selected archive's SHA-256 checksum, and installs the binary and browser client for the current user. `openssl` is required for signature verification.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Agusx1211/term-server/main/install.sh | sh
@@ -35,6 +35,12 @@ sh install.sh
 
 `main` is a moving development channel. Pin a versioned release instead when stable releases become available.
 
+Installed releases check their configured channel for signed updates after login and every six hours. When an update is available, the sidebar and **Settings → Updates** show an **Update** action. Updating verifies the signed release manifest, target architecture, archive size and SHA-256 checksum, and the new binary's embedded version and source commit before replacing any files. The HTTPS process then restarts itself and reconnects to the private session broker, so active terminals and their replay buffers remain available.
+
+The broker is a hidden mode of the same executable. It listens on `session-broker.sock` inside the data directory with user-only permissions and accepts no network connections. An explicit service stop also stops the broker and its terminals; an in-process signed update leaves it running. The broker protocol is versioned so future web processes can reject an incompatible handoff instead of silently corrupting a session.
+
+Automatic installation is intentionally disabled for source builds, containers, and system packages whose binary and `client/` directory are not writable siblings. Those builds still expose their version and commit through `term-server --version`, the status bar, and the authenticated configuration API.
+
 On first boot, open `https://127.0.0.1:8090`. term-server prints a random password once and stores only its Argon2 hash. The browser will warn about the locally generated certificate; trust it, provide your own certificate, or terminate TLS at a reverse proxy.
 
 ## What it includes
@@ -43,11 +49,12 @@ On first boot, open `https://127.0.0.1:8090`. term-server prints a random passwo
 - **Phone and tablet support:** touch-sized navigation, a workspace drawer, focused pane switching, safe-area-aware layouts, and terminal actions that do not depend on hover or hardware-keyboard shortcuts.
 - **Directory-aware organization:** terminals move between collapsible workspaces as their shell changes directory. Workspace colors, names, filters, and sidebar sizing stay stable across reconnects.
 - **Resilient sessions:** bounded server-side replay, slow-client protection, coherent WebSocket reconnects, browser renderer caching, and a separate pane layout in each browser tab. A closed pane detaches the view without killing its process.
-- **Files when needed:** searchable explorer, local image previews, and a lazy-loaded CodeMirror editor with syntax highlighting, atomic saves, and stale-file conflict detection.
+- **Files when needed:** searchable explorer, local image and PDF previews, direct downloads, and a lazy-loaded CodeMirror editor with syntax highlighting, atomic saves, and stale-file conflict detection.
+- **Editable agent artifacts:** multiline messages, comments, prompts, and snippets can arrive as session-scoped tabs that are easy to inspect, copy, change, save, and revisit with the agent.
 - **Process visibility:** a lightweight Linux `/proc` sampler shows the live descendant process tree and foreground job with secret-aware command-line redaction. It does not capture command input or output or retain exited processes.
-- **Agent awareness:** Codex, Claude, and Pi sessions show working, idle, and closed states. An unseen return to idle gets a distinct bell until you focus that terminal. Optional browser notifications focus the relevant terminal when work completes.
+- **Agent awareness:** Codex, Claude, and Pi sessions show working, idle, and closed states. An unseen return to idle gets a distinct bell until you focus that terminal. Completion alerts can appear in-app, as desktop notifications, in both places, or remain off.
 - **Secure defaults:** loopback binding, HTTPS, Argon2 password hashing, signed HTTP-only SameSite cookies, origin enforcement, CSP, HSTS, login throttling, and bounded memory use.
-- **Deployment choices:** one native daemon plus static browser assets, with Docker Compose and a systemd user service included.
+- **Deployment choices:** one native executable plus static browser assets, with Docker Compose and a systemd user service included.
 
 ## A closer look
 
@@ -93,6 +100,29 @@ Useful shortcuts:
 
 Filesystem access has the same operating-system permissions as the daemon. Anyone who can sign in can also open a shell, so treat access as equivalent to SSH access for that user.
 
+### Agent artifacts
+
+The release installer makes the bundled `term-server-artifacts` Codex skill available in
+`${CODEX_HOME:-~/.codex}/skills`. When an agent uses it from a term-server terminal, its helper
+creates a private file under `/tmp/artifacts/<session>/<artifact-id>/` and prints both the full
+`file://` URI and absolute path. Term-server discovers the file and opens it as an artifact tab;
+the same path remains usable with normal tools such as `cat` in any other terminal.
+
+![Editable session artifact opened in term-server](docs/screenshots/session-artifact.jpg)
+
+Artifact tabs reuse the file editor, including conflict-safe saves, line wrapping, syntax
+highlighting, and one-click copy. Edits are visible to the agent at the same path on later turns.
+Artifacts are temporary: the operating system may clear `/tmp`, and they are not added to a
+project or committed automatically.
+
+For a source checkout, install the skill by linking it into Codex:
+
+```bash
+mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
+ln -s "$PWD/skills/term-server-artifacts" \
+  "${CODEX_HOME:-$HOME/.codex}/skills/term-server-artifacts"
+```
+
 ## Configuration
 
 Run `term-server --help` for generated CLI help. CLI flags take precedence over environment variables.
@@ -114,6 +144,9 @@ Run `term-server --help` for generated CLI help. CLI flags take precedence over 
 | `--scrollback-lines` | `TERM_SERVER_SCROLLBACK_LINES` | `200000` | Browser scrollback per pane |
 | `--max-panes` | `TERM_SERVER_MAX_PANES` | `4` | Visible pane limit, 1–8 |
 | `--client-dir` | `TERM_SERVER_CLIENT_DIR` | auto-detected | Compiled browser application |
+| `--disable-updates` | `TERM_SERVER_DISABLE_UPDATES` | off | Disable signed update checks and installation |
+| `--update-channel` | `TERM_SERVER_UPDATE_CHANNEL` | `main` | Signed release channel to follow |
+| — | `TERM_SERVER_RELEASE_BASE_URL` | GitHub releases | Alternate HTTPS release base URL |
 | `--log` | `TERM_SERVER_LOG` | `term_server=info,tower_http=info` | Rust tracing filter |
 
 For an unattended deployment, provide the password through the environment or a protected file:
@@ -143,10 +176,12 @@ term-server does not trust forwarded client-IP headers. Keep the loopback listen
 
 ```bash
 export TERM_SERVER_PASSWORD='use-a-long-random-secret'
+export TERM_SERVER_BUILD_COMMIT="$(git rev-parse HEAD)"
 docker compose up --build
 ```
 
 The image runs as UID/GID `10001`. Bind-mounted projects must be readable by that user, and the data volume must be writable.
+Container self-updates are disabled by its split, read-only image layout; rebuild the image to update it.
 
 ## systemd user service
 
@@ -193,12 +228,19 @@ npm run check
 
 ## Builds and release artifacts
 
-[GitHub Actions](.github/workflows/ci.yml) formats, lints, type-checks, tests, and builds the project on every pull request and push to `main`. Native Ubuntu runners then produce self-contained archives for:
+[GitHub Actions](.github/workflows/ci.yml) formats, lints, type-checks, tests, and builds the project on every pull request, push to `main`, and `v*` tag. Native Ubuntu runners embed the Cargo version and exact source commit, then produce self-contained archives for:
 
 - `term-server-linux-x86_64.tar.gz`
 - `term-server-linux-aarch64.tar.gz`
 
-Each archive contains the native binary, compiled `client/`, README, license, and systemd unit. Successful `main` pushes update the rolling `main` prerelease and its `SHA256SUMS`; `install.sh` consumes exactly those assets. Build the current machine’s archive locally with `npm run package`.
+Each archive contains the native binary, compiled `client/`, README, license, and systemd unit. Successful `main` pushes update the rolling `main` prerelease, while a tag matching the Cargo version (for example `v0.1.0`) publishes a versioned release. Releases contain:
+
+- the x86-64 and ARM64 archives
+- `SHA256SUMS` and its raw Ed25519 signature
+- `release-manifest.json` with the version, commit, channel, publication time, target, size, and checksum of each archive
+- the manifest's raw Ed25519 signature
+
+The signing private key lives only in the `RELEASE_SIGNING_KEY` GitHub Actions secret. Its public half is committed at [`release/public-key.txt`](release/public-key.txt) and embedded in the daemon and installer. Publishing fails closed when the secret is absent or does not match that public key. Build the current machine’s archive locally with `npm run package`.
 
 ## Architecture
 
