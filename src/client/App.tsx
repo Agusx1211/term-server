@@ -112,6 +112,7 @@ const defaultConfig: ClientConfig = {
     version: "unknown",
     commit: "unknown",
   },
+  broker: null,
   updates: {
     enabled: false,
     channel: "main",
@@ -194,6 +195,7 @@ export function App() {
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
   const [checkingForUpdate, setCheckingForUpdate] = useState(false);
   const [installingUpdate, setInstallingUpdate] = useState(false);
+  const [restartingBroker, setRestartingBroker] = useState(false);
   const [restartingForUpdate, setRestartingForUpdate] = useState<ReleaseInfo>();
   const [notice, setNotice] = useState("");
   const [agentToasts, setAgentToasts] = useState<AgentToast[]>([]);
@@ -427,6 +429,11 @@ export function App() {
         .then(([next, artifacts]) => {
           const running = next.filter((terminal) => terminal.status === "running");
           setTerminals(running);
+          setConfig((current) => (
+            current.broker && current.broker.sessions !== running.length
+              ? { ...current, broker: { ...current.broker, sessions: running.length } }
+              : current
+          ));
           const available = new Set(running.map((terminal) => terminal.id));
           setLayout((current) => pruneLayout(current, available));
           syncArtifacts(artifacts, activeIdRef.current, running);
@@ -902,18 +909,22 @@ export function App() {
     localStorage.setItem(CONFIRM_TERMINAL_KILLS_STORAGE_KEY, String(enabled));
   };
 
-  const waitForUpdatedServer = async (expectedCommit: string) => {
+  const waitForServer = async (ready: (nextConfig: ClientConfig) => boolean) => {
     for (let attempt = 0; attempt < 120; attempt += 1) {
       await new Promise((resolve) => window.setTimeout(resolve, 500));
       try {
-        const nextConfig = await api.config();
-        if (nextConfig.build.commit === expectedCommit) {
-          location.reload();
-          return;
-        }
+        if (ready(await api.config())) return true;
       } catch {
-        // The server is expected to be briefly unavailable while it restarts.
+        // The server is expected to be briefly unavailable during a restart.
       }
+    }
+    return false;
+  };
+
+  const waitForUpdatedServer = async (expectedCommit: string) => {
+    if (await waitForServer((nextConfig) => nextConfig.build.commit === expectedCommit)) {
+      location.reload();
+      return;
     }
     setRestartingForUpdate(undefined);
     showNotice("The update was installed, but the server did not restart; restart term-server manually");
@@ -936,6 +947,34 @@ export function App() {
     } catch (error) {
       showNotice(error instanceof Error ? error.message : "Unable to install the update");
       setInstallingUpdate(false);
+    }
+  };
+
+  const waitForCurrentBroker = async () => {
+    if (await waitForServer((nextConfig) => Boolean(
+      nextConfig.broker && !nextConfig.broker.restartRequired,
+    ))) {
+      location.reload();
+      return;
+    }
+    setRestartingBroker(false);
+    showNotice("The session broker did not restart; restart term-server manually");
+  };
+
+  const restartBroker = async () => {
+    const broker = config.broker;
+    if (!broker?.restartRequired) return;
+    const closeTerminals = broker.sessions > 0;
+    if (closeTerminals && !confirm(
+      `Restart the session broker? This will close ${broker.sessions} open terminal${broker.sessions === 1 ? "" : "s"}.`,
+    )) return;
+    setRestartingBroker(true);
+    try {
+      await api.restartBroker(closeTerminals);
+      void waitForCurrentBroker();
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : "Unable to restart the session broker");
+      setRestartingBroker(false);
     }
   };
 
@@ -1210,10 +1249,12 @@ export function App() {
                 theme={theme}
                 pi={config.pi}
                 build={config.build}
+                broker={config.broker}
                 updateConfig={config.updates}
                 updateStatus={updateStatus}
                 checkingForUpdate={checkingForUpdate}
                 installingUpdate={installingUpdate}
+                restartingBroker={restartingBroker}
                 passwordManagedExternally={config.passwordManagedExternally}
                 notificationMode={notificationMode}
                 notificationPosition={notificationPosition}
@@ -1226,6 +1267,7 @@ export function App() {
                 )}
                 onCheckForUpdate={() => void checkForUpdates(true)}
                 onInstallUpdate={() => void installUpdate()}
+                onRestartBroker={() => void restartBroker()}
                 onNotificationModeChange={(mode) => void updateNotificationMode(mode)}
                 onNotificationPositionChange={updateNotificationPosition}
                 onNotificationDurationChange={updateNotificationDuration}
@@ -1261,11 +1303,19 @@ export function App() {
           </span>
         </span>
       </footer>
-      {restartingForUpdate && (
+      {(restartingForUpdate || restartingBroker) && (
         <div class="update-restarting" role="status" aria-live="assertive">
           <LoaderCircle class="spin" size={22} />
-          <strong>Installing term-server v{restartingForUpdate.version}</strong>
-          <span>Verified update installed. Terminals are still running while the server reconnects…</span>
+          <strong>
+            {restartingBroker
+              ? "Restarting session broker"
+              : `Installing term-server v${restartingForUpdate?.version}`}
+          </strong>
+          <span>
+            {restartingBroker
+              ? "Loading the current broker build and reconnecting the server…"
+              : "Verified update installed. Terminals are still running while the server reconnects…"}
+          </span>
         </div>
       )}
       {(agentToasts.length > 0 || notice) && (
