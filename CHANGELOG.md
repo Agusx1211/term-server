@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.4.0 - 2026-07-24
+
+Term-server can now receive privacy-bounded lifecycle events directly from Codex, Claude Code, and
+Pi while keeping its existing process, output, CPU, terminal-signal, and OSC inference.
+
+### Added
+
+- Settings → Live agent activity can install, repair, and remove a dedicated local plugin or
+  extension for Codex, Claude Code, and Pi.
+- The terminal sidebar shows transient native activity such as thinking, running a command, editing
+  files, searching, waiting for approval, and compacting context.
+
+### Changed
+
+- Native events feed the existing working, idle, and closed state machine and completion
+  notifications instead of creating a separate status system.
+- Existing inference remains enabled at all times. If a native update goes stale or a hook fails,
+  term-server automatically returns control to its heuristic detection.
+- Managed integrations use their own package roots and local marketplaces. Install, repair, and
+  removal do not edit existing provider hook files.
+
+### Security
+
+- Hook payloads are reduced to fixed activity categories before they reach the private session
+  broker. Prompts, command text, tool arguments, and tool output are not forwarded.
+- Managed hooks do nothing outside a term-server terminal, verify exact marketplace ownership, and
+  refuse to claim a conflicting marketplace name.
+
+### Upgrade notes
+
+- There are no breaking changes, data migrations, or broker protocol changes.
+- Native integrations are optional. Existing agent detection continues to work before installation,
+  after removal, or when a provider is unavailable.
+- Restart the session broker from Settings after upgrading so new terminals receive the native hook
+  environment. Restarting the broker closes open terminals and requires confirmation when any are
+  running.
+- Codex requires a one-time review of the installed hooks through `/hooks`. Start a new agent session
+  after installing or changing any provider package.
+- The release is safe for automatic installation over `0.3.3`.
+
 ## 0.3.3 - 2026-07-24
 
 The login page can now reset stale browser state when Safari or an installed app keeps loading an old client.
