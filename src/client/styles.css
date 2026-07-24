@@ -782,6 +782,14 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
 .login-card { width: min(360px, 100%); }
 .login-card h1 { margin: 0 0 9px; color: var(--foreground); font-size: 28px; font-weight: 550; letter-spacing: -.02em; }
 .login-copy { margin: 0 0 28px; color: var(--muted); line-height: 1.5; }
+.login-username {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  opacity: 0;
+  pointer-events: none;
+}
 .login-card label { display: block; margin: 0 0 7px; color: var(--foreground); font-size: 12px; }
 .login-card label { font-weight: 550; }
 .input-with-icon { position: relative; display: flex; align-items: center; }

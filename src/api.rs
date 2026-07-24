@@ -12,9 +12,9 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State, ws::WebSocketUpgrade},
-    http::{HeaderMap, HeaderValue, StatusCode, Uri, header},
+    http::{HeaderMap, HeaderValue, StatusCode, Uri, header, uri::Authority},
     response::{IntoResponse, Response},
-    routing::{any, delete, get, patch, post},
+    routing::{any, delete, get, get_service, patch, post},
 };
 use axum_extra::extract::{
     CookieJar,
@@ -39,7 +39,7 @@ use crate::broker::BrokerWebSocket;
 use crate::{
     ai::{PiClientConfig, UpdatePiSettings},
     artifacts,
-    auth::{AuthError, AuthService, LoginLimiter},
+    auth::{AuthError, AuthService, LoginLimiter, SESSION_LIFETIME_DAYS},
     build,
     files::{self, FileError},
     terminal::{CreateTerminal, RenameTerminal, TerminalError},
@@ -281,7 +281,7 @@ fn session_cookie(state: &AppState) -> Cookie<'static> {
         .http_only(true)
         .secure(state.secure || state.secure_cookie)
         .same_site(SameSite::Strict)
-        .max_age(Duration::days(7))
+        .max_age(Duration::days(SESSION_LIFETIME_DAYS))
         .build()
 }
 
@@ -313,6 +313,65 @@ fn require_origin(headers: &HeaderMap, uri: &Uri, state: &AppState) -> Result<()
 
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "ok" }))
+}
+
+fn request_hostname(headers: &HeaderMap, fallback: &str) -> String {
+    headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<Authority>().ok())
+        .map(|authority| authority.host().trim_matches(['[', ']']).to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| fallback.to_owned())
+}
+
+async fn web_manifest(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let hostname = request_hostname(&headers, &state.hostname);
+    let name = format!("{hostname} Term Server");
+    let icon_revision = build::COMMIT;
+    let manifest = serde_json::json!({
+        "id": "/",
+        "name": name,
+        "short_name": name,
+        "description": "A fast, secure terminal workspace that lives in your browser.",
+        "theme_color": "#181818",
+        "background_color": "#181818",
+        "display": "standalone",
+        "orientation": "any",
+        "scope": "/",
+        "start_url": "/",
+        "lang": "en",
+        "categories": ["developer", "productivity", "utilities"],
+        "icons": [
+            {
+                "src": format!("/pwa-192x192.png?v={icon_revision}"),
+                "sizes": "192x192",
+                "type": "image/png",
+                "purpose": "any"
+            },
+            {
+                "src": format!("/pwa-512x512.png?v={icon_revision}"),
+                "sizes": "512x512",
+                "type": "image/png",
+                "purpose": "any"
+            },
+            {
+                "src": format!("/pwa-maskable-512x512.png?v={icon_revision}"),
+                "sizes": "512x512",
+                "type": "image/png",
+                "purpose": "maskable"
+            }
+        ]
+    });
+    let mut response = Json(manifest).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/manifest+json"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response
 }
 
 async fn session(State(state): State<AppState>, jar: CookieJar) -> Json<SessionResponse> {
@@ -874,15 +933,27 @@ pub fn build_router(state: AppState, client_directory: Option<PathBuf>) -> Route
         .route("/files/content", get(read_file).put(save_file))
         .route("/files/raw", get(preview_file))
         .route("/files/download", get(download_file))
-        .fallback(api_not_found);
+        .fallback(api_not_found)
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        ));
     let secure = state.secure;
     let mut router = Router::new()
         .route("/healthz", get(health))
+        .route("/manifest.webmanifest", get(web_manifest))
         .nest("/api", api)
         .with_state(state);
 
     if let Some(directory) = client_directory {
         let index = directory.join("index.html");
+        router = router.route(
+            "/",
+            get_service(ServeFile::new(&index)).layer(SetResponseHeaderLayer::overriding(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("no-cache"),
+            )),
+        );
         router = router.fallback_service(ServeDir::new(directory).fallback(ServeFile::new(index)));
     }
 
@@ -1120,6 +1191,7 @@ mod tests {
             .unwrap();
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("SameSite=Strict"));
+        assert!(cookie.contains("Max-Age=34560000"));
     }
 
     #[tokio::test]
@@ -1291,8 +1363,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
         let body = to_bytes(response.into_body(), 1024).await.unwrap();
         assert!(String::from_utf8_lossy(&body).contains("terminal not found"));
+    }
+
+    #[tokio::test]
+    async fn web_manifest_uses_the_request_hostname_and_versioned_icons() {
+        let response = build_router(test_state().await, None)
+            .oneshot(
+                Request::builder()
+                    .uri("/manifest.webmanifest")
+                    .header(header::HOST, "terminal.example:8090")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/manifest+json"
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-cache"
+        );
+        let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(manifest["name"], "terminal.example Term Server");
+        assert_eq!(manifest["short_name"], "terminal.example Term Server");
+        assert_eq!(
+            manifest["icons"][0]["src"],
+            format!("/pwa-192x192.png?v={}", build::COMMIT)
+        );
     }
 
     #[tokio::test]
@@ -1309,6 +1417,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-cache"
+        );
         assert!(
             response
                 .headers()

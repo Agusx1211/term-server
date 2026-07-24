@@ -86,7 +86,7 @@ Serve term-server from a trusted HTTPS origin, then open it in your phone's brow
 - On iPhone or iPad, use Safari's **Share → Add to Home Screen** action.
 - On Android, use the browser menu's **Install app** or **Add to Home screen** action.
 
-The installed app launches in its own standalone window and respects the device safe areas. Its interface assets are cached for resilient loading, but terminals, files, and authentication still require a connection to the term-server daemon. A browser warning bypass for the generated self-signed certificate may not qualify as a trusted origin; use a trusted certificate or TLS-terminating reverse proxy when installing from another device.
+The installed app launches as **`<hostname> Term Server`** in its own standalone window and respects the device safe areas. It loads the current interface from the daemon instead of keeping an offline app shell, so a server update cannot strand the installed app on an incompatible client. Upgrading from an older release clears that legacy app-shell cache automatically. Terminals, files, and authentication require a connection to the term-server daemon. A browser warning bypass for the generated self-signed certificate may not qualify as a trusted origin; use a trusted certificate or TLS-terminating reverse proxy when installing from another device.
 
 Useful shortcuts:
 
@@ -165,7 +165,8 @@ term-server --password-file /run/secrets/term-server-password
 Passwords stored in `credentials.json` can be changed from **Settings → Security**. Changing
 the password signs out other browser sessions. Passwords supplied through the environment or a
 secret file remain externally managed and must be changed at their source before restarting the
-server.
+server. A successful login creates a revocable 400-day browser session and offers the credential
+to supported browser password managers; explicit logout or a password change still invalidates it.
 
 Use `--no-https` only for local development or behind a trusted TLS-terminating proxy. When proxying, forward WebSocket upgrades and declare the public origin:
 
