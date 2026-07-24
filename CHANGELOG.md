@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.4.1 - 2026-07-24
+
+Pi-generated terminal titles now describe the agent's initial task instead of terminal setup traffic.
+
+### Fixed
+
+- Prompt capture now discards OSC and other terminal control-string replies, including xterm
+  foreground and background color responses, rather than sending them to Pi as the initial user
+  message.
+
+### Upgrade notes
+
+- There are no breaking changes, data migrations, or broker protocol changes.
+- Restart the session broker from Settings after upgrading so new terminals use the corrected
+  prompt capture. Restarting the broker closes open terminals and requires confirmation when any
+  are running.
+- The release is safe for automatic installation over `0.4.0`.
+
 ## 0.4.0 - 2026-07-24
 
 Term-server can now receive privacy-bounded lifecycle events directly from Codex, Claude Code, and
