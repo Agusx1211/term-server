@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.3.1 - 2026-07-24
+
+Installed apps now stay aligned with the running server, sign-in lasts across normal browser use, and fast agent tasks reliably produce completion notifications.
+
+### Added
+
+- Installed apps use the server hostname in their display name, which makes multiple term-server installations easier to distinguish.
+- Successful logins offer credentials to supported browser password managers.
+
+### Fixed
+
+- Installed PWAs no longer keep an old application shell after a server update. The replacement service worker removes the legacy Workbox cache, takes control immediately, and reloads affected installed clients once.
+- Agent tasks submitted before the first 1.5-second process discovery sample now produce completion notifications, summaries, and attention state. Starting an agent without a task remains silent.
+
+### Changed
+
+- Successful logins create revocable 400-day sessions instead of seven-day sessions.
+- Authenticated API responses are marked `no-store`; the application entry point and generated web manifest are revalidated, and install icons include the build revision.
+- PWA navigation is network-only because terminals, files, and authentication already require the running daemon.
+
+### Security
+
+- Longer sessions remain protected by HTTP-only, SameSite cookies and are still revoked by explicit logout or password changes.
+- Authenticated API responses are explicitly non-cacheable to avoid retaining session data in browser caches.
+
+### Upgrade notes
+
+- There are no breaking changes, data migrations, or broker protocol changes.
+- Older installed PWAs automatically remove their legacy application cache and may reload once during the upgrade.
+- The release is safe for automatic installation over `0.3.0`.
+
 ## 0.3.0 - 2026-07-23
 
 Terminal and artifact management now cover the common cleanup and inspection workflows directly from the workspace, with better mobile sizing and more useful completion notifications.
