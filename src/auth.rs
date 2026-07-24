@@ -19,7 +19,8 @@ use thiserror::Error;
 use tokio::{fs, sync::Mutex as AsyncMutex};
 use uuid::Uuid;
 
-const SESSION_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+pub const SESSION_LIFETIME_DAYS: i64 = 400;
+const SESSION_LIFETIME: Duration = Duration::from_secs(SESSION_LIFETIME_DAYS as u64 * 24 * 60 * 60);
 const CREDENTIALS_VERSION: u8 = 1;
 
 #[derive(Debug, Error)]

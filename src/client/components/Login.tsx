@@ -1,6 +1,7 @@
 import { useState } from "preact/hooks";
 import { LockKeyhole } from "lucide-preact";
 import { api } from "../lib/api";
+import { credentialUsername, rememberPassword } from "../lib/browser-credentials";
 import { TermServerLogo } from "./TermServerLogo";
 
 interface LoginProps {
@@ -18,6 +19,7 @@ export function Login({ onAuthenticated }: LoginProps) {
     setError("");
     try {
       await api.login(password);
+      rememberPassword(password);
       onAuthenticated();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Unable to sign in");
@@ -33,7 +35,17 @@ export function Login({ onAuthenticated }: LoginProps) {
         <p class="eyebrow">REMOTE TERMINAL WORKSPACE</p>
         <h1 id="login-title">term-server</h1>
         <p class="login-copy">Enter the server password to connect to your terminal sessions.</p>
-        <form onSubmit={submit}>
+        <form onSubmit={submit} autocomplete="on">
+          <input
+            class="login-username"
+            name="username"
+            type="text"
+            value={credentialUsername(location.hostname)}
+            autocomplete="username"
+            tabindex={-1}
+            aria-hidden="true"
+            readonly
+          />
           <label for="password">Password</label>
           <div class="input-with-icon">
             <LockKeyhole size={16} aria-hidden="true" />
@@ -53,7 +65,9 @@ export function Login({ onAuthenticated }: LoginProps) {
             {busy ? "Connecting…" : "Connect"}
           </button>
         </form>
-        <p class="login-footnote">Session cookies are HTTP-only and never expose your password to the browser.</p>
+        <p class="login-footnote">
+          This device stays signed in, and your browser can save the password for future logins.
+        </p>
       </section>
     </main>
   );
