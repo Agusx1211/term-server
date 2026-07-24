@@ -1,0 +1,20 @@
+{
+  "name": "term-server-agent-events",
+  "version": "0.1.0",
+  "description": "Reports Codex lifecycle activity to the term-server session that launched it.",
+  "author": {
+    "name": "term-server"
+  },
+  "repository": "https://github.com/Agusx1211/term-server",
+  "license": "MIT",
+  "keywords": ["term-server", "observability", "hooks"],
+  "interface": {
+    "displayName": "term-server agent events",
+    "shortDescription": "Show live Codex activity in term-server.",
+    "longDescription": "Reports coarse lifecycle events to the private term-server session broker. It sends no prompts, command arguments, or tool output and is inactive outside term-server.",
+    "developerName": "term-server",
+    "category": "Productivity",
+    "capabilities": ["Lifecycle hooks"],
+    "defaultPrompt": ["Show live Codex activity in term-server."]
+  }
+}

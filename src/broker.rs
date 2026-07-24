@@ -10,7 +10,7 @@ use axum::{
     extract::{Path as AxumPath, Query, State, ws::WebSocketUpgrade},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{any, get, patch},
+    routing::{any, get, patch, post},
 };
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -26,6 +26,7 @@ use tokio_tungstenite::{WebSocketStream, client_async};
 use uuid::Uuid;
 
 use crate::{
+    agent_events::AgentEvent,
     ai::{PiClientConfig, PiService, UpdatePiSettings},
     build,
     config::Cli,
@@ -180,6 +181,15 @@ impl BrokerClient {
         settings: UpdatePiSettings,
     ) -> Result<PiClientConfig, BrokerError> {
         self.send_json(Method::PATCH, "/pi", Some(&settings)).await
+    }
+
+    pub async fn agent_event(&self, id: Uuid, event: &AgentEvent) -> Result<(), BrokerError> {
+        self.send_empty(
+            Method::POST,
+            &format!("/terminals/{id}/agent-event"),
+            Some(event),
+        )
+        .await
     }
 
     pub async fn terminal_socket(
@@ -392,7 +402,9 @@ pub async fn run_session_broker(
     };
     set_socket_permissions(&path)?;
 
-    let terminals = Arc::new(TerminalManager::new(default_shell, replay_bytes));
+    let terminals = Arc::new(
+        TerminalManager::new(default_shell, replay_bytes).with_agent_event_socket(path.clone()),
+    );
     let pi = Arc::new(PiService::new(data_directory));
     terminals.start_monitor(pi.clone());
     let shutdown = Arc::new(Notify::new());
@@ -414,6 +426,10 @@ pub async fn run_session_broker(
             patch(rename_broker_terminal).delete(remove_broker_terminal),
         )
         .route("/terminals/{id}/processes", get(broker_terminal_processes))
+        .route(
+            "/terminals/{id}/agent-event",
+            post(broker_terminal_agent_event),
+        )
         .route("/terminals/{id}/socket", any(broker_terminal_socket))
         .route("/shutdown", axum::routing::post(shutdown_broker))
         .with_state(state);
@@ -484,6 +500,18 @@ async fn create_broker_terminal(
         })?
         .map_err(|error| BrokerApiError::BadRequest(error.to_string()))?;
     Ok((StatusCode::CREATED, Json(terminal)))
+}
+
+async fn broker_terminal_agent_event(
+    State(state): State<BrokerState>,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(event): Json<AgentEvent>,
+) -> Result<StatusCode, BrokerApiError> {
+    state
+        .terminals
+        .apply_agent_event(id, event, state.pi.clone())
+        .then_some(StatusCode::NO_CONTENT)
+        .ok_or(BrokerApiError::NotFound)
 }
 
 async fn rename_broker_terminal(
@@ -630,6 +658,27 @@ mod tests {
             })
             .await
             .unwrap();
+        client
+            .agent_event(
+                terminal.id,
+                &AgentEvent {
+                    provider: "codex".to_owned(),
+                    kind: crate::agent_events::AgentEventKind::Thinking,
+                },
+            )
+            .await
+            .unwrap();
+        let observed = client
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == terminal.id)
+            .unwrap()
+            .agent
+            .unwrap();
+        assert_eq!(observed.status, crate::terminal::AgentStatus::Working);
+        assert_eq!(observed.activity.unwrap().label, "thinking");
         let mut first = client
             .terminal_socket(terminal.id, Some((80, 24)))
             .await

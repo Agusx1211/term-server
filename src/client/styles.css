@@ -334,6 +334,23 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
 .settings-hint { margin: 8px 2px 0; color: var(--subtle); font-size: 9.5px; line-height: 1.4; }
 .settings-hint + .settings-toggle { margin-top: 10px; }
 .settings-hint strong { color: var(--muted); font-weight: 650; text-transform: capitalize; }
+.agent-integration-list { display: grid; gap: 6px; }
+.agent-integration {
+  min-width: 0; min-height: 52px; display: flex; align-items: center; gap: 9px; padding: 7px 8px;
+  border: 1px solid var(--border); border-radius: 4px; background: color-mix(in srgb, var(--editor) 45%, transparent);
+}
+.agent-integration-state {
+  width: 8px; height: 8px; flex: none; border-radius: 50%; background: var(--subtle);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--subtle) 12%, transparent);
+}
+.agent-integration-state.installed { background: #3fb950; box-shadow: 0 0 0 3px color-mix(in srgb, #3fb950 14%, transparent); }
+.agent-integration-state.needsRepair { background: #d29922; box-shadow: 0 0 0 3px color-mix(in srgb, #d29922 14%, transparent); }
+.agent-integration-state.unavailable { background: #8c959f; box-shadow: none; }
+.agent-integration-copy { min-width: 0; flex: 1; display: grid; gap: 2px; }
+.agent-integration-copy b { color: var(--foreground); font-size: 10.5px; font-weight: 650; }
+.agent-integration-copy small { color: var(--muted); font-size: 9px; line-height: 1.35; }
+.agent-integration-actions { flex: none; display: flex; align-items: center; gap: 5px; }
+.agent-integration-actions .settings-update-action { width: auto; min-width: 70px; }
 .settings-update { display: grid; gap: 7px; }
 .settings-update-version, .settings-update-available {
   display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 0; color: var(--muted); font-size: 10.5px;
@@ -365,6 +382,11 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
 .settings-update-action:hover:not(:disabled) { border-color: var(--border-strong); background: var(--hover); color: var(--foreground); }
 .settings-update-action.primary { border-color: var(--accent); background: var(--accent); color: #fff; }
 .settings-update-action.primary:hover:not(:disabled) { background: var(--accent-hover); }
+.settings-update-action.danger { color: var(--danger); }
+.settings-update-action.danger:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--danger) 55%, var(--border));
+  background: color-mix(in srgb, var(--danger) 9%, var(--hover));
+}
 .settings-update-action.broker-restart {
   border-color: color-mix(in srgb, var(--broker-warning) 55%, var(--border)); color: var(--broker-warning);
 }
@@ -1054,6 +1076,10 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
   .settings-page-header p { line-height: 1.4; }
   .settings-grid { grid-template-columns: minmax(0, 1fr); }
   .settings-card-wide { grid-column: auto; }
+  .agent-integration { align-items: flex-start; flex-wrap: wrap; }
+  .agent-integration-copy { flex-basis: calc(100% - 20px); }
+  .agent-integration-actions { width: 100%; padding-left: 17px; }
+  .agent-integration-actions .settings-update-action { flex: 1; }
   .notification-mode-grid { grid-template-columns: minmax(0, 1fr); }
 
   .welcome { justify-content: safe center; padding: 20px 16px; gap: 10px; }

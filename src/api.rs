@@ -37,6 +37,10 @@ use uuid::Uuid;
 #[cfg(unix)]
 use crate::broker::BrokerWebSocket;
 use crate::{
+    agent_integrations::{
+        AgentIntegrationAction, AgentIntegrationProvider, AgentIntegrationService,
+        AgentIntegrationsConfig,
+    },
     ai::{PiClientConfig, UpdatePiSettings},
     artifacts,
     auth::{AuthError, AuthService, LoginLimiter, SESSION_LIFETIME_DAYS},
@@ -68,6 +72,7 @@ pub struct AppState {
     pub max_panes: u8,
     pub hostname: String,
     pub updates: Arc<UpdateService>,
+    pub agent_integrations: Arc<AgentIntegrationService>,
     pub server_control: ServerControl,
 }
 
@@ -248,6 +253,7 @@ struct ClientConfig {
     hostname: String,
     password_managed_externally: bool,
     pi: PiClientConfig,
+    agent_integrations: AgentIntegrationsConfig,
     build: build::BuildInfo,
     broker: Option<SessionBrokerInfo>,
     updates: UpdateConfig,
@@ -262,6 +268,11 @@ struct InstallUpdateRequest {
 #[serde(rename_all = "camelCase")]
 struct RestartBrokerRequest {
     close_terminals: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateAgentIntegrationRequest {
+    action: AgentIntegrationAction,
 }
 
 #[derive(Debug, Deserialize)]
@@ -514,6 +525,7 @@ async fn config(
     require_auth(&jar, &state)?;
     let (pi, broker) =
         tokio::try_join!(state.workspace.pi_config(), state.workspace.broker_info())?;
+    let agent_integrations = state.agent_integrations.status().await;
     Ok(Json(ClientConfig {
         scrollback_lines: state.scrollback_lines,
         max_panes: state.max_panes,
@@ -521,10 +533,37 @@ async fn config(
         hostname: state.hostname.clone(),
         password_managed_externally: state.auth.password_is_externally_managed(),
         pi,
+        agent_integrations,
         build: build::info(),
         broker,
         updates: state.updates.config(),
     }))
+}
+
+async fn agent_integrations(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> Result<Json<AgentIntegrationsConfig>, ApiError> {
+    require_auth(&jar, &state)?;
+    Ok(Json(state.agent_integrations.status().await))
+}
+
+async fn update_agent_integration(
+    State(state): State<AppState>,
+    Path(provider): Path<AgentIntegrationProvider>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+    Json(body): Json<UpdateAgentIntegrationRequest>,
+) -> Result<Json<AgentIntegrationsConfig>, ApiError> {
+    require_origin(&headers, &uri, &state)?;
+    require_auth(&jar, &state)?;
+    state
+        .agent_integrations
+        .apply(provider, body.action)
+        .await
+        .map(Json)
+        .map_err(ApiError::BadGateway)
 }
 
 async fn update_status(
@@ -999,6 +1038,11 @@ pub fn build_router(state: AppState, client_directory: Option<PathBuf>) -> Route
         .route("/password", patch(change_password))
         .route("/config", get(config))
         .route("/config/pi", patch(update_pi_config))
+        .route("/config/agent-integrations", get(agent_integrations))
+        .route(
+            "/config/agent-integrations/{provider}",
+            patch(update_agent_integration),
+        )
         .route("/broker/restart", post(restart_broker))
         .route("/update", get(update_status).post(install_update))
         .route("/terminals", get(list_terminals).post(create_terminal))
@@ -1114,6 +1158,7 @@ mod tests {
                 "https://example.invalid/releases/download".to_owned(),
                 true,
             )),
+            agent_integrations: Arc::new(AgentIntegrationService::new(directory.path())),
             server_control: ServerControl::new(Handle::new()),
         }
     }
@@ -1252,6 +1297,43 @@ mod tests {
         let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
         let config: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(config["broker"], serde_json::Value::Null);
+        assert_eq!(config["agentIntegrations"]["fallbacksEnabled"], true);
+        assert_eq!(
+            config["agentIntegrations"]["providers"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn protects_agent_integration_management() {
+        let app = build_router(test_state().await, None);
+        let list = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config/agent-integrations")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list.status(), StatusCode::UNAUTHORIZED);
+
+        let update = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/config/agent-integrations/codex")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"action":"install"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(update.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

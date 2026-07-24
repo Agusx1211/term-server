@@ -1,0 +1,11 @@
+{
+  "name": "term-server-agent-events",
+  "version": "0.1.0",
+  "description": "Reports Claude Code lifecycle activity to the term-server session that launched it.",
+  "author": {
+    "name": "term-server"
+  },
+  "repository": "https://github.com/Agusx1211/term-server",
+  "license": "MIT",
+  "keywords": ["term-server", "observability", "hooks"]
+}

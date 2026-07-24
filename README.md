@@ -130,6 +130,23 @@ ln -s "$PWD/skills/term-server-artifacts" \
   "${CODEX_HOME:-$HOME/.codex}/skills/term-server-artifacts"
 ```
 
+### Live agent activity
+
+Term-server continues to infer Codex, Claude Code, and Pi state from their process trees, terminal
+signals, output, and CPU activity. **Settings → Live agent activity** can additionally install a
+small provider-native plugin or extension for more immediate lifecycle updates such as thinking,
+running a command, waiting for approval, and compacting context. These updates appear in the
+existing terminal subtitle; working, idle, ready, closed, and completion notifications keep using
+the existing state machine.
+
+The managed packages are additive: they do not edit or replace existing hook files, and uninstalling
+them removes only term-server's package and dedicated local marketplace. They do nothing outside a
+term-server terminal. Events are reduced to a fixed activity category before they reach the private
+session broker; prompts, command text, tool arguments, and tool output are not forwarded. Fallback
+inference remains enabled whether a package is installed, unavailable, broken, or removed, and
+automatically takes over if a native update goes stale. Codex requires a one-time review of newly
+installed hooks through `/hooks`; start a new agent session after any package change.
+
 ## Configuration
 
 Run `term-server --help` for generated CLI help. CLI flags take precedence over environment variables.

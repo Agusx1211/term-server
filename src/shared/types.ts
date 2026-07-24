@@ -1,6 +1,11 @@
 export type TerminalStatus = "running" | "exited";
 export type AgentStatus = "working" | "idle" | "closed";
 
+export interface AgentActivity {
+  label: string;
+  updatedAt: number;
+}
+
 export interface AgentInfo {
   kind: "codex" | "claude" | "pi" | string;
   status: AgentStatus;
@@ -9,6 +14,7 @@ export interface AgentInfo {
   revision: number;
   completedAt: number | null;
   summary: string | null;
+  activity?: AgentActivity | null;
 }
 
 export interface TerminalInfo {
@@ -63,6 +69,7 @@ export interface ClientConfig {
   hostname: string;
   passwordManagedExternally: boolean;
   pi: PiConfig;
+  agentIntegrations: AgentIntegrationsConfig;
   build: BuildInfo;
   broker: SessionBrokerInfo | null;
   updates: UpdateConfig;
@@ -113,6 +120,26 @@ export interface UpdatePiConfig {
   titlesEnabled: boolean;
   summariesEnabled: boolean;
   model: string;
+}
+
+export type AgentIntegrationProvider = "codex" | "claude" | "pi";
+export type AgentIntegrationState =
+  | "unavailable"
+  | "notInstalled"
+  | "installed"
+  | "needsRepair";
+export type AgentIntegrationAction = "install" | "repair" | "remove";
+
+export interface AgentIntegrationStatus {
+  provider: AgentIntegrationProvider;
+  name: string;
+  state: AgentIntegrationState;
+  message: string;
+}
+
+export interface AgentIntegrationsConfig {
+  providers: AgentIntegrationStatus[];
+  fallbacksEnabled: boolean;
 }
 
 export type FileEntryKind = "file" | "directory";
