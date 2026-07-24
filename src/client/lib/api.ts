@@ -1,4 +1,7 @@
 import type {
+  AgentIntegrationAction,
+  AgentIntegrationProvider,
+  AgentIntegrationsConfig,
   ArtifactEntry,
   ClientConfig,
   CreateTerminalRequest,
@@ -75,6 +78,15 @@ export const api = {
     }),
   updatePiConfig: (config: UpdatePiConfig) =>
     request<PiConfig>("/api/config/pi", { method: "PATCH", body: JSON.stringify(config) }),
+  agentIntegrations: () =>
+    request<AgentIntegrationsConfig>("/api/config/agent-integrations"),
+  updateAgentIntegration: (
+    provider: AgentIntegrationProvider,
+    action: AgentIntegrationAction,
+  ) => request<AgentIntegrationsConfig>(`/api/config/agent-integrations/${provider}`, {
+    method: "PATCH",
+    body: JSON.stringify({ action }),
+  }),
   terminals: () => request<TerminalInfo[]>("/api/terminals"),
   createTerminal: (terminal: CreateTerminalRequest) =>
     request<TerminalInfo>("/api/terminals", { method: "POST", body: JSON.stringify(terminal) }),

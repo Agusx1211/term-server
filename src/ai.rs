@@ -417,7 +417,7 @@ fn discover_models(executable: &Path) -> Vec<PiModel> {
         .collect()
 }
 
-fn find_executable(name: &str) -> Option<PathBuf> {
+pub(crate) fn find_executable(name: &str) -> Option<PathBuf> {
     let path = env::var_os("PATH");
     let home = env::var_os("HOME").map(PathBuf::from);
     find_executable_in(name, path.as_deref(), home.as_deref())

@@ -1,0 +1,93 @@
+{
+  "description": "Report privacy-bounded Codex lifecycle activity to term-server.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event codex 2>/dev/null || true; else cat >/dev/null; fi'",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event codex 2>/dev/null || true; else cat >/dev/null; fi'",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event codex 2>/dev/null || true; else cat >/dev/null; fi'",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event codex 2>/dev/null || true; else cat >/dev/null; fi'",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event codex 2>/dev/null || true; else cat >/dev/null; fi'",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event codex 2>/dev/null || true; else cat >/dev/null; fi'",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event codex 2>/dev/null || true; else cat >/dev/null; fi'",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event codex 2>/dev/null || true; else cat >/dev/null; fi'",
+            "timeout": 1
+          }
+        ]
+      }
+    ]
+  }
+}

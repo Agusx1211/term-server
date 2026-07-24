@@ -1,12 +1,19 @@
-use std::{env, ffi::OsString, net::SocketAddr, path::Path, process::Command, sync::Arc};
+use std::{
+    env,
+    ffi::OsString,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::Arc,
+};
 
 use axum_server::Handle;
 use clap::Parser;
 #[cfg(unix)]
 use term_server::broker::{BrokerClient, run_session_broker};
-#[cfg(not(unix))]
-use term_server::{ai::PiService, terminal::TerminalManager};
 use term_server::{
+    agent_events::read_hook_event,
+    agent_integrations::AgentIntegrationService,
     api::{AppState, ServerControl, build_router},
     auth::{LoginLimiter, load_auth},
     config::Cli,
@@ -14,12 +21,19 @@ use term_server::{
     update::UpdateService,
     workspace::WorkspaceBackend,
 };
+#[cfg(not(unix))]
+use term_server::{ai::PiService, terminal::TerminalManager};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let executable = env::current_exe()?;
+    if let Some(provider) = cli.agent_event.as_deref() {
+        #[cfg(unix)]
+        forward_agent_event(provider).await;
+        return Ok(());
+    }
     let restart_arguments = env::args_os().skip(1).collect::<Vec<_>>();
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_new(&cli.log)?)
@@ -85,6 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_panes: cli.max_panes,
         hostname,
         updates,
+        agent_integrations: Arc::new(AgentIntegrationService::new(&cli.data_dir)),
         server_control: server_control.clone(),
     };
     let app = build_router(state, client_directory);
@@ -122,6 +137,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         restart_process(&executable, &restart_arguments)?;
     }
     Ok(())
+}
+
+#[cfg(unix)]
+async fn forward_agent_event(provider: &str) {
+    let Some(socket) = env::var_os("TERM_SERVER_BROKER_SOCKET").map(PathBuf::from) else {
+        return;
+    };
+    let Some(id) = env::var("TERM_SERVER_SESSION")
+        .ok()
+        .and_then(|value| uuid::Uuid::parse_str(&value).ok())
+    else {
+        return;
+    };
+    let Ok(Some(event)) = read_hook_event(provider, std::io::stdin().lock()) else {
+        return;
+    };
+    let _ = BrokerClient::new(socket).agent_event(id, &event).await;
 }
 
 #[cfg(unix)]

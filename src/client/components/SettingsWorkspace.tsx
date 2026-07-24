@@ -1,4 +1,5 @@
 import {
+  Activity,
   Bell,
   BellOff,
   BellRing,
@@ -18,6 +19,9 @@ import {
   TriangleAlert,
 } from "lucide-preact";
 import type {
+  AgentIntegrationAction,
+  AgentIntegrationProvider,
+  AgentIntegrationsConfig,
   BuildInfo,
   PiConfig,
   SessionBrokerInfo,
@@ -36,6 +40,8 @@ interface SettingsWorkspaceProps {
   active: boolean;
   theme: ThemeName;
   pi: PiConfig;
+  agentIntegrations: AgentIntegrationsConfig;
+  updatingAgentIntegration?: AgentIntegrationProvider;
   build: BuildInfo;
   broker: SessionBrokerInfo | null;
   updateConfig: UpdateConfig;
@@ -51,6 +57,10 @@ interface SettingsWorkspaceProps {
   confirmTerminalKills: boolean;
   onTheme: (theme: ThemeName) => void;
   onPiChange: (titlesEnabled: boolean, summariesEnabled: boolean, model: string) => void;
+  onAgentIntegration: (
+    provider: AgentIntegrationProvider,
+    action: AgentIntegrationAction,
+  ) => void;
   onCheckForUpdate: () => void;
   onInstallUpdate: () => void;
   onRestartBroker: () => void;
@@ -119,6 +129,8 @@ export function SettingsWorkspace({
   active,
   theme,
   pi,
+  agentIntegrations,
+  updatingAgentIntegration,
   build,
   broker,
   updateConfig,
@@ -134,6 +146,7 @@ export function SettingsWorkspace({
   confirmTerminalKills,
   onTheme,
   onPiChange,
+  onAgentIntegration,
   onCheckForUpdate,
   onInstallUpdate,
   onRestartBroker,
@@ -264,6 +277,70 @@ export function SettingsWorkspace({
             <p class="settings-hint">
               Desktop permission: <strong>{systemPermission}</strong>. Placement and timing apply to in-app cards and
               desktop fallbacks.
+            </p>
+          </section>
+
+          <section class="settings-card settings-card-wide">
+            <header><Activity size={16} /><h2>Live agent activity</h2></header>
+            <p>
+              Add privacy-bounded native lifecycle events without replacing provider hooks or
+              term-server&apos;s process, output, CPU, and terminal-signal inference.
+            </p>
+            <div class="agent-integration-list">
+              {agentIntegrations.providers.map((integration) => {
+                const busy = updatingAgentIntegration === integration.provider;
+                const unavailable = integration.state === "unavailable";
+                return (
+                  <div class="agent-integration" key={integration.provider}>
+                    <span
+                      class={`agent-integration-state ${integration.state}`}
+                      aria-hidden="true"
+                    />
+                    <span class="agent-integration-copy">
+                      <b>{integration.name}</b>
+                      <small>{integration.message}</small>
+                    </span>
+                    <span class="agent-integration-actions">
+                      {integration.state === "notInstalled" ? (
+                        <button
+                          class="settings-update-action primary"
+                          disabled={busy}
+                          onClick={() => onAgentIntegration(integration.provider, "install")}
+                        >
+                          {busy && <LoaderCircle class="spin" size={13} />}
+                          {busy ? "Installing…" : "Install"}
+                        </button>
+                      ) : unavailable ? (
+                        <button class="settings-update-action" disabled>Unavailable</button>
+                      ) : (
+                        <>
+                          <button
+                            class="settings-update-action"
+                            disabled={busy}
+                            onClick={() => onAgentIntegration(integration.provider, "repair")}
+                          >
+                            {busy && <LoaderCircle class="spin" size={13} />}
+                            {busy ? "Working…" : "Repair"}
+                          </button>
+                          <button
+                            class="settings-update-action danger"
+                            disabled={busy}
+                            onClick={() => onAgentIntegration(integration.provider, "remove")}
+                          >
+                            Remove
+                          </button>
+                        </>
+                      )}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+            <p class="settings-hint">
+              {agentIntegrations.fallbacksEnabled
+                ? "Fallback detection stays enabled before, during, and after native package changes."
+                : "Native packages are optional."}
+              {" "}Package changes apply to new agent sessions.
             </p>
           </section>
 
