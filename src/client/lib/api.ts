@@ -13,6 +13,7 @@ import type {
   FileSearchResults,
   FileTarget,
   SaveFileRequest,
+  SessionBrokerInfo,
   UpdateStatus,
   ReleaseInfo,
 } from "../../shared/types";
@@ -65,6 +66,11 @@ export const api = {
     request<ReleaseInfo>("/api/update", {
       method: "POST",
       body: JSON.stringify({ commit }),
+    }),
+  restartBroker: (closeTerminals: boolean) =>
+    request<SessionBrokerInfo>("/api/broker/restart", {
+      method: "POST",
+      body: JSON.stringify({ closeTerminals }),
     }),
   updatePiConfig: (config: UpdatePiConfig) =>
     request<PiConfig>("/api/config/pi", { method: "PATCH", body: JSON.stringify(config) }),

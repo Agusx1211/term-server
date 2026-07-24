@@ -112,7 +112,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
     };
     let restarting = server_control.restart_requested() && serve_result.is_ok();
-    if !restarting {
+    let restarting_broker = restarting && server_control.broker_restart_requested();
+    if !restarting || restarting_broker {
         tracing::info!("shutting down terminal sessions");
         workspace.shutdown().await;
     }
@@ -159,14 +160,14 @@ async fn shutdown_signal(server_control: ServerControl) {
     let _ = tokio::signal::ctrl_c().await;
 
     tracing::info!("shutting down web server");
-    server_control.shutdown(false);
+    server_control.shutdown();
 }
 
 #[cfg(unix)]
 fn restart_process(executable: &Path, arguments: &[OsString]) -> std::io::Result<()> {
     use std::os::unix::process::CommandExt;
 
-    tracing::info!("restarting into the installed update");
+    tracing::info!("restarting term-server process");
     let error = Command::new(executable).args(arguments).exec();
     Err(error)
 }

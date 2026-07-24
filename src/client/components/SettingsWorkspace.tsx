@@ -15,10 +15,12 @@ import {
   Sun,
   RefreshCw,
   Trash2,
+  TriangleAlert,
 } from "lucide-preact";
 import type {
   BuildInfo,
   PiConfig,
+  SessionBrokerInfo,
   UpdateConfig,
   UpdateStatus,
 } from "../../shared/types";
@@ -35,10 +37,12 @@ interface SettingsWorkspaceProps {
   theme: ThemeName;
   pi: PiConfig;
   build: BuildInfo;
+  broker: SessionBrokerInfo | null;
   updateConfig: UpdateConfig;
   updateStatus: UpdateStatus | null;
   checkingForUpdate: boolean;
   installingUpdate: boolean;
+  restartingBroker: boolean;
   passwordManagedExternally: boolean;
   notificationMode: NotificationMode;
   notificationPosition: NotificationPosition;
@@ -49,6 +53,7 @@ interface SettingsWorkspaceProps {
   onPiChange: (titlesEnabled: boolean, summariesEnabled: boolean, model: string) => void;
   onCheckForUpdate: () => void;
   onInstallUpdate: () => void;
+  onRestartBroker: () => void;
   onNotificationModeChange: (mode: NotificationMode) => void;
   onNotificationPositionChange: (position: NotificationPosition) => void;
   onNotificationDurationChange: (duration: NotificationDuration) => void;
@@ -115,10 +120,12 @@ export function SettingsWorkspace({
   theme,
   pi,
   build,
+  broker,
   updateConfig,
   updateStatus,
   checkingForUpdate,
   installingUpdate,
+  restartingBroker,
   passwordManagedExternally,
   notificationMode,
   notificationPosition,
@@ -129,6 +136,7 @@ export function SettingsWorkspace({
   onPiChange,
   onCheckForUpdate,
   onInstallUpdate,
+  onRestartBroker,
   onNotificationModeChange,
   onNotificationPositionChange,
   onNotificationDurationChange,
@@ -319,6 +327,36 @@ export function SettingsWorkspace({
                 <span>term-server v{build.version}</span>
                 <code title={build.commit}>{build.commit.slice(0, 12)}</code>
               </div>
+              {broker?.restartRequired && (
+                <div class="settings-broker-warning">
+                  <div class="settings-broker-warning-title">
+                    <TriangleAlert size={15} />
+                    <span>
+                      <strong>Session broker update pending</strong>
+                      <small>
+                        Broker v{broker.version} · {broker.commit.slice(0, 12)}
+                      </small>
+                    </span>
+                  </div>
+                  <p>
+                    The server is newer than the process managing terminal sessions. Restart the
+                    broker to activate its fixes and features.
+                  </p>
+                  {broker.sessions > 0 && (
+                    <p class="settings-broker-terminal-warning">
+                      Restarting will close {broker.sessions} open terminal{broker.sessions === 1 ? "" : "s"}.
+                    </p>
+                  )}
+                  <button
+                    class="settings-update-action broker-restart"
+                    onClick={onRestartBroker}
+                    disabled={restartingBroker}
+                  >
+                    <RefreshCw class={restartingBroker ? "spin" : ""} size={14} />
+                    {restartingBroker ? "Restarting…" : "Restart session broker"}
+                  </button>
+                </div>
+              )}
               {updateStatus?.state === "available" && updateStatus.latest ? (
                 <>
                   <p class="settings-update-available">

@@ -39,6 +39,8 @@ Installed releases check their configured channel for signed updates after login
 
 The broker is a hidden mode of the same executable. It listens on `session-broker.sock` inside the data directory with user-only permissions and accepts no network connections. An explicit service stop also stops the broker and its terminals; an in-process signed update leaves it running. The broker protocol is versioned so future web processes can reject an incompatible handoff instead of silently corrupting a session.
 
+When an update leaves an older compatible broker running, **Settings → Updates** shows both builds and offers to restart the broker. The action is immediate when no terminals are open; otherwise term-server warns that the open terminals will be closed and requires confirmation.
+
 Automatic installation is intentionally disabled for source builds, containers, and system packages whose binary and `client/` directory are not writable siblings. Those builds still expose their version and commit through `term-server --version`, the status bar, and the authenticated configuration API.
 
 On first boot, open `https://127.0.0.1:8090`. term-server prints a random password once and stores only its Argon2 hash. The browser will warn about the locally generated certificate; trust it, provide your own certificate, or terminate TLS at a reverse proxy.

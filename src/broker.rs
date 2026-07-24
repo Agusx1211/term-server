@@ -32,7 +32,10 @@ use crate::{
     terminal::{
         CreateTerminal, ProcessInspectorSnapshot, RenameTerminal, TerminalInfo, TerminalManager,
     },
-    workspace::{TerminalSocketQuery, WorkspaceError as BrokerError, serve_terminal_socket},
+    workspace::{
+        SessionBrokerInfo, TerminalSocketQuery, WorkspaceError as BrokerError,
+        serve_terminal_socket,
+    },
 };
 
 const PROTOCOL_VERSION: u32 = 2;
@@ -198,7 +201,32 @@ impl BrokerClient {
     }
 
     pub async fn shutdown(&self) -> Result<(), BrokerError> {
-        self.send_empty::<()>(Method::POST, "/shutdown", None).await
+        self.send_empty::<()>(Method::POST, "/shutdown", None)
+            .await?;
+        for _ in 0..100 {
+            if UnixStream::connect(self.socket_path.as_ref())
+                .await
+                .is_err()
+            {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Err(BrokerError::Unavailable(
+            "session broker did not stop".to_owned(),
+        ))
+    }
+
+    pub async fn info(&self) -> Result<SessionBrokerInfo, BrokerError> {
+        let health = self.health().await?;
+        let restart_required =
+            health.build.version != build::VERSION || health.build.commit != build::COMMIT;
+        Ok(SessionBrokerInfo {
+            version: health.build.version,
+            commit: health.build.commit,
+            sessions: health.sessions,
+            restart_required,
+        })
     }
 
     async fn get_json<R: DeserializeOwned>(&self, path: &str) -> Result<R, BrokerError> {
@@ -587,6 +615,11 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        let broker = client.info().await.unwrap();
+        assert_eq!(broker.version, build::VERSION);
+        assert_eq!(broker.commit, build::COMMIT);
+        assert_eq!(broker.sessions, 0);
+        assert!(!broker.restart_required);
 
         let terminal = client
             .create(CreateTerminal {

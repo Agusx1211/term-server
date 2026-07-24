@@ -64,12 +64,18 @@ export interface ClientConfig {
   passwordManagedExternally: boolean;
   pi: PiConfig;
   build: BuildInfo;
+  broker: SessionBrokerInfo | null;
   updates: UpdateConfig;
 }
 
 export interface BuildInfo {
   version: string;
   commit: string;
+}
+
+export interface SessionBrokerInfo extends BuildInfo {
+  sessions: number;
+  restartRequired: boolean;
 }
 
 export interface UpdateConfig {

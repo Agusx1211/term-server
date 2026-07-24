@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.3.2 - 2026-07-24
+
+Session broker updates are now visible and can be activated from Settings without manually restarting the service.
+
+### Added
+
+- Settings → Updates reports when the persistent session broker is older than the web server, including both build versions and the number of open terminals.
+- An authenticated restart action activates the current broker build and reconnects the browser automatically.
+
+### Fixed
+
+- Broker-side fixes no longer remain silently unavailable after an in-process update preserves an older compatible broker.
+- Broker restarts wait for the old Unix socket to disappear before the web process starts again, avoiding a reconnect to the broker being replaced.
+
+### Security
+
+- Restart requests require authentication and same-origin validation. The server requires explicit acknowledgement before it will close open terminals.
+
+### Upgrade notes
+
+- There are no breaking changes, data migrations, or broker protocol changes.
+- Normal automatic updates still preserve running terminals. If Settings reports a broker mismatch, restarting it with open terminals requires confirmation and closes those terminals.
+- The release is safe for automatic installation over `0.3.1`.
+
 ## 0.3.1 - 2026-07-24
 
 Installed apps now stay aligned with the running server, sign-in lasts across normal browser use, and fast agent tasks reliably produce completion notifications.
