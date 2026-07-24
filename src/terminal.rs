@@ -320,8 +320,20 @@ impl ReplayBuffer {
 struct PromptCapture {
     characters: Vec<char>,
     cursor: usize,
-    escape: String,
+    escape: PromptEscape,
     bracketed_paste: bool,
+}
+
+#[derive(Debug, Default)]
+enum PromptEscape {
+    #[default]
+    None,
+    Escape,
+    Sequence(String),
+    ControlString {
+        bell_terminated: bool,
+        escape_seen: bool,
+    },
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -340,52 +352,79 @@ impl PromptCapture {
     }
 
     fn observe_character(&mut self, character: char, input: &mut PromptInput) {
-        if !self.escape.is_empty() {
-            if self.escape == "\u{1b}" && !matches!(character, '[' | 'O') {
-                self.escape.clear();
-                if matches!(character, '\r' | '\n') {
-                    self.insert('\n');
-                    return;
+        match std::mem::take(&mut self.escape) {
+            PromptEscape::Escape => match character {
+                '[' | 'O' => {
+                    let mut sequence = "\u{1b}".to_owned();
+                    sequence.push(character);
+                    self.escape = PromptEscape::Sequence(sequence);
                 }
-                self.observe_character(character, input);
-                return;
-            }
-            self.escape.push(character);
-            if escape_sequence_complete(&self.escape) {
-                let sequence = std::mem::take(&mut self.escape);
-                self.apply_escape(&sequence);
-            } else if self.escape.chars().count() > 32 {
-                self.escape.clear();
-            }
-            return;
-        }
-
-        match character {
-            '\u{1b}' => self.escape.push(character),
-            '\r' | '\n' if self.bracketed_paste => self.insert('\n'),
-            '\r' | '\n' => {
-                input.submitted = true;
-                let prompt = self.characters.iter().collect::<String>();
-                let prompt = prompt.trim();
-                if !prompt.is_empty() {
-                    input.prompt = Some(prompt.to_owned());
+                ']' => {
+                    self.escape = PromptEscape::ControlString {
+                        bell_terminated: true,
+                        escape_seen: false,
+                    };
                 }
-                self.characters.clear();
-                self.cursor = 0;
+                'P' | 'X' | '^' | '_' => {
+                    self.escape = PromptEscape::ControlString {
+                        bell_terminated: false,
+                        escape_seen: false,
+                    };
+                }
+                _ => {
+                    if matches!(character, '\r' | '\n') {
+                        self.insert('\n');
+                        return;
+                    }
+                    self.observe_character(character, input);
+                }
+            },
+            PromptEscape::Sequence(mut sequence) => {
+                sequence.push(character);
+                if escape_sequence_complete(&sequence) {
+                    self.apply_escape(&sequence);
+                } else if sequence.chars().count() <= 32 {
+                    self.escape = PromptEscape::Sequence(sequence);
+                }
             }
-            '\u{1}' => self.cursor = 0,
-            '\u{5}' => self.cursor = self.characters.len(),
-            '\u{3}' | '\u{15}' => {
-                self.characters.clear();
-                self.cursor = 0;
+            PromptEscape::ControlString {
+                bell_terminated,
+                escape_seen,
+            } => {
+                if !(bell_terminated && character == '\u{7}' || escape_seen && character == '\\') {
+                    self.escape = PromptEscape::ControlString {
+                        bell_terminated,
+                        escape_seen: character == '\u{1b}',
+                    };
+                }
             }
-            '\u{11}' => self.characters.truncate(self.cursor),
-            '\u{17}' => self.delete_previous_word(),
-            '\u{8}' | '\u{7f}' => self.delete_before_cursor(),
-            '\u{4}' => self.delete_at_cursor(),
-            '\t' => {}
-            value if !value.is_control() => self.insert(value),
-            _ => {}
+            PromptEscape::None => match character {
+                '\u{1b}' => self.escape = PromptEscape::Escape,
+                '\r' | '\n' if self.bracketed_paste => self.insert('\n'),
+                '\r' | '\n' => {
+                    input.submitted = true;
+                    let prompt = self.characters.iter().collect::<String>();
+                    let prompt = prompt.trim();
+                    if !prompt.is_empty() {
+                        input.prompt = Some(prompt.to_owned());
+                    }
+                    self.characters.clear();
+                    self.cursor = 0;
+                }
+                '\u{1}' => self.cursor = 0,
+                '\u{5}' => self.cursor = self.characters.len(),
+                '\u{3}' | '\u{15}' => {
+                    self.characters.clear();
+                    self.cursor = 0;
+                }
+                '\u{11}' => self.characters.truncate(self.cursor),
+                '\u{17}' => self.delete_previous_word(),
+                '\u{8}' | '\u{7f}' => self.delete_before_cursor(),
+                '\u{4}' => self.delete_at_cursor(),
+                '\t' => {}
+                value if !value.is_control() => self.insert(value),
+                _ => {}
+            },
         }
     }
 
@@ -3054,5 +3093,26 @@ mod tests {
         capture.observe(b"\x1b[13;2u");
         capture.observe(b"two");
         assert_eq!(capture.observe(b"\r").prompt.as_deref(), Some("one\ntwo"));
+    }
+
+    #[test]
+    fn ignores_terminal_control_replies_in_agent_prompts() {
+        let mut capture = PromptCapture::default();
+        assert_eq!(
+            capture.observe(b"\x1b]10;rgb:ffff/ffff/ffff\x07"),
+            PromptInput::default()
+        );
+        assert_eq!(
+            capture.observe(b"\x1b]11;rgb:0000/0000"),
+            PromptInput::default()
+        );
+        assert_eq!(capture.observe(b"/0000\x1b\\"), PromptInput::default());
+        assert_eq!(
+            capture.observe(b"\x1bP1$r0m\x1b\\fix incorrect terminal title\r"),
+            PromptInput {
+                submitted: true,
+                prompt: Some("fix incorrect terminal title".to_owned()),
+            }
+        );
     }
 }
