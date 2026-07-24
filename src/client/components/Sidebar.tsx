@@ -24,6 +24,7 @@ import {
   X,
 } from "lucide-preact";
 import type { AgentInfo, FileEntry, TerminalInfo } from "../../shared/types";
+import { agentSubtitle } from "../lib/agent-activity";
 import { configureTerminalDrag } from "../lib/layout";
 import {
   clampSidebarWidth,
@@ -123,7 +124,7 @@ function TreeNode({
           <span class="terminal-copy">
             <span class="terminal-title">{terminal.name}</span>
             <span class="terminal-meta">
-              <span>{terminal.agent ? `${terminal.agent.kind} agent` : terminal.program}</span>
+              <span>{terminal.agent ? agentSubtitle(terminal.agent) : terminal.program}</span>
               {artifactCount > 0 && (
                 <span
                   class="terminal-artifact-count"

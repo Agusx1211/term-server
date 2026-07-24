@@ -19,6 +19,7 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::{
+    agent_events::{AgentActivity, AgentEvent, AgentEventKind},
     ai::{PiRequest, PiService, PiTaskKind},
     artifacts,
 };
@@ -42,6 +43,7 @@ const SUBMISSION_WORKING_MILLIS: u64 = 12_000;
 const PI_QUIET_SAMPLES_TO_IDLE: u8 = 2;
 const PI_SUBMISSION_WORKING_MILLIS: u64 = 3_000;
 const REPORTED_WORKING_FRESH_MILLIS: u64 = 5_000;
+const NATIVE_EVENT_FRESH_MILLIS: u64 = 15_000;
 const MAX_CAPTURED_PROMPT_CHARS: usize = 16_000;
 const DEFAULT_VIEWPORT_SIZE: ViewportSize = ViewportSize {
     cols: 100,
@@ -74,6 +76,8 @@ pub struct AgentInfo {
     #[serde(default)]
     pub completed_at: Option<u64>,
     pub summary: Option<String>,
+    #[serde(default)]
+    pub activity: Option<AgentActivity>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -475,6 +479,9 @@ struct SessionActivity {
     title_revision: u64,
     title_in_flight_revision: Option<u64>,
     summary_in_flight_revision: Option<u64>,
+    native_provider: Option<String>,
+    native_status: Option<AgentStatus>,
+    native_updated_at: u64,
 }
 
 impl Default for SessionActivity {
@@ -495,11 +502,26 @@ impl Default for SessionActivity {
             title_revision: 0,
             title_in_flight_revision: None,
             summary_in_flight_revision: None,
+            native_provider: None,
+            native_status: None,
+            native_updated_at: 0,
         }
     }
 }
 
 impl SessionActivity {
+    fn expire_native_state(&mut self, now: u64) -> bool {
+        if self.native_status.is_none()
+            || now.saturating_sub(self.native_updated_at) <= NATIVE_EVENT_FRESH_MILLIS
+        {
+            return false;
+        }
+        self.native_provider = None;
+        self.native_status = None;
+        self.native_updated_at = 0;
+        true
+    }
+
     fn queue_title_for_submission(
         &mut self,
         agent_status: &AgentStatus,
@@ -537,6 +559,10 @@ impl SessionActivity {
         self.input_submitted_at = submitted_at;
         self.active_samples = 0;
         self.quiet_samples = 0;
+        self.native_provider = None;
+        self.native_status = None;
+        self.native_updated_at = 0;
+        agent.activity = None;
         if agent.status != AgentStatus::Working {
             agent.status = AgentStatus::Working;
             agent.status_changed_at = submitted_at;
@@ -1027,6 +1053,11 @@ impl TerminalSession {
         let reported_state = self.signals.lock().agent_state;
         let mut activity = self.activity.lock();
         let mut info = self.info.write();
+        if activity.expire_native_state(now)
+            && let Some(agent) = info.agent.as_mut()
+        {
+            agent.activity = None;
+        }
         let previous_program = info.program.clone();
         info.program = observation.program.clone();
 
@@ -1038,6 +1069,12 @@ impl TerminalSession {
                     .as_ref()
                     .is_none_or(|current| current.kind != agent.kind);
             if is_new_agent {
+                let preserve_native_state = activity.native_provider.as_deref()
+                    == Some(agent.kind.as_str())
+                    && info
+                        .agent
+                        .as_ref()
+                        .is_some_and(|current| current.kind == agent.kind);
                 let pending_submission =
                     activity
                         .pending_agent_submission
@@ -1059,38 +1096,53 @@ impl TerminalSession {
                 activity.generated_title = None;
                 activity.initial_title_prompt = None;
                 activity.summary_in_flight_revision = None;
-                let revision = info
-                    .agent
-                    .as_ref()
-                    .map_or(1, |current| current.revision.saturating_add(1));
-                let initial_state = initial_agent_state(
-                    reported_state,
-                    now,
-                    revision,
-                    pending_submission
+                if preserve_native_state {
+                    activity.input_submitted_at =
+                        if activity.native_status == Some(AgentStatus::Working) {
+                            now
+                        } else {
+                            0
+                        };
+                } else {
+                    activity.native_provider = None;
+                    activity.native_status = None;
+                    activity.native_updated_at = 0;
+                    let revision = info
+                        .agent
                         .as_ref()
-                        .map(|submission| submission.submitted_at),
-                );
-                activity.input_submitted_at = initial_state.input_submitted_at;
-                if let Some(submission) = pending_submission {
-                    activity
-                        .queue_title_for_submission(&AgentStatus::Idle, Some(submission.prompt));
-                }
-                info.agent = Some(AgentInfo {
-                    kind: agent.kind.clone(),
-                    status: initial_state.status,
-                    status_changed_at: now,
-                    started_at: now,
-                    revision: initial_state.revision,
-                    completed_at: initial_state.completed_at,
-                    summary: None,
-                });
-                if initial_state.completed_at.is_some() && pi_summaries_enabled {
-                    activity.summary_in_flight_revision = Some(initial_state.revision);
-                    outcome.summary = Some((
-                        initial_state.revision,
-                        self.pi_request(PiTaskKind::Summary, &info, &agent.kind, None),
-                    ));
+                        .map_or(1, |current| current.revision.saturating_add(1));
+                    let initial_state = initial_agent_state(
+                        reported_state,
+                        now,
+                        revision,
+                        pending_submission
+                            .as_ref()
+                            .map(|submission| submission.submitted_at),
+                    );
+                    activity.input_submitted_at = initial_state.input_submitted_at;
+                    if let Some(submission) = pending_submission {
+                        activity.queue_title_for_submission(
+                            &AgentStatus::Idle,
+                            Some(submission.prompt),
+                        );
+                    }
+                    info.agent = Some(AgentInfo {
+                        kind: agent.kind.clone(),
+                        status: initial_state.status,
+                        status_changed_at: now,
+                        started_at: now,
+                        revision: initial_state.revision,
+                        completed_at: initial_state.completed_at,
+                        summary: None,
+                        activity: None,
+                    });
+                    if initial_state.completed_at.is_some() && pi_summaries_enabled {
+                        activity.summary_in_flight_revision = Some(initial_state.revision);
+                        outcome.summary = Some((
+                            initial_state.revision,
+                            self.pi_request(PiTaskKind::Summary, &info, &agent.kind, None),
+                        ));
+                    }
                 }
             } else {
                 let cpu_delta = agent.cpu_ticks.saturating_sub(activity.last_cpu_ticks);
@@ -1109,15 +1161,17 @@ impl TerminalSession {
                     .as_ref()
                     .map(|current| current.status.clone())
                     .unwrap_or(AgentStatus::Idle);
-                let next_status = select_agent_status(
-                    &agent.kind,
-                    current_status,
-                    reported_state,
-                    now,
-                    activity.input_submitted_at,
-                    activity.active_samples,
-                    activity.quiet_samples,
-                );
+                let next_status = activity.native_status.clone().unwrap_or_else(|| {
+                    select_agent_status(
+                        &agent.kind,
+                        current_status,
+                        reported_state,
+                        now,
+                        activity.input_submitted_at,
+                        activity.active_samples,
+                        activity.quiet_samples,
+                    )
+                });
                 if let Some(current) = info.agent.as_mut()
                     && current.status != next_status
                 {
@@ -1125,6 +1179,9 @@ impl TerminalSession {
                     current.status = next_status.clone();
                     current.status_changed_at = now;
                     current.revision = current.revision.saturating_add(1);
+                    if next_status != AgentStatus::Working {
+                        current.activity = None;
+                    }
                     if was_working
                         && next_status == AgentStatus::Idle
                         && activity.input_submitted_at > 0
@@ -1168,6 +1225,7 @@ impl TerminalSession {
                 current.status = AgentStatus::Closed;
                 current.status_changed_at = now;
                 current.revision = current.revision.saturating_add(1);
+                current.activity = None;
                 if completed_task {
                     current.completed_at = Some(now);
                     current.summary = None;
@@ -1189,6 +1247,9 @@ impl TerminalSession {
             activity.input_submitted_at = 0;
             activity.pending_title_prompt = None;
             activity.title_in_flight_revision = None;
+            activity.native_provider = None;
+            activity.native_status = None;
+            activity.native_updated_at = 0;
             *self.signals.lock() = TerminalSignals::default();
             if !observation.shell_foreground {
                 activity.generated_title = None;
@@ -1211,6 +1272,81 @@ impl TerminalSession {
             || info.path != terminal_path(&info.workspace, &info.name)
         {
             info.path = terminal_path(&info.workspace, &info.name);
+        }
+        outcome
+    }
+
+    fn apply_agent_event(
+        &self,
+        event: AgentEvent,
+        pi_summaries_enabled: bool,
+        now: u64,
+    ) -> RefreshOutcome {
+        let mut activity = self.activity.lock();
+        let mut info = self.info.write();
+        let next_status = match event.kind {
+            AgentEventKind::Completed => AgentStatus::Idle,
+            AgentEventKind::Closed => AgentStatus::Closed,
+            _ => AgentStatus::Working,
+        };
+        activity.native_provider = Some(event.provider.clone());
+        activity.native_status = Some(next_status.clone());
+        activity.native_updated_at = now;
+        activity.input_submitted_at = if next_status == AgentStatus::Working {
+            now
+        } else {
+            0
+        };
+
+        let next_activity = event.kind.activity_label().map(|label| AgentActivity {
+            label: label.to_owned(),
+            updated_at: now,
+        });
+        let current = info.agent.take();
+        let mut agent = match current {
+            Some(current) if current.kind == event.provider => current,
+            previous => AgentInfo {
+                kind: event.provider.clone(),
+                status: next_status.clone(),
+                status_changed_at: now,
+                started_at: now,
+                revision: previous.map_or(1, |agent| agent.revision.saturating_add(1)),
+                completed_at: None,
+                summary: None,
+                activity: next_activity.clone(),
+            },
+        };
+
+        let previous_status = agent.status.clone();
+        if agent.status != next_status {
+            agent.status = next_status.clone();
+            agent.status_changed_at = now;
+            agent.revision = agent.revision.saturating_add(1);
+            if next_status == AgentStatus::Working {
+                agent.completed_at = None;
+                agent.summary = None;
+            } else if previous_status == AgentStatus::Working {
+                agent.completed_at = Some(now);
+                agent.summary = None;
+            }
+        }
+        agent.activity = next_activity;
+        let completed_revision = (previous_status == AgentStatus::Working
+            && next_status != AgentStatus::Working)
+            .then_some(agent.revision);
+        let agent_kind = agent.kind.clone();
+        info.agent = Some(agent);
+
+        let mut outcome = RefreshOutcome::default();
+        if let Some(revision) = completed_revision
+            && pi_summaries_enabled
+            && activity.summary_in_flight_revision != Some(revision)
+        {
+            activity.summary_in_flight_revision = Some(revision);
+            outcome.summary = Some((
+                revision,
+                self.pi_request(PiTaskKind::Summary, &info, &agent_kind, None),
+            ));
         }
         outcome
     }
@@ -1282,6 +1418,8 @@ pub struct TerminalManager {
     default_shell: RwLock<Option<String>>,
     replay_bytes: AtomicUsize,
     home_directory: PathBuf,
+    agent_event_socket: Option<PathBuf>,
+    executable: Option<PathBuf>,
 }
 
 impl TerminalManager {
@@ -1294,7 +1432,14 @@ impl TerminalManager {
             default_shell: RwLock::new(default_shell),
             replay_bytes: AtomicUsize::new(replay_bytes),
             home_directory,
+            agent_event_socket: None,
+            executable: std::env::current_exe().ok(),
         }
+    }
+
+    pub fn with_agent_event_socket(mut self, socket: PathBuf) -> Self {
+        self.agent_event_socket = Some(socket);
+        self
     }
 
     pub fn configure(&self, default_shell: Option<String>, replay_bytes: usize) {
@@ -1327,6 +1472,19 @@ impl TerminalManager {
                 manager.refresh_processes(pi.clone());
             }
         });
+    }
+
+    pub fn apply_agent_event(&self, id: Uuid, event: AgentEvent, pi: Arc<PiService>) -> bool {
+        let Some(session) = self.get(id) else {
+            return false;
+        };
+        let outcome = session.apply_agent_event(event, pi.summaries_enabled(), current_millis());
+        if let Some((revision, request)) = outcome.summary {
+            tokio::spawn(async move {
+                session.finish_summary(revision, pi.generate(request).await);
+            });
+        }
+        true
     }
 
     fn refresh_processes(&self, pi: Arc<PiService>) {
@@ -1425,6 +1583,10 @@ impl TerminalManager {
         command.cwd(&cwd);
         configure_terminal_environment(&mut command);
         command.env("TERM_SERVER_SESSION", id.to_string());
+        if let (Some(executable), Some(socket)) = (&self.executable, &self.agent_event_socket) {
+            command.env("TERM_SERVER_EXECUTABLE", executable);
+            command.env("TERM_SERVER_BROKER_SOCKET", socket);
+        }
         let mut child =
             pair.slave
                 .spawn_command(command)
@@ -2479,6 +2641,8 @@ mod tests {
             default_shell: RwLock::new(Some("/bin/sh".into())),
             replay_bytes: AtomicUsize::new(1024 * 1024),
             home_directory: directory.path().to_path_buf(),
+            agent_event_socket: None,
+            executable: None,
         };
         let info = manager
             .create(CreateTerminal {
@@ -2533,6 +2697,88 @@ mod tests {
         assert!(!manager.remove(info.id));
         assert!(manager.remove(clone.id));
         assert!(manager.list().is_empty());
+    }
+
+    #[test]
+    fn native_events_feed_existing_agent_transitions_without_extra_revisions() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = TerminalManager {
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            default_shell: RwLock::new(Some("/bin/sh".into())),
+            replay_bytes: AtomicUsize::new(1024 * 1024),
+            home_directory: directory.path().to_path_buf(),
+            agent_event_socket: None,
+            executable: None,
+        };
+        let info = manager
+            .create(CreateTerminal {
+                path: None,
+                cwd: None,
+                shell: None,
+                clone_from: None,
+            })
+            .unwrap();
+        let pi = Arc::new(PiService::new(directory.path()));
+
+        for (kind, label) in [
+            (AgentEventKind::Thinking, "thinking"),
+            (AgentEventKind::RunningCommand, "running a command"),
+        ] {
+            assert!(manager.apply_agent_event(
+                info.id,
+                AgentEvent {
+                    provider: "codex".to_owned(),
+                    kind,
+                },
+                pi.clone(),
+            ));
+            let agent = manager.get(info.id).unwrap().info().agent.unwrap();
+            assert_eq!(agent.status, AgentStatus::Working);
+            assert_eq!(agent.revision, 1);
+            assert_eq!(agent.activity.unwrap().label, label);
+        }
+
+        let session = manager.get(info.id).unwrap();
+        let mut activity = session.activity.lock();
+        let updated_at = activity.native_updated_at;
+        assert!(!activity.expire_native_state(updated_at + NATIVE_EVENT_FRESH_MILLIS));
+        assert!(activity.expire_native_state(updated_at + NATIVE_EVENT_FRESH_MILLIS + 1));
+        assert!(activity.native_status.is_none());
+        drop(activity);
+
+        manager.get(info.id).unwrap().write(b"true\n").unwrap();
+        let fallback = manager.get(info.id).unwrap().info().agent.unwrap();
+        assert_eq!(fallback.status, AgentStatus::Working);
+        assert_eq!(fallback.revision, 1);
+        assert!(fallback.activity.is_none());
+
+        assert!(manager.apply_agent_event(
+            info.id,
+            AgentEvent {
+                provider: "codex".to_owned(),
+                kind: AgentEventKind::Completed,
+            },
+            pi.clone(),
+        ));
+        let ready = manager.get(info.id).unwrap().info().agent.unwrap();
+        assert_eq!(ready.status, AgentStatus::Idle);
+        assert_eq!(ready.revision, 2);
+        assert!(ready.completed_at.is_some());
+        assert!(ready.activity.is_none());
+
+        assert!(manager.apply_agent_event(
+            info.id,
+            AgentEvent {
+                provider: "codex".to_owned(),
+                kind: AgentEventKind::Closed,
+            },
+            pi,
+        ));
+        let closed = manager.get(info.id).unwrap().info().agent.unwrap();
+        assert_eq!(closed.status, AgentStatus::Closed);
+        assert_eq!(closed.revision, 3);
+        assert!(closed.activity.is_none());
+        assert!(manager.remove(info.id));
     }
 
     #[test]

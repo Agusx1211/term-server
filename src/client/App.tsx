@@ -11,6 +11,8 @@ import {
   X,
 } from "lucide-preact";
 import type {
+  AgentIntegrationAction,
+  AgentIntegrationProvider,
   ArtifactEntry,
   ClientConfig,
   FileEntry,
@@ -108,6 +110,10 @@ const defaultConfig: ClientConfig = {
     model: "",
     models: [],
   },
+  agentIntegrations: {
+    providers: [],
+    fallbacksEnabled: true,
+  },
   build: {
     version: "unknown",
     commit: "unknown",
@@ -196,6 +202,8 @@ export function App() {
   const [checkingForUpdate, setCheckingForUpdate] = useState(false);
   const [installingUpdate, setInstallingUpdate] = useState(false);
   const [restartingBroker, setRestartingBroker] = useState(false);
+  const [updatingAgentIntegration, setUpdatingAgentIntegration] =
+    useState<AgentIntegrationProvider>();
   const [restartingForUpdate, setRestartingForUpdate] = useState<ReleaseInfo>();
   const [notice, setNotice] = useState("");
   const [agentToasts, setAgentToasts] = useState<AgentToast[]>([]);
@@ -861,6 +869,22 @@ export function App() {
     }
   };
 
+  const updateAgentIntegration = async (
+    provider: AgentIntegrationProvider,
+    action: AgentIntegrationAction,
+  ) => {
+    setUpdatingAgentIntegration(provider);
+    try {
+      const agentIntegrations = await api.updateAgentIntegration(provider, action);
+      setConfig((current) => ({ ...current, agentIntegrations }));
+      showNotice(`Agent integration ${action === "remove" ? "removed" : "updated"}`);
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : "Unable to update agent integration");
+    } finally {
+      setUpdatingAgentIntegration(undefined);
+    }
+  };
+
   const updateNotificationMode = async (mode: NotificationMode) => {
     if (includesSystemNotifications(mode)) {
       if (typeof Notification === "undefined") {
@@ -1248,6 +1272,8 @@ export function App() {
                 active={settingsActive}
                 theme={theme}
                 pi={config.pi}
+                agentIntegrations={config.agentIntegrations}
+                updatingAgentIntegration={updatingAgentIntegration}
                 build={config.build}
                 broker={config.broker}
                 updateConfig={config.updates}
@@ -1264,6 +1290,9 @@ export function App() {
                 onTheme={setTheme}
                 onPiChange={(titlesEnabled, summariesEnabled, model) => (
                   void updatePiConfig(titlesEnabled, summariesEnabled, model)
+                )}
+                onAgentIntegration={(provider, action) => (
+                  void updateAgentIntegration(provider, action)
                 )}
                 onCheckForUpdate={() => void checkForUpdates(true)}
                 onInstallUpdate={() => void installUpdate()}

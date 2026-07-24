@@ -1,0 +1,116 @@
+{
+  "description": "Report privacy-bounded Claude Code lifecycle activity to term-server.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event claude 2>/dev/null || true; else cat >/dev/null; fi'",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event claude 2>/dev/null || true; else cat >/dev/null; fi'",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event claude 2>/dev/null || true; else cat >/dev/null; fi'",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "permission_prompt",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event claude 2>/dev/null || true; else cat >/dev/null; fi'",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event claude 2>/dev/null || true; else cat >/dev/null; fi'",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event claude 2>/dev/null || true; else cat >/dev/null; fi'",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event claude 2>/dev/null || true; else cat >/dev/null; fi'",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event claude 2>/dev/null || true; else cat >/dev/null; fi'",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event claude 2>/dev/null || true; else cat >/dev/null; fi'",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event claude 2>/dev/null || true; else cat >/dev/null; fi'",
+            "timeout": 1
+          }
+        ]
+      }
+    ]
+  }
+}

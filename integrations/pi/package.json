@@ -1,0 +1,10 @@
+{
+  "name": "term-server-agent-events",
+  "version": "0.1.0",
+  "description": "Reports Pi lifecycle activity to the term-server session that launched it.",
+  "license": "MIT",
+  "keywords": ["pi-package", "pi-extension", "term-server", "observability"],
+  "pi": {
+    "extensions": ["./extensions/term-server-agent-events.ts"]
+  }
+}

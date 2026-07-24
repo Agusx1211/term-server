@@ -123,6 +123,10 @@ pub struct Cli {
     #[arg(long, hide = true)]
     pub session_broker: bool,
 
+    /// Forward a provider lifecycle event from stdin to the session broker.
+    #[arg(long, hide = true, value_name = "PROVIDER")]
+    pub agent_event: Option<String>,
+
     /// Disable signed update checks and installation.
     #[arg(long, env = "TERM_SERVER_DISABLE_UPDATES", action = ArgAction::SetTrue)]
     pub disable_updates: bool,

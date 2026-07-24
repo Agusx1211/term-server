@@ -1,3 +1,5 @@
+pub mod agent_events;
+pub mod agent_integrations;
 pub mod ai;
 pub mod api;
 pub mod artifacts;
