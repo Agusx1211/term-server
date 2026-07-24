@@ -820,6 +820,10 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
 .login-button { width: 100%; height: 34px; margin-top: 14px; }
 .form-error { margin: 9px 0 0; color: #f1707a; font-size: 12px; line-height: 1.4; }
 .login-footnote { margin: 22px 0 0; color: var(--subtle); font-size: 11px; line-height: 1.45; }
+.login-recovery { display: grid; gap: 8px; margin-top: 18px; padding-top: 18px; border-top: 1px solid var(--border); }
+.login-recovery span { color: var(--subtle); font-size: 11px; line-height: 1.45; }
+.login-clear-button { width: 100%; min-height: 34px; color: var(--muted); }
+.login-clear-button:hover { color: var(--foreground); }
 
 .update-restarting {
   position: fixed; inset: 0; z-index: 200; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 9px;
@@ -1079,6 +1083,7 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
   }
   .input-with-icon input { height: 44px; font-size: 16px; }
   .login-button { height: 44px; }
+  .login-clear-button { min-height: 44px; }
 }
 
 @media (max-height: 500px) and (pointer: coarse) {
