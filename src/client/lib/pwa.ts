@@ -17,3 +17,34 @@ export function registerPwaWorker(): void {
       .catch(() => undefined);
   });
 }
+
+async function bestEffort(action: () => void | Promise<unknown>): Promise<void> {
+  try {
+    await action();
+  } catch {
+    // Browser storage APIs can be unavailable or partially implemented.
+  }
+}
+
+export async function clearBrowserSiteData(): Promise<void> {
+  const cleanup = [
+    bestEffort(() => localStorage.clear()),
+    bestEffort(() => sessionStorage.clear()),
+  ];
+
+  if ("caches" in globalThis) {
+    cleanup.push(bestEffort(async () => {
+      const names = await caches.keys();
+      await Promise.all(names.map((name) => caches.delete(name)));
+    }));
+  }
+
+  if ("serviceWorker" in navigator) {
+    cleanup.push(bestEffort(async () => {
+      const registrations = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(registrations.map((registration) => registration.unregister()));
+    }));
+  }
+
+  await Promise.all(cleanup);
+}

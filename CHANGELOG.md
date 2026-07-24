@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.3 - 2026-07-24
+
+The login page can now reset stale browser state when Safari or an installed app keeps loading an old client.
+
+### Added
+
+- A confirmed “Clear cache and site data” action on the login page signs out the current browser, removes saved term-server settings, deletes Cache Storage entries, unregisters service workers, and reloads from a cache-busting URL.
+- The reset response asks supported browsers to clear HTTP caches and origin storage, covering storage that the client does not use directly.
+
+### Security
+
+- The reset endpoint is available before authentication because it only removes data from the requesting browser. Cross-origin requests are rejected, and server-side terminal sessions keep running.
+
+### Upgrade notes
+
+- There are no breaking changes, data migrations, or broker protocol changes.
+- Clearing site data removes browser-only preferences and the current sign-in cookie. Password-manager entries and server-side terminal sessions are not removed.
+- The release is safe for automatic installation over `0.3.2`.
+
 ## 0.3.2 - 2026-07-24
 
 Session broker updates are now visible and can be activated from Settings without manually restarting the service.

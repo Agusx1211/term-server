@@ -12,7 +12,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State, ws::WebSocketUpgrade},
-    http::{HeaderMap, HeaderValue, StatusCode, Uri, header, uri::Authority},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header, uri::Authority},
     response::{IntoResponse, Response},
     routing::{any, delete, get, get_service, patch, post},
 };
@@ -309,6 +309,16 @@ fn session_cookie(state: &AppState) -> Cookie<'static> {
         .build()
 }
 
+fn expired_session_cookie(state: &AppState) -> Cookie<'static> {
+    Cookie::build((SESSION_COOKIE, ""))
+        .path("/")
+        .http_only(true)
+        .secure(state.secure || state.secure_cookie)
+        .same_site(SameSite::Strict)
+        .max_age(Duration::ZERO)
+        .build()
+}
+
 fn require_origin(headers: &HeaderMap, uri: &Uri, state: &AppState) -> Result<(), ApiError> {
     let Some(origin) = headers.get(header::ORIGIN) else {
         return Ok(());
@@ -444,14 +454,25 @@ async fn logout(
 ) -> Result<(CookieJar, Json<serde_json::Value>), ApiError> {
     require_origin(&headers, &uri, &state)?;
     require_auth(&jar, &state)?;
-    let removal = Cookie::build((SESSION_COOKIE, ""))
-        .path("/")
-        .http_only(true)
-        .secure(state.secure || state.secure_cookie)
-        .same_site(SameSite::Strict)
-        .max_age(Duration::ZERO)
-        .build();
-    Ok((jar.remove(removal), Json(serde_json::json!({ "ok": true }))))
+    Ok((
+        jar.remove(expired_session_cookie(&state)),
+        Json(serde_json::json!({ "ok": true })),
+    ))
+}
+
+async fn clear_site_data(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+) -> Result<(CookieJar, Response), ApiError> {
+    require_origin(&headers, &uri, &state)?;
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response.headers_mut().insert(
+        HeaderName::from_static("clear-site-data"),
+        HeaderValue::from_static("\"cache\", \"storage\""),
+    );
+    Ok((jar.remove(expired_session_cookie(&state)), response))
 }
 
 async fn change_password(
@@ -974,6 +995,7 @@ pub fn build_router(state: AppState, client_directory: Option<PathBuf>) -> Route
         .route("/session", get(session))
         .route("/login", post(login))
         .route("/logout", post(logout))
+        .route("/site-data", delete(clear_site_data))
         .route("/password", patch(change_password))
         .route("/config", get(config))
         .route("/config/pi", patch(update_pi_config))
@@ -1352,6 +1374,56 @@ mod tests {
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("SameSite=Strict"));
         assert!(cookie.contains("Max-Age=34560000"));
+    }
+
+    #[tokio::test]
+    async fn site_data_clear_expires_the_session_and_clears_browser_storage() {
+        let response = build_router(test_state().await, None)
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/site-data")
+                    .header(header::COOKIE, "term_server_session=stale")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            response
+                .headers()
+                .get(HeaderName::from_static("clear-site-data"))
+                .unwrap(),
+            "\"cache\", \"storage\""
+        );
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(cookie.starts_with("term_server_session=;"));
+        assert!(cookie.contains("Max-Age=0"));
+    }
+
+    #[tokio::test]
+    async fn cross_origin_site_data_clear_is_rejected() {
+        let response = build_router(test_state().await, None)
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/site-data")
+                    .header(header::HOST, "localhost")
+                    .header(header::ORIGIN, "https://attacker.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

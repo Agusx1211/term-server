@@ -55,6 +55,7 @@ export const api = {
   login: (password: string) =>
     request<{ ok: true }>("/api/login", { method: "POST", body: JSON.stringify({ password }) }),
   logout: () => request<{ ok: true }>("/api/logout", { method: "POST" }),
+  clearSiteData: () => request<void>("/api/site-data", { method: "DELETE" }),
   changePassword: (currentPassword: string, newPassword: string) =>
     request<{ ok: true }>("/api/password", {
       method: "PATCH",
