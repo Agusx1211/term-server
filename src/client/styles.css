@@ -343,6 +343,21 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
 }
 .settings-update-available { color: var(--foreground); }
 .settings-update-available code { color: #58a6e7; }
+.settings-broker-warning {
+  --broker-warning: #d29922;
+  display: grid; gap: 7px; padding: 9px; border: 1px solid color-mix(in srgb, var(--broker-warning) 55%, var(--border));
+  border-radius: 4px; background: color-mix(in srgb, var(--broker-warning) 8%, var(--panel));
+}
+.settings-broker-warning-title { display: flex; align-items: center; gap: 7px; color: var(--broker-warning); }
+.settings-broker-warning-title > svg { flex: none; }
+.settings-broker-warning-title > span { min-width: 0; display: grid; gap: 2px; }
+.settings-broker-warning-title strong { color: var(--foreground); font-size: 10.5px; }
+.settings-broker-warning-title small {
+  overflow: hidden; color: var(--muted); font: 9px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+.settings-broker-warning p { margin: 0; color: var(--muted); font-size: 9.5px; line-height: 1.4; }
+.settings-broker-warning .settings-broker-terminal-warning { color: var(--broker-warning); }
 .settings-update-action {
   width: 100%; min-height: 30px; display: flex; align-items: center; justify-content: center; gap: 6px;
   border: 1px solid var(--border); border-radius: 3px; background: transparent; color: var(--muted); cursor: pointer;
@@ -350,6 +365,12 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
 .settings-update-action:hover:not(:disabled) { border-color: var(--border-strong); background: var(--hover); color: var(--foreground); }
 .settings-update-action.primary { border-color: var(--accent); background: var(--accent); color: #fff; }
 .settings-update-action.primary:hover:not(:disabled) { background: var(--accent-hover); }
+.settings-update-action.broker-restart {
+  border-color: color-mix(in srgb, var(--broker-warning) 55%, var(--border)); color: var(--broker-warning);
+}
+.settings-update-action.broker-restart:hover:not(:disabled) {
+  border-color: var(--broker-warning); background: color-mix(in srgb, var(--broker-warning) 10%, var(--hover)); color: var(--foreground);
+}
 .settings-update-action:disabled { opacity: .6; cursor: default; }
 .settings-password { width: 100%; min-height: 38px; padding: 0 10px; color: var(--muted); border: 1px solid var(--border); }
 .settings-password:disabled { opacity: .6; cursor: default; }

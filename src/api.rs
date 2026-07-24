@@ -45,8 +45,8 @@ use crate::{
     terminal::{CreateTerminal, RenameTerminal, TerminalError},
     update::{UpdateConfig, UpdateError, UpdateService, UpdateStatus},
     workspace::{
-        SessionConnection, TerminalSocketQuery, WorkspaceBackend, WorkspaceError,
-        serve_terminal_socket,
+        SessionBrokerInfo, SessionConnection, TerminalSocketQuery, WorkspaceBackend,
+        WorkspaceError, serve_terminal_socket,
     },
 };
 #[cfg(unix)]
@@ -75,6 +75,7 @@ pub struct AppState {
 pub struct ServerControl {
     handle: Handle<SocketAddr>,
     restart_requested: Arc<AtomicBool>,
+    broker_restart_requested: Arc<AtomicBool>,
 }
 
 impl ServerControl {
@@ -82,19 +83,35 @@ impl ServerControl {
         Self {
             handle,
             restart_requested: Arc::new(AtomicBool::new(false)),
+            broker_restart_requested: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    pub fn shutdown(&self, restart: bool) {
-        if restart {
-            self.restart_requested.store(true, Ordering::SeqCst);
-        }
+    fn begin_shutdown(&self) {
         self.handle
             .graceful_shutdown(Some(std::time::Duration::from_secs(5)));
     }
 
+    pub fn shutdown(&self) {
+        self.begin_shutdown();
+    }
+
+    pub fn restart(&self) {
+        self.restart_requested.store(true, Ordering::SeqCst);
+        self.begin_shutdown();
+    }
+
     pub fn restart_requested(&self) -> bool {
         self.restart_requested.load(Ordering::SeqCst)
+    }
+
+    pub fn restart_broker(&self) {
+        self.broker_restart_requested.store(true, Ordering::SeqCst);
+        self.restart();
+    }
+
+    pub fn broker_restart_requested(&self) -> bool {
+        self.broker_restart_requested.load(Ordering::SeqCst)
     }
 }
 
@@ -232,12 +249,19 @@ struct ClientConfig {
     password_managed_externally: bool,
     pi: PiClientConfig,
     build: build::BuildInfo,
+    broker: Option<SessionBrokerInfo>,
     updates: UpdateConfig,
 }
 
 #[derive(Debug, Deserialize)]
 struct InstallUpdateRequest {
     commit: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RestartBrokerRequest {
+    close_terminals: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -467,14 +491,17 @@ async fn config(
     jar: CookieJar,
 ) -> Result<Json<ClientConfig>, ApiError> {
     require_auth(&jar, &state)?;
+    let (pi, broker) =
+        tokio::try_join!(state.workspace.pi_config(), state.workspace.broker_info())?;
     Ok(Json(ClientConfig {
         scrollback_lines: state.scrollback_lines,
         max_panes: state.max_panes,
         secure: state.secure,
         hostname: state.hostname.clone(),
         password_managed_externally: state.auth.password_is_externally_managed(),
-        pi: state.workspace.pi_config().await?,
+        pi,
         build: build::info(),
+        broker,
         updates: state.updates.config(),
     }))
 }
@@ -500,9 +527,49 @@ async fn install_update(
     let control = state.server_control.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(750)).await;
-        control.shutdown(true);
+        control.restart();
     });
     Ok(Json(release))
+}
+
+fn validate_broker_restart(
+    broker: &SessionBrokerInfo,
+    close_terminals: bool,
+) -> Result<(), ApiError> {
+    if !broker.restart_required {
+        return Err(ApiError::Conflict(
+            "the session broker is already running the current build".to_owned(),
+        ));
+    }
+    if broker.sessions > 0 && !close_terminals {
+        return Err(ApiError::Conflict(format!(
+            "restarting the session broker will close {} open terminal{}; confirmation is required",
+            broker.sessions,
+            if broker.sessions == 1 { "" } else { "s" },
+        )));
+    }
+    Ok(())
+}
+
+async fn restart_broker(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+    Json(body): Json<RestartBrokerRequest>,
+) -> Result<Json<SessionBrokerInfo>, ApiError> {
+    require_origin(&headers, &uri, &state)?;
+    require_auth(&jar, &state)?;
+    let broker = state.workspace.broker_info().await?.ok_or_else(|| {
+        ApiError::BadRequest("this term-server instance does not use a session broker".to_owned())
+    })?;
+    validate_broker_restart(&broker, body.close_terminals)?;
+    let control = state.server_control.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+        control.restart_broker();
+    });
+    Ok(Json(broker))
 }
 
 async fn update_pi_config(
@@ -910,6 +977,7 @@ pub fn build_router(state: AppState, client_directory: Option<PathBuf>) -> Route
         .route("/password", patch(change_password))
         .route("/config", get(config))
         .route("/config/pi", patch(update_pi_config))
+        .route("/broker/restart", post(restart_broker))
         .route("/update", get(update_status).post(install_update))
         .route("/terminals", get(list_terminals).post(create_terminal))
         .route(
@@ -1143,6 +1211,98 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn config_reports_when_no_session_broker_is_in_use() {
+        let (app, cookie) = authenticated_app().await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let config: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(config["broker"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn protects_session_broker_restarts() {
+        let response = build_router(test_state().await, None)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/broker/restart")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"closeTerminals":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn rejects_session_broker_restarts_without_a_broker() {
+        let (app, cookie) = authenticated_app().await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/broker/restart")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::from(r#"{"closeTerminals":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn session_broker_restart_requires_terminal_confirmation() {
+        let broker = SessionBrokerInfo {
+            version: "0.2.0".to_owned(),
+            commit: "old".to_owned(),
+            sessions: 2,
+            restart_required: true,
+        };
+        assert!(matches!(
+            validate_broker_restart(&broker, false),
+            Err(ApiError::Conflict(_))
+        ));
+        assert!(validate_broker_restart(&broker, true).is_ok());
+        assert!(
+            validate_broker_restart(
+                &SessionBrokerInfo {
+                    sessions: 0,
+                    ..broker
+                },
+                false,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn current_session_broker_cannot_be_restarted_from_the_mismatch_action() {
+        let broker = SessionBrokerInfo {
+            version: build::VERSION.to_owned(),
+            commit: build::COMMIT.to_owned(),
+            sessions: 0,
+            restart_required: false,
+        };
+        assert!(matches!(
+            validate_broker_restart(&broker, false),
+            Err(ApiError::Conflict(_))
+        ));
     }
 
     #[tokio::test]

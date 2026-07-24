@@ -18,6 +18,15 @@ use crate::{
     },
 };
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionBrokerInfo {
+    pub version: String,
+    pub commit: String,
+    pub sessions: usize,
+    pub restart_required: bool,
+}
+
 #[derive(Debug, Error)]
 pub enum WorkspaceError {
     #[error("terminal workspace is unavailable: {0}")]
@@ -185,6 +194,14 @@ impl WorkspaceBackend {
             Self::Local { pi, .. } => Ok(pi.client_config()),
             #[cfg(unix)]
             Self::Broker(client) => client.pi_config().await,
+        }
+    }
+
+    pub async fn broker_info(&self) -> Result<Option<SessionBrokerInfo>, WorkspaceError> {
+        match self {
+            Self::Local { .. } => Ok(None),
+            #[cfg(unix)]
+            Self::Broker(client) => client.info().await.map(Some),
         }
     }
 
