@@ -470,6 +470,7 @@ struct SessionActivity {
     quiet_samples: u8,
     input_submitted_at: u64,
     prompt_capture: PromptCapture,
+    pending_agent_submission: Option<PendingAgentSubmission>,
     pending_title_prompt: Option<(u64, String)>,
     title_revision: u64,
     title_in_flight_revision: Option<u64>,
@@ -489,6 +490,7 @@ impl Default for SessionActivity {
             quiet_samples: 0,
             input_submitted_at: 0,
             prompt_capture: PromptCapture::default(),
+            pending_agent_submission: None,
             pending_title_prompt: None,
             title_revision: 0,
             title_in_flight_revision: None,
@@ -520,6 +522,38 @@ impl SessionActivity {
         self.title_revision = self.title_revision.saturating_add(1);
         self.pending_title_prompt = Some((self.title_revision, prompt));
     }
+
+    fn begin_submission(
+        &mut self,
+        agent: &mut AgentInfo,
+        submitted_at: u64,
+        prompt: Option<String>,
+    ) {
+        let has_prompt = prompt.is_some();
+        self.queue_title_for_submission(&agent.status, prompt);
+        if !has_prompt && self.input_submitted_at == 0 {
+            return;
+        }
+        self.input_submitted_at = submitted_at;
+        self.active_samples = 0;
+        self.quiet_samples = 0;
+        if agent.status != AgentStatus::Working {
+            agent.status = AgentStatus::Working;
+            agent.status_changed_at = submitted_at;
+            agent.revision = agent.revision.saturating_add(1);
+            agent.completed_at = None;
+            agent.summary = None;
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PendingAgentSubmission {
+    agent_pid: u32,
+    agent_start_ticks: u64,
+    agent_kind: String,
+    submitted_at: u64,
+    prompt: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -677,7 +711,45 @@ fn agent_sample_active(agent_kind: &str, cpu_delta: u64, output_delta: u64) -> b
 struct AgentObservation {
     kind: String,
     pid: u32,
+    start_ticks: u64,
     cpu_ticks: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct InitialAgentState {
+    status: AgentStatus,
+    revision: u64,
+    input_submitted_at: u64,
+    completed_at: Option<u64>,
+}
+
+fn initial_agent_state(
+    reported_state: Option<(ReportedAgentState, u64)>,
+    now: u64,
+    startup_revision: u64,
+    submitted_at: Option<u64>,
+) -> InitialAgentState {
+    let Some(submitted_at) = submitted_at else {
+        return InitialAgentState {
+            status: AgentStatus::Idle,
+            revision: startup_revision,
+            input_submitted_at: 0,
+            completed_at: None,
+        };
+    };
+    let completed = reported_state.is_some_and(|(state, reported_at)| {
+        state == ReportedAgentState::Idle && reported_at >= submitted_at
+    });
+    InitialAgentState {
+        status: if completed {
+            AgentStatus::Idle
+        } else {
+            AgentStatus::Working
+        },
+        revision: startup_revision.saturating_add(if completed { 2 } else { 1 }),
+        input_submitted_at: if completed { 0 } else { submitted_at },
+        completed_at: completed.then_some(now),
+    }
 }
 
 #[derive(Debug)]
@@ -794,36 +866,43 @@ impl TerminalSession {
             return Ok(());
         }
         let now = current_millis();
-        let agent_active = self
-            .info
-            .read()
-            .agent
-            .as_ref()
-            .is_some_and(|agent| agent.status != AgentStatus::Closed);
-        if agent_active {
-            let mut activity = self.activity.lock();
-            let input = activity.prompt_capture.observe(data);
-            if input.submitted {
+        let input = self.activity.lock().prompt_capture.observe(data);
+        if input.submitted {
+            let agent_active = self
+                .info
+                .read()
+                .agent
+                .as_ref()
+                .is_some_and(|agent| agent.status != AgentStatus::Closed);
+            if agent_active {
+                let mut activity = self.activity.lock();
                 let mut info = self.info.write();
                 if let Some(agent) = info.agent.as_mut()
                     && agent.status != AgentStatus::Closed
                 {
                     // Anchor the chat title to its first task. Follow-up work cycles keep
                     // that title, and a failed generation retries with the original task.
-                    let has_prompt = input.prompt.is_some();
-                    activity.queue_title_for_submission(&agent.status, input.prompt);
-                    if has_prompt || activity.input_submitted_at > 0 {
-                        activity.input_submitted_at = now;
-                        activity.active_samples = 0;
-                        activity.quiet_samples = 0;
-                        if agent.status != AgentStatus::Working {
-                            agent.status = AgentStatus::Working;
-                            agent.status_changed_at = now;
-                            agent.revision = agent.revision.saturating_add(1);
-                            agent.completed_at = None;
-                            agent.summary = None;
-                        }
-                    }
+                    activity.begin_submission(agent, now, input.prompt);
+                }
+            } else if let Some(prompt) = input.prompt
+                && let Some(agent) = self.live_agent_observation()
+            {
+                let mut activity = self.activity.lock();
+                let mut info = self.info.write();
+                if activity.agent_pid == Some(agent.pid)
+                    && let Some(current) = info.agent.as_mut()
+                    && current.kind == agent.kind
+                    && current.status != AgentStatus::Closed
+                {
+                    activity.begin_submission(current, now, Some(prompt));
+                } else {
+                    activity.pending_agent_submission = Some(PendingAgentSubmission {
+                        agent_pid: agent.pid,
+                        agent_start_ticks: agent.start_ticks,
+                        agent_kind: agent.kind,
+                        submitted_at: now,
+                        prompt,
+                    });
                 }
             }
         }
@@ -832,6 +911,16 @@ impl TerminalSession {
             .write_all(data)
             .and_then(|()| writer.flush())
             .map_err(|error| TerminalError::Io(error.to_string()))
+    }
+
+    fn live_agent_observation(&self) -> Option<AgentObservation> {
+        let info = self.info.read();
+        let shell_pid = info.pid?;
+        let shell_name = executable_name(&info.shell);
+        drop(info);
+        ProcessSnapshot::read(&[shell_pid])
+            .observe(shell_pid, &shell_name)
+            .agent
     }
 
     fn update_viewports(
@@ -949,12 +1038,20 @@ impl TerminalSession {
                     .as_ref()
                     .is_none_or(|current| current.kind != agent.kind);
             if is_new_agent {
+                let pending_submission =
+                    activity
+                        .pending_agent_submission
+                        .take()
+                        .filter(|submission| {
+                            submission.agent_pid == agent.pid
+                                && submission.agent_start_ticks == agent.start_ticks
+                                && submission.agent_kind == agent.kind
+                        });
                 activity.agent_pid = Some(agent.pid);
                 activity.last_cpu_ticks = agent.cpu_ticks;
                 activity.last_sample_output_bytes = output_bytes;
                 activity.active_samples = 0;
                 activity.quiet_samples = 0;
-                activity.input_submitted_at = 0;
                 activity.prompt_capture = PromptCapture::default();
                 activity.pending_title_prompt = None;
                 activity.title_revision = 0;
@@ -966,23 +1063,35 @@ impl TerminalSession {
                     .agent
                     .as_ref()
                     .map_or(1, |current| current.revision.saturating_add(1));
+                let initial_state = initial_agent_state(
+                    reported_state,
+                    now,
+                    revision,
+                    pending_submission
+                        .as_ref()
+                        .map(|submission| submission.submitted_at),
+                );
+                activity.input_submitted_at = initial_state.input_submitted_at;
+                if let Some(submission) = pending_submission {
+                    activity
+                        .queue_title_for_submission(&AgentStatus::Idle, Some(submission.prompt));
+                }
                 info.agent = Some(AgentInfo {
                     kind: agent.kind.clone(),
-                    status: select_agent_status(
-                        &agent.kind,
-                        AgentStatus::Idle,
-                        reported_state,
-                        now,
-                        0,
-                        0,
-                        0,
-                    ),
+                    status: initial_state.status,
                     status_changed_at: now,
                     started_at: now,
-                    revision,
-                    completed_at: None,
+                    revision: initial_state.revision,
+                    completed_at: initial_state.completed_at,
                     summary: None,
                 });
+                if initial_state.completed_at.is_some() && pi_summaries_enabled {
+                    activity.summary_in_flight_revision = Some(initial_state.revision);
+                    outcome.summary = Some((
+                        initial_state.revision,
+                        self.pi_request(PiTaskKind::Summary, &info, &agent.kind, None),
+                    ));
+                }
             } else {
                 let cpu_delta = agent.cpu_ticks.saturating_sub(activity.last_cpu_ticks);
                 let output_delta = output_bytes.saturating_sub(activity.last_sample_output_bytes);
@@ -1078,7 +1187,6 @@ impl TerminalSession {
             activity.active_samples = 0;
             activity.quiet_samples = 0;
             activity.input_submitted_at = 0;
-            activity.prompt_capture = PromptCapture::default();
             activity.pending_title_prompt = None;
             activity.title_in_flight_revision = None;
             *self.signals.lock() = TerminalSignals::default();
@@ -1705,6 +1813,7 @@ impl ProcessSnapshot {
             agent_kind(process).map(|kind| AgentObservation {
                 kind,
                 pid: root.pid,
+                start_ticks: root.start_ticks,
                 cpu_ticks: candidates.iter().map(|process| process.cpu_ticks).sum(),
             })
         });
@@ -2511,6 +2620,42 @@ mod tests {
                 0,
             ),
             AgentStatus::Idle
+        );
+    }
+
+    #[test]
+    fn restores_tasks_submitted_before_agent_discovery() {
+        assert_eq!(
+            initial_agent_state(Some((ReportedAgentState::Working, 1_010)), 1_020, 1, None,),
+            InitialAgentState {
+                status: AgentStatus::Idle,
+                revision: 1,
+                input_submitted_at: 0,
+                completed_at: None,
+            }
+        );
+        assert_eq!(
+            initial_agent_state(None, 1_020, 1, Some(1_000)),
+            InitialAgentState {
+                status: AgentStatus::Working,
+                revision: 2,
+                input_submitted_at: 1_000,
+                completed_at: None,
+            }
+        );
+        assert_eq!(
+            initial_agent_state(
+                Some((ReportedAgentState::Idle, 1_010)),
+                1_020,
+                1,
+                Some(1_000),
+            ),
+            InitialAgentState {
+                status: AgentStatus::Idle,
+                revision: 3,
+                input_submitted_at: 0,
+                completed_at: Some(1_020),
+            }
         );
     }
 
