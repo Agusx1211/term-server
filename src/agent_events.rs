@@ -87,13 +87,15 @@ impl AgentEvent {
 
 pub fn read_hook_event(
     provider: &str,
-    reader: impl std::io::Read,
+    mut reader: impl std::io::Read,
 ) -> std::io::Result<Option<AgentEvent>> {
     let mut bytes = Vec::new();
     reader
+        .by_ref()
         .take(MAX_HOOK_INPUT_BYTES + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_HOOK_INPUT_BYTES {
+        std::io::copy(&mut reader, &mut std::io::sink())?;
         return Ok(None);
     }
     let Ok(input) = serde_json::from_slice::<Value>(&bytes) else {
@@ -186,7 +188,7 @@ mod tests {
     }
 
     #[test]
-    fn ignores_unknown_providers_events_and_oversized_inputs() {
+    fn ignores_unknown_providers_events_and_drains_oversized_inputs() {
         assert!(AgentEvent::from_hook_input(
             "other",
             &serde_json::json!({ "hook_event_name": "Stop" }),
@@ -199,11 +201,9 @@ mod tests {
             )
             .is_none()
         );
-        let oversized = vec![b' '; MAX_HOOK_INPUT_BYTES as usize + 1];
-        assert!(
-            read_hook_event("codex", oversized.as_slice())
-                .unwrap()
-                .is_none()
-        );
+        let oversized = vec![b' '; MAX_HOOK_INPUT_BYTES as usize + 1024];
+        let mut input = std::io::Cursor::new(oversized);
+        assert!(read_hook_event("codex", &mut input).unwrap().is_none());
+        assert_eq!(input.position(), input.get_ref().len() as u64);
     }
 }

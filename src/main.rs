@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::time::Duration;
 use std::{
     env,
     ffi::OsString,
@@ -24,6 +26,9 @@ use term_server::{
 #[cfg(not(unix))]
 use term_server::{ai::PiService, terminal::TerminalManager};
 use tracing_subscriber::EnvFilter;
+
+#[cfg(unix)]
+const AGENT_EVENT_FORWARD_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -153,7 +158,8 @@ async fn forward_agent_event(provider: &str) {
     let Ok(Some(event)) = read_hook_event(provider, std::io::stdin().lock()) else {
         return;
     };
-    let _ = BrokerClient::new(socket).agent_event(id, &event).await;
+    let client = BrokerClient::new(socket);
+    let _ = tokio::time::timeout(AGENT_EVENT_FORWARD_TIMEOUT, client.agent_event(id, &event)).await;
 }
 
 #[cfg(unix)]

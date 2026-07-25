@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c 'if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event codex 2>/dev/null || true; else cat >/dev/null; fi'",
+            "command": "sh -c 'exec 3<&0; if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event codex <&3 >/dev/null 2>&1 & else cat <&3 >/dev/null; fi'",
             "timeout": 1
           }
         ]
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c 'if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event codex 2>/dev/null || true; else cat >/dev/null; fi'",
+            "command": "sh -c 'exec 3<&0; if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event codex <&3 >/dev/null 2>&1 & else cat <&3 >/dev/null; fi'",
             "timeout": 1
           }
         ]
@@ -28,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c 'if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event codex 2>/dev/null || true; else cat >/dev/null; fi'",
+            "command": "sh -c 'exec 3<&0; if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event codex <&3 >/dev/null 2>&1 & else cat <&3 >/dev/null; fi'",
             "timeout": 1
           }
         ]
@@ -39,7 +39,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c 'if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event codex 2>/dev/null || true; else cat >/dev/null; fi'",
+            "command": "sh -c 'exec 3<&0; if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event codex <&3 >/dev/null 2>&1 & else cat <&3 >/dev/null; fi'",
             "timeout": 1
           }
         ]
@@ -50,7 +50,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c 'if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event codex 2>/dev/null || true; else cat >/dev/null; fi'",
+            "command": "sh -c 'exec 3<&0; if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event codex <&3 >/dev/null 2>&1 & else cat <&3 >/dev/null; fi'",
             "timeout": 1
           }
         ]
@@ -61,7 +61,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c 'if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event codex 2>/dev/null || true; else cat >/dev/null; fi'",
+            "command": "sh -c 'exec 3<&0; if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event codex <&3 >/dev/null 2>&1 & else cat <&3 >/dev/null; fi'",
             "timeout": 1
           }
         ]
@@ -72,7 +72,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c 'if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event codex 2>/dev/null || true; else cat >/dev/null; fi'",
+            "command": "sh -c 'exec 3<&0; if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event codex <&3 >/dev/null 2>&1 & else cat <&3 >/dev/null; fi'",
             "timeout": 1
           }
         ]
@@ -83,7 +83,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c 'if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event codex 2>/dev/null || true; else cat >/dev/null; fi'",
+            "command": "sh -c 'exec 3<&0; if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event codex <&3 >/dev/null 2>&1 & else cat <&3 >/dev/null; fi'",
             "timeout": 1
           }
         ]
