@@ -735,6 +735,19 @@ where
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn hook_commands(manifest: &str) -> Vec<String> {
+        let manifest: Value = serde_json::from_str(manifest).unwrap();
+        manifest["hooks"]
+            .as_object()
+            .unwrap()
+            .values()
+            .flat_map(|groups| groups.as_array().unwrap())
+            .flat_map(|group| group["hooks"].as_array().unwrap())
+            .map(|hook| hook["command"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
     #[test]
     fn classifies_additive_installation_states() {
         assert_eq!(
@@ -810,6 +823,69 @@ mod tests {
             b"User packages:\n  /tmp/term-server/agent-integrations/pi-other\n",
             expected
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_hooks_detach_delivery_without_closing_stdin() {
+        use std::{
+            io::Write,
+            os::unix::fs::PermissionsExt,
+            process::{Command as StdCommand, Stdio as StdStdio},
+            thread,
+            time::{Duration, Instant},
+        };
+
+        for manifest in [CODEX_HOOKS, CLAUDE_HOOKS] {
+            for command in hook_commands(manifest) {
+                assert!(command.contains("exec 3<&0"));
+                assert!(command.contains("<&3 >/dev/null 2>&1 &"));
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let helper = directory.path().join("slow-agent-event");
+        let capture = directory.path().join("stdin");
+        std::fs::write(&helper, "#!/bin/sh\ncat >\"$HOOK_CAPTURE\"\nsleep 2\n").unwrap();
+        let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&helper, permissions).unwrap();
+
+        let command = hook_commands(CODEX_HOOKS).into_iter().next().unwrap();
+        let input = vec![b'x'; 2 * 1024 * 1024];
+        let started = Instant::now();
+        let mut hook = StdCommand::new("sh")
+            .arg("-c")
+            .arg(command)
+            .env("TERM_SERVER_EXECUTABLE", &helper)
+            .env("TERM_SERVER_SESSION", "test")
+            .env("TERM_SERVER_BROKER_SOCKET", "test")
+            .env("HOOK_CAPTURE", &capture)
+            .stdin(StdStdio::piped())
+            .stdout(StdStdio::null())
+            .stderr(StdStdio::null())
+            .spawn()
+            .unwrap();
+        hook.stdin
+            .take()
+            .unwrap()
+            .write_all(&input)
+            .expect("the detached reader must keep hook stdin open");
+        assert!(hook.wait().unwrap().success());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the hook waited for the slow event forwarder"
+        );
+
+        for _ in 0..100 {
+            if std::fs::metadata(&capture)
+                .is_ok_and(|metadata| metadata.len() == input.len() as u64)
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read(&capture).unwrap(), input);
     }
 
     #[tokio::test]
