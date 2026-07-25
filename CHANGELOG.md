@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.5.0 - 2026-07-25
+
+Live agent activity no longer delays Codex or Claude Code when tools return large payloads or the
+private session broker is slow.
+
+### Changed
+
+- Managed Codex and Claude Code hooks detach lifecycle event forwarding from the provider's
+  synchronous hook command while continuing to consume its input.
+- Broker event delivery now stops after 500 milliseconds if the private session broker does not
+  respond.
+
+### Fixed
+
+- Oversized hook payloads are fully drained before the helper exits, preventing broken pipe errors
+  after image previews and other tools with large results.
+- Detached hook forwarding retains its input pipe until the provider finishes writing, so broker
+  latency does not hold up the agent loop.
+
+### Security
+
+- The 1 MiB parsing limit remains enforced. Oversized payloads are discarded without parsing or
+  forwarding prompts, tool arguments, or tool output to the session broker.
+
+### Upgrade notes
+
+- There are no breaking changes, data migrations, or broker protocol changes.
+- After upgrading, repair installed Codex or Claude Code packages from Settings → Live agent
+  activity. Codex will ask you to review the changed hook through `/hooks`; start a new agent
+  session after repairing either package.
+- The Pi integration is unchanged.
+- The release is safe for automatic installation over `0.4.1`.
+
 ## 0.4.1 - 2026-07-24
 
 Pi-generated terminal titles now describe the agent's initial task instead of terminal setup traffic.
