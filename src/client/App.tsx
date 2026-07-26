@@ -13,6 +13,7 @@ import {
 import type {
   AgentIntegrationAction,
   AgentIntegrationProvider,
+  ArtifactSkillAction,
   ArtifactEntry,
   ClientConfig,
   FileEntry,
@@ -114,6 +115,12 @@ const defaultConfig: ClientConfig = {
     providers: [],
     fallbacksEnabled: true,
   },
+  artifactSkill: {
+    available: false,
+    source: null,
+    message: null,
+    providers: [],
+  },
   build: {
     version: "unknown",
     commit: "unknown",
@@ -203,6 +210,8 @@ export function App() {
   const [installingUpdate, setInstallingUpdate] = useState(false);
   const [restartingBroker, setRestartingBroker] = useState(false);
   const [updatingAgentIntegration, setUpdatingAgentIntegration] =
+    useState<AgentIntegrationProvider>();
+  const [updatingArtifactSkill, setUpdatingArtifactSkill] =
     useState<AgentIntegrationProvider>();
   const [restartingForUpdate, setRestartingForUpdate] = useState<ReleaseInfo>();
   const [notice, setNotice] = useState("");
@@ -885,6 +894,22 @@ export function App() {
     }
   };
 
+  const updateArtifactSkill = async (
+    provider: AgentIntegrationProvider,
+    action: ArtifactSkillAction,
+  ) => {
+    setUpdatingArtifactSkill(provider);
+    try {
+      const artifactSkill = await api.updateArtifactSkill(provider, action);
+      setConfig((current) => ({ ...current, artifactSkill }));
+      showNotice(`Artifact skill ${action === "remove" ? "removed" : "updated"}`);
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : "Unable to update artifact skill");
+    } finally {
+      setUpdatingArtifactSkill(undefined);
+    }
+  };
+
   const updateNotificationMode = async (mode: NotificationMode) => {
     if (includesSystemNotifications(mode)) {
       if (typeof Notification === "undefined") {
@@ -1274,6 +1299,8 @@ export function App() {
                 pi={config.pi}
                 agentIntegrations={config.agentIntegrations}
                 updatingAgentIntegration={updatingAgentIntegration}
+                artifactSkill={config.artifactSkill}
+                updatingArtifactSkill={updatingArtifactSkill}
                 build={config.build}
                 broker={config.broker}
                 updateConfig={config.updates}
@@ -1293,6 +1320,9 @@ export function App() {
                 )}
                 onAgentIntegration={(provider, action) => (
                   void updateAgentIntegration(provider, action)
+                )}
+                onArtifactSkill={(provider, action) => (
+                  void updateArtifactSkill(provider, action)
                 )}
                 onCheckForUpdate={() => void checkForUpdates(true)}
                 onInstallUpdate={() => void installUpdate()}

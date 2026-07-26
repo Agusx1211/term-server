@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.5.1 - 2026-07-26
+
+Term-server now owns, updates, and reports the artifact skill used by Codex, Claude Code, and Pi.
+
+### Added
+
+- Settings → Artifact skill reports whether each agent uses term-server's bundled skill, a matching
+  external copy, an outdated copy, a broken link, or no skill.
+- Per-agent actions can install the bundled skill, adopt it in place of an external symlink, or
+  remove a link managed by term-server.
+
+### Changed
+
+- The canonical artifact skill is embedded in the term-server binary and repaired into the installed
+  release bundle on startup.
+- Signed automatic updates now validate and replace the bundled `skills/` directory together with
+  the browser client and binary, including rollback on installation failures.
+- Artifact skill instructions now tell Codex, Claude Code, and Pi to record their own provider name
+  instead of hard-coding Codex.
+
+### Fixed
+
+- Upgrading with the 0.5.0 automatic updater no longer leaves the original artifact helper behind.
+  The 0.5.1 binary repairs that bootstrap case on its first startup.
+- External artifact skill copies are identified in Settings instead of silently shadowing the
+  bundled version and drifting out of sync.
+
+### Security
+
+- Artifact skill status requires authentication, and install, repair, and removal require both
+  authentication and a same-origin request.
+- Repair can replace only a symlink. Standalone files and directories are never overwritten, and
+  removal refuses to touch links not owned by term-server.
+
+### Upgrade notes
+
+- There are no breaking changes, data migrations, or broker protocol changes.
+- If Settings reports an external or outdated artifact skill, choose **Use bundled skill** and start
+  a new agent session. Standalone directories must be moved aside manually before adoption.
+- The separate `my-skills` repository no longer distributes `term-server-artifacts`; term-server is
+  its single source of truth.
+- The release is safe for automatic installation over `0.5.0`.
+
 ## 0.5.0 - 2026-07-25
 
 Live agent activity no longer delays Codex or Claude Code when tools return large payloads or the
