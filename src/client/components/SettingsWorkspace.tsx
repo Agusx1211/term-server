@@ -9,6 +9,7 @@ import {
   LogOut,
   MessageSquareText,
   Moon,
+  PackageOpen,
   Settings,
   Shield,
   Sparkles,
@@ -22,6 +23,8 @@ import type {
   AgentIntegrationAction,
   AgentIntegrationProvider,
   AgentIntegrationsConfig,
+  ArtifactSkillAction,
+  ArtifactSkillConfig,
   BuildInfo,
   PiConfig,
   SessionBrokerInfo,
@@ -42,6 +45,8 @@ interface SettingsWorkspaceProps {
   pi: PiConfig;
   agentIntegrations: AgentIntegrationsConfig;
   updatingAgentIntegration?: AgentIntegrationProvider;
+  artifactSkill: ArtifactSkillConfig;
+  updatingArtifactSkill?: AgentIntegrationProvider;
   build: BuildInfo;
   broker: SessionBrokerInfo | null;
   updateConfig: UpdateConfig;
@@ -60,6 +65,10 @@ interface SettingsWorkspaceProps {
   onAgentIntegration: (
     provider: AgentIntegrationProvider,
     action: AgentIntegrationAction,
+  ) => void;
+  onArtifactSkill: (
+    provider: AgentIntegrationProvider,
+    action: ArtifactSkillAction,
   ) => void;
   onCheckForUpdate: () => void;
   onInstallUpdate: () => void;
@@ -131,6 +140,8 @@ export function SettingsWorkspace({
   pi,
   agentIntegrations,
   updatingAgentIntegration,
+  artifactSkill,
+  updatingArtifactSkill,
   build,
   broker,
   updateConfig,
@@ -147,6 +158,7 @@ export function SettingsWorkspace({
   onTheme,
   onPiChange,
   onAgentIntegration,
+  onArtifactSkill,
   onCheckForUpdate,
   onInstallUpdate,
   onRestartBroker,
@@ -208,6 +220,73 @@ export function SettingsWorkspace({
               />
             </label>
             <p class="settings-hint">Turn this off to make every terminal kill action immediate.</p>
+          </section>
+
+          <section class="settings-card settings-card-wide">
+            <header><PackageOpen size={16} /><h2>Artifact skill</h2></header>
+            <p>
+              Use term-server&apos;s bundled artifact skill as the source of truth for every agent.
+              Managed links automatically follow term-server updates.
+            </p>
+            <div class="agent-integration-list">
+              {artifactSkill.providers.map((skill) => {
+                const busy = updatingArtifactSkill === skill.provider;
+                const unavailable = skill.state === "unavailable";
+                const installed = skill.state === "installed";
+                return (
+                  <div class="agent-integration" key={skill.provider}>
+                    <span
+                      class={`agent-integration-state ${skill.state}`}
+                      aria-hidden="true"
+                    />
+                    <span class="agent-integration-copy">
+                      <b>{skill.name}</b>
+                      <small>{skill.message}</small>
+                    </span>
+                    <span class="agent-integration-actions">
+                      {skill.state === "notInstalled" ? (
+                        <button
+                          class="settings-update-action primary"
+                          disabled={busy}
+                          onClick={() => onArtifactSkill(skill.provider, "install")}
+                        >
+                          {busy && <LoaderCircle class="spin" size={13} />}
+                          {busy ? "Installing…" : "Install"}
+                        </button>
+                      ) : unavailable ? (
+                        <button class="settings-update-action" disabled>Unavailable</button>
+                      ) : installed ? (
+                        <button
+                          class="settings-update-action danger"
+                          disabled={busy}
+                          onClick={() => onArtifactSkill(skill.provider, "remove")}
+                        >
+                          {busy && <LoaderCircle class="spin" size={13} />}
+                          {busy ? "Removing…" : "Remove"}
+                        </button>
+                      ) : !skill.repairable ? (
+                        <button class="settings-update-action" disabled>Move aside manually</button>
+                      ) : (
+                        <button
+                          class="settings-update-action primary"
+                          disabled={busy}
+                          onClick={() => onArtifactSkill(skill.provider, "repair")}
+                        >
+                          {busy && <LoaderCircle class="spin" size={13} />}
+                          {busy ? "Working…" : "Use bundled skill"}
+                        </button>
+                      )}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+            <p class="settings-hint">
+              {artifactSkill.available
+                ? `Bundled with term-server ${build.version}. Agent changes apply to new sessions.`
+                : artifactSkill.message
+                  ?? "The bundled skill is unavailable in this development or custom installation."}
+            </p>
           </section>
 
           <section class="settings-card settings-card-wide">

@@ -104,12 +104,17 @@ Filesystem access has the same operating-system permissions as the daemon. Anyon
 
 ### Agent artifacts
 
-The release installer makes the bundled `term-server-artifacts` Codex skill available in
-`${CODEX_HOME:-~/.codex}/skills`. When an agent uses it from a term-server terminal, its helper
-creates a private file under `/tmp/artifacts/<session>/<artifact-id>/` and prints both the full
-`file://` URI and absolute path. Term-server discovers the completed file atomically and places it
-in that session's artifact sidebar. Workspace rows and terminal headers show how many artifacts
-belong to each agent, and the same path remains usable with normal tools such as `cat`.
+Term-server ships the canonical `term-server-artifacts` skill with every release. The installer
+links it into `${CODEX_HOME:-~/.codex}/skills`, and **Settings → Artifact skill** reports whether
+Codex, Claude Code, and Pi use that bundled version, another matching copy, an outdated copy, or a
+broken link. Explicit install and repair actions link an agent to the bundled skill; term-server
+never replaces a standalone directory. Managed links automatically follow term-server updates.
+
+When an agent uses the skill from a term-server terminal, its helper creates a private file under
+`/tmp/artifacts/<session>/<artifact-id>/` and prints both the full `file://` URI and absolute path.
+Term-server discovers the completed file atomically and places it in that session's artifact
+sidebar. Workspace rows and terminal headers show how many artifacts belong to each agent, and the
+same path remains usable with normal tools such as `cat`.
 
 ![Editable session artifact opened in term-server](docs/screenshots/session-artifact.jpg)
 
