@@ -42,6 +42,7 @@ use crate::{
         AgentIntegrationsConfig,
     },
     ai::{PiClientConfig, UpdatePiSettings},
+    artifact_skill::{ArtifactSkillAction, ArtifactSkillConfig, ArtifactSkillService},
     artifacts,
     auth::{AuthError, AuthService, LoginLimiter, SESSION_LIFETIME_DAYS},
     build,
@@ -73,6 +74,7 @@ pub struct AppState {
     pub hostname: String,
     pub updates: Arc<UpdateService>,
     pub agent_integrations: Arc<AgentIntegrationService>,
+    pub artifact_skill: Arc<ArtifactSkillService>,
     pub server_control: ServerControl,
 }
 
@@ -254,6 +256,7 @@ struct ClientConfig {
     password_managed_externally: bool,
     pi: PiClientConfig,
     agent_integrations: AgentIntegrationsConfig,
+    artifact_skill: ArtifactSkillConfig,
     build: build::BuildInfo,
     broker: Option<SessionBrokerInfo>,
     updates: UpdateConfig,
@@ -273,6 +276,11 @@ struct RestartBrokerRequest {
 #[derive(Debug, Deserialize)]
 struct UpdateAgentIntegrationRequest {
     action: AgentIntegrationAction,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateArtifactSkillRequest {
+    action: ArtifactSkillAction,
 }
 
 #[derive(Debug, Deserialize)]
@@ -534,6 +542,7 @@ async fn config(
         password_managed_externally: state.auth.password_is_externally_managed(),
         pi,
         agent_integrations,
+        artifact_skill: state.artifact_skill.status(),
         build: build::info(),
         broker,
         updates: state.updates.config(),
@@ -546,6 +555,31 @@ async fn agent_integrations(
 ) -> Result<Json<AgentIntegrationsConfig>, ApiError> {
     require_auth(&jar, &state)?;
     Ok(Json(state.agent_integrations.status().await))
+}
+
+async fn artifact_skill(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> Result<Json<ArtifactSkillConfig>, ApiError> {
+    require_auth(&jar, &state)?;
+    Ok(Json(state.artifact_skill.status()))
+}
+
+async fn update_artifact_skill(
+    State(state): State<AppState>,
+    Path(provider): Path<AgentIntegrationProvider>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+    Json(body): Json<UpdateArtifactSkillRequest>,
+) -> Result<Json<ArtifactSkillConfig>, ApiError> {
+    require_origin(&headers, &uri, &state)?;
+    require_auth(&jar, &state)?;
+    state
+        .artifact_skill
+        .apply(provider, body.action)
+        .map(Json)
+        .map_err(ApiError::Conflict)
 }
 
 async fn update_agent_integration(
@@ -1038,6 +1072,11 @@ pub fn build_router(state: AppState, client_directory: Option<PathBuf>) -> Route
         .route("/password", patch(change_password))
         .route("/config", get(config))
         .route("/config/pi", patch(update_pi_config))
+        .route("/config/artifact-skill", get(artifact_skill))
+        .route(
+            "/config/artifact-skill/{provider}",
+            patch(update_artifact_skill),
+        )
         .route("/config/agent-integrations", get(agent_integrations))
         .route(
             "/config/agent-integrations/{provider}",
@@ -1129,7 +1168,10 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::{ai::PiService, auth::load_auth, terminal::TerminalManager};
+    use crate::{
+        ai::PiService, artifact_skill::ArtifactSkillService, auth::load_auth,
+        terminal::TerminalManager,
+    };
 
     async fn test_state() -> AppState {
         let directory = tempfile::tempdir().unwrap();
@@ -1159,6 +1201,7 @@ mod tests {
                 true,
             )),
             agent_integrations: Arc::new(AgentIntegrationService::new(directory.path())),
+            artifact_skill: Arc::new(ArtifactSkillService::new(None, directory.path())),
             server_control: ServerControl::new(Handle::new()),
         }
     }
@@ -1298,6 +1341,7 @@ mod tests {
         let config: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(config["broker"], serde_json::Value::Null);
         assert_eq!(config["agentIntegrations"]["fallbacksEnabled"], true);
+        assert_eq!(config["artifactSkill"]["available"], false);
         assert_eq!(
             config["agentIntegrations"]["providers"]
                 .as_array()
@@ -1305,6 +1349,35 @@ mod tests {
                 .len(),
             3
         );
+    }
+
+    #[tokio::test]
+    async fn protects_artifact_skill_management() {
+        let app = build_router(test_state().await, None);
+        let list = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config/artifact-skill")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list.status(), StatusCode::UNAUTHORIZED);
+
+        let update = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/config/artifact-skill/codex")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"action":"install"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(update.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

@@ -17,6 +17,7 @@ use term_server::{
     agent_events::read_hook_event,
     agent_integrations::AgentIntegrationService,
     api::{AppState, ServerControl, build_router},
+    artifact_skill::ArtifactSkillService,
     auth::{LoginLimiter, load_auth},
     config::Cli,
     tls::load_tls,
@@ -105,6 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         hostname,
         updates,
         agent_integrations: Arc::new(AgentIntegrationService::new(&cli.data_dir)),
+        artifact_skill: Arc::new(ArtifactSkillService::discover()),
         server_control: server_control.clone(),
     };
     let app = build_router(state, client_directory);

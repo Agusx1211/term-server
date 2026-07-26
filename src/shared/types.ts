@@ -70,6 +70,7 @@ export interface ClientConfig {
   passwordManagedExternally: boolean;
   pi: PiConfig;
   agentIntegrations: AgentIntegrationsConfig;
+  artifactSkill: ArtifactSkillConfig;
   build: BuildInfo;
   broker: SessionBrokerInfo | null;
   updates: UpdateConfig;
@@ -140,6 +141,31 @@ export interface AgentIntegrationStatus {
 export interface AgentIntegrationsConfig {
   providers: AgentIntegrationStatus[];
   fallbacksEnabled: boolean;
+}
+
+export type ArtifactSkillState =
+  | "unavailable"
+  | "notInstalled"
+  | "installed"
+  | "external"
+  | "outdated"
+  | "broken";
+export type ArtifactSkillAction = "install" | "repair" | "remove";
+
+export interface ArtifactSkillStatus {
+  provider: AgentIntegrationProvider;
+  name: string;
+  state: ArtifactSkillState;
+  message: string;
+  path: string;
+  repairable: boolean;
+}
+
+export interface ArtifactSkillConfig {
+  available: boolean;
+  source: string | null;
+  message: string | null;
+  providers: ArtifactSkillStatus[];
 }
 
 export type FileEntryKind = "file" | "directory";

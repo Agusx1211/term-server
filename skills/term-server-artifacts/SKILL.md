@@ -12,14 +12,15 @@ Turn multiline handoff content into an editable temporary file instead of reprod
 Resolve `scripts/create_artifact.py` relative to this `SKILL.md`, then run it with a short descriptive filename and the content on standard input:
 
 ```bash
-python3 <absolute-skill-directory>/scripts/create_artifact.py --producer codex --name review-comment.md <<'ARTIFACT'
+# Replace AGENT with codex, claude, or pi.
+python3 <absolute-skill-directory>/scripts/create_artifact.py --producer AGENT --name review-comment.md <<'ARTIFACT'
 The multiline content goes here.
 ARTIFACT
 ```
 
 Use the file extension that best describes the content. Use `--from-file <path>` to import an existing text or image file without loading it into the command, or `--content <text>` when the execution tool can pass a multiline argument safely.
 
-Pass the current agent name with `--producer` so Term Server can preserve the exact artifact origin even if the terminal later runs another agent.
+Replace `AGENT` with the current agent name and pass it with `--producer` so Term Server can preserve the exact artifact origin even if the terminal later runs another agent.
 
 The helper prints two values:
 

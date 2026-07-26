@@ -2,6 +2,8 @@ import type {
   AgentIntegrationAction,
   AgentIntegrationProvider,
   AgentIntegrationsConfig,
+  ArtifactSkillAction,
+  ArtifactSkillConfig,
   ArtifactEntry,
   ClientConfig,
   CreateTerminalRequest,
@@ -84,6 +86,14 @@ export const api = {
     provider: AgentIntegrationProvider,
     action: AgentIntegrationAction,
   ) => request<AgentIntegrationsConfig>(`/api/config/agent-integrations/${provider}`, {
+    method: "PATCH",
+    body: JSON.stringify({ action }),
+  }),
+  artifactSkill: () => request<ArtifactSkillConfig>("/api/config/artifact-skill"),
+  updateArtifactSkill: (
+    provider: AgentIntegrationProvider,
+    action: ArtifactSkillAction,
+  ) => request<ArtifactSkillConfig>(`/api/config/artifact-skill/${provider}`, {
     method: "PATCH",
     body: JSON.stringify({ action }),
   }),

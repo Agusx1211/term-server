@@ -84,6 +84,7 @@ struct VerifiedRelease {
 struct Installation {
     executable: PathBuf,
     client_directory: PathBuf,
+    skills_directory: PathBuf,
     root: PathBuf,
 }
 
@@ -350,6 +351,7 @@ fn detect_installation(client_directory: Option<&Path>) -> Result<Installation, 
     Ok(Installation {
         executable,
         client_directory: client_directory.to_owned(),
+        skills_directory: root.join("skills"),
         root,
     })
 }
@@ -497,9 +499,15 @@ fn validate_archive_path(path: &Path, package_name: &str) -> Result<(), UpdateEr
 fn verify_package(package: &Path, release: &ReleaseInfo) -> Result<(), UpdateError> {
     let executable = package.join("term-server");
     let client_index = package.join("client/index.html");
-    if !executable.is_file() || !client_index.is_file() {
+    let skill = package.join("skills/term-server-artifacts/SKILL.md");
+    let skill_helper = package.join("skills/term-server-artifacts/scripts/create_artifact.py");
+    if !executable.is_file()
+        || !client_index.is_file()
+        || !skill.is_file()
+        || !skill_helper.is_file()
+    {
         return Err(UpdateError::InvalidRelease(
-            "release archive is missing its binary or browser client".to_owned(),
+            "release archive is missing its binary, browser client, or artifact skill".to_owned(),
         ));
     }
     #[cfg(unix)]
@@ -541,37 +549,81 @@ fn replace_installation(
 ) -> Result<(), UpdateError> {
     let candidate_binary = package.join("term-server");
     let candidate_client = package.join("client");
+    let candidate_skills = package.join("skills");
     let previous_binary = temporary.join("previous-term-server");
     let previous_client = temporary.join("previous-client");
+    let previous_skills = temporary.join("previous-skills");
 
     fs::rename(&installation.client_directory, &previous_client).map_err(install_error)?;
     if let Err(error) = fs::rename(&candidate_client, &installation.client_directory) {
         let _ = fs::rename(&previous_client, &installation.client_directory);
         return Err(install_error(error));
     }
-    if let Err(error) = fs::rename(&installation.executable, &previous_binary) {
-        rollback_client(
+    let had_skills = if installation.skills_directory.exists() {
+        if let Err(error) = fs::rename(&installation.skills_directory, &previous_skills) {
+            rollback_directory(
+                &installation.client_directory,
+                &candidate_client,
+                &previous_client,
+                true,
+            );
+            return Err(install_error(error));
+        }
+        true
+    } else {
+        false
+    };
+    if let Err(error) = fs::rename(&candidate_skills, &installation.skills_directory) {
+        if had_skills {
+            let _ = fs::rename(&previous_skills, &installation.skills_directory);
+        }
+        rollback_directory(
             &installation.client_directory,
             &candidate_client,
             &previous_client,
+            true,
+        );
+        return Err(install_error(error));
+    }
+    if let Err(error) = fs::rename(&installation.executable, &previous_binary) {
+        rollback_directory(
+            &installation.skills_directory,
+            &candidate_skills,
+            &previous_skills,
+            had_skills,
+        );
+        rollback_directory(
+            &installation.client_directory,
+            &candidate_client,
+            &previous_client,
+            true,
         );
         return Err(install_error(error));
     }
     if let Err(error) = fs::rename(&candidate_binary, &installation.executable) {
         let _ = fs::rename(&previous_binary, &installation.executable);
-        rollback_client(
+        rollback_directory(
+            &installation.skills_directory,
+            &candidate_skills,
+            &previous_skills,
+            had_skills,
+        );
+        rollback_directory(
             &installation.client_directory,
             &candidate_client,
             &previous_client,
+            true,
         );
         return Err(install_error(error));
     }
     Ok(())
 }
 
-fn rollback_client(current: &Path, candidate: &Path, previous: &Path) {
+fn rollback_directory(current: &Path, candidate: &Path, previous: &Path, had_previous: bool) {
     let _ = fs::rename(current, candidate);
-    let _ = fs::rename(previous, current);
+    if had_previous {
+        let _ = fs::rename(previous, current);
+    }
 }
 
 fn install_error(error: impl std::fmt::Display) -> UpdateError {
@@ -696,24 +748,30 @@ mod tests {
     }
 
     #[test]
-    fn replaces_the_binary_and_client_together() {
+    fn replaces_the_binary_client_and_skills_together() {
         let root = tempfile::tempdir().unwrap();
         let executable = root.path().join("term-server");
         let client_directory = root.path().join("client");
+        let skills_directory = root.path().join("skills");
         let package = root.path().join("package");
         let temporary = root.path().join("temporary");
         fs::create_dir(&client_directory).unwrap();
+        fs::create_dir(&skills_directory).unwrap();
         fs::create_dir_all(package.join("client")).unwrap();
+        fs::create_dir(package.join("skills")).unwrap();
         fs::create_dir(&temporary).unwrap();
         fs::write(&executable, "old binary").unwrap();
         fs::write(client_directory.join("index.html"), "old client").unwrap();
+        fs::write(skills_directory.join("version"), "old skill").unwrap();
         fs::write(package.join("term-server"), "new binary").unwrap();
         fs::write(package.join("client/index.html"), "new client").unwrap();
+        fs::write(package.join("skills/version"), "new skill").unwrap();
 
         replace_installation(
             &Installation {
                 executable: executable.clone(),
                 client_directory: client_directory.clone(),
+                skills_directory: skills_directory.clone(),
                 root: root.path().to_owned(),
             },
             &package,
@@ -725,6 +783,10 @@ mod tests {
         assert_eq!(
             fs::read_to_string(client_directory.join("index.html")).unwrap(),
             "new client"
+        );
+        assert_eq!(
+            fs::read_to_string(skills_directory.join("version")).unwrap(),
+            "new skill"
         );
     }
 }

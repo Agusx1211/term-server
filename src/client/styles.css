@@ -344,6 +344,9 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--subtle) 12%, transparent);
 }
 .agent-integration-state.installed { background: #3fb950; box-shadow: 0 0 0 3px color-mix(in srgb, #3fb950 14%, transparent); }
+.agent-integration-state.external { background: #58a6e7; box-shadow: 0 0 0 3px color-mix(in srgb, #58a6e7 14%, transparent); }
+.agent-integration-state.outdated,
+.agent-integration-state.broken,
 .agent-integration-state.needsRepair { background: #d29922; box-shadow: 0 0 0 3px color-mix(in srgb, #d29922 14%, transparent); }
 .agent-integration-state.unavailable { background: #8c959f; box-shadow: none; }
 .agent-integration-copy { min-width: 0; flex: 1; display: grid; gap: 2px; }
