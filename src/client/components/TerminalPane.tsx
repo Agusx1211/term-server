@@ -50,6 +50,7 @@ import {
   MIN_TERMINAL_FONT_SIZE,
   terminalZoomPercent,
 } from "../lib/terminal-zoom";
+import { closeTerminalSocket } from "../lib/terminal-socket";
 import { TerminalStreamState, decodeTerminalFrame } from "../lib/terminal-stream";
 import { ProcessInspector } from "./ProcessInspector";
 import { ArtifactDrawer } from "./ArtifactDrawer";
@@ -493,7 +494,7 @@ export function TerminalPane({
           acceptingInput = false;
           term.options.disableStdin = true;
           onNotice(error instanceof Error ? error.message : "Invalid terminal stream");
-          next.close(1002, "Invalid terminal stream");
+          closeTerminalSocket(next, "protocol-error");
         });
       });
       next.addEventListener("close", () => {
@@ -516,7 +517,7 @@ export function TerminalPane({
       const current = socket.current;
       if (current?.readyState !== WebSocket.OPEN) return;
       if (Date.now() - lastServerMessage > 45_000) {
-        current.close(1001, "Terminal connection timed out");
+        closeTerminalSocket(current, "timeout");
         return;
       }
       current.send(JSON.stringify({ type: "ping" } satisfies ClientTerminalMessage));
