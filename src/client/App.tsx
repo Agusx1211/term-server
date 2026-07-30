@@ -70,9 +70,10 @@ import {
   TERMINAL_FONT_SIZE_STORAGE_KEY,
 } from "./lib/terminal-zoom";
 import {
-  parseTerminalPreviewMode,
+  parseTerminalPreviewSettings,
   TERMINAL_PREVIEW_MODE_STORAGE_KEY,
-  type TerminalPreviewMode,
+  TERMINAL_PREVIEW_SETTINGS_STORAGE_KEY,
+  type TerminalPreviewSettings,
 } from "./lib/terminal-preview";
 import {
   artifactCountsBySession,
@@ -117,6 +118,7 @@ const ResourceDocuments = lazy(() => import("./components/ResourceWorkspace"));
 const defaultConfig: ClientConfig = {
   scrollbackLines: 200_000,
   maxPanes: 4,
+  cachedTerminals: 6,
   secure: true,
   hostname: "",
   passwordManagedExternally: true,
@@ -243,8 +245,11 @@ const initialConfirmTerminalKills = () =>
 const initialTerminalFontSize = () =>
   parseTerminalFontSize(localStorage.getItem(TERMINAL_FONT_SIZE_STORAGE_KEY));
 
-const initialTerminalPreviewMode = () =>
-  parseTerminalPreviewMode(localStorage.getItem(TERMINAL_PREVIEW_MODE_STORAGE_KEY));
+const initialTerminalPreviewSettings = () =>
+  parseTerminalPreviewSettings(
+    localStorage.getItem(TERMINAL_PREVIEW_SETTINGS_STORAGE_KEY),
+    localStorage.getItem(TERMINAL_PREVIEW_MODE_STORAGE_KEY),
+  );
 
 const initialViewedAgentRevisions = () =>
   parseViewedAgentRevisions(localStorage.getItem(VIEWED_AGENT_REVISIONS_STORAGE_KEY));
@@ -284,7 +289,8 @@ export function App() {
   const [tileNewTerminals, setTileNewTerminals] = useState(initialTileNewTerminals);
   const [confirmTerminalKills, setConfirmTerminalKills] = useState(initialConfirmTerminalKills);
   const [terminalFontSize, setTerminalFontSize] = useState(initialTerminalFontSize);
-  const [terminalPreviewMode, setTerminalPreviewMode] = useState(initialTerminalPreviewMode);
+  const [terminalPreviewSettings, setTerminalPreviewSettings] =
+    useState(initialTerminalPreviewSettings);
   const legacyViewedAgentRevisions = useRef(initialViewedAgentRevisions());
   const legacyViewedCommandCompletions = useRef(initialViewedCommandCompletions());
   const [artifacts, setArtifacts] = useState<ArtifactEntry[]>([]);
@@ -729,12 +735,11 @@ export function App() {
 
   useEffect(() => {
     const available = new Set(terminals.map((terminal) => terminal.id));
-    const cacheLimit = Math.max(config.maxPanes, 6);
     setMountedIds((current) => {
-      const next = reconcileMounted(current, paneIds, available, cacheLimit);
+      const next = reconcileMounted(current, paneIds, available, config.cachedTerminals);
       return next.length === current.length && next.every((id, index) => id === current[index]) ? current : next;
     });
-  }, [paneIds, terminals, config.maxPanes]);
+  }, [paneIds, terminals, config.cachedTerminals]);
 
   const markTerminalActivityViewed = (id: string) => {
     const terminal = terminalsRef.current.find((candidate) => candidate.id === id);
@@ -1104,9 +1109,9 @@ export function App() {
     localStorage.setItem(CONFIRM_TERMINAL_KILLS_STORAGE_KEY, String(enabled));
   };
 
-  const updateTerminalPreviewMode = (mode: TerminalPreviewMode) => {
-    setTerminalPreviewMode(mode);
-    localStorage.setItem(TERMINAL_PREVIEW_MODE_STORAGE_KEY, mode);
+  const updateTerminalPreviewSettings = (settings: TerminalPreviewSettings) => {
+    setTerminalPreviewSettings(settings);
+    localStorage.setItem(TERMINAL_PREVIEW_SETTINGS_STORAGE_KEY, JSON.stringify(settings));
   };
 
   const waitForServer = async (ready: (nextConfig: ClientConfig) => boolean) => {
@@ -1251,7 +1256,7 @@ export function App() {
           settingsActive={settingsActive}
           updateAvailable={updateStatus?.state === "available"}
           fileRoot={terminalById.get(activeId ?? "")?.cwd ?? "~"}
-          previewMode={terminalPreviewMode}
+          previewSettings={terminalPreviewSettings}
           theme={theme}
           onMobileClose={closeMobileSidebar}
           onNew={(cwd) => void createTerminal(cwd)}
@@ -1467,7 +1472,7 @@ export function App() {
                 notificationDuration={notificationDuration}
                 tileNewTerminals={tileNewTerminals}
                 confirmTerminalKills={confirmTerminalKills}
-                terminalPreviewMode={terminalPreviewMode}
+                terminalPreviewSettings={terminalPreviewSettings}
                 onTheme={setTheme}
                 onPiChange={(titlesEnabled, summariesEnabled, model) => (
                   void updatePiConfig(titlesEnabled, summariesEnabled, model)
@@ -1486,7 +1491,7 @@ export function App() {
                 onNotificationDurationChange={updateNotificationDuration}
                 onTileNewTerminalsChange={updateTileNewTerminals}
                 onConfirmTerminalKillsChange={updateConfirmTerminalKills}
-                onTerminalPreviewModeChange={updateTerminalPreviewMode}
+                onTerminalPreviewSettingsChange={updateTerminalPreviewSettings}
                 onPasswordChanged={() => showNotice("Password changed; other sessions were signed out")}
                 onLogout={() => void logout()}
               />

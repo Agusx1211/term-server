@@ -23,6 +23,7 @@ interface TerminalPreviewProps {
   theme: ThemeName;
   mode: TerminalPreviewMode;
   position: { left: number; top: number };
+  animationDuration: number;
 }
 
 type PreviewConnection = "connecting" | "connected" | "unavailable";
@@ -32,6 +33,7 @@ export function TerminalPreview({
   theme,
   mode,
   position,
+  animationDuration,
 }: TerminalPreviewProps) {
   const container = useRef<HTMLDivElement>(null);
   const xterm = useRef<XTerm>();
@@ -179,6 +181,7 @@ export function TerminalPreview({
       style={{
         "--preview-left": `${position.left}px`,
         "--preview-top": `${position.top}px`,
+        "--preview-animation-duration": `${animationDuration}ms`,
         "--terminal-color": terminal.color,
         "--terminal-background": mixedTerminalBackground(theme, terminal.color),
       }}

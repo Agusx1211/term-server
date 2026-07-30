@@ -111,6 +111,10 @@ pub struct Cli {
     #[arg(long, env = "TERM_SERVER_MAX_PANES", default_value_t = 4, value_parser = clap::value_parser!(u8).range(1..=8))]
     pub max_panes: u8,
 
+    /// Target number of terminal renderers kept mounted in each browser tab.
+    #[arg(long, env = "TERM_SERVER_CACHED_TERMINALS", default_value_t = 6)]
+    pub cached_terminals: u16,
+
     /// Directory containing the compiled browser application.
     #[arg(long, env = "TERM_SERVER_CLIENT_DIR", default_value_os_t = default_client_dir())]
     pub client_dir: PathBuf,
@@ -203,6 +207,7 @@ mod tests {
         assert!(cli.is_https());
         assert!(cli.tls_hostnames.is_empty());
         assert_eq!(cli.scrollback_lines, 200_000);
+        assert_eq!(cli.cached_terminals, 6);
         assert_eq!(cli.update_channel, "main");
         assert!(!cli.disable_updates);
     }
@@ -218,11 +223,14 @@ mod tests {
             "32",
             "--max-panes",
             "2",
+            "--cached-terminals",
+            "24",
         ])
         .unwrap();
         assert!(!cli.is_https());
         assert_eq!(cli.tls_hostnames, ["vscode4", "vscode11"]);
         assert_eq!(cli.replay_bytes(), 32 * 1024 * 1024);
         assert_eq!(cli.max_panes, 2);
+        assert_eq!(cli.cached_terminals, 24);
     }
 }

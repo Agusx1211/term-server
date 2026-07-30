@@ -178,6 +178,7 @@ Run `term-server --help` for generated CLI help. CLI flags take precedence over 
 | `--replay-mb` | `TERM_SERVER_REPLAY_MB` | `16` | Canonical reconnect state and recent output per terminal |
 | `--scrollback-lines` | `TERM_SERVER_SCROLLBACK_LINES` | `200000` | Browser scrollback per pane |
 | `--max-panes` | `TERM_SERVER_MAX_PANES` | `4` | Visible pane limit, 1–8 |
+| `--cached-terminals` | `TERM_SERVER_CACHED_TERMINALS` | `6` | Mounted terminal renderers per browser tab; `0` keeps only visible panes |
 | `--client-dir` | `TERM_SERVER_CLIENT_DIR` | auto-detected | Compiled browser application |
 | `--disable-updates` | `TERM_SERVER_DISABLE_UPDATES` | off | Disable signed update checks and installation |
 | `--update-channel` | `TERM_SERVER_UPDATE_CHANNEL` | `main` | Signed release channel to follow |

@@ -88,6 +88,7 @@ export interface ProcessInspectorSnapshot {
 export interface ClientConfig {
   scrollbackLines: number;
   maxPanes: number;
+  cachedTerminals: number;
   secure: boolean;
   hostname: string;
   passwordManagedExternally: boolean;
