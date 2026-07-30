@@ -340,6 +340,32 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
 .settings-hint { margin: 8px 2px 0; color: var(--subtle); font-size: 9.5px; line-height: 1.4; }
 .settings-hint + .settings-toggle { margin-top: 10px; }
 .settings-hint strong { color: var(--muted); font-weight: 650; text-transform: capitalize; }
+.terminal-preview-setting {
+  min-width: 0; margin: 14px 0 0; padding: 13px 0 0; border: 0; border-top: 1px solid var(--border);
+}
+.terminal-preview-setting legend { padding: 0; color: var(--muted); font-size: 10px; font-weight: 650; }
+.terminal-preview-mode-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; margin-top: 8px; }
+.terminal-preview-mode {
+  position: relative; min-width: 0; min-height: 62px; display: flex; align-items: center; gap: 9px; padding: 8px;
+  border: 1px solid var(--border); border-radius: 4px; color: var(--muted); cursor: pointer;
+}
+.terminal-preview-mode:hover { border-color: var(--border-strong); background: var(--hover); }
+.terminal-preview-mode.active {
+  border-color: var(--accent); background: color-mix(in srgb, var(--accent) 9%, var(--panel)); color: var(--accent);
+}
+.terminal-preview-mode:has(input:focus-visible) { outline: 2px solid var(--focus); outline-offset: 1px; }
+.terminal-preview-mode > input { position: absolute; opacity: 0; pointer-events: none; }
+.terminal-preview-mode > span:last-child { min-width: 0; display: grid; gap: 2px; }
+.terminal-preview-mode b { color: var(--foreground); font-size: 10.5px; font-weight: 650; }
+.terminal-preview-mode small { color: var(--muted); font-size: 8.5px; line-height: 1.3; }
+.terminal-preview-mode-icon {
+  position: relative; width: 31px; height: 22px; flex: none; border: 1px solid currentColor; border-radius: 2px; opacity: .8;
+}
+.terminal-preview-mode-icon > span {
+  position: absolute; border: 1px solid currentColor; border-radius: 1px; background: color-mix(in srgb, var(--accent) 16%, var(--panel));
+}
+.terminal-preview-mode-icon.compact > span { top: 3px; right: 3px; width: 13px; height: 9px; }
+.terminal-preview-mode-icon.large > span { inset: 3px; }
 .agent-integration-list { display: grid; gap: 6px; }
 .agent-integration {
   min-width: 0; min-height: 52px; display: flex; align-items: center; gap: 9px; padding: 7px 8px;
@@ -600,6 +626,54 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
 .terminal-image-preview header span { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .terminal-image-preview header small { flex: none; color: var(--subtle); font-size: 8.5px; }
 .terminal-image-preview img { width: 100%; max-height: 238px; display: block; object-fit: contain; background: var(--editor); }
+.terminal-preview {
+  position: fixed; z-index: 130; min-width: 0; min-height: 0; overflow: hidden; display: grid; grid-template-rows: 38px minmax(0, 1fr);
+  pointer-events: none; border: 1px solid color-mix(in srgb, var(--terminal-color) 62%, var(--border-strong)); border-radius: 7px;
+  background: var(--panel); color: var(--foreground); box-shadow: 0 14px 38px var(--shadow);
+  animation: terminal-preview-in .12s ease-out;
+}
+.terminal-preview-compact {
+  left: var(--preview-left); top: var(--preview-top); width: min(520px, calc(100vw - var(--preview-left) - 12px));
+  height: min(330px, calc(100vh - 24px));
+}
+.terminal-preview-large {
+  left: var(--preview-left); right: 18px; top: 50%; width: auto; height: min(700px, calc(100vh - 72px));
+  transform: translateY(-50%);
+  box-shadow: 0 0 0 100vmax rgba(0, 0, 0, .42), 0 18px 52px var(--shadow);
+}
+@keyframes terminal-preview-in {
+  from { opacity: 0; }
+}
+.terminal-preview > header {
+  min-width: 0; display: flex; align-items: center; gap: 8px; padding: 0 9px;
+  border-bottom: 1px solid var(--border); background: color-mix(in srgb, var(--terminal-color) 5%, var(--panel));
+}
+.terminal-preview-icon {
+  width: 23px; height: 23px; flex: none; display: grid; place-items: center; border: 1px solid color-mix(in srgb, var(--terminal-color) 48%, var(--border));
+  border-radius: 4px; background: color-mix(in srgb, var(--terminal-color) 9%, var(--panel)); color: var(--terminal-color);
+}
+.terminal-preview-copy { min-width: 0; flex: 1; display: grid; gap: 1px; }
+.terminal-preview-copy strong, .terminal-preview-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.terminal-preview-copy strong { font-size: 10.5px; font-weight: 650; }
+.terminal-preview-copy small { color: var(--subtle); font: 8px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.terminal-preview-status {
+  flex: none; display: inline-flex; align-items: center; gap: 4px; color: var(--muted); font-size: 8.5px; white-space: nowrap;
+}
+.terminal-preview-status > span { width: 6px; height: 6px; border-radius: 50%; background: #d29922; }
+.terminal-preview-status.connected > span { background: #3fb950; }
+.terminal-preview-status.unavailable { color: var(--danger); }
+.terminal-preview-status.unavailable > span { background: var(--danger); }
+.terminal-preview-body { position: relative; min-width: 0; min-height: 0; overflow: hidden; background: var(--terminal-background); }
+.terminal-preview-xterm { position: absolute; inset: 0; overflow: hidden; background: var(--terminal-background); }
+.terminal-preview-xterm .xterm { height: 100%; padding: 7px 7px 3px 9px; }
+.terminal-preview-xterm .xterm-viewport {
+  overflow: hidden !important; background-color: var(--terminal-background) !important;
+}
+.terminal-preview-error {
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); max-width: calc(100% - 30px);
+  padding: 6px 9px; border: 1px solid color-mix(in srgb, var(--danger) 55%, var(--border)); border-radius: 4px;
+  background: var(--panel); color: var(--danger); box-shadow: 0 3px 12px var(--shadow); font-size: 9px; text-align: center;
+}
 .pane-banner { position: absolute; left: 50%; bottom: 13px; transform: translateX(-50%); display: flex; align-items: center; gap: 6px; padding: 5px 10px; border-radius: 4px; background: #332b15; color: #e3c269; box-shadow: 0 3px 12px var(--shadow); font-size: 11px; z-index: 3; }
 .pane-banner.exited { background: var(--panel); color: var(--muted); border: 1px solid var(--border); }
 

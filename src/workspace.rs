@@ -233,6 +233,7 @@ impl WorkspaceBackend {
         id: Uuid,
         initial_size: Option<(u16, u16)>,
         sequence: Option<u64>,
+        observer: bool,
     ) -> Result<SessionConnection, WorkspaceError> {
         match self {
             Self::Local { terminals, .. } => terminals
@@ -244,7 +245,7 @@ impl WorkspaceBackend {
                 }),
             #[cfg(unix)]
             Self::Broker(client) => client
-                .terminal_socket(id, initial_size, sequence)
+                .terminal_socket(id, initial_size, sequence, observer)
                 .await
                 .map(Box::new)
                 .map(SessionConnection::Broker),
@@ -281,6 +282,8 @@ pub(crate) struct TerminalSocketQuery {
     cols: Option<u16>,
     rows: Option<u16>,
     sequence: Option<u64>,
+    #[serde(default)]
+    observer: bool,
 }
 
 impl TerminalSocketQuery {
@@ -290,6 +293,10 @@ impl TerminalSocketQuery {
 
     pub(crate) fn sequence(&self) -> Option<u64> {
         self.sequence
+    }
+
+    pub(crate) fn observer(&self) -> bool {
+        self.observer
     }
 }
 
@@ -358,16 +365,21 @@ pub(crate) async fn serve_terminal_socket(
     terminal: Arc<TerminalSession>,
     initial_size: Option<(u16, u16)>,
     requested_sequence: Option<u64>,
+    observer: bool,
 ) {
     let client_id = Uuid::new_v4();
-    if let Err(error) = terminal.attach(client_id, initial_size) {
-        terminal.detach(client_id);
-        tracing::debug!(%error, "initial terminal resize failed");
-        return;
-    }
-    let _attachment = Attachment {
-        terminal: terminal.clone(),
-        client_id,
+    let _attachment = if observer {
+        None
+    } else {
+        if let Err(error) = terminal.attach(client_id, initial_size) {
+            terminal.detach(client_id);
+            tracing::debug!(%error, "initial terminal resize failed");
+            return;
+        }
+        Some(Attachment {
+            terminal: terminal.clone(),
+            client_id,
+        })
     };
     let ready = serde_json::to_string(&TerminalServerMessage::Ready {
         terminal: Box::new(terminal.info()),
@@ -443,6 +455,18 @@ pub(crate) async fn serve_terminal_socket(
                 let Some(Ok(message)) = incoming else { break; };
                 match message {
                     Message::Text(text) => match serde_json::from_str::<TerminalClientMessage>(&text) {
+                        Ok(TerminalClientMessage::Ping) => {
+                            let pong = serde_json::to_string(&TerminalServerMessage::Pong)
+                                .expect("serializable pong");
+                            if sender.send(Message::Text(pong.into())).await.is_err() { break; }
+                        }
+                        Ok(_) if observer => {
+                            let error = serde_json::to_string(&TerminalServerMessage::Error {
+                                message: "observer connections are read-only",
+                            })
+                            .expect("serializable error");
+                            if sender.send(Message::Text(error.into())).await.is_err() { break; }
+                        }
                         Ok(TerminalClientMessage::Input { data }) if data.len() <= 64 * 1024 => {
                             if let Err(error) = terminal.write(data.as_bytes()) {
                                 tracing::debug!(%error, "terminal input failed");
@@ -454,11 +478,6 @@ pub(crate) async fn serve_terminal_socket(
                         }
                         Ok(TerminalClientMessage::Focus { focused }) => {
                             if terminal.focus_client(client_id, focused).is_err() { break; }
-                        }
-                        Ok(TerminalClientMessage::Ping) => {
-                            let pong = serde_json::to_string(&TerminalServerMessage::Pong)
-                                .expect("serializable pong");
-                            if sender.send(Message::Text(pong.into())).await.is_err() { break; }
                         }
                         _ => {
                             let error = serde_json::to_string(&TerminalServerMessage::Error {

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
+import { lazy, Suspense } from "preact/compat";
 import {
   Activity,
   Bell,
@@ -35,6 +36,12 @@ import { agentSubtitle } from "../lib/agent-activity";
 import { commandSubtitle } from "../lib/command-status";
 import { configureTerminalDrag } from "../lib/layout";
 import {
+  terminalPreviewAllowed,
+  terminalPreviewPosition,
+  type TerminalPreviewMode,
+} from "../lib/terminal-preview";
+import type { ThemeName } from "../lib/terminal-theme";
+import {
   clampSidebarWidth,
   DEFAULT_SIDEBAR_WIDTH,
   MAX_SIDEBAR_WIDTH,
@@ -46,6 +53,10 @@ import { buildTerminalTree, type TerminalTreeNode } from "../lib/tree";
 import { FileExplorer } from "./FileExplorer";
 import { WorkingDuration } from "./WorkingDuration";
 
+const TerminalPreview = lazy(() =>
+  import("./TerminalPreview").then((module) => ({ default: module.TerminalPreview })),
+);
+
 interface SidebarProps {
   terminals: TerminalInfo[];
   activeIds: string[];
@@ -56,6 +67,8 @@ interface SidebarProps {
   settingsActive: boolean;
   updateAvailable: boolean;
   fileRoot: string;
+  previewMode: TerminalPreviewMode;
+  theme: ThemeName;
   onMobileClose: () => void;
   onNew: (cwd?: string) => void;
   onOpen: (id: string) => void;
@@ -75,6 +88,8 @@ interface NodeProps {
   activeIds: string[];
   attentionTerminalIds: Set<string>;
   artifactCounts: ReadonlyMap<string, number>;
+  onPreview: (terminal: TerminalInfo, row: HTMLElement, pointerType: string) => void;
+  onPreviewLeave: () => void;
   onToggle: (path: string) => void;
   onNew: (cwd?: string) => void;
   onOpen: (id: string) => void;
@@ -92,6 +107,8 @@ function TreeNode({
   activeIds,
   attentionTerminalIds,
   artifactCounts,
+  onPreview,
+  onPreviewLeave,
   onToggle,
   onNew,
   onOpen,
@@ -117,6 +134,10 @@ function TreeNode({
       <div
         class={`tree-row terminal-row ${activityClass} ${needsAttention ? "activity-attention" : ""} ${activeIds.includes(terminal.id) ? "active" : ""}`}
         style={{ "--depth": depth, "--workspace-color": terminal.color }}
+        onPointerEnter={(event) => (
+          onPreview(terminal, event.currentTarget, event.pointerType)
+        )}
+        onPointerLeave={onPreviewLeave}
       >
         <button
           class="tree-main terminal-drag-source"
@@ -213,6 +234,8 @@ function TreeNode({
               activeIds={activeIds}
               attentionTerminalIds={attentionTerminalIds}
               artifactCounts={artifactCounts}
+              onPreview={onPreview}
+              onPreviewLeave={onPreviewLeave}
               onToggle={onToggle}
               onNew={onNew}
               onOpen={onOpen}
@@ -255,6 +278,8 @@ export function Sidebar({
   settingsActive,
   updateAvailable,
   fileRoot,
+  previewMode,
+  theme,
   onMobileClose,
   onNew,
   onOpen,
@@ -272,18 +297,66 @@ export function Sidebar({
   const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth);
   const sidebarWidthRef = useRef(sidebarWidth);
   const resizeStart = useRef<{ pointerId: number; x: number; width: number }>();
+  const previewTimer = useRef<number>();
+  const previewLeaveTimer = useRef<number>();
   const mobileCloseButton = useRef<HTMLButtonElement>(null);
+  const [preview, setPreview] = useState<{
+    terminal: TerminalInfo;
+    position: { left: number; top: number };
+  }>();
   const matching = useMemo(() => {
     const needle = query.trim().toLocaleLowerCase();
     return needle ? terminals.filter((terminal) => terminal.path.toLocaleLowerCase().includes(needle)) : terminals;
   }, [query, terminals]);
   const tree = useMemo(() => buildTerminalTree(matching), [matching]);
 
-  useEffect(() => () => document.body.classList.remove("sidebar-resizing"), []);
+  useEffect(() => {
+    const hidePreview = () => setPreview(undefined);
+    window.addEventListener("resize", hidePreview);
+    return () => {
+      document.body.classList.remove("sidebar-resizing");
+      window.removeEventListener("resize", hidePreview);
+      if (previewTimer.current) clearTimeout(previewTimer.current);
+      if (previewLeaveTimer.current) clearTimeout(previewLeaveTimer.current);
+    };
+  }, []);
 
   useEffect(() => {
     if (mobileOpen) requestAnimationFrame(() => mobileCloseButton.current?.focus());
   }, [mobileOpen]);
+
+  useEffect(() => {
+    if (filesOpen || mobileOpen) setPreview(undefined);
+  }, [filesOpen, mobileOpen]);
+
+  const clearPreviewTimers = () => {
+    if (previewTimer.current) clearTimeout(previewTimer.current);
+    if (previewLeaveTimer.current) clearTimeout(previewLeaveTimer.current);
+    previewTimer.current = undefined;
+    previewLeaveTimer.current = undefined;
+  };
+
+  const beginPreview = (terminal: TerminalInfo, row: HTMLElement, pointerType: string) => {
+    if (!terminalPreviewAllowed(pointerType)) return;
+    clearPreviewTimers();
+    const rectangle = row.getBoundingClientRect();
+    previewTimer.current = window.setTimeout(() => {
+      setPreview({
+        terminal,
+        position: terminalPreviewPosition(rectangle, window.innerHeight),
+      });
+      previewTimer.current = undefined;
+    }, 260);
+  };
+
+  const leavePreview = () => {
+    if (previewTimer.current) clearTimeout(previewTimer.current);
+    previewTimer.current = undefined;
+    previewLeaveTimer.current = window.setTimeout(() => {
+      setPreview(undefined);
+      previewLeaveTimer.current = undefined;
+    }, 80);
+  };
 
   const updateSidebarWidth = (width: number, persist = false) => {
     sidebarWidthRef.current = width;
@@ -410,13 +483,19 @@ export function Sidebar({
                 activeIds={activeIds}
                 attentionTerminalIds={attentionTerminalIds}
                 artifactCounts={artifactCounts}
+                onPreview={beginPreview}
+                onPreviewLeave={leavePreview}
                 onToggle={toggle}
                 onNew={onNew}
                 onOpen={onOpen}
                 onSplit={onSplit}
                 onRename={onRename}
                 onRemove={onRemove}
-                onDragStart={onDragStart}
+                onDragStart={(id) => {
+                  clearPreviewTimers();
+                  setPreview(undefined);
+                  onDragStart(id);
+                }}
                 onDragEnd={onDragEnd}
               />
             ))}
@@ -449,6 +528,16 @@ export function Sidebar({
         <span class="status-dot online" />
         <span>{terminals.filter((terminal) => terminal.status === "running").length}</span>
       </footer>
+      {preview && (
+        <Suspense fallback={null}>
+          <TerminalPreview
+            terminal={preview.terminal}
+            theme={theme}
+            mode={previewMode}
+            position={preview.position}
+          />
+        </Suspense>
+      )}
       <div
         class="sidebar-resize-handle"
         role="separator"
