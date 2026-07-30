@@ -2,9 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { AgentInfo } from "../../shared/types";
 import {
   agentNeedsAttention,
-  markAgentRevisionViewed,
   parseViewedAgentRevisions,
-  pruneViewedAgentRevisions,
 } from "./agent-attention";
 
 const agent = (status: AgentInfo["status"], revision: number): AgentInfo => ({
@@ -22,18 +20,19 @@ describe("agent attention", () => {
     expect(agentNeedsAttention(agent("working", 2), undefined)).toBe(false);
     expect(agentNeedsAttention(agent("closed", 2), undefined)).toBe(false);
     expect(agentNeedsAttention(agent("idle", 1), undefined)).toBe(false);
-    expect(agentNeedsAttention(agent("idle", 3), 2)).toBe(true);
-    expect(agentNeedsAttention(agent("idle", 3), 3)).toBe(false);
+    expect(agentNeedsAttention(agent("idle", 3), 1002)).toBe(true);
+    expect(agentNeedsAttention(agent("idle", 3), 1003)).toBe(false);
   });
 
   it("does not flag startup idleness before a task completes", () => {
     expect(agentNeedsAttention({ ...agent("idle", 2), completedAt: null }, undefined)).toBe(false);
   });
 
-  it("marks revisions monotonically", () => {
-    const viewed = { terminal: 3 };
-    expect(markAgentRevisionViewed(viewed, "terminal", 2)).toBe(viewed);
-    expect(markAgentRevisionViewed(viewed, "terminal", 4)).toEqual({ terminal: 4 });
+  it("does not hide a new agent lifecycle when its revision restarts", () => {
+    expect(agentNeedsAttention(
+      { ...agent("idle", 2), completedAt: 2000 },
+      1500,
+    )).toBe(true);
   });
 
   it("parses valid stored revisions and ignores malformed entries", () => {
@@ -42,10 +41,4 @@ describe("agent attention", () => {
     expect(parseViewedAgentRevisions("[]")).toEqual({});
   });
 
-  it("prunes terminals that no longer exist", () => {
-    expect(pruneViewedAgentRevisions(
-      { keep: 2, remove: 4 },
-      new Set(["keep"]),
-    )).toEqual({ keep: 2 });
-  });
 });

@@ -4,9 +4,7 @@ import {
   commandCompletionEvent,
   commandNeedsAttention,
   commandSubtitle,
-  markCommandCompletionViewed,
   parseViewedCommandCompletions,
-  pruneViewedCommandCompletions,
 } from "./command-status";
 
 const command = (
@@ -35,22 +33,12 @@ describe("foreground command status", () => {
     expect(commandNeedsAttention(command({ status: "live", completedAt: null }), undefined)).toBe(false);
   });
 
-  it("marks completion timestamps monotonically", () => {
-    const viewed = { terminal: 20 };
-    expect(markCommandCompletionViewed(viewed, "terminal", 19)).toBe(viewed);
-    expect(markCommandCompletionViewed(viewed, "terminal", 21)).toEqual({ terminal: 21 });
-  });
-
-  it("parses and prunes valid stored completion timestamps", () => {
+  it("parses valid stored completion timestamps", () => {
     expect(parseViewedCommandCompletions(
       '{"one":2,"two":-1,"three":"3","four":1.5}',
     )).toEqual({ one: 2 });
     expect(parseViewedCommandCompletions("not json")).toEqual({});
     expect(parseViewedCommandCompletions("[]")).toEqual({});
-    expect(pruneViewedCommandCompletions(
-      { keep: 2, remove: 4 },
-      new Set(["keep"]),
-    )).toEqual({ keep: 2 });
   });
 
   it("describes running commands, TUIs, and completed commands distinctly", () => {
