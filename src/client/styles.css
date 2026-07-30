@@ -344,6 +344,9 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
   min-width: 0; margin: 14px 0 0; padding: 13px 0 0; border: 0; border-top: 1px solid var(--border);
 }
 .terminal-preview-setting legend { padding: 0; color: var(--muted); font-size: 10px; font-weight: 650; }
+.terminal-preview-control-label {
+  display: block; margin-top: 8px; color: var(--subtle); font-size: 9px; font-weight: 650; text-transform: uppercase; letter-spacing: .04em;
+}
 .terminal-preview-mode-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; margin-top: 8px; }
 .terminal-preview-mode {
   position: relative; min-width: 0; min-height: 62px; display: flex; align-items: center; gap: 9px; padding: 8px;
@@ -366,6 +369,22 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
 }
 .terminal-preview-mode-icon.compact > span { top: 3px; right: 3px; width: 13px; height: 9px; }
 .terminal-preview-mode-icon.large > span { inset: 3px; }
+.terminal-preview-range-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; margin-top: 8px; }
+.terminal-preview-range {
+  min-width: 0; display: grid; gap: 6px; padding: 9px; border: 1px solid var(--border); border-radius: 4px; color: var(--muted);
+}
+.terminal-preview-range > span { min-width: 0; display: flex; align-items: center; gap: 8px; }
+.terminal-preview-range b { min-width: 0; flex: 1; color: var(--foreground); font-size: 10px; font-weight: 650; }
+.terminal-preview-range output {
+  flex: none; color: var(--accent); font: 9px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums;
+}
+.terminal-preview-range input { width: 100%; margin: 0; accent-color: var(--accent); cursor: pointer; }
+.terminal-preview-range small { color: var(--subtle); font-size: 8.5px; line-height: 1.35; }
+.terminal-preview-reset {
+  min-height: 28px; margin-top: 8px; padding: 0 9px; border: 1px solid var(--border); border-radius: 3px;
+  background: transparent; color: var(--muted); font-size: 9px; cursor: pointer;
+}
+.terminal-preview-reset:hover { border-color: var(--border-strong); background: var(--hover); color: var(--foreground); }
 .agent-integration-list { display: grid; gap: 6px; }
 .agent-integration {
   min-width: 0; min-height: 52px; display: flex; align-items: center; gap: 9px; padding: 7px 8px;
@@ -630,7 +649,7 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
   position: fixed; z-index: 130; min-width: 0; min-height: 0; overflow: hidden; display: grid; grid-template-rows: 38px minmax(0, 1fr);
   pointer-events: none; border: 1px solid color-mix(in srgb, var(--terminal-color) 62%, var(--border-strong)); border-radius: 7px;
   background: var(--panel); color: var(--foreground); box-shadow: 0 14px 38px var(--shadow);
-  animation: terminal-preview-in .12s ease-out;
+  animation: terminal-preview-in var(--preview-animation-duration, 120ms) ease-out;
 }
 .terminal-preview-compact {
   left: var(--preview-left); top: var(--preview-top); width: min(520px, calc(100vw - var(--preview-left) - 12px));
@@ -1164,6 +1183,7 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
   .agent-integration-actions { width: 100%; padding-left: 17px; }
   .agent-integration-actions .settings-update-action { flex: 1; }
   .notification-mode-grid { grid-template-columns: minmax(0, 1fr); }
+  .terminal-preview-range-grid { grid-template-columns: minmax(0, 1fr); }
 
   .welcome { justify-content: safe center; padding: 20px 16px; gap: 10px; }
   .welcome-ascii { max-width: 100%; font-size: clamp(8px, 2.5vw, 10px); }

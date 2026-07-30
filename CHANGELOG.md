@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.7.1 - 2026-07-30
+
+Live terminal previews can now be disabled and tuned for each browser.
+
+### Added
+
+- Settings → Terminal behavior includes an explicit toggle for live hover previews.
+- Hover delay is adjustable from immediate to one second.
+- Fade-in duration is adjustable from off to 400 milliseconds, with a reset action for all preview
+  controls.
+- Server operators can set the mounted terminal renderer cache per browser tab with
+  `--cached-terminals` or `TERM_SERVER_CACHED_TERMINALS`.
+
+### Changed
+
+- Preview enabled state, compact or large size, hover delay, and animation duration are stored
+  together as one browser preference.
+- Existing compact or large preferences are migrated automatically.
+
+### Fixed
+
+- Turning previews off immediately cancels pending hover timers and closes any visible preview,
+  preventing new observer connections while disabled.
+
+### Upgrade notes
+
+- There are no breaking changes, data migrations, or broker protocol changes.
+- The new renderer cache setting defaults to six terminals, matching the previous behavior, so no
+  configuration change is required.
+- No additional broker restart is required after `0.7.0`. If the broker has not been restarted since
+  installing `0.7.0`, restart it from Settings before enabling previews.
+- The release is safe for automatic installation over `0.7.0`.
+
 ## 0.7.0 - 2026-07-30
 
 Terminals now have live hover previews, and unread agent and long-command completions stay
