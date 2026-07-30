@@ -2,6 +2,7 @@ import type {
   AgentIntegrationAction,
   AgentIntegrationProvider,
   AgentIntegrationsConfig,
+  ActivityView,
   ArtifactSkillAction,
   ArtifactSkillConfig,
   ArtifactEntry,
@@ -12,6 +13,7 @@ import type {
   PiConfig,
   ProcessInspectorSnapshot,
   UpdatePiConfig,
+  UpdateActivityView,
   DirectoryListing,
   FileDocument,
   FileEntry,
@@ -102,6 +104,11 @@ export const api = {
     request<TerminalInfo>("/api/terminals", { method: "POST", body: JSON.stringify(terminal) }),
   renameTerminal: (id: string, terminal: RenameTerminalRequest) =>
     request<TerminalInfo>(`/api/terminals/${id}`, { method: "PATCH", body: JSON.stringify(terminal) }),
+  updateTerminalActivityView: (id: string, activityView: UpdateActivityView) =>
+    request<ActivityView>(`/api/terminals/${id}/activity-view`, {
+      method: "PATCH",
+      body: JSON.stringify(activityView),
+    }),
   removeTerminal: (id: string) => request<void>(`/api/terminals/${id}`, { method: "DELETE" }),
   terminalProcesses: (id: string) =>
     request<ProcessInspectorSnapshot>(`/api/terminals/${id}/processes`),

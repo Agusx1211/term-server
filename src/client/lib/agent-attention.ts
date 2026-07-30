@@ -23,31 +23,13 @@ export function parseViewedAgentRevisions(raw: string | null): ViewedAgentRevisi
 
 export function agentNeedsAttention(
   agent: AgentInfo | null,
-  viewedRevision: number | undefined,
+  viewedCompletion: number | undefined,
 ): boolean {
   return Boolean(
     agent
     && agent.status === "idle"
     && agent.completedAt != null
     && agent.revision > 1
-    && agent.revision > (viewedRevision ?? 0),
+    && agent.completedAt > (viewedCompletion ?? 0),
   );
-}
-
-export function markAgentRevisionViewed(
-  current: ViewedAgentRevisions,
-  terminalId: string,
-  revision: number,
-): ViewedAgentRevisions {
-  if ((current[terminalId] ?? 0) >= revision) return current;
-  return { ...current, [terminalId]: revision };
-}
-
-export function pruneViewedAgentRevisions(
-  current: ViewedAgentRevisions,
-  terminalIds: Set<string>,
-): ViewedAgentRevisions {
-  const entries = Object.entries(current).filter(([id]) => terminalIds.has(id));
-  if (entries.length === Object.keys(current).length) return current;
-  return Object.fromEntries(entries);
 }
