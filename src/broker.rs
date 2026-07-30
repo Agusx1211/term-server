@@ -85,30 +85,20 @@ impl BrokerClient {
     pub async fn connect_or_start(cli: &Cli, executable: &Path) -> Result<Self, BrokerError> {
         tokio::fs::create_dir_all(&cli.data_dir).await?;
         let client = Self::new(socket_path(&cli.data_dir));
-        if client.health().await.is_err() {
-            spawn_broker(cli, executable)?;
-            let mut last_error = None;
-            for _ in 0..50 {
-                match client.health().await {
-                    Ok(_) => {
-                        last_error = None;
-                        break;
-                    }
-                    Err(error) => last_error = Some(error),
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+        let health = match client.health().await {
+            Ok(health) if health.protocol_version != PROTOCOL_VERSION => {
+                tracing::warn!(
+                    expected_protocol = PROTOCOL_VERSION,
+                    actual_protocol = health.protocol_version,
+                    sessions = health.sessions,
+                    "replacing incompatible session broker; existing terminals will close"
+                );
+                client.shutdown().await?;
+                client.start_and_wait(cli, executable).await?
             }
-            if let Some(error) = last_error {
-                return Err(error);
-            }
-        }
-        let health = client.health().await?;
-        if health.protocol_version != PROTOCOL_VERSION {
-            return Err(BrokerError::Protocol {
-                expected: PROTOCOL_VERSION,
-                actual: health.protocol_version,
-            });
-        }
+            Ok(health) => health,
+            Err(_) => client.start_and_wait(cli, executable).await?,
+        };
         tracing::info!(
             broker_version = %health.build.version,
             broker_commit = %health.build.commit,
@@ -120,6 +110,31 @@ impl BrokerClient {
             .configure(cli.shell.clone(), cli.replay_bytes())
             .await?;
         Ok(client)
+    }
+
+    async fn start_and_wait(
+        &self,
+        cli: &Cli,
+        executable: &Path,
+    ) -> Result<HealthResponse, BrokerError> {
+        spawn_broker(cli, executable)?;
+        let mut last_error = None;
+        for _ in 0..50 {
+            match self.health().await {
+                Ok(health) if health.protocol_version == PROTOCOL_VERSION => return Ok(health),
+                Ok(health) => {
+                    last_error = Some(BrokerError::Protocol {
+                        expected: PROTOCOL_VERSION,
+                        actual: health.protocol_version,
+                    });
+                }
+                Err(error) => last_error = Some(error),
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Err(last_error.unwrap_or_else(|| {
+            BrokerError::Unavailable("session broker did not become ready".to_owned())
+        }))
     }
 
     async fn health(&self) -> Result<HealthResponse, BrokerError> {
