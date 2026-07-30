@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  DEFAULT_TERMINAL_PREVIEW_SETTINGS,
   parseTerminalPreviewMode,
+  parseTerminalPreviewSettings,
   terminalPreviewAllowed,
   terminalPreviewFontSize,
   terminalPreviewPosition,
@@ -14,10 +16,40 @@ describe("terminal preview preferences", () => {
     expect(parseTerminalPreviewMode("large")).toBe("large");
   });
 
+  it("loads every control and clamps untrusted durations", () => {
+    expect(parseTerminalPreviewSettings(JSON.stringify({
+      enabled: false,
+      mode: "large",
+      hoverDelay: -40,
+      animationDuration: 900,
+    }))).toEqual({
+      enabled: false,
+      mode: "large",
+      hoverDelay: 0,
+      animationDuration: 400,
+    });
+  });
+
+  it("migrates the legacy size and recovers malformed settings", () => {
+    expect(parseTerminalPreviewSettings(null, "large")).toEqual({
+      ...DEFAULT_TERMINAL_PREVIEW_SETTINGS,
+      mode: "large",
+    });
+    expect(parseTerminalPreviewSettings("{bad json", "compact"))
+      .toEqual(DEFAULT_TERMINAL_PREVIEW_SETTINGS);
+    expect(parseTerminalPreviewSettings(JSON.stringify({
+      enabled: "yes",
+      mode: "unknown",
+      hoverDelay: "slow",
+      animationDuration: null,
+    }))).toEqual(DEFAULT_TERMINAL_PREVIEW_SETTINGS);
+  });
+
   it("does not open hover previews for touch pointers", () => {
-    expect(terminalPreviewAllowed("mouse")).toBe(true);
-    expect(terminalPreviewAllowed("pen")).toBe(true);
-    expect(terminalPreviewAllowed("touch")).toBe(false);
+    expect(terminalPreviewAllowed(true, "mouse")).toBe(true);
+    expect(terminalPreviewAllowed(true, "pen")).toBe(true);
+    expect(terminalPreviewAllowed(true, "touch")).toBe(false);
+    expect(terminalPreviewAllowed(false, "mouse")).toBe(false);
   });
 });
 

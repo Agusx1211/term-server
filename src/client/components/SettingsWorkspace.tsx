@@ -4,6 +4,7 @@ import {
   BellOff,
   BellRing,
   Download,
+  Eye,
   LayoutDashboard,
   LoaderCircle,
   LogOut,
@@ -36,7 +37,12 @@ import type {
   NotificationMode,
   NotificationPosition,
 } from "../lib/notifications";
-import type { TerminalPreviewMode } from "../lib/terminal-preview";
+import {
+  DEFAULT_TERMINAL_PREVIEW_SETTINGS,
+  TERMINAL_PREVIEW_LIMITS,
+  type TerminalPreviewMode,
+  type TerminalPreviewSettings,
+} from "../lib/terminal-preview";
 import { ChangePassword } from "./ChangePassword";
 import type { ThemeName } from "../lib/terminal-theme";
 
@@ -61,7 +67,7 @@ interface SettingsWorkspaceProps {
   notificationDuration: NotificationDuration;
   tileNewTerminals: boolean;
   confirmTerminalKills: boolean;
-  terminalPreviewMode: TerminalPreviewMode;
+  terminalPreviewSettings: TerminalPreviewSettings;
   onTheme: (theme: ThemeName) => void;
   onPiChange: (titlesEnabled: boolean, summariesEnabled: boolean, model: string) => void;
   onAgentIntegration: (
@@ -80,7 +86,7 @@ interface SettingsWorkspaceProps {
   onNotificationDurationChange: (duration: NotificationDuration) => void;
   onTileNewTerminalsChange: (enabled: boolean) => void;
   onConfirmTerminalKillsChange: (enabled: boolean) => void;
-  onTerminalPreviewModeChange: (mode: TerminalPreviewMode) => void;
+  onTerminalPreviewSettingsChange: (settings: TerminalPreviewSettings) => void;
   onPasswordChanged: () => void;
   onLogout: () => void;
 }
@@ -158,7 +164,7 @@ export function SettingsWorkspace({
   notificationDuration,
   tileNewTerminals,
   confirmTerminalKills,
-  terminalPreviewMode,
+  terminalPreviewSettings,
   onTheme,
   onPiChange,
   onAgentIntegration,
@@ -171,11 +177,14 @@ export function SettingsWorkspace({
   onNotificationDurationChange,
   onTileNewTerminalsChange,
   onConfirmTerminalKillsChange,
-  onTerminalPreviewModeChange,
+  onTerminalPreviewSettingsChange,
   onPasswordChanged,
   onLogout,
 }: SettingsWorkspaceProps) {
   const systemPermission = typeof Notification === "undefined" ? "unsupported" : Notification.permission;
+  const updatePreviewSettings = (changes: Partial<TerminalPreviewSettings>) => {
+    onTerminalPreviewSettingsChange({ ...terminalPreviewSettings, ...changes });
+  };
 
   return (
     <section class={`settings-workspace ${active ? "visible" : ""}`} aria-hidden={!active}>
@@ -225,8 +234,23 @@ export function SettingsWorkspace({
               />
             </label>
             <p class="settings-hint">Turn this off to make every terminal kill action immediate.</p>
+            <label class={`settings-toggle ${terminalPreviewSettings.enabled ? "active" : ""}`}>
+              <Eye size={14} />
+              <span>Live terminal hover previews</span>
+              <input
+                type="checkbox"
+                checked={terminalPreviewSettings.enabled}
+                onChange={(event) => updatePreviewSettings({
+                  enabled: event.currentTarget.checked,
+                })}
+              />
+            </label>
+            <p class="settings-hint">
+              Open a read-only terminal view when the pointer rests on a workspace row.
+            </p>
             <fieldset class="terminal-preview-setting">
-              <legend>Hover preview size</legend>
+              <legend>Hover preview controls</legend>
+              <span class="terminal-preview-control-label">Size</span>
               <div class="terminal-preview-mode-grid" role="radiogroup">
                 {([
                   {
@@ -246,14 +270,14 @@ export function SettingsWorkspace({
                 }>).map(({ mode, label, description }) => (
                   <label
                     key={mode}
-                    class={`terminal-preview-mode ${terminalPreviewMode === mode ? "active" : ""}`}
+                    class={`terminal-preview-mode ${terminalPreviewSettings.mode === mode ? "active" : ""}`}
                   >
                     <input
                       type="radio"
                       name="terminal-preview-mode"
                       value={mode}
-                      checked={terminalPreviewMode === mode}
-                      onChange={() => onTerminalPreviewModeChange(mode)}
+                      checked={terminalPreviewSettings.mode === mode}
+                      onChange={() => updatePreviewSettings({ mode })}
                     />
                     <span class={`terminal-preview-mode-icon ${mode}`} aria-hidden="true">
                       <span />
@@ -265,6 +289,61 @@ export function SettingsWorkspace({
                   </label>
                 ))}
               </div>
+              <div class="terminal-preview-range-grid">
+                <label class="terminal-preview-range">
+                  <span>
+                    <b>Hover delay</b>
+                    <output>
+                      {terminalPreviewSettings.hoverDelay === 0
+                        ? "Immediate"
+                        : `${terminalPreviewSettings.hoverDelay} ms`}
+                    </output>
+                  </span>
+                  <input
+                    type="range"
+                    aria-label="Hover delay"
+                    min={TERMINAL_PREVIEW_LIMITS.hoverDelay.min}
+                    max={TERMINAL_PREVIEW_LIMITS.hoverDelay.max}
+                    step={TERMINAL_PREVIEW_LIMITS.hoverDelay.step}
+                    value={terminalPreviewSettings.hoverDelay}
+                    onInput={(event) => updatePreviewSettings({
+                      hoverDelay: Number(event.currentTarget.value),
+                    })}
+                  />
+                  <small>How long the pointer must stay before opening a preview.</small>
+                </label>
+                <label class="terminal-preview-range">
+                  <span>
+                    <b>Open animation</b>
+                    <output>
+                      {terminalPreviewSettings.animationDuration === 0
+                        ? "Off"
+                        : `${terminalPreviewSettings.animationDuration} ms`}
+                    </output>
+                  </span>
+                  <input
+                    type="range"
+                    aria-label="Open animation duration"
+                    min={TERMINAL_PREVIEW_LIMITS.animationDuration.min}
+                    max={TERMINAL_PREVIEW_LIMITS.animationDuration.max}
+                    step={TERMINAL_PREVIEW_LIMITS.animationDuration.step}
+                    value={terminalPreviewSettings.animationDuration}
+                    onInput={(event) => updatePreviewSettings({
+                      animationDuration: Number(event.currentTarget.value),
+                    })}
+                  />
+                  <small>Controls the fade-in duration; set it to zero for no animation.</small>
+                </label>
+              </div>
+              <button
+                type="button"
+                class="terminal-preview-reset"
+                onClick={() => onTerminalPreviewSettingsChange({
+                  ...DEFAULT_TERMINAL_PREVIEW_SETTINGS,
+                })}
+              >
+                Reset preview controls
+              </button>
             </fieldset>
           </section>
 

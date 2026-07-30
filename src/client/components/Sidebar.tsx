@@ -38,7 +38,7 @@ import { configureTerminalDrag } from "../lib/layout";
 import {
   terminalPreviewAllowed,
   terminalPreviewPosition,
-  type TerminalPreviewMode,
+  type TerminalPreviewSettings,
 } from "../lib/terminal-preview";
 import type { ThemeName } from "../lib/terminal-theme";
 import {
@@ -67,7 +67,7 @@ interface SidebarProps {
   settingsActive: boolean;
   updateAvailable: boolean;
   fileRoot: string;
-  previewMode: TerminalPreviewMode;
+  previewSettings: TerminalPreviewSettings;
   theme: ThemeName;
   onMobileClose: () => void;
   onNew: (cwd?: string) => void;
@@ -278,7 +278,7 @@ export function Sidebar({
   settingsActive,
   updateAvailable,
   fileRoot,
-  previewMode,
+  previewSettings,
   theme,
   onMobileClose,
   onNew,
@@ -325,10 +325,6 @@ export function Sidebar({
     if (mobileOpen) requestAnimationFrame(() => mobileCloseButton.current?.focus());
   }, [mobileOpen]);
 
-  useEffect(() => {
-    if (filesOpen || mobileOpen) setPreview(undefined);
-  }, [filesOpen, mobileOpen]);
-
   const clearPreviewTimers = () => {
     if (previewTimer.current) clearTimeout(previewTimer.current);
     if (previewLeaveTimer.current) clearTimeout(previewLeaveTimer.current);
@@ -336,8 +332,15 @@ export function Sidebar({
     previewLeaveTimer.current = undefined;
   };
 
+  useEffect(() => {
+    if (filesOpen || mobileOpen || !previewSettings.enabled) {
+      clearPreviewTimers();
+      setPreview(undefined);
+    }
+  }, [filesOpen, mobileOpen, previewSettings.enabled]);
+
   const beginPreview = (terminal: TerminalInfo, row: HTMLElement, pointerType: string) => {
-    if (!terminalPreviewAllowed(pointerType)) return;
+    if (!terminalPreviewAllowed(previewSettings.enabled, pointerType)) return;
     clearPreviewTimers();
     const rectangle = row.getBoundingClientRect();
     previewTimer.current = window.setTimeout(() => {
@@ -346,7 +349,7 @@ export function Sidebar({
         position: terminalPreviewPosition(rectangle, window.innerHeight),
       });
       previewTimer.current = undefined;
-    }, 260);
+    }, previewSettings.hoverDelay);
   };
 
   const leavePreview = () => {
@@ -533,8 +536,9 @@ export function Sidebar({
           <TerminalPreview
             terminal={preview.terminal}
             theme={theme}
-            mode={previewMode}
+            mode={previewSettings.mode}
             position={preview.position}
+            animationDuration={previewSettings.animationDuration}
           />
         </Suspense>
       )}
