@@ -47,6 +47,7 @@ const terminal = (overrides: Partial<TerminalInfo> = {}): TerminalInfo => ({
     completedAt: null,
     summary: null,
   },
+  command: null,
   createdAt: 1,
   pid: 10,
   status: "running",

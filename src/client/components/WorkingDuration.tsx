@@ -12,9 +12,9 @@ export function WorkingDuration({ since }: { since: number }) {
 
   const elapsed = formatWorkingDuration(now - since);
   return (
-    <span class="agent-working-readout" aria-label={`Working for ${elapsed}`}>
-      <span class="agent-working-time" aria-hidden="true">{elapsed}</span>
-      <span class="agent-working-dots" aria-hidden="true">
+    <span class="working-readout" aria-label={`Working for ${elapsed}`}>
+      <span class="working-time" aria-hidden="true">{elapsed}</span>
+      <span class="working-dots" aria-hidden="true">
         <span>.</span><span>.</span><span>.</span>
       </span>
     </span>

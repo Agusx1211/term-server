@@ -5,6 +5,7 @@ import {
   Bot,
   ChevronDown,
   ChevronUp,
+  CircleCheck,
   CirclePause,
   CircleX,
   ClipboardCopy,
@@ -15,7 +16,9 @@ import {
   ListTree,
   Maximize2,
   PackageOpen,
+  Radio,
   Search,
+  TerminalSquare,
   Trash2,
   WifiOff,
   X,
@@ -50,6 +53,8 @@ import {
   MIN_TERMINAL_FONT_SIZE,
   terminalZoomPercent,
 } from "../lib/terminal-zoom";
+import { closeTerminalSocket } from "../lib/terminal-socket";
+import { TerminalStreamState, decodeTerminalFrame } from "../lib/terminal-stream";
 import { ProcessInspector } from "./ProcessInspector";
 import { ArtifactDrawer } from "./ArtifactDrawer";
 import { WorkingDuration } from "./WorkingDuration";
@@ -261,6 +266,7 @@ export function TerminalPane({
       allowProposedApi: true,
       cursorBlink: true,
       cursorStyle: "block",
+      disableStdin: true,
       fontFamily: "'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace",
       fontSize,
       letterSpacing: 0,
@@ -347,6 +353,12 @@ export function TerminalPane({
     const send = (message: ClientTerminalMessage) => {
       if (socket.current?.readyState === WebSocket.OPEN) socket.current.send(JSON.stringify(message));
     };
+    const stream = new TerminalStreamState();
+    let acceptingInput = false;
+    let parsingOutput = false;
+    let responder = false;
+    let messageQueue = Promise.resolve();
+    let lastServerMessage = Date.now();
     const proposedViewport = () => {
       if (!container.current?.clientWidth || !container.current.clientHeight) return;
       try {
@@ -365,6 +377,11 @@ export function TerminalPane({
     reportTerminalViewport.current = reportViewport;
 
     const dataDisposable = term.onData((data) => {
+      if (!acceptingInput || parsingOutput && !responder) return;
+      if (parsingOutput) {
+        send({ type: "input", data });
+        return;
+      }
       const currentModifiers = modifiers.current;
       send({ type: "input", data: transformTerminalInput(data, currentModifiers) });
       if (currentModifiers.alt || currentModifiers.ctrl) {
@@ -394,9 +411,28 @@ export function TerminalPane({
       return true;
     });
 
+    const writeTerminal = (data: Uint8Array, commit?: number) => new Promise<void>((resolve, reject) => {
+      parsingOutput = true;
+      try {
+        term.write(data, () => {
+          parsingOutput = false;
+          try {
+            if (commit !== undefined) stream.commit(commit);
+            resolve();
+          } catch (error) {
+            reject(error);
+          }
+        });
+      } catch (error) {
+        parsingOutput = false;
+        reject(error);
+      }
+    });
+
     const connect = () => {
       if (disposed || exited.current) return;
-      if (attempts > 0) term.reset();
+      acceptingInput = false;
+      term.options.disableStdin = true;
       setConnection("connecting");
       const protocol = location.protocol === "https:" ? "wss:" : "ws:";
       const url = new URL(`${protocol}//${location.host}/api/terminals/${terminal.id}/socket`);
@@ -405,50 +441,90 @@ export function TerminalPane({
         url.searchParams.set("cols", String(size.cols));
         url.searchParams.set("rows", String(size.rows));
       }
+      const resumeSequence = stream.resumeSequence;
+      if (resumeSequence !== undefined) url.searchParams.set("sequence", String(resumeSequence));
       const next = new WebSocket(url);
+      let protocolFailed = false;
       next.binaryType = "arraybuffer";
       socket.current = next;
       next.addEventListener("open", () => {
-        attempts = 0;
-        setConnection("connected");
+        lastServerMessage = Date.now();
         reportViewport();
-        term.focus();
       });
       next.addEventListener("message", (event) => {
-        if (event.data instanceof ArrayBuffer) {
-          term.write(new Uint8Array(event.data));
-          return;
-        }
-        if (event.data instanceof Blob) {
-          void event.data.arrayBuffer().then((data) => term.write(new Uint8Array(data)));
-          return;
-        }
-        try {
+        if (protocolFailed) return;
+        lastServerMessage = Date.now();
+        messageQueue = messageQueue.then(async () => {
+          if (protocolFailed) return;
+          const binary = event.data instanceof Blob ? await event.data.arrayBuffer() : event.data;
+          if (binary instanceof ArrayBuffer) {
+            const frame = decodeTerminalFrame(binary);
+            const commit = stream.accept(frame);
+            await writeTerminal(frame.data, commit);
+            return;
+          }
           const message = JSON.parse(String(event.data)) as ServerTerminalMessage;
           if (message.type === "ready") onUpdate(message.terminal);
           if (message.type === "size") {
             term.resize(message.cols, message.rows);
+            responder = message.responder;
             setTerminalSize({ focused: message.focused, controller: message.controller });
+          }
+          if (message.type === "sync") {
+            acceptingInput = false;
+            term.options.disableStdin = true;
+            if (stream.begin(message.mode, message.sequence)) term.reset();
+          }
+          if (message.type === "synced") {
+            stream.finish(message.sequence);
+            acceptingInput = true;
+            term.options.disableStdin = false;
+            attempts = 0;
+            setConnection("connected");
+            reportViewport();
+            term.focus();
           }
           if (message.type === "exit") {
             exited.current = true;
+            acceptingInput = false;
+            term.options.disableStdin = true;
             setConnection("exited");
             onExit();
           }
           if (message.type === "error") onNotice(message.message);
-        } catch {
-          // Ignore malformed control frames; terminal data is always binary.
-        }
+        }).catch((error) => {
+          protocolFailed = true;
+          acceptingInput = false;
+          term.options.disableStdin = true;
+          onNotice(error instanceof Error ? error.message : "Invalid terminal stream");
+          closeTerminalSocket(next, "protocol-error");
+        });
       });
       next.addEventListener("close", () => {
         if (disposed || exited.current) return;
+        acceptingInput = false;
+        term.options.disableStdin = true;
+        if (socket.current === next) socket.current = undefined;
         setTerminalSize({ focused: false, controller: false });
         setConnection("disconnected");
         attempts += 1;
-        reconnectTimer.current = window.setTimeout(connect, Math.min(5000, 250 * 2 ** attempts));
+        void messageQueue.then(() => {
+          if (disposed || exited.current) return;
+          reconnectTimer.current = window.setTimeout(connect, Math.min(5000, 250 * 2 ** attempts));
+        });
       });
       next.addEventListener("error", () => next.close());
     };
+
+    const keepaliveTimer = window.setInterval(() => {
+      const current = socket.current;
+      if (current?.readyState !== WebSocket.OPEN) return;
+      if (Date.now() - lastServerMessage > 45_000) {
+        closeTerminalSocket(current, "timeout");
+        return;
+      }
+      current.send(JSON.stringify({ type: "ping" } satisfies ClientTerminalMessage));
+    }, 15_000);
 
     const observer = new ResizeObserver(reportViewport);
     observer.observe(container.current);
@@ -458,6 +534,7 @@ export function TerminalPane({
     return () => {
       disposed = true;
       cancelAnimationFrame(resizeFrame);
+      clearInterval(keepaliveTimer);
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
       observer.disconnect();
       imagePreviews.clear();
@@ -670,6 +747,9 @@ export function TerminalPane({
         <TerminalPath path={terminal.path} />
         {terminal.agent && (
           <PaneAgentState agent={terminal.agent} needsAttention={needsAttention} />
+        )}
+        {!terminal.agent && terminal.command && (
+          <PaneCommandState command={terminal.command} needsAttention={needsAttention} />
         )}
         {artifacts.length > 0 && (
           <button
@@ -948,14 +1028,50 @@ function PaneAgentState({
         : CircleX;
   return (
     <span
-      class={`pane-agent ${needsAttention ? "attention" : agent.status}`}
+      class={`pane-activity ${needsAttention ? "attention" : agent.status}`}
       title={agent.summary ?? `${agent.kind} is ${label.toLocaleLowerCase()}`}
     >
       <Bot size={12} aria-hidden="true" />
-      <span class="pane-agent-kind">{agent.kind}</span>
-      <span class="pane-agent-state">
+      <span class="pane-activity-kind">{agent.kind}</span>
+      <span class="pane-activity-state">
         <Icon size={11} strokeWidth={2.2} aria-hidden="true" />
         {agent.status === "working" ? <WorkingDuration since={agent.statusChangedAt} /> : label}
+      </span>
+    </span>
+  );
+}
+
+function PaneCommandState({
+  command,
+  needsAttention,
+}: {
+  command: NonNullable<TerminalInfo["command"]>;
+  needsAttention: boolean;
+}) {
+  const label = command.status === "live" ? "Live" : "Done";
+  const Icon = needsAttention
+    ? Bell
+    : command.status === "running"
+      ? Activity
+      : command.status === "live"
+        ? Radio
+        : CircleCheck;
+  const stateTitle = command.status === "running"
+    ? `${command.name} is running`
+    : command.status === "live"
+      ? `${command.name} is live`
+      : `${command.name} finished`;
+  const title = needsAttention ? `${stateTitle} — unread` : stateTitle;
+  return (
+    <span
+      class={`pane-activity ${needsAttention ? "attention" : command.status}`}
+      title={title}
+    >
+      <TerminalSquare size={12} aria-hidden="true" />
+      <span class="pane-activity-kind">{command.name}</span>
+      <span class="pane-activity-state">
+        <Icon size={11} strokeWidth={2.2} aria-hidden="true" />
+        {command.status === "running" ? <WorkingDuration since={command.startedAt} /> : label}
       </span>
     </span>
   );

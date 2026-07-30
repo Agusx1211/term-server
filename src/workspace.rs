@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::ws::{CloseFrame, Message, WebSocket},
+    extract::ws::{Message, WebSocket},
     http::StatusCode,
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt, stream::SplitSink};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -16,7 +16,13 @@ use crate::{
         TerminalEvent, TerminalInfo, TerminalManager, TerminalSession, TerminalSizeState,
         terminate_descendant_process,
     },
+    terminal_state::{SequencedOutput, SyncMode, TerminalSync},
 };
+
+const TERMINAL_FRAME_HEADER_BYTES: usize = 9;
+const TERMINAL_FRAME_PAYLOAD_BYTES: usize = 60 * 1024;
+const TERMINAL_FRAME_SNAPSHOT: u8 = 0;
+const TERMINAL_FRAME_OUTPUT: u8 = 1;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -226,6 +232,7 @@ impl WorkspaceBackend {
         &self,
         id: Uuid,
         initial_size: Option<(u16, u16)>,
+        sequence: Option<u64>,
     ) -> Result<SessionConnection, WorkspaceError> {
         match self {
             Self::Local { terminals, .. } => terminals
@@ -237,7 +244,7 @@ impl WorkspaceBackend {
                 }),
             #[cfg(unix)]
             Self::Broker(client) => client
-                .terminal_socket(id, initial_size)
+                .terminal_socket(id, initial_size, sequence)
                 .await
                 .map(Box::new)
                 .map(SessionConnection::Broker),
@@ -273,11 +280,16 @@ fn process_signal_error(error: ProcessSignalError) -> WorkspaceError {
 pub(crate) struct TerminalSocketQuery {
     cols: Option<u16>,
     rows: Option<u16>,
+    sequence: Option<u64>,
 }
 
 impl TerminalSocketQuery {
     pub(crate) fn viewport(&self) -> Option<(u16, u16)> {
         self.cols.zip(self.rows)
+    }
+
+    pub(crate) fn sequence(&self) -> Option<u64> {
+        self.sequence
     }
 }
 
@@ -305,6 +317,14 @@ enum TerminalServerMessage<'a> {
         rows: u16,
         focused: bool,
         controller: bool,
+        responder: bool,
+    },
+    Sync {
+        mode: &'a str,
+        sequence: u64,
+    },
+    Synced {
+        sequence: u64,
     },
     Pong,
     Error {
@@ -329,6 +349,7 @@ fn size_message(state: TerminalSizeState, client_id: Uuid) -> TerminalServerMess
         rows: state.rows,
         focused: state.focused_client.is_some(),
         controller: state.focused_client == Some(client_id),
+        responder: state.responder_client == Some(client_id),
     }
 }
 
@@ -336,21 +357,18 @@ pub(crate) async fn serve_terminal_socket(
     mut socket: WebSocket,
     terminal: Arc<TerminalSession>,
     initial_size: Option<(u16, u16)>,
+    requested_sequence: Option<u64>,
 ) {
     let client_id = Uuid::new_v4();
-    let size = match terminal.attach(client_id, initial_size) {
-        Ok(size) => size,
-        Err(error) => {
-            terminal.detach(client_id);
-            tracing::debug!(%error, "initial terminal resize failed");
-            return;
-        }
-    };
+    if let Err(error) = terminal.attach(client_id, initial_size) {
+        terminal.detach(client_id);
+        tracing::debug!(%error, "initial terminal resize failed");
+        return;
+    }
     let _attachment = Attachment {
         terminal: terminal.clone(),
         client_id,
     };
-    let (mut events, replay) = terminal.subscribe();
     let ready = serde_json::to_string(&TerminalServerMessage::Ready {
         terminal: Box::new(terminal.info()),
     })
@@ -358,24 +376,40 @@ pub(crate) async fn serve_terminal_socket(
     if socket.send(Message::Text(ready.into())).await.is_err() {
         return;
     }
-    let size =
-        serde_json::to_string(&size_message(size, client_id)).expect("serializable terminal size");
-    if socket.send(Message::Text(size.into())).await.is_err() {
-        return;
-    }
-    for chunk in replay {
-        if socket.send(Message::Binary(chunk)).await.is_err() {
-            return;
-        }
-    }
-
     let (mut sender, mut receiver) = socket.split();
+    let Ok(Some((mut events, mut sent_sequence))) =
+        synchronize_terminal(&mut sender, &terminal, client_id, requested_sequence).await
+    else {
+        return;
+    };
     loop {
         tokio::select! {
             event = events.recv() => {
                 match event {
-                    Ok(TerminalEvent::Output(chunk)) => {
-                        if sender.send(Message::Binary(chunk)).await.is_err() { break; }
+                    Ok(TerminalEvent::Output(output)) => {
+                        if output.end_sequence() <= sent_sequence {
+                            continue;
+                        }
+                        if output.sequence > sent_sequence {
+                            match synchronize_terminal(
+                                &mut sender,
+                                &terminal,
+                                client_id,
+                                Some(sent_sequence),
+                            ).await {
+                                Ok(Some((next_events, sequence))) => {
+                                    events = next_events;
+                                    sent_sequence = sequence;
+                                }
+                                Ok(None) | Err(()) => break,
+                            }
+                            continue;
+                        }
+                        let Some(output) = output.slice_from(sent_sequence) else {
+                            continue;
+                        };
+                        if send_terminal_output(&mut sender, &output).await.is_err() { break; }
+                        sent_sequence = output.end_sequence();
                     }
                     Ok(TerminalEvent::Exit(exit_code)) => {
                         let message = serde_json::to_string(&TerminalServerMessage::Exit { exit_code })
@@ -389,11 +423,18 @@ pub(crate) async fn serve_terminal_socket(
                         if sender.send(Message::Text(message.into())).await.is_err() { break; }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        let _ = sender.send(Message::Close(Some(CloseFrame {
-                            code: 1013,
-                            reason: "terminal client fell behind".into(),
-                        }))).await;
-                        break;
+                        match synchronize_terminal(
+                            &mut sender,
+                            &terminal,
+                            client_id,
+                            Some(sent_sequence),
+                        ).await {
+                            Ok(Some((next_events, sequence))) => {
+                                events = next_events;
+                                sent_sequence = sequence;
+                            }
+                            Ok(None) | Err(()) => break,
+                        }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
@@ -436,4 +477,98 @@ pub(crate) async fn serve_terminal_socket(
             }
         }
     }
+}
+
+async fn synchronize_terminal(
+    sender: &mut SplitSink<WebSocket, Message>,
+    terminal: &TerminalSession,
+    client_id: Uuid,
+    requested_sequence: Option<u64>,
+) -> Result<Option<(tokio::sync::broadcast::Receiver<TerminalEvent>, u64)>, ()> {
+    let (events, sync, size, exit_code) = terminal.subscribe(requested_sequence);
+    send_terminal_control(sender, size_message(size, client_id)).await?;
+    let sequence = send_terminal_sync(sender, sync).await?;
+    if let Some(exit_code) = exit_code {
+        send_terminal_control(sender, TerminalServerMessage::Exit { exit_code }).await?;
+        return Ok(None);
+    }
+    Ok(Some((events, sequence)))
+}
+
+async fn send_terminal_sync(
+    sender: &mut SplitSink<WebSocket, Message>,
+    sync: TerminalSync,
+) -> Result<u64, ()> {
+    let mode = match sync.mode {
+        SyncMode::Snapshot => "snapshot",
+        SyncMode::Resume => "resume",
+    };
+    send_terminal_control(
+        sender,
+        TerminalServerMessage::Sync {
+            mode,
+            sequence: sync.sequence,
+        },
+    )
+    .await?;
+    if let Some(snapshot) = sync.snapshot {
+        send_terminal_bytes(sender, TERMINAL_FRAME_SNAPSHOT, sync.sequence, &snapshot).await?;
+    }
+    for output in sync.output {
+        send_terminal_output(sender, &output).await?;
+    }
+    send_terminal_control(
+        sender,
+        TerminalServerMessage::Synced {
+            sequence: sync.sequence,
+        },
+    )
+    .await?;
+    Ok(sync.sequence)
+}
+
+async fn send_terminal_output(
+    sender: &mut SplitSink<WebSocket, Message>,
+    output: &SequencedOutput,
+) -> Result<(), ()> {
+    send_terminal_bytes(
+        sender,
+        TERMINAL_FRAME_OUTPUT,
+        output.sequence,
+        &output.bytes,
+    )
+    .await
+}
+
+async fn send_terminal_bytes(
+    sender: &mut SplitSink<WebSocket, Message>,
+    kind: u8,
+    mut sequence: u64,
+    bytes: &[u8],
+) -> Result<(), ()> {
+    for chunk in bytes.chunks(TERMINAL_FRAME_PAYLOAD_BYTES) {
+        let mut frame = Vec::with_capacity(TERMINAL_FRAME_HEADER_BYTES + chunk.len());
+        frame.push(kind);
+        frame.extend_from_slice(&sequence.to_be_bytes());
+        frame.extend_from_slice(chunk);
+        sender
+            .send(Message::Binary(frame.into()))
+            .await
+            .map_err(|_| ())?;
+        if kind == TERMINAL_FRAME_OUTPUT {
+            sequence += chunk.len() as u64;
+        }
+    }
+    Ok(())
+}
+
+async fn send_terminal_control(
+    sender: &mut SplitSink<WebSocket, Message>,
+    message: TerminalServerMessage<'_>,
+) -> Result<(), ()> {
+    let message = serde_json::to_string(&message).expect("serializable terminal control message");
+    sender
+        .send(Message::Text(message.into()))
+        .await
+        .map_err(|_| ())
 }

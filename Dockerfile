@@ -14,6 +14,8 @@ COPY Cargo.toml Cargo.lock ./
 COPY build.rs ./
 COPY src ./src
 COPY release ./release
+COPY integrations ./integrations
+COPY skills ./skills
 RUN TERM_SERVER_BUILD_COMMIT="$TERM_SERVER_BUILD_COMMIT" cargo build --release --locked
 
 FROM debian:bookworm-slim

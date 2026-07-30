@@ -12,6 +12,7 @@ const terminal = (id: string, workspace: string, name: string): TerminalInfo => 
   program: "sh",
   color: "#4daafc",
   agent: null,
+  command: null,
   createdAt: 0,
   pid: 1,
   status: "running",
