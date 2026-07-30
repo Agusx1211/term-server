@@ -14,6 +14,7 @@ use clap::Parser;
 #[cfg(unix)]
 use term_server::broker::{BrokerClient, run_session_broker};
 use term_server::{
+    activity_view::ActivityViewService,
     agent_events::read_hook_event,
     agent_integrations::AgentIntegrationService,
     api::{AppState, ServerControl, build_router},
@@ -106,6 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         hostname,
         updates,
         agent_integrations: Arc::new(AgentIntegrationService::new(&cli.data_dir)),
+        activity_views: ActivityViewService::new(&cli.data_dir),
         artifact_skill: Arc::new(ArtifactSkillService::discover()),
         server_control: server_control.clone(),
     };

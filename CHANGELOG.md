@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.6.1 - 2026-07-30
+
+Unread agent and long-command completions now stay synchronized across browsers and machines.
+
+### Changed
+
+- Viewing an agent **Ready** state or completed long command advances a server-owned watermark that
+  every connected browser receives on its normal terminal refresh.
+- Completion watermarks are stored atomically in the term-server data directory and survive web
+  process restarts while the private session broker keeps terminals running.
+- Existing per-browser viewed state is migrated to the server on first load after upgrading.
+
+### Fixed
+
+- A completion acknowledged on one machine no longer remains unread on every other machine.
+- Stale browser requests and out-of-order terminal refreshes cannot move an acknowledgment backward
+  or hide newer work.
+- Starting a new agent lifecycle in the same terminal cannot inherit an unrelated viewed revision
+  and suppress its next **Ready** state.
+- Closing a terminal pane no longer treats later activity as viewed while the pane stays hidden.
+- Interactive alternate-screen applications remain **Live** without an elapsed counter and never
+  create a completed or unread watermark when they exit.
+
+### Security
+
+- Completion acknowledgment updates require authentication and a same-origin request.
+- The server rejects watermarks newer than the completion currently observable in the terminal.
+- The persisted activity file is written atomically with owner-only permissions.
+
+### Upgrade notes
+
+- There are no breaking changes, configuration changes, or manual data migrations.
+- This patch keeps session broker protocol 3. Updating from `0.6.0` restarts only the web process;
+  the existing broker and terminal processes stay running and browsers reconnect to them.
+- The release is safe for automatic installation over `0.6.0`.
+
 ## 0.6.0 - 2026-07-30
 
 Terminal reconnections now resume from compact canonical state instead of replaying the entire

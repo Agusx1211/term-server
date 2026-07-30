@@ -20,24 +20,28 @@ import type {
   FileTarget,
   ReleaseInfo,
   TerminalInfo,
+  UpdateActivityView,
   UpdateStatus,
 } from "../shared/types";
 import { api, ApiError } from "./lib/api";
 import {
   agentNeedsAttention,
-  markAgentRevisionViewed,
   parseViewedAgentRevisions,
-  pruneViewedAgentRevisions,
   VIEWED_AGENT_REVISIONS_STORAGE_KEY,
 } from "./lib/agent-attention";
 import {
   commandCompletionEvent,
   commandNeedsAttention,
-  markCommandCompletionViewed,
   parseViewedCommandCompletions,
-  pruneViewedCommandCompletions,
   VIEWED_COMMAND_COMPLETIONS_STORAGE_KEY,
 } from "./lib/command-status";
+import {
+  activityView,
+  currentActivityViewUpdate,
+  legacyActivityViewUpdate,
+  mergeTerminalActivityViews,
+  withActivityView,
+} from "./lib/activity-view";
 import { documentTitle } from "./lib/document-title";
 import {
   CONFIRM_TERMINAL_KILLS_STORAGE_KEY,
@@ -281,9 +285,8 @@ export function App() {
   const [confirmTerminalKills, setConfirmTerminalKills] = useState(initialConfirmTerminalKills);
   const [terminalFontSize, setTerminalFontSize] = useState(initialTerminalFontSize);
   const [terminalPreviewMode, setTerminalPreviewMode] = useState(initialTerminalPreviewMode);
-  const [viewedAgentRevisions, setViewedAgentRevisions] = useState(initialViewedAgentRevisions);
-  const [viewedCommandCompletions, setViewedCommandCompletions] =
-    useState(initialViewedCommandCompletions);
+  const legacyViewedAgentRevisions = useRef(initialViewedAgentRevisions());
+  const legacyViewedCommandCompletions = useRef(initialViewedCommandCompletions());
   const [artifacts, setArtifacts] = useState<ArtifactEntry[]>([]);
   const [resources, setResources] = useState<ResourceTab[]>([]);
   const [activeResource, setActiveResource] = useState<string>();
@@ -296,6 +299,7 @@ export function App() {
   const commandEventsInitialized = useRef(false);
   const deliveredCommandEvents = useRef(new Map<string, number>());
   const pendingAgentNotifications = useRef(new Map<string, { event: number; timer: number }>());
+  const pendingActivityViews = useRef(new Map<string, UpdateActivityView>());
   const completionToastTimers = useRef(new Map<string, number>());
   const notificationModeRef = useRef(notificationMode);
   notificationModeRef.current = notificationMode;
@@ -387,6 +391,34 @@ export function App() {
     completionToastTimers.current.set(toast.id, timer);
   };
 
+  const migrateLegacyActivityViews = async (
+    nextTerminals: TerminalInfo[],
+  ): Promise<TerminalInfo[]> => {
+    let failed = false;
+    const migrated = await Promise.all(nextTerminals.map(async (terminal) => {
+      const update = legacyActivityViewUpdate(
+        terminal,
+        legacyViewedAgentRevisions.current,
+        legacyViewedCommandCompletions.current,
+      );
+      if (!update) return terminal;
+      try {
+        const viewed = await api.updateTerminalActivityView(terminal.id, update);
+        return withActivityView(terminal, viewed);
+      } catch {
+        failed = true;
+        return terminal;
+      }
+    }));
+    if (!failed) {
+      localStorage.removeItem(VIEWED_AGENT_REVISIONS_STORAGE_KEY);
+      localStorage.removeItem(VIEWED_COMMAND_COMPLETIONS_STORAGE_KEY);
+      legacyViewedAgentRevisions.current = {};
+      legacyViewedCommandCompletions.current = {};
+    }
+    return migrated;
+  };
+
   const loadWorkspace = async () => {
     try {
       const [nextConfig, nextTerminals, artifacts] = await Promise.all([
@@ -394,7 +426,9 @@ export function App() {
         api.terminals(),
         api.artifacts(),
       ]);
-      const runningTerminals = nextTerminals.filter((terminal) => terminal.status === "running");
+      const runningTerminals = await migrateLegacyActivityViews(
+        nextTerminals.filter((terminal) => terminal.status === "running"),
+      );
       const focusedSession = activeIdRef.current
         && runningTerminals.some((terminal) => terminal.id === activeIdRef.current)
         ? activeIdRef.current
@@ -477,47 +511,6 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    localStorage.setItem(
-      VIEWED_AGENT_REVISIONS_STORAGE_KEY,
-      JSON.stringify(viewedAgentRevisions),
-    );
-  }, [viewedAgentRevisions]);
-
-  useEffect(() => {
-    localStorage.setItem(
-      VIEWED_COMMAND_COMPLETIONS_STORAGE_KEY,
-      JSON.stringify(viewedCommandCompletions),
-    );
-  }, [viewedCommandCompletions]);
-
-  useEffect(() => {
-    const syncViewedAgentRevisions = (event: StorageEvent) => {
-      if (event.key !== VIEWED_AGENT_REVISIONS_STORAGE_KEY) return;
-      setViewedAgentRevisions(parseViewedAgentRevisions(event.newValue));
-    };
-    window.addEventListener("storage", syncViewedAgentRevisions);
-    return () => window.removeEventListener("storage", syncViewedAgentRevisions);
-  }, []);
-
-  useEffect(() => {
-    const syncViewedCommandCompletions = (event: StorageEvent) => {
-      if (event.key !== VIEWED_COMMAND_COMPLETIONS_STORAGE_KEY) return;
-      setViewedCommandCompletions(parseViewedCommandCompletions(event.newValue));
-    };
-    window.addEventListener("storage", syncViewedCommandCompletions);
-    return () => window.removeEventListener("storage", syncViewedCommandCompletions);
-  }, []);
-
-  useEffect(() => {
-    if (!workspaceLoaded) return;
-    const terminalIds = new Set(terminals.map((terminal) => terminal.id));
-    setViewedAgentRevisions((current) => pruneViewedAgentRevisions(current, terminalIds));
-    setViewedCommandCompletions((current) => (
-      pruneViewedCommandCompletions(current, terminalIds)
-    ));
-  }, [workspaceLoaded, terminals]);
-
-  useEffect(() => {
     sessionStorage.setItem("term-server:panes", JSON.stringify(paneIds));
     sessionStorage.setItem("term-server:layout", JSON.stringify(layout));
   }, [paneIds, layout]);
@@ -528,7 +521,7 @@ export function App() {
       void Promise.all([api.terminals(), api.artifacts()])
         .then(([next, artifacts]) => {
           const running = next.filter((terminal) => terminal.status === "running");
-          setTerminals(running);
+          setTerminals((current) => mergeTerminalActivityViews(running, current));
           setConfig((current) => (
             current.broker && current.broker.sessions !== running.length
               ? { ...current, broker: { ...current.broker, sessions: running.length } }
@@ -681,7 +674,7 @@ export function App() {
   }, [resources]);
 
   useEffect(() => {
-    if (paneIds.length && !paneIds.includes(activeId ?? "")) setActiveId(paneIds[0]);
+    if (activeId && !paneIds.includes(activeId)) setActiveId(paneIds[0]);
   }, [paneIds, activeId]);
 
   useEffect(() => {
@@ -707,16 +700,14 @@ export function App() {
     return grouped;
   }, [artifacts]);
   const attentionTerminalIds = useMemo(
-    () => new Set(terminals.flatMap((terminal) => (
-      agentNeedsAttention(terminal.agent, viewedAgentRevisions[terminal.id])
-        || commandNeedsAttention(
-          terminal.command,
-          viewedCommandCompletions[terminal.id],
-        )
+    () => new Set(terminals.flatMap((terminal) => {
+      const viewed = activityView(terminal);
+      return agentNeedsAttention(terminal.agent, viewed.agentCompletedAt)
+          || commandNeedsAttention(terminal.command, viewed.commandCompletedAt)
         ? [terminal.id]
-        : []
-    ))),
-    [terminals, viewedAgentRevisions, viewedCommandCompletions],
+        : [];
+    })),
+    [terminals],
   );
   const visibleTerminals = paneIds.map((id) => terminalById.get(id)).filter(Boolean) as TerminalInfo[];
   const renderedIds = [...mountedIds, ...paneIds.filter((id) => !mountedIds.includes(id))];
@@ -747,23 +738,44 @@ export function App() {
 
   const markTerminalActivityViewed = (id: string) => {
     const terminal = terminalsRef.current.find((candidate) => candidate.id === id);
-    const agent = terminal?.agent;
-    if (agent?.status === "idle") {
-      setViewedAgentRevisions((current) => (
-        markAgentRevisionViewed(current, id, agent.revision)
-      ));
-    }
-    const completion = commandCompletionEvent(terminal?.command ?? null);
-    if (completion != null) {
-      setViewedCommandCompletions((current) => (
-        markCommandCompletionViewed(current, id, completion)
-      ));
-    }
+    if (!terminal) return;
+    const update = currentActivityViewUpdate(terminal);
+    if (!update) return;
+
+    const pending = pendingActivityViews.current.get(id);
+    if (
+      (update.agentCompletedAt ?? 0) <= (pending?.agentCompletedAt ?? 0)
+      && (update.commandCompletedAt ?? 0) <= (pending?.commandCompletedAt ?? 0)
+    ) return;
+    const requested = {
+      agentCompletedAt: Math.max(
+        update.agentCompletedAt ?? 0,
+        pending?.agentCompletedAt ?? 0,
+      ) || undefined,
+      commandCompletedAt: Math.max(
+        update.commandCompletedAt ?? 0,
+        pending?.commandCompletedAt ?? 0,
+      ) || undefined,
+    };
+    pendingActivityViews.current.set(id, requested);
+    void api.updateTerminalActivityView(id, requested)
+      .then((viewed) => {
+        setTerminals((current) => current.map((candidate) => (
+          candidate.id === id ? withActivityView(candidate, viewed) : candidate
+        )));
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (pendingActivityViews.current.get(id) === requested) {
+          pendingActivityViews.current.delete(id);
+        }
+      });
   };
 
   useEffect(() => {
     if (
       !activeId
+      || !paneIds.includes(activeId)
       || activeResource
       || settingsActive
       || mobileSidebar
@@ -771,13 +783,19 @@ export function App() {
       || !document.hasFocus()
     ) return;
     markTerminalActivityViewed(activeId);
-  }, [activeId, activeResource, settingsActive, mobileSidebar, terminals]);
+  }, [activeId, activeResource, settingsActive, mobileSidebar, terminals, paneIds]);
 
   useEffect(() => {
     const markActiveActivityViewed = () => {
       if (document.visibilityState !== "visible" || !document.hasFocus()) return;
       const id = activeId;
-      if (id && !activeResource && !settingsActive && !mobileSidebar) {
+      if (
+        id
+        && paneIds.includes(id)
+        && !activeResource
+        && !settingsActive
+        && !mobileSidebar
+      ) {
         markTerminalActivityViewed(id);
       }
     };
@@ -787,7 +805,7 @@ export function App() {
       window.removeEventListener("focus", markActiveActivityViewed);
       document.removeEventListener("visibilitychange", markActiveActivityViewed);
     };
-  }, [activeId, activeResource, settingsActive, mobileSidebar]);
+  }, [activeId, activeResource, settingsActive, mobileSidebar, paneIds]);
 
   const openTerminal = (id: string, split = false) => {
     setLayout((current) => {
@@ -991,7 +1009,9 @@ export function App() {
   };
 
   const updateTerminal = (next: TerminalInfo) => {
-    setTerminals((current) => current.map((terminal) => (terminal.id === next.id ? next : terminal)));
+    setTerminals((current) => current.map((terminal) => (
+      terminal.id === next.id ? withActivityView(next, activityView(terminal)) : terminal
+    )));
   };
 
   const updatePiConfig = async (titlesEnabled: boolean, summariesEnabled: boolean, model: string) => {

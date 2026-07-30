@@ -27,6 +27,16 @@ export interface ForegroundCommandInfo {
   completedAt: number | null;
 }
 
+export interface ActivityView {
+  agentCompletedAt: number;
+  commandCompletedAt: number;
+}
+
+export interface UpdateActivityView {
+  agentCompletedAt?: number;
+  commandCompletedAt?: number;
+}
+
 export interface TerminalInfo {
   id: string;
   name: string;
@@ -43,6 +53,8 @@ export interface TerminalInfo {
   status: TerminalStatus;
   exitCode: number | null;
   clients: number;
+  /** Present on REST responses; broker-ready messages from older patch releases omit it. */
+  activityViewed?: ActivityView;
 }
 
 export interface CreateTerminalRequest {

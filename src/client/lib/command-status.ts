@@ -39,24 +39,6 @@ export function commandNeedsAttention(
   return completedAt != null && completedAt > (viewedCompletion ?? 0);
 }
 
-export function markCommandCompletionViewed(
-  current: ViewedCommandCompletions,
-  terminalId: string,
-  completedAt: number,
-): ViewedCommandCompletions {
-  if ((current[terminalId] ?? 0) >= completedAt) return current;
-  return { ...current, [terminalId]: completedAt };
-}
-
-export function pruneViewedCommandCompletions(
-  current: ViewedCommandCompletions,
-  terminalIds: Set<string>,
-): ViewedCommandCompletions {
-  const entries = Object.entries(current).filter(([id]) => terminalIds.has(id));
-  if (entries.length === Object.keys(current).length) return current;
-  return Object.fromEntries(entries);
-}
-
 export function commandSubtitle(command: ForegroundCommandInfo): string {
   if (command.status === "running") return `${command.name} · running`;
   if (command.status === "live") return `${command.name} · live`;
