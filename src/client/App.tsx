@@ -30,6 +30,14 @@ import {
   pruneViewedAgentRevisions,
   VIEWED_AGENT_REVISIONS_STORAGE_KEY,
 } from "./lib/agent-attention";
+import {
+  commandCompletionEvent,
+  commandNeedsAttention,
+  markCommandCompletionViewed,
+  parseViewedCommandCompletions,
+  pruneViewedCommandCompletions,
+  VIEWED_COMMAND_COMPLETIONS_STORAGE_KEY,
+} from "./lib/command-status";
 import { documentTitle } from "./lib/document-title";
 import {
   CONFIRM_TERMINAL_KILLS_STORAGE_KEY,
@@ -135,12 +143,48 @@ const defaultConfig: ClientConfig = {
 const dropPositions: DropPosition[] = ["left", "top", "center", "bottom", "right"];
 const TILE_NEW_TERMINALS_STORAGE_KEY = "term-server:tile-new-terminals";
 
-interface AgentToast {
+interface CompletionToast {
   id: string;
   terminalId: string;
   title: string;
   body: string;
   color: string;
+}
+
+function deliverCompletionNotification({
+  mode,
+  toast,
+  tag,
+  showToast,
+  onOpen,
+}: {
+  mode: NotificationMode;
+  toast: CompletionToast;
+  tag: string;
+  showToast: (toast: CompletionToast) => void;
+  onOpen: () => void;
+}) {
+  const showFallback = () => {
+    if (!includesInAppNotifications(mode)) showToast(toast);
+  };
+
+  if (includesInAppNotifications(mode)) showToast(toast);
+  if (!includesSystemNotifications(mode)) return;
+  if (typeof Notification === "undefined" || Notification.permission !== "granted") {
+    showFallback();
+    return;
+  }
+  try {
+    const notification = new Notification(toast.title, { body: toast.body, tag });
+    notification.onerror = showFallback;
+    notification.onclick = () => {
+      window.focus();
+      onOpen();
+      notification.close();
+    };
+  } catch {
+    showFallback();
+  }
 }
 
 const initialTheme = (): ThemeName => {
@@ -193,6 +237,11 @@ const initialTerminalFontSize = () =>
 const initialViewedAgentRevisions = () =>
   parseViewedAgentRevisions(localStorage.getItem(VIEWED_AGENT_REVISIONS_STORAGE_KEY));
 
+const initialViewedCommandCompletions = () =>
+  parseViewedCommandCompletions(
+    localStorage.getItem(VIEWED_COMMAND_COMPLETIONS_STORAGE_KEY),
+  );
+
 export function App() {
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
   const [workspaceLoaded, setWorkspaceLoaded] = useState(false);
@@ -215,7 +264,7 @@ export function App() {
     useState<AgentIntegrationProvider>();
   const [restartingForUpdate, setRestartingForUpdate] = useState<ReleaseInfo>();
   const [notice, setNotice] = useState("");
-  const [agentToasts, setAgentToasts] = useState<AgentToast[]>([]);
+  const [completionToasts, setCompletionToasts] = useState<CompletionToast[]>([]);
   const [mobileSidebar, setMobileSidebar] = useState(false);
   const [notificationMode, setNotificationMode] = useState(initialNotificationMode);
   const [notificationPosition, setNotificationPosition] = useState(initialNotificationPosition);
@@ -224,6 +273,8 @@ export function App() {
   const [confirmTerminalKills, setConfirmTerminalKills] = useState(initialConfirmTerminalKills);
   const [terminalFontSize, setTerminalFontSize] = useState(initialTerminalFontSize);
   const [viewedAgentRevisions, setViewedAgentRevisions] = useState(initialViewedAgentRevisions);
+  const [viewedCommandCompletions, setViewedCommandCompletions] =
+    useState(initialViewedCommandCompletions);
   const [artifacts, setArtifacts] = useState<ArtifactEntry[]>([]);
   const [resources, setResources] = useState<ResourceTab[]>([]);
   const [activeResource, setActiveResource] = useState<string>();
@@ -233,8 +284,10 @@ export function App() {
   const [settingsActive, setSettingsActive] = useState(false);
   const agentEventsInitialized = useRef(false);
   const deliveredAgentEvents = useRef(new Map<string, number>());
+  const commandEventsInitialized = useRef(false);
+  const deliveredCommandEvents = useRef(new Map<string, number>());
   const pendingAgentNotifications = useRef(new Map<string, { event: number; timer: number }>());
-  const agentToastTimers = useRef(new Map<string, number>());
+  const completionToastTimers = useRef(new Map<string, number>());
   const notificationModeRef = useRef(notificationMode);
   notificationModeRef.current = notificationMode;
   const notificationDurationRef = useRef(notificationDuration);
@@ -303,24 +356,26 @@ export function App() {
     }
   };
 
-  const dismissAgentToast = (id: string) => {
-    const timer = agentToastTimers.current.get(id);
+  const dismissCompletionToast = (id: string) => {
+    const timer = completionToastTimers.current.get(id);
     if (timer) clearTimeout(timer);
-    agentToastTimers.current.delete(id);
-    setAgentToasts((current) => current.filter((toast) => toast.id !== id));
+    completionToastTimers.current.delete(id);
+    setCompletionToasts((current) => current.filter((toast) => toast.id !== id));
   };
 
-  const showAgentToast = (toast: AgentToast) => {
-    const existingTimer = agentToastTimers.current.get(toast.id);
+  const showCompletionToast = (toast: CompletionToast) => {
+    const existingTimer = completionToastTimers.current.get(toast.id);
     if (existingTimer) clearTimeout(existingTimer);
-    setAgentToasts((current) => [...current.filter((item) => item.id !== toast.id), toast].slice(-3));
+    setCompletionToasts((current) => (
+      [...current.filter((item) => item.id !== toast.id), toast].slice(-3)
+    ));
     const duration = notificationDurationRef.current;
     if (duration === 0) {
-      agentToastTimers.current.delete(toast.id);
+      completionToastTimers.current.delete(toast.id);
       return;
     }
-    const timer = window.setTimeout(() => dismissAgentToast(toast.id), duration);
-    agentToastTimers.current.set(toast.id, timer);
+    const timer = window.setTimeout(() => dismissCompletionToast(toast.id), duration);
+    completionToastTimers.current.set(toast.id, timer);
   };
 
   const loadWorkspace = async () => {
@@ -420,6 +475,13 @@ export function App() {
   }, [viewedAgentRevisions]);
 
   useEffect(() => {
+    localStorage.setItem(
+      VIEWED_COMMAND_COMPLETIONS_STORAGE_KEY,
+      JSON.stringify(viewedCommandCompletions),
+    );
+  }, [viewedCommandCompletions]);
+
+  useEffect(() => {
     const syncViewedAgentRevisions = (event: StorageEvent) => {
       if (event.key !== VIEWED_AGENT_REVISIONS_STORAGE_KEY) return;
       setViewedAgentRevisions(parseViewedAgentRevisions(event.newValue));
@@ -429,9 +491,21 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    const syncViewedCommandCompletions = (event: StorageEvent) => {
+      if (event.key !== VIEWED_COMMAND_COMPLETIONS_STORAGE_KEY) return;
+      setViewedCommandCompletions(parseViewedCommandCompletions(event.newValue));
+    };
+    window.addEventListener("storage", syncViewedCommandCompletions);
+    return () => window.removeEventListener("storage", syncViewedCommandCompletions);
+  }, []);
+
+  useEffect(() => {
     if (!workspaceLoaded) return;
     const terminalIds = new Set(terminals.map((terminal) => terminal.id));
     setViewedAgentRevisions((current) => pruneViewedAgentRevisions(current, terminalIds));
+    setViewedCommandCompletions((current) => (
+      pruneViewedCommandCompletions(current, terminalIds)
+    ));
   }, [workspaceLoaded, terminals]);
 
   useEffect(() => {
@@ -469,6 +543,7 @@ export function App() {
       deliveredAgentEvents.current.clear();
       return;
     }
+    if (!workspaceLoaded) return;
     if (!agentEventsInitialized.current) {
       for (const terminal of terminals) {
         const event = agentCompletionEvent(terminal.agent);
@@ -492,7 +567,6 @@ export function App() {
           ? `${agent.kind} is idle and ready for input in ${terminal.workspace}`
           : `${agent.kind} closed in ${terminal.workspace}`
       );
-      const mode = notificationModeRef.current;
       const toast = {
         id: `${terminal.id}:${event}`,
         terminalId: terminal.id,
@@ -500,31 +574,13 @@ export function App() {
         body,
         color: terminal.color,
       };
-      const showFallback = () => {
-        if (!includesInAppNotifications(mode)) showAgentToast(toast);
-      };
-
-      if (includesInAppNotifications(mode)) showAgentToast(toast);
-      if (includesSystemNotifications(mode)) {
-        if (typeof Notification === "undefined" || Notification.permission !== "granted") {
-          showFallback();
-        } else {
-          try {
-            const notification = new Notification(terminal.name, {
-              body,
-              tag: `term-server:${terminal.id}:${event}`,
-            });
-            notification.onerror = showFallback;
-            notification.onclick = () => {
-              window.focus();
-              openTerminal(terminal.id);
-              notification.close();
-            };
-          } catch {
-            showFallback();
-          }
-        }
-      }
+      deliverCompletionNotification({
+        mode: notificationModeRef.current,
+        toast,
+        tag: `term-server:${terminal.id}:${event}`,
+        showToast: showCompletionToast,
+        onOpen: () => openTerminal(terminal.id),
+      });
       deliveredAgentEvents.current.set(terminalId, event);
     };
 
@@ -553,11 +609,56 @@ export function App() {
         deliver(terminal.id, event);
       }
     }
-  }, [authenticated, terminals, config.pi.summariesEnabled]);
+  }, [authenticated, workspaceLoaded, terminals, config.pi.summariesEnabled]);
+
+  useEffect(() => {
+    if (!authenticated) {
+      commandEventsInitialized.current = false;
+      deliveredCommandEvents.current.clear();
+      return;
+    }
+    if (!workspaceLoaded) return;
+    if (!commandEventsInitialized.current) {
+      for (const terminal of terminals) {
+        const event = commandCompletionEvent(terminal.command);
+        if (event != null) deliveredCommandEvents.current.set(terminal.id, event);
+      }
+      commandEventsInitialized.current = true;
+      return;
+    }
+
+    const deliver = (terminalId: string, event: number) => {
+      const terminal = terminalsRef.current.find((candidate) => candidate.id === terminalId);
+      const command = terminal?.command;
+      if (!terminal || !command || commandCompletionEvent(command) !== event) return;
+      const body = `${command.name} finished in ${terminal.workspace}`;
+      const toast = {
+        id: `command:${terminal.id}:${event}`,
+        terminalId: terminal.id,
+        title: terminal.name,
+        body,
+        color: terminal.color,
+      };
+      deliverCompletionNotification({
+        mode: notificationModeRef.current,
+        toast,
+        tag: `term-server:command:${terminal.id}:${event}`,
+        showToast: showCompletionToast,
+        onOpen: () => openTerminal(terminal.id),
+      });
+      deliveredCommandEvents.current.set(terminalId, event);
+    };
+
+    for (const terminal of terminals) {
+      const event = commandCompletionEvent(terminal.command);
+      if (event == null || deliveredCommandEvents.current.get(terminal.id) === event) continue;
+      deliver(terminal.id, event);
+    }
+  }, [authenticated, workspaceLoaded, terminals]);
 
   useEffect(() => () => {
     for (const pending of pendingAgentNotifications.current.values()) clearTimeout(pending.timer);
-    for (const timer of agentToastTimers.current.values()) clearTimeout(timer);
+    for (const timer of completionToastTimers.current.values()) clearTimeout(timer);
   }, []);
 
   useEffect(() => {
@@ -596,11 +697,17 @@ export function App() {
     }
     return grouped;
   }, [artifacts]);
-  const attentionAgentIds = useMemo(
+  const attentionTerminalIds = useMemo(
     () => new Set(terminals.flatMap((terminal) => (
-      agentNeedsAttention(terminal.agent, viewedAgentRevisions[terminal.id]) ? [terminal.id] : []
+      agentNeedsAttention(terminal.agent, viewedAgentRevisions[terminal.id])
+        || commandNeedsAttention(
+          terminal.command,
+          viewedCommandCompletions[terminal.id],
+        )
+        ? [terminal.id]
+        : []
     ))),
-    [terminals, viewedAgentRevisions],
+    [terminals, viewedAgentRevisions, viewedCommandCompletions],
   );
   const visibleTerminals = paneIds.map((id) => terminalById.get(id)).filter(Boolean) as TerminalInfo[];
   const renderedIds = [...mountedIds, ...paneIds.filter((id) => !mountedIds.includes(id))];
@@ -629,12 +736,20 @@ export function App() {
     });
   }, [paneIds, terminals, config.maxPanes]);
 
-  const markAgentViewed = (id: string) => {
-    const agent = terminalsRef.current.find((terminal) => terminal.id === id)?.agent;
-    if (!agent || agent.status !== "idle") return;
-    setViewedAgentRevisions((current) => (
-      markAgentRevisionViewed(current, id, agent.revision)
-    ));
+  const markTerminalActivityViewed = (id: string) => {
+    const terminal = terminalsRef.current.find((candidate) => candidate.id === id);
+    const agent = terminal?.agent;
+    if (agent?.status === "idle") {
+      setViewedAgentRevisions((current) => (
+        markAgentRevisionViewed(current, id, agent.revision)
+      ));
+    }
+    const completion = commandCompletionEvent(terminal?.command ?? null);
+    if (completion != null) {
+      setViewedCommandCompletions((current) => (
+        markCommandCompletionViewed(current, id, completion)
+      ));
+    }
   };
 
   useEffect(() => {
@@ -646,20 +761,22 @@ export function App() {
       || document.visibilityState !== "visible"
       || !document.hasFocus()
     ) return;
-    markAgentViewed(activeId);
+    markTerminalActivityViewed(activeId);
   }, [activeId, activeResource, settingsActive, mobileSidebar, terminals]);
 
   useEffect(() => {
-    const markActiveAgentViewed = () => {
+    const markActiveActivityViewed = () => {
       if (document.visibilityState !== "visible" || !document.hasFocus()) return;
       const id = activeId;
-      if (id && !activeResource && !settingsActive && !mobileSidebar) markAgentViewed(id);
+      if (id && !activeResource && !settingsActive && !mobileSidebar) {
+        markTerminalActivityViewed(id);
+      }
     };
-    window.addEventListener("focus", markActiveAgentViewed);
-    document.addEventListener("visibilitychange", markActiveAgentViewed);
+    window.addEventListener("focus", markActiveActivityViewed);
+    document.addEventListener("visibilitychange", markActiveActivityViewed);
     return () => {
-      window.removeEventListener("focus", markActiveAgentViewed);
-      document.removeEventListener("visibilitychange", markActiveAgentViewed);
+      window.removeEventListener("focus", markActiveActivityViewed);
+      document.removeEventListener("visibilitychange", markActiveActivityViewed);
     };
   }, [activeId, activeResource, settingsActive, mobileSidebar]);
 
@@ -1093,7 +1210,7 @@ export function App() {
         <Sidebar
           terminals={terminals}
           activeIds={paneIds}
-          attentionAgentIds={attentionAgentIds}
+          attentionTerminalIds={attentionTerminalIds}
           artifactCounts={artifactCounts}
           mobileOpen={mobileSidebar}
           creating={creating}
@@ -1173,7 +1290,7 @@ export function App() {
                 >
                   <TerminalPane
                     terminal={terminal}
-                    needsAttention={attentionAgentIds.has(terminal.id)}
+                    needsAttention={attentionTerminalIds.has(terminal.id)}
                     artifacts={artifactsBySession.get(terminal.id) ?? []}
                     config={config}
                     theme={theme}
@@ -1377,30 +1494,30 @@ export function App() {
           </span>
         </div>
       )}
-      {(agentToasts.length > 0 || notice) && (
+      {(completionToasts.length > 0 || notice) && (
         <div class={`toast-stack ${notificationPosition}`} aria-live="polite">
-          {agentToasts.map((toast) => (
+          {completionToasts.map((toast) => (
             <div
               key={toast.id}
-              class="toast agent-toast"
+              class="toast completion-toast"
               style={{ "--notification-color": toast.color }}
             >
               <button
-                class="agent-toast-main"
+                class="completion-toast-main"
                 onClick={() => {
                   openTerminal(toast.terminalId);
-                  dismissAgentToast(toast.id);
+                  dismissCompletionToast(toast.id);
                 }}
               >
-                <span class="agent-toast-icon"><Bell size={16} /></span>
-                <span class="agent-toast-copy">
+                <span class="completion-toast-icon"><Bell size={16} /></span>
+                <span class="completion-toast-copy">
                   <b>{toast.title}</b>
                   <span>{toast.body}</span>
                 </span>
               </button>
               <button
-                class="agent-toast-close"
-                onClick={() => dismissAgentToast(toast.id)}
+                class="completion-toast-close"
+                onClick={() => dismissCompletionToast(toast.id)}
                 aria-label={`Dismiss ${toast.title} notification`}
               >
                 <X size={14} />

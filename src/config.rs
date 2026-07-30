@@ -99,7 +99,7 @@ pub struct Cli {
     )]
     pub allowed_origins: Vec<String>,
 
-    /// Reconnect history retained per terminal, in MiB.
+    /// Canonical reconnect state and recent output retained per terminal, in MiB.
     #[arg(long, env = "TERM_SERVER_REPLAY_MB", default_value_t = 16, value_parser = clap::value_parser!(u64).range(1..=1024))]
     pub replay_mb: u64,
 

@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.6.0 - 2026-07-30
+
+Terminal reconnections now resume from compact canonical state instead of replaying the entire
+session history, and long foreground work is visible without treating interactive TUIs as finished
+commands.
+
+### Added
+
+- On Linux, foreground commands that run for at least five seconds show their name and elapsed time
+  in the sidebar and pane header. The browser tab count includes them alongside working agents.
+- Completed long-running commands use the existing unread bell, in-app toast, and desktop
+  notification preferences.
+- Interactive applications that enter the terminal alternate screen are marked **Live** without an
+  elapsed counter and disappear silently when they exit.
+
+### Changed
+
+- The session broker keeps a bounded VT model of each terminal's screen, scrollback, modes, cursor,
+  and alternate-screen state together with a short sequenced output ring.
+- Existing renderers resume from their last parser-committed byte. New or lagging renderers receive
+  only the missing output or a compact snapshot, including recovery in place on the same WebSocket.
+- Foreground activity follows process groups, so pipelines remain one command when their leading
+  process exits. Agent activity continues to take precedence over ordinary commands.
+- One focused browser responds to live terminal device queries when several clients are attached.
+
+### Fixed
+
+- Reconnecting to a long session no longer requires streaming its complete retained history.
+- Full-screen TUIs restore their canonical alternate-screen state instead of depending on a raw
+  output replay that can corrupt or terminate the application.
+- Browser-initiated protocol and timeout closes now use valid WebSocket application close codes.
+- Docker release builds include the embedded agent integrations and artifact skill required by the
+  Rust build.
+- A `0.5.1` in-app update now replaces its incompatible protocol-2 session broker automatically
+  instead of leaving the new web process unable to start.
+
+### Security
+
+- Snapshot application suppresses terminal-generated replies, so historical device queries are not
+  written back into the live PTY.
+- Interpreted scripts are labeled from their basename without exposing script arguments or inline
+  command text in command status and notifications.
+
+### Upgrade notes
+
+- This release upgrades the private session broker protocol from 2 to 3. Updating from `0.5.1`
+  automatically restarts the broker and closes existing terminals. Let long-running terminal work
+  finish before installing the update.
+- There are no data migrations or configuration changes.
+- The release is safe for automatic installation over `0.5.1`; an incompatible broker is replaced
+  and the web process reconnects to the new broker automatically.
+
 ## 0.5.1 - 2026-07-26
 
 Term-server now owns, updates, and reports the artifact skill used by Codex, Claude Code, and Pi.

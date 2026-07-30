@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
@@ -22,6 +22,7 @@ use crate::{
     agent_events::{AgentActivity, AgentEvent, AgentEventKind},
     ai::{PiRequest, PiService, PiTaskKind},
     artifacts,
+    terminal_state::{SequencedOutput, TerminalOutputState, TerminalSync},
 };
 
 // Neighboring buckets jump across the hue wheel and keep similar luminance across themes.
@@ -44,6 +45,7 @@ const PI_QUIET_SAMPLES_TO_IDLE: u8 = 2;
 const PI_SUBMISSION_WORKING_MILLIS: u64 = 3_000;
 const REPORTED_WORKING_FRESH_MILLIS: u64 = 5_000;
 const NATIVE_EVENT_FRESH_MILLIS: u64 = 15_000;
+const LONG_RUNNING_COMMAND_MILLIS: u64 = 5_000;
 const MAX_CAPTURED_PROMPT_CHARS: usize = 16_000;
 const DEFAULT_VIEWPORT_SIZE: ViewportSize = ViewportSize {
     cols: 100,
@@ -80,6 +82,24 @@ pub struct AgentInfo {
     pub activity: Option<AgentActivity>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ForegroundCommandStatus {
+    Running,
+    Live,
+    Completed,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ForegroundCommandInfo {
+    pub name: String,
+    pub status: ForegroundCommandStatus,
+    pub status_changed_at: u64,
+    pub started_at: u64,
+    pub completed_at: Option<u64>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalInfo {
@@ -92,6 +112,8 @@ pub struct TerminalInfo {
     pub program: String,
     pub color: String,
     pub agent: Option<AgentInfo>,
+    #[serde(default)]
+    pub command: Option<ForegroundCommandInfo>,
     pub created_at: u64,
     pub pid: Option<u32>,
     pub status: TerminalStatus,
@@ -141,7 +163,7 @@ pub enum ProcessSignalError {
 
 #[derive(Debug, Clone)]
 pub enum TerminalEvent {
-    Output(Bytes),
+    Output(SequencedOutput),
     Exit(u32),
     Size(TerminalSizeState),
 }
@@ -151,6 +173,7 @@ pub struct TerminalSizeState {
     pub cols: u16,
     pub rows: u16,
     pub focused_client: Option<Uuid>,
+    pub responder_client: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,6 +195,7 @@ impl ViewportSize {
 struct ClientViewports {
     sizes: HashMap<Uuid, Option<ViewportSize>>,
     focused_client: Option<Uuid>,
+    responder_client: Option<Uuid>,
     published: TerminalSizeState,
 }
 
@@ -180,10 +204,12 @@ impl Default for ClientViewports {
         Self {
             sizes: HashMap::new(),
             focused_client: None,
+            responder_client: None,
             published: TerminalSizeState {
                 cols: DEFAULT_VIEWPORT_SIZE.cols,
                 rows: DEFAULT_VIEWPORT_SIZE.rows,
                 focused_client: None,
+                responder_client: None,
             },
         }
     }
@@ -192,12 +218,16 @@ impl Default for ClientViewports {
 impl ClientViewports {
     fn attach(&mut self, client_id: Uuid, size: Option<ViewportSize>) {
         self.sizes.insert(client_id, size);
+        self.responder_client.get_or_insert(client_id);
     }
 
     fn detach(&mut self, client_id: Uuid) {
         self.sizes.remove(&client_id);
         if self.focused_client == Some(client_id) {
             self.focused_client = None;
+        }
+        if self.responder_client == Some(client_id) {
+            self.responder_client = self.sizes.keys().copied().min();
         }
     }
 
@@ -210,6 +240,7 @@ impl ClientViewports {
     fn focus(&mut self, client_id: Uuid, focused: bool) {
         if focused && self.sizes.get(&client_id).is_some_and(Option::is_some) {
             self.focused_client = Some(client_id);
+            self.responder_client = Some(client_id);
         } else if !focused && self.focused_client == Some(client_id) {
             self.focused_client = None;
         }
@@ -236,6 +267,7 @@ impl ClientViewports {
             cols: size.cols,
             rows: size.rows,
             focused_client: self.focused_client,
+            responder_client: self.responder_client,
         }
     }
 }
@@ -261,59 +293,6 @@ pub struct ProcessRecord {
 pub struct ProcessInspectorSnapshot {
     pub supported: bool,
     pub processes: Vec<ProcessRecord>,
-}
-
-#[derive(Debug)]
-struct ReplayBuffer {
-    chunks: VecDeque<Bytes>,
-    bytes: usize,
-    maximum_bytes: usize,
-}
-
-impl ReplayBuffer {
-    fn new(maximum_bytes: usize) -> Self {
-        Self {
-            chunks: VecDeque::new(),
-            bytes: 0,
-            maximum_bytes,
-        }
-    }
-
-    fn push(&mut self, chunk: Bytes) {
-        if chunk.is_empty() {
-            return;
-        }
-        self.bytes += chunk.len();
-        self.chunks.push_back(chunk);
-        while self.bytes > self.maximum_bytes && self.chunks.len() > 1 {
-            if let Some(removed) = self.chunks.pop_front() {
-                self.bytes -= removed.len();
-            }
-        }
-    }
-
-    fn snapshot(&self) -> Vec<Bytes> {
-        self.chunks.iter().cloned().collect()
-    }
-
-    fn text_tail(&self, maximum_bytes: usize) -> String {
-        let mut remaining = maximum_bytes;
-        let mut chunks = Vec::new();
-        for chunk in self.chunks.iter().rev() {
-            if remaining == 0 {
-                break;
-            }
-            let start = chunk.len().saturating_sub(remaining);
-            chunks.push(chunk.slice(start..));
-            remaining = remaining.saturating_sub(chunk.len() - start);
-        }
-        chunks.reverse();
-        let mut bytes = Vec::new();
-        for chunk in chunks {
-            bytes.extend_from_slice(&chunk);
-        }
-        sanitize_terminal_text(&String::from_utf8_lossy(&bytes))
-    }
 }
 
 #[derive(Debug, Default)]
@@ -521,6 +500,7 @@ struct SessionActivity {
     native_provider: Option<String>,
     native_status: Option<AgentStatus>,
     native_updated_at: u64,
+    foreground_command: ForegroundCommandTracker,
 }
 
 impl Default for SessionActivity {
@@ -544,6 +524,7 @@ impl Default for SessionActivity {
             native_provider: None,
             native_status: None,
             native_updated_at: 0,
+            foreground_command: ForegroundCommandTracker::default(),
         }
     }
 }
@@ -780,6 +761,114 @@ struct AgentObservation {
     cpu_ticks: u64,
 }
 
+#[derive(Debug)]
+struct ForegroundObservation {
+    group: i32,
+    name: String,
+}
+
+#[derive(Debug)]
+struct ForegroundCommandCandidate {
+    group: i32,
+    name: String,
+    first_seen_at: u64,
+    live: bool,
+}
+
+#[derive(Debug, Default)]
+struct ForegroundCommandTracker {
+    candidate: Option<ForegroundCommandCandidate>,
+}
+
+impl ForegroundCommandTracker {
+    fn refresh(
+        &mut self,
+        current: &mut Option<ForegroundCommandInfo>,
+        observation: Option<&ForegroundObservation>,
+        alternate_screen: bool,
+        agent_active: bool,
+        now: u64,
+    ) {
+        if agent_active {
+            self.candidate = None;
+            *current = None;
+            return;
+        }
+
+        let Some(observation) = observation else {
+            self.finish(current, now);
+            return;
+        };
+        if self
+            .candidate
+            .as_ref()
+            .is_none_or(|candidate| candidate.group != observation.group)
+        {
+            self.finish(current, now);
+            self.candidate = Some(ForegroundCommandCandidate {
+                group: observation.group,
+                name: observation.name.clone(),
+                first_seen_at: now,
+                live: alternate_screen,
+            });
+        } else if alternate_screen {
+            self.candidate
+                .as_mut()
+                .expect("foreground candidate exists")
+                .live = true;
+        }
+
+        let candidate = self
+            .candidate
+            .as_ref()
+            .expect("foreground candidate created");
+        let status = if candidate.live {
+            Some(ForegroundCommandStatus::Live)
+        } else if now.saturating_sub(candidate.first_seen_at) >= LONG_RUNNING_COMMAND_MILLIS {
+            Some(ForegroundCommandStatus::Running)
+        } else {
+            None
+        };
+        let Some(status) = status else {
+            return;
+        };
+        if current
+            .as_ref()
+            .is_some_and(|command| command.name == candidate.name && command.status == status)
+        {
+            return;
+        }
+        *current = Some(ForegroundCommandInfo {
+            name: candidate.name.clone(),
+            status,
+            status_changed_at: now,
+            started_at: candidate.first_seen_at,
+            completed_at: None,
+        });
+    }
+
+    fn finish(&mut self, current: &mut Option<ForegroundCommandInfo>, now: u64) {
+        let Some(candidate) = self.candidate.take() else {
+            return;
+        };
+        let Some(command) = current.as_mut() else {
+            return;
+        };
+        if command.name != candidate.name {
+            return;
+        }
+        match command.status {
+            ForegroundCommandStatus::Running => {
+                command.status = ForegroundCommandStatus::Completed;
+                command.status_changed_at = now;
+                command.completed_at = Some(now);
+            }
+            ForegroundCommandStatus::Live => *current = None,
+            ForegroundCommandStatus::Completed => {}
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct InitialAgentState {
     status: AgentStatus,
@@ -822,6 +911,7 @@ struct ProcessObservation {
     program: String,
     shell_foreground: bool,
     agent: Option<AgentObservation>,
+    foreground: Option<ForegroundObservation>,
 }
 
 #[derive(Debug, Default)]
@@ -835,7 +925,7 @@ pub struct TerminalSession {
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Mutex<Box<dyn Write + Send>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
-    replay: Mutex<ReplayBuffer>,
+    output: Mutex<TerminalOutputState>,
     events: broadcast::Sender<TerminalEvent>,
     viewports: Mutex<ClientViewports>,
     output_bytes: AtomicU64,
@@ -853,13 +943,25 @@ impl TerminalSession {
         info
     }
 
-    pub fn subscribe(&self) -> (broadcast::Receiver<TerminalEvent>, Vec<Bytes>) {
-        // The output thread publishes while holding this same lock. Subscribing
-        // before copying the replay buffer prevents gaps or duplicated chunks.
-        let replay = self.replay.lock();
+    pub fn subscribe(
+        &self,
+        requested_sequence: Option<u64>,
+    ) -> (
+        broadcast::Receiver<TerminalEvent>,
+        TerminalSync,
+        TerminalSizeState,
+        Option<u32>,
+    ) {
+        // Publishing uses the same lock. Subscribing before constructing the
+        // sync plan prevents a gap between the snapshot/delta and live output.
+        // Viewports are locked first, matching resize's lock order, so the
+        // accompanying grid dimensions describe this exact snapshot.
+        let viewports = self.viewports.lock();
+        let output = self.output.lock();
         let receiver = self.events.subscribe();
-        let snapshot = replay.snapshot();
-        (receiver, snapshot)
+        let sync = output.sync(requested_sequence);
+        let exit_code = output.exit_code();
+        (receiver, sync, viewports.published, exit_code)
     }
 
     pub fn process_inspector(&self) -> ProcessInspectorSnapshot {
@@ -997,10 +1099,13 @@ impl TerminalSession {
         let state = viewports.state();
         let size_changed =
             (state.cols, state.rows) != (viewports.published.cols, viewports.published.rows);
-        // Keep resize redraws behind the size control frame so every browser
-        // applies the shared grid before it processes output for that grid.
-        let replay = size_changed.then(|| self.replay.lock());
-        if size_changed && self.info.read().status == TerminalStatus::Running {
+        let publish = state != viewports.published;
+        let running = self.info.read().status == TerminalStatus::Running;
+        // Serialize controller/responder changes and resize redraws with PTY
+        // output so every browser applies the role and grid before the output
+        // whose replies it may be responsible for.
+        let mut output = publish.then(|| self.output.lock());
+        if size_changed && running {
             self.master
                 .lock()
                 .resize(PtySize {
@@ -1010,13 +1115,16 @@ impl TerminalSession {
                     pixel_height: 0,
                 })
                 .map_err(|error| TerminalError::Io(error.to_string()))?;
+            output
+                .as_mut()
+                .expect("output state locked for resize")
+                .resize(state.rows, state.cols);
         }
-        let publish = state != viewports.published;
         viewports.published = state;
         if publish {
             let _ = self.events.send(TerminalEvent::Size(state));
         }
-        drop(replay);
+        drop(output);
         Ok(state)
     }
 
@@ -1031,9 +1139,8 @@ impl TerminalSession {
         self.signals.lock().observe(&bytes, now);
         self.output_bytes
             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-        let mut replay = self.replay.lock();
-        replay.push(bytes.clone());
-        let _ = self.events.send(TerminalEvent::Output(bytes));
+        let output = self.output.lock().publish(bytes);
+        let _ = self.events.send(TerminalEvent::Output(output));
     }
 
     fn exited(&self, exit_code: u32) {
@@ -1043,6 +1150,10 @@ impl TerminalSession {
             info.exit_code = Some(exit_code);
             info.pid = None;
         }
+        // Serialize exit with output and subscriptions. A subscriber that
+        // attaches after the broadcast can observe the stored exit code
+        // instead of waiting forever for an event it missed.
+        self.output.lock().mark_exited(exit_code);
         let _ = self.events.send(TerminalEvent::Exit(exit_code));
     }
 
@@ -1088,6 +1199,7 @@ impl TerminalSession {
         );
         let shell_name = executable_name(&self.info.read().shell);
         let observation = processes.observe(shell_pid, &shell_name);
+        let alternate_screen = self.output.lock().alternate_screen();
         let output_bytes = self.output_bytes.load(Ordering::Relaxed);
         let reported_state = self.signals.lock().agent_state;
         let mut activity = self.activity.lock();
@@ -1099,6 +1211,13 @@ impl TerminalSession {
         }
         let previous_program = info.program.clone();
         info.program = observation.program.clone();
+        activity.foreground_command.refresh(
+            &mut info.command,
+            observation.foreground.as_ref(),
+            alternate_screen,
+            observation.agent.is_some(),
+            now,
+        );
 
         let mut outcome = RefreshOutcome::default();
         if let Some(agent) = observation.agent {
@@ -1323,6 +1442,8 @@ impl TerminalSession {
     ) -> RefreshOutcome {
         let mut activity = self.activity.lock();
         let mut info = self.info.write();
+        activity.foreground_command.candidate = None;
+        info.command = None;
         let next_status = match event.kind {
             AgentEventKind::Completed => AgentStatus::Idle,
             AgentEventKind::Closed => AgentStatus::Closed,
@@ -1404,7 +1525,7 @@ impl TerminalSession {
             agent: agent.to_owned(),
             user_prompt,
             recent_output: if kind == PiTaskKind::Summary {
-                self.replay.lock().text_tail(12 * 1024)
+                self.output.lock().text_tail(12 * 1024)
             } else {
                 String::new()
             },
@@ -1657,6 +1778,7 @@ impl TerminalManager {
                 program: executable_name(&shell),
                 shell,
                 agent: None,
+                command: None,
                 created_at: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
@@ -1669,7 +1791,11 @@ impl TerminalManager {
             master: Mutex::new(pair.master),
             writer: Mutex::new(writer),
             killer: Mutex::new(killer),
-            replay: Mutex::new(ReplayBuffer::new(self.replay_bytes.load(Ordering::Relaxed))),
+            output: Mutex::new(TerminalOutputState::new(
+                self.replay_bytes.load(Ordering::Relaxed),
+                DEFAULT_VIEWPORT_SIZE.rows,
+                DEFAULT_VIEWPORT_SIZE.cols,
+            )),
             events,
             viewports: Mutex::new(ClientViewports::default()),
             output_bytes: AtomicU64::new(0),
@@ -1977,6 +2103,7 @@ impl ProcessSnapshot {
                 program: shell_name.to_owned(),
                 shell_foreground: true,
                 agent: None,
+                foreground: None,
             };
         };
         let foreground_group = shell.foreground_group;
@@ -1985,6 +2112,7 @@ impl ProcessSnapshot {
                 program: shell_name.to_owned(),
                 shell_foreground: true,
                 agent: None,
+                foreground: None,
             };
         }
         let candidates = self
@@ -1997,6 +2125,7 @@ impl ProcessSnapshot {
                 program: shell_name.to_owned(),
                 shell_foreground: true,
                 agent: None,
+                foreground: None,
             };
         }
 
@@ -2010,6 +2139,7 @@ impl ProcessSnapshot {
             .min_by_key(|process| process.pid)
             .copied()
             .unwrap_or(candidates[0]);
+        let program = process_program(root);
         let agent = candidates.iter().find_map(|process| {
             agent_kind(process).map(|kind| AgentObservation {
                 kind,
@@ -2022,9 +2152,13 @@ impl ProcessSnapshot {
             program: agent
                 .as_ref()
                 .map(|agent| agent.kind.clone())
-                .unwrap_or_else(|| process_program(root)),
+                .unwrap_or_else(|| program.clone()),
             shell_foreground: false,
             agent,
+            foreground: Some(ForegroundObservation {
+                group: foreground_group,
+                name: program,
+            }),
         }
     }
 
@@ -2282,12 +2416,32 @@ fn process_program(process: &ProcessInfo) -> String {
         .unwrap_or_else(|| process.command.clone());
     if matches!(
         first_name.as_str(),
-        "node" | "nodejs" | "python" | "python3" | "bun"
+        "node"
+            | "nodejs"
+            | "python"
+            | "python3"
+            | "bun"
+            | "bash"
+            | "dash"
+            | "sh"
+            | "zsh"
+            | "fish"
+            | "ruby"
+            | "perl"
+            | "php"
     ) && let Some(script) = process.arguments.get(1)
+        && !script.starts_with('-')
     {
         let script_name = executable_name(script)
             .trim_end_matches(".js")
+            .trim_end_matches(".mjs")
+            .trim_end_matches(".cjs")
+            .trim_end_matches(".ts")
             .trim_end_matches(".py")
+            .trim_end_matches(".sh")
+            .trim_end_matches(".rb")
+            .trim_end_matches(".pl")
+            .trim_end_matches(".php")
             .to_owned();
         if !script_name.is_empty() {
             return script_name;
@@ -2317,7 +2471,7 @@ fn current_millis() -> u64 {
         .as_millis() as u64
 }
 
-fn sanitize_terminal_text(input: &str) -> String {
+pub(crate) fn sanitize_terminal_text(input: &str) -> String {
     let mut output = String::with_capacity(input.len());
     let mut characters = input.chars().peekable();
     while let Some(character) = characters.next() {
@@ -2427,6 +2581,170 @@ pub fn validate_working_directory(path: &Path) -> bool {
 mod tests {
     use super::*;
 
+    fn foreground(group: i32, name: &str) -> ForegroundObservation {
+        ForegroundObservation {
+            group,
+            name: name.to_owned(),
+        }
+    }
+
+    #[test]
+    fn ignores_short_foreground_commands() {
+        let mut tracker = ForegroundCommandTracker::default();
+        let mut current = None;
+        let command = foreground(20, "sleep");
+
+        tracker.refresh(&mut current, Some(&command), false, false, 1_000);
+        tracker.refresh(
+            &mut current,
+            Some(&command),
+            false,
+            false,
+            1_000 + LONG_RUNNING_COMMAND_MILLIS - 1,
+        );
+        tracker.refresh(&mut current, None, false, false, 7_000);
+
+        assert_eq!(current, None);
+    }
+
+    #[test]
+    fn reports_long_foreground_commands_and_their_completion() {
+        let mut tracker = ForegroundCommandTracker::default();
+        let mut current = None;
+        let command = foreground(20, "backup");
+
+        tracker.refresh(&mut current, Some(&command), false, false, 1_000);
+        tracker.refresh(
+            &mut current,
+            Some(&command),
+            false,
+            false,
+            1_000 + LONG_RUNNING_COMMAND_MILLIS,
+        );
+        assert_eq!(
+            current,
+            Some(ForegroundCommandInfo {
+                name: "backup".to_owned(),
+                status: ForegroundCommandStatus::Running,
+                status_changed_at: 1_000 + LONG_RUNNING_COMMAND_MILLIS,
+                started_at: 1_000,
+                completed_at: None,
+            })
+        );
+
+        tracker.refresh(&mut current, None, false, false, 8_000);
+        assert_eq!(
+            current.as_ref().map(|command| &command.status),
+            Some(&ForegroundCommandStatus::Completed)
+        );
+        assert_eq!(
+            current.as_ref().and_then(|command| command.completed_at),
+            Some(8_000)
+        );
+    }
+
+    #[test]
+    fn keeps_tuis_live_without_a_timer_or_completion() {
+        let mut tracker = ForegroundCommandTracker::default();
+        let mut current = None;
+        let tui = foreground(20, "btop");
+
+        tracker.refresh(&mut current, Some(&tui), true, false, 1_000);
+        assert_eq!(
+            current.as_ref().map(|command| &command.status),
+            Some(&ForegroundCommandStatus::Live)
+        );
+
+        // Once a process group has entered the alternate screen it remains a TUI,
+        // including during its exit redraw after it restores the normal screen.
+        tracker.refresh(&mut current, Some(&tui), false, false, 20_000);
+        assert_eq!(
+            current.as_ref().map(|command| &command.status),
+            Some(&ForegroundCommandStatus::Live)
+        );
+
+        tracker.refresh(&mut current, None, false, false, 21_000);
+        assert_eq!(current, None);
+    }
+
+    #[test]
+    fn suppresses_completion_when_a_running_command_becomes_a_tui() {
+        let mut tracker = ForegroundCommandTracker::default();
+        let mut current = None;
+        let command = foreground(20, "interactive-script");
+
+        tracker.refresh(&mut current, Some(&command), false, false, 1_000);
+        tracker.refresh(&mut current, Some(&command), false, false, 6_000);
+        tracker.refresh(&mut current, Some(&command), true, false, 7_000);
+        assert_eq!(
+            current.as_ref().map(|command| &command.status),
+            Some(&ForegroundCommandStatus::Live)
+        );
+
+        tracker.refresh(&mut current, None, false, false, 8_000);
+        assert_eq!(current, None);
+    }
+
+    #[test]
+    fn tracks_process_groups_across_pipeline_member_changes() {
+        let mut tracker = ForegroundCommandTracker::default();
+        let mut current = None;
+        let first_member = foreground(20, "producer");
+        let next_member = foreground(20, "consumer");
+
+        tracker.refresh(&mut current, Some(&first_member), false, false, 1_000);
+        tracker.refresh(&mut current, Some(&next_member), false, false, 6_000);
+
+        assert_eq!(
+            current.as_ref().map(|command| command.name.as_str()),
+            Some("producer")
+        );
+        assert_eq!(
+            current.as_ref().map(|command| &command.status),
+            Some(&ForegroundCommandStatus::Running)
+        );
+    }
+
+    #[test]
+    fn replacing_a_command_finishes_the_old_group_and_times_the_new_one() {
+        let mut tracker = ForegroundCommandTracker::default();
+        let mut current = None;
+        let first = foreground(20, "first");
+        let second = foreground(30, "second");
+
+        tracker.refresh(&mut current, Some(&first), false, false, 1_000);
+        tracker.refresh(&mut current, Some(&first), false, false, 6_000);
+        tracker.refresh(&mut current, Some(&second), false, false, 7_000);
+        assert_eq!(
+            current
+                .as_ref()
+                .map(|command| (command.name.as_str(), &command.status)),
+            Some(("first", &ForegroundCommandStatus::Completed))
+        );
+
+        tracker.refresh(&mut current, Some(&second), false, false, 12_000);
+        assert_eq!(
+            current
+                .as_ref()
+                .map(|command| (command.name.as_str(), &command.status)),
+            Some(("second", &ForegroundCommandStatus::Running))
+        );
+    }
+
+    #[test]
+    fn agent_activity_takes_precedence_over_command_activity() {
+        let mut tracker = ForegroundCommandTracker::default();
+        let mut current = None;
+        let command = foreground(20, "worker");
+
+        tracker.refresh(&mut current, Some(&command), false, false, 1_000);
+        tracker.refresh(&mut current, Some(&command), false, false, 6_000);
+        tracker.refresh(&mut current, Some(&command), false, true, 7_000);
+
+        assert_eq!(current, None);
+        assert!(tracker.candidate.is_none());
+    }
+
     #[test]
     fn normalizes_tree_paths() {
         assert_eq!(
@@ -2435,14 +2753,6 @@ mod tests {
         );
         assert!(normalize_terminal_path("../secret").is_err());
         assert!(normalize_terminal_path("//").is_err());
-    }
-
-    #[test]
-    fn replay_buffer_evicts_whole_old_chunks() {
-        let mut replay = ReplayBuffer::new(5);
-        replay.push(Bytes::from_static(b"abc"));
-        replay.push(Bytes::from_static(b"def"));
-        assert_eq!(replay.snapshot(), vec![Bytes::from_static(b"def")]);
     }
 
     #[test]
@@ -2459,6 +2769,18 @@ mod tests {
                 cols: 60,
                 rows: 22,
                 focused_client: None,
+                responder_client: Some(desktop),
+            }
+        );
+
+        viewports.focus(mobile, true);
+        assert_eq!(
+            viewports.state(),
+            TerminalSizeState {
+                cols: 60,
+                rows: 22,
+                focused_client: Some(mobile),
+                responder_client: Some(mobile),
             }
         );
 
@@ -2469,6 +2791,7 @@ mod tests {
                 cols: 180,
                 rows: 50,
                 focused_client: Some(desktop),
+                responder_client: Some(desktop),
             }
         );
 
@@ -2482,6 +2805,7 @@ mod tests {
                 cols: 40,
                 rows: 16,
                 focused_client: None,
+                responder_client: Some(mobile),
             }
         );
 
@@ -2493,6 +2817,7 @@ mod tests {
                 cols: 40,
                 rows: 16,
                 focused_client: None,
+                responder_client: None,
             }
         );
     }
@@ -2845,6 +3170,41 @@ mod tests {
         assert_eq!(
             agent_kind(&process("node", &["node", "/opt/pi-coding-agent/dist.js"])).as_deref(),
             Some("pi")
+        );
+    }
+
+    #[test]
+    fn labels_interpreted_scripts_without_exposing_their_arguments() {
+        let process = |command: &str, arguments: &[&str]| ProcessInfo {
+            pid: 10,
+            parent: 1,
+            group: 10,
+            foreground_group: 10,
+            command: command.to_owned(),
+            arguments: arguments.iter().map(|value| (*value).to_owned()).collect(),
+            cwd: Some(PathBuf::from("/tmp")),
+            start_ticks: 100,
+            cpu_ticks: 0,
+            memory_bytes: 0,
+        };
+
+        assert_eq!(
+            process_program(&process(
+                "bash",
+                &["bash", "/work/nightly-backup.sh", "--token=secret"]
+            )),
+            "nightly-backup"
+        );
+        assert_eq!(
+            process_program(&process(
+                "python3",
+                &["python3", "/work/report.py", "--customer", "private"]
+            )),
+            "report"
+        );
+        assert_eq!(
+            process_program(&process("bash", &["bash", "-c", "private command text"])),
+            "bash"
         );
     }
 

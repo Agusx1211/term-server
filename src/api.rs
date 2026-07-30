@@ -1000,7 +1000,11 @@ async fn terminal_socket(
     require_origin(&headers, &uri, &state)?;
     require_auth(&jar, &state)?;
     let initial_size = query.viewport();
-    let terminal = state.workspace.connect_terminal(id, initial_size).await?;
+    let sequence = query.sequence();
+    let terminal = state
+        .workspace
+        .connect_terminal(id, initial_size, sequence)
+        .await?;
     Ok(websocket
         .max_message_size(64 * 1024)
         .max_frame_size(64 * 1024)
@@ -1009,7 +1013,7 @@ async fn terminal_socket(
         .on_upgrade(move |socket| async move {
             match terminal {
                 SessionConnection::Local(terminal) => {
-                    serve_terminal_socket(socket, terminal, initial_size).await;
+                    serve_terminal_socket(socket, terminal, initial_size, sequence).await;
                 }
                 #[cfg(unix)]
                 SessionConnection::Broker(broker) => {
@@ -1337,7 +1341,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
         let config: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(config["broker"], serde_json::Value::Null);
         assert_eq!(config["agentIntegrations"]["fallbacksEnabled"], true);

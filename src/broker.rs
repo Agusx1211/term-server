@@ -39,7 +39,7 @@ use crate::{
     },
 };
 
-const PROTOCOL_VERSION: u32 = 2;
+const PROTOCOL_VERSION: u32 = 3;
 const SOCKET_NAME: &str = "session-broker.sock";
 
 pub type BrokerWebSocket = WebSocketStream<UnixStream>;
@@ -85,30 +85,20 @@ impl BrokerClient {
     pub async fn connect_or_start(cli: &Cli, executable: &Path) -> Result<Self, BrokerError> {
         tokio::fs::create_dir_all(&cli.data_dir).await?;
         let client = Self::new(socket_path(&cli.data_dir));
-        if client.health().await.is_err() {
-            spawn_broker(cli, executable)?;
-            let mut last_error = None;
-            for _ in 0..50 {
-                match client.health().await {
-                    Ok(_) => {
-                        last_error = None;
-                        break;
-                    }
-                    Err(error) => last_error = Some(error),
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+        let health = match client.health().await {
+            Ok(health) if health.protocol_version != PROTOCOL_VERSION => {
+                tracing::warn!(
+                    expected_protocol = PROTOCOL_VERSION,
+                    actual_protocol = health.protocol_version,
+                    sessions = health.sessions,
+                    "replacing incompatible session broker; existing terminals will close"
+                );
+                client.shutdown().await?;
+                client.start_and_wait(cli, executable).await?
             }
-            if let Some(error) = last_error {
-                return Err(error);
-            }
-        }
-        let health = client.health().await?;
-        if health.protocol_version != PROTOCOL_VERSION {
-            return Err(BrokerError::Protocol {
-                expected: PROTOCOL_VERSION,
-                actual: health.protocol_version,
-            });
-        }
+            Ok(health) => health,
+            Err(_) => client.start_and_wait(cli, executable).await?,
+        };
         tracing::info!(
             broker_version = %health.build.version,
             broker_commit = %health.build.commit,
@@ -120,6 +110,31 @@ impl BrokerClient {
             .configure(cli.shell.clone(), cli.replay_bytes())
             .await?;
         Ok(client)
+    }
+
+    async fn start_and_wait(
+        &self,
+        cli: &Cli,
+        executable: &Path,
+    ) -> Result<HealthResponse, BrokerError> {
+        spawn_broker(cli, executable)?;
+        let mut last_error = None;
+        for _ in 0..50 {
+            match self.health().await {
+                Ok(health) if health.protocol_version == PROTOCOL_VERSION => return Ok(health),
+                Ok(health) => {
+                    last_error = Some(BrokerError::Protocol {
+                        expected: PROTOCOL_VERSION,
+                        actual: health.protocol_version,
+                    });
+                }
+                Err(error) => last_error = Some(error),
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Err(last_error.unwrap_or_else(|| {
+            BrokerError::Unavailable("session broker did not become ready".to_owned())
+        }))
     }
 
     async fn health(&self) -> Result<HealthResponse, BrokerError> {
@@ -196,11 +211,22 @@ impl BrokerClient {
         &self,
         id: Uuid,
         initial_size: Option<(u16, u16)>,
+        sequence: Option<u64>,
     ) -> Result<BrokerWebSocket, BrokerError> {
         let stream = UnixStream::connect(self.socket_path.as_ref()).await?;
-        let query = initial_size
-            .map(|(cols, rows)| format!("?cols={cols}&rows={rows}"))
-            .unwrap_or_default();
+        let mut query = vec![];
+        if let Some((cols, rows)) = initial_size {
+            query.push(format!("cols={cols}"));
+            query.push(format!("rows={rows}"));
+        }
+        if let Some(sequence) = sequence {
+            query.push(format!("sequence={sequence}"));
+        }
+        let query = if query.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", query.join("&"))
+        };
         let (socket, _) = client_async(
             format!("ws://localhost/terminals/{id}/socket{query}"),
             stream,
@@ -561,7 +587,9 @@ async fn broker_terminal_socket(
         .max_frame_size(64 * 1024)
         .write_buffer_size(128 * 1024)
         .max_write_buffer_size(4 * 1024 * 1024)
-        .on_upgrade(move |socket| serve_terminal_socket(socket, terminal, query.viewport())))
+        .on_upgrade(move |socket| {
+            serve_terminal_socket(socket, terminal, query.viewport(), query.sequence())
+        }))
 }
 
 async fn shutdown_broker(State(state): State<BrokerState>) -> StatusCode {
@@ -579,9 +607,29 @@ mod tests {
     use std::path::PathBuf;
 
     use futures_util::{SinkExt, StreamExt};
+    use tempfile::TempDir;
+    use tokio::task::JoinHandle;
     use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 
     use super::*;
+
+    async fn start_test_broker(replay_bytes: usize) -> (TempDir, JoinHandle<()>, BrokerClient) {
+        let directory = tempfile::tempdir().unwrap();
+        let data_directory = directory.path().to_path_buf();
+        let server = tokio::spawn(async move {
+            run_session_broker(&data_directory, Some("/bin/sh".to_owned()), replay_bytes)
+                .await
+                .unwrap();
+        });
+        let client = BrokerClient::new(socket_path(directory.path()));
+        for _ in 0..50 {
+            if client.health().await.is_ok() {
+                return (directory, server, client);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("test broker did not start");
+    }
 
     async fn wait_for_control(
         socket: &mut BrokerWebSocket,
@@ -612,7 +660,8 @@ mod tests {
             while let Some(message) = socket.next().await {
                 match message.unwrap() {
                     TungsteniteMessage::Binary(bytes) => {
-                        output.push_str(&String::from_utf8_lossy(&bytes));
+                        assert!(bytes.len() >= 9, "terminal frame includes its header");
+                        output.push_str(&String::from_utf8_lossy(&bytes[9..]));
                         if output.contains(needle) {
                             return;
                         }
@@ -627,22 +676,41 @@ mod tests {
         output
     }
 
+    async fn wait_for_resynchronized_output(socket: &mut BrokerWebSocket, needle: &str) -> String {
+        let mut output = String::new();
+        let mut resynchronized = false;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while let Some(message) = socket.next().await {
+                match message.unwrap() {
+                    TungsteniteMessage::Text(text) => {
+                        let value = serde_json::from_str::<serde_json::Value>(&text).unwrap();
+                        if value["type"] == "sync" {
+                            resynchronized = true;
+                        }
+                    }
+                    TungsteniteMessage::Binary(bytes) => {
+                        assert!(bytes.len() >= 9, "terminal frame includes its header");
+                        output.push_str(&String::from_utf8_lossy(&bytes[9..]));
+                        if output.contains(needle) && resynchronized {
+                            return;
+                        }
+                    }
+                    TungsteniteMessage::Close(_) => {
+                        panic!("lagging terminal socket was closed instead of resynchronized")
+                    }
+                    _ => {}
+                }
+            }
+            panic!("terminal socket ended before it resynchronized");
+        })
+        .await
+        .expect("terminal resynchronization timeout");
+        output
+    }
+
     #[tokio::test]
     async fn sessions_survive_web_client_reconnections() {
-        let directory = tempfile::tempdir().unwrap();
-        let data_directory = directory.path().to_path_buf();
-        let server = tokio::spawn(async move {
-            run_session_broker(&data_directory, Some("/bin/sh".to_owned()), 1024 * 1024)
-                .await
-                .unwrap();
-        });
-        let client = BrokerClient::new(socket_path(directory.path()));
-        for _ in 0..50 {
-            if client.health().await.is_ok() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        let (directory, server, client) = start_test_broker(1024 * 1024).await;
         let broker = client.info().await.unwrap();
         assert_eq!(broker.version, build::VERSION);
         assert_eq!(broker.commit, build::COMMIT);
@@ -680,7 +748,7 @@ mod tests {
         assert_eq!(observed.status, crate::terminal::AgentStatus::Working);
         assert_eq!(observed.activity.unwrap().label, "thinking");
         let mut first = client
-            .terminal_socket(terminal.id, Some((80, 24)))
+            .terminal_socket(terminal.id, Some((80, 24)), None)
             .await
             .unwrap();
         let size = wait_for_control(&mut first, "size").await;
@@ -688,6 +756,11 @@ mod tests {
             (size["cols"].as_u64(), size["rows"].as_u64()),
             (Some(80), Some(24))
         );
+        let initial_sync = wait_for_control(&mut first, "sync").await;
+        assert_eq!(initial_sync["mode"], "snapshot");
+        let initial_sequence = initial_sync["sequence"].as_u64().unwrap();
+        let synced = wait_for_control(&mut first, "synced").await;
+        assert_eq!(synced["sequence"], initial_sequence);
         first
             .send(TungsteniteMessage::Text(
                 r#"{"type":"focus","focused":true}"#.into(),
@@ -715,14 +788,74 @@ mod tests {
                 .any(|candidate| candidate.id == terminal.id)
         );
         let mut second = replacement_client
-            .terminal_socket(terminal.id, Some((80, 24)))
+            .terminal_socket(terminal.id, Some((80, 24)), Some(initial_sequence))
             .await
             .unwrap();
+        let size = wait_for_control(&mut second, "size").await;
+        assert_eq!(
+            (size["cols"].as_u64(), size["rows"].as_u64()),
+            (Some(80), Some(24))
+        );
+        let resumed = wait_for_control(&mut second, "sync").await;
+        assert_eq!(resumed["mode"], "resume");
         let replay = wait_for_output(&mut second, "before-restart").await;
         assert!(replay.contains("before-restart"));
+        let synced = wait_for_control(&mut second, "synced").await;
+        assert!(synced["sequence"].as_u64().unwrap() > initial_sequence);
+        second
+            .send(TungsteniteMessage::Text(r#"{"type":"ping"}"#.into()))
+            .await
+            .unwrap();
+        wait_for_control(&mut second, "pong").await;
 
         replacement_client.remove(terminal.id).await.unwrap();
         replacement_client.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("broker shutdown timeout")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn lagging_clients_resynchronize_without_disconnecting() {
+        let (_directory, server, client) = start_test_broker(1024 * 1024).await;
+        let terminal = client
+            .create(CreateTerminal {
+                path: Some("lag-test".to_owned()),
+                cwd: Some(PathBuf::from("/tmp")),
+                shell: Some("/bin/sh".to_owned()),
+                clone_from: None,
+            })
+            .await
+            .unwrap();
+        let mut socket = client
+            .terminal_socket(terminal.id, Some((80, 24)), None)
+            .await
+            .unwrap();
+        wait_for_control(&mut socket, "size").await;
+        wait_for_control(&mut socket, "sync").await;
+        wait_for_control(&mut socket, "synced").await;
+
+        let command = "yes x | head -c 6000000; printf '\\nLAG-%s\\n' DONE\n";
+        socket
+            .send(TungsteniteMessage::Text(
+                serde_json::json!({ "type": "input", "data": command })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let output = wait_for_resynchronized_output(&mut socket, "LAG-DONE").await;
+        assert!(output.contains("LAG-DONE"));
+
+        socket
+            .send(TungsteniteMessage::Text(r#"{"type":"ping"}"#.into()))
+            .await
+            .unwrap();
+        wait_for_control(&mut socket, "pong").await;
+        client.remove(terminal.id).await.unwrap();
+        client.shutdown().await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), server)
             .await
             .expect("broker shutdown timeout")
