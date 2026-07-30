@@ -11,6 +11,7 @@ pub mod build;
 pub mod config;
 pub mod files;
 pub mod terminal;
+mod terminal_state;
 pub mod tls;
 pub mod update;
 pub mod workspace;

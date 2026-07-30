@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
@@ -22,6 +22,7 @@ use crate::{
     agent_events::{AgentActivity, AgentEvent, AgentEventKind},
     ai::{PiRequest, PiService, PiTaskKind},
     artifacts,
+    terminal_state::{SequencedOutput, TerminalOutputState, TerminalSync},
 };
 
 // Neighboring buckets jump across the hue wheel and keep similar luminance across themes.
@@ -141,7 +142,7 @@ pub enum ProcessSignalError {
 
 #[derive(Debug, Clone)]
 pub enum TerminalEvent {
-    Output(Bytes),
+    Output(SequencedOutput),
     Exit(u32),
     Size(TerminalSizeState),
 }
@@ -151,6 +152,7 @@ pub struct TerminalSizeState {
     pub cols: u16,
     pub rows: u16,
     pub focused_client: Option<Uuid>,
+    pub responder_client: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,6 +174,7 @@ impl ViewportSize {
 struct ClientViewports {
     sizes: HashMap<Uuid, Option<ViewportSize>>,
     focused_client: Option<Uuid>,
+    responder_client: Option<Uuid>,
     published: TerminalSizeState,
 }
 
@@ -180,10 +183,12 @@ impl Default for ClientViewports {
         Self {
             sizes: HashMap::new(),
             focused_client: None,
+            responder_client: None,
             published: TerminalSizeState {
                 cols: DEFAULT_VIEWPORT_SIZE.cols,
                 rows: DEFAULT_VIEWPORT_SIZE.rows,
                 focused_client: None,
+                responder_client: None,
             },
         }
     }
@@ -192,12 +197,16 @@ impl Default for ClientViewports {
 impl ClientViewports {
     fn attach(&mut self, client_id: Uuid, size: Option<ViewportSize>) {
         self.sizes.insert(client_id, size);
+        self.responder_client.get_or_insert(client_id);
     }
 
     fn detach(&mut self, client_id: Uuid) {
         self.sizes.remove(&client_id);
         if self.focused_client == Some(client_id) {
             self.focused_client = None;
+        }
+        if self.responder_client == Some(client_id) {
+            self.responder_client = self.sizes.keys().copied().min();
         }
     }
 
@@ -210,6 +219,7 @@ impl ClientViewports {
     fn focus(&mut self, client_id: Uuid, focused: bool) {
         if focused && self.sizes.get(&client_id).is_some_and(Option::is_some) {
             self.focused_client = Some(client_id);
+            self.responder_client = Some(client_id);
         } else if !focused && self.focused_client == Some(client_id) {
             self.focused_client = None;
         }
@@ -236,6 +246,7 @@ impl ClientViewports {
             cols: size.cols,
             rows: size.rows,
             focused_client: self.focused_client,
+            responder_client: self.responder_client,
         }
     }
 }
@@ -261,59 +272,6 @@ pub struct ProcessRecord {
 pub struct ProcessInspectorSnapshot {
     pub supported: bool,
     pub processes: Vec<ProcessRecord>,
-}
-
-#[derive(Debug)]
-struct ReplayBuffer {
-    chunks: VecDeque<Bytes>,
-    bytes: usize,
-    maximum_bytes: usize,
-}
-
-impl ReplayBuffer {
-    fn new(maximum_bytes: usize) -> Self {
-        Self {
-            chunks: VecDeque::new(),
-            bytes: 0,
-            maximum_bytes,
-        }
-    }
-
-    fn push(&mut self, chunk: Bytes) {
-        if chunk.is_empty() {
-            return;
-        }
-        self.bytes += chunk.len();
-        self.chunks.push_back(chunk);
-        while self.bytes > self.maximum_bytes && self.chunks.len() > 1 {
-            if let Some(removed) = self.chunks.pop_front() {
-                self.bytes -= removed.len();
-            }
-        }
-    }
-
-    fn snapshot(&self) -> Vec<Bytes> {
-        self.chunks.iter().cloned().collect()
-    }
-
-    fn text_tail(&self, maximum_bytes: usize) -> String {
-        let mut remaining = maximum_bytes;
-        let mut chunks = Vec::new();
-        for chunk in self.chunks.iter().rev() {
-            if remaining == 0 {
-                break;
-            }
-            let start = chunk.len().saturating_sub(remaining);
-            chunks.push(chunk.slice(start..));
-            remaining = remaining.saturating_sub(chunk.len() - start);
-        }
-        chunks.reverse();
-        let mut bytes = Vec::new();
-        for chunk in chunks {
-            bytes.extend_from_slice(&chunk);
-        }
-        sanitize_terminal_text(&String::from_utf8_lossy(&bytes))
-    }
 }
 
 #[derive(Debug, Default)]
@@ -835,7 +793,7 @@ pub struct TerminalSession {
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Mutex<Box<dyn Write + Send>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
-    replay: Mutex<ReplayBuffer>,
+    output: Mutex<TerminalOutputState>,
     events: broadcast::Sender<TerminalEvent>,
     viewports: Mutex<ClientViewports>,
     output_bytes: AtomicU64,
@@ -853,13 +811,25 @@ impl TerminalSession {
         info
     }
 
-    pub fn subscribe(&self) -> (broadcast::Receiver<TerminalEvent>, Vec<Bytes>) {
-        // The output thread publishes while holding this same lock. Subscribing
-        // before copying the replay buffer prevents gaps or duplicated chunks.
-        let replay = self.replay.lock();
+    pub fn subscribe(
+        &self,
+        requested_sequence: Option<u64>,
+    ) -> (
+        broadcast::Receiver<TerminalEvent>,
+        TerminalSync,
+        TerminalSizeState,
+        Option<u32>,
+    ) {
+        // Publishing uses the same lock. Subscribing before constructing the
+        // sync plan prevents a gap between the snapshot/delta and live output.
+        // Viewports are locked first, matching resize's lock order, so the
+        // accompanying grid dimensions describe this exact snapshot.
+        let viewports = self.viewports.lock();
+        let output = self.output.lock();
         let receiver = self.events.subscribe();
-        let snapshot = replay.snapshot();
-        (receiver, snapshot)
+        let sync = output.sync(requested_sequence);
+        let exit_code = output.exit_code();
+        (receiver, sync, viewports.published, exit_code)
     }
 
     pub fn process_inspector(&self) -> ProcessInspectorSnapshot {
@@ -997,10 +967,13 @@ impl TerminalSession {
         let state = viewports.state();
         let size_changed =
             (state.cols, state.rows) != (viewports.published.cols, viewports.published.rows);
-        // Keep resize redraws behind the size control frame so every browser
-        // applies the shared grid before it processes output for that grid.
-        let replay = size_changed.then(|| self.replay.lock());
-        if size_changed && self.info.read().status == TerminalStatus::Running {
+        let publish = state != viewports.published;
+        let running = self.info.read().status == TerminalStatus::Running;
+        // Serialize controller/responder changes and resize redraws with PTY
+        // output so every browser applies the role and grid before the output
+        // whose replies it may be responsible for.
+        let mut output = publish.then(|| self.output.lock());
+        if size_changed && running {
             self.master
                 .lock()
                 .resize(PtySize {
@@ -1010,13 +983,16 @@ impl TerminalSession {
                     pixel_height: 0,
                 })
                 .map_err(|error| TerminalError::Io(error.to_string()))?;
+            output
+                .as_mut()
+                .expect("output state locked for resize")
+                .resize(state.rows, state.cols);
         }
-        let publish = state != viewports.published;
         viewports.published = state;
         if publish {
             let _ = self.events.send(TerminalEvent::Size(state));
         }
-        drop(replay);
+        drop(output);
         Ok(state)
     }
 
@@ -1031,9 +1007,8 @@ impl TerminalSession {
         self.signals.lock().observe(&bytes, now);
         self.output_bytes
             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-        let mut replay = self.replay.lock();
-        replay.push(bytes.clone());
-        let _ = self.events.send(TerminalEvent::Output(bytes));
+        let output = self.output.lock().publish(bytes);
+        let _ = self.events.send(TerminalEvent::Output(output));
     }
 
     fn exited(&self, exit_code: u32) {
@@ -1043,6 +1018,10 @@ impl TerminalSession {
             info.exit_code = Some(exit_code);
             info.pid = None;
         }
+        // Serialize exit with output and subscriptions. A subscriber that
+        // attaches after the broadcast can observe the stored exit code
+        // instead of waiting forever for an event it missed.
+        self.output.lock().mark_exited(exit_code);
         let _ = self.events.send(TerminalEvent::Exit(exit_code));
     }
 
@@ -1404,7 +1383,7 @@ impl TerminalSession {
             agent: agent.to_owned(),
             user_prompt,
             recent_output: if kind == PiTaskKind::Summary {
-                self.replay.lock().text_tail(12 * 1024)
+                self.output.lock().text_tail(12 * 1024)
             } else {
                 String::new()
             },
@@ -1669,7 +1648,11 @@ impl TerminalManager {
             master: Mutex::new(pair.master),
             writer: Mutex::new(writer),
             killer: Mutex::new(killer),
-            replay: Mutex::new(ReplayBuffer::new(self.replay_bytes.load(Ordering::Relaxed))),
+            output: Mutex::new(TerminalOutputState::new(
+                self.replay_bytes.load(Ordering::Relaxed),
+                DEFAULT_VIEWPORT_SIZE.rows,
+                DEFAULT_VIEWPORT_SIZE.cols,
+            )),
             events,
             viewports: Mutex::new(ClientViewports::default()),
             output_bytes: AtomicU64::new(0),
@@ -2317,7 +2300,7 @@ fn current_millis() -> u64 {
         .as_millis() as u64
 }
 
-fn sanitize_terminal_text(input: &str) -> String {
+pub(crate) fn sanitize_terminal_text(input: &str) -> String {
     let mut output = String::with_capacity(input.len());
     let mut characters = input.chars().peekable();
     while let Some(character) = characters.next() {
@@ -2438,14 +2421,6 @@ mod tests {
     }
 
     #[test]
-    fn replay_buffer_evicts_whole_old_chunks() {
-        let mut replay = ReplayBuffer::new(5);
-        replay.push(Bytes::from_static(b"abc"));
-        replay.push(Bytes::from_static(b"def"));
-        assert_eq!(replay.snapshot(), vec![Bytes::from_static(b"def")]);
-    }
-
-    #[test]
     fn terminal_size_uses_the_smallest_viewport_until_one_client_is_focused() {
         let desktop = Uuid::from_u128(1);
         let mobile = Uuid::from_u128(2);
@@ -2459,6 +2434,18 @@ mod tests {
                 cols: 60,
                 rows: 22,
                 focused_client: None,
+                responder_client: Some(desktop),
+            }
+        );
+
+        viewports.focus(mobile, true);
+        assert_eq!(
+            viewports.state(),
+            TerminalSizeState {
+                cols: 60,
+                rows: 22,
+                focused_client: Some(mobile),
+                responder_client: Some(mobile),
             }
         );
 
@@ -2469,6 +2456,7 @@ mod tests {
                 cols: 180,
                 rows: 50,
                 focused_client: Some(desktop),
+                responder_client: Some(desktop),
             }
         );
 
@@ -2482,6 +2470,7 @@ mod tests {
                 cols: 40,
                 rows: 16,
                 focused_client: None,
+                responder_client: Some(mobile),
             }
         );
 
@@ -2493,6 +2482,7 @@ mod tests {
                 cols: 40,
                 rows: 16,
                 focused_client: None,
+                responder_client: None,
             }
         );
     }

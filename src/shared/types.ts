@@ -230,6 +230,15 @@ export type ClientTerminalMessage =
 export type ServerTerminalMessage =
   | { type: "ready"; terminal: TerminalInfo }
   | { type: "exit"; exitCode: number }
-  | { type: "size"; cols: number; rows: number; focused: boolean; controller: boolean }
+  | {
+      type: "size";
+      cols: number;
+      rows: number;
+      focused: boolean;
+      controller: boolean;
+      responder: boolean;
+    }
+  | { type: "sync"; mode: "snapshot" | "resume"; sequence: number }
+  | { type: "synced"; sequence: number }
   | { type: "pong" }
   | { type: "error"; message: string };

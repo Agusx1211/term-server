@@ -35,7 +35,7 @@ sh install.sh
 
 `main` is a moving development channel. Pin a versioned release instead when stable releases become available.
 
-Installed releases check their configured channel for signed updates after login and every six hours. When an update is available, the sidebar and **Settings → Updates** show an **Update** action. Updating verifies the signed release manifest, target architecture, archive size and SHA-256 checksum, and the new binary's embedded version and source commit before replacing any files. The HTTPS process then restarts itself and reconnects to the private session broker, so active terminals and their replay buffers remain available.
+Installed releases check their configured channel for signed updates after login and every six hours. When an update is available, the sidebar and **Settings → Updates** show an **Update** action. Updating verifies the signed release manifest, target architecture, archive size and SHA-256 checksum, and the new binary's embedded version and source commit before replacing any files. The HTTPS process then restarts itself and reconnects to the private session broker, so active terminals and their reconnect state remain available.
 
 The broker is a hidden mode of the same executable. It listens on `session-broker.sock` inside the data directory with user-only permissions and accepts no network connections. An explicit service stop also stops the broker and its terminals; an in-process signed update leaves it running. The broker protocol is versioned so future web processes can reject an incompatible handoff instead of silently corrupting a session.
 
@@ -50,7 +50,7 @@ On first boot, open `https://127.0.0.1:8090`. term-server prints a random passwo
 - **Terminal-first workspace:** native PTYs, xterm.js WebGL rendering, truecolor, selection, clipboard shortcuts, search, links, up to eight panes, and as many as 2,000,000 scrollback lines per pane.
 - **Phone and tablet support:** touch-sized navigation, a workspace drawer, focused pane switching, safe-area-aware layouts, and terminal actions that do not depend on hover or hardware-keyboard shortcuts.
 - **Directory-aware organization:** terminals move between collapsible workspaces as their shell changes directory. Workspace colors, names, filters, and sidebar sizing stay stable across reconnects.
-- **Resilient sessions:** bounded server-side replay, slow-client protection, coherent WebSocket reconnects, browser renderer caching, and a separate pane layout in each browser tab. A closed pane detaches the view without killing its process.
+- **Resilient sessions:** bounded server-side terminal snapshots, sequenced reconnect resumption, in-place slow-client recovery, browser renderer caching, and a separate pane layout in each browser tab. A closed pane detaches the view without killing its process.
 - **Files when needed:** searchable explorer, local image and PDF previews, direct downloads, and a lazy-loaded CodeMirror editor with syntax highlighting, atomic saves, and stale-file conflict detection.
 - **Agent-connected artifacts:** multiline handoffs stay attached to the terminal and agent that created them, with inline text, image, and PDF previews plus an optional full editor.
 - **Process visibility and control:** a lightweight Linux `/proc` sampler shows the complete live descendant process tree, foreground job, CPU and memory usage, and lets you send SIGTERM to a selected process. Command lines are secret-aware and redacted; input, output, and exited processes are not retained.
@@ -169,7 +169,7 @@ Run `term-server --help` for generated CLI help. CLI flags take precedence over 
 | `--data-dir` | `TERM_SERVER_DATA_DIR` | `$XDG_DATA_HOME/term-server` | Credentials, TLS files, and settings |
 | `--shell` | `TERM_SERVER_SHELL` | `$SHELL` | Default shell executable |
 | `--allowed-origin` | `TERM_SERVER_ALLOWED_ORIGINS` | same origin | Extra reverse-proxy origins |
-| `--replay-mb` | `TERM_SERVER_REPLAY_MB` | `16` | Reconnect buffer per terminal |
+| `--replay-mb` | `TERM_SERVER_REPLAY_MB` | `16` | Canonical reconnect state and recent output per terminal |
 | `--scrollback-lines` | `TERM_SERVER_SCROLLBACK_LINES` | `200000` | Browser scrollback per pane |
 | `--max-panes` | `TERM_SERVER_MAX_PANES` | `4` | Visible pane limit, 1–8 |
 | `--client-dir` | `TERM_SERVER_CLIENT_DIR` | auto-detected | Compiled browser application |
@@ -274,11 +274,11 @@ The signing private key lives only in the `RELEASE_SIGNING_KEY` GitHub Actions s
 
 ## Architecture
 
-Each terminal owns a native PTY, a bounded raw-output ring, and a Tokio broadcast channel. Dedicated blocking-reader threads keep PTY I/O away from the async Axum runtime. WebSocket subscribers receive a coherent replay before live output; lagging clients reconnect instead of allowing unbounded queues.
+Each terminal owns a native PTY, a bounded VT state model, a short sequenced output ring, and a Tokio broadcast channel. Dedicated blocking-reader threads keep PTY I/O away from the async Axum runtime. A newly mounted renderer receives a compact canonical snapshot of the current screen, scrollback, modes, cursor, and alternate-screen state. An existing renderer resumes from its last parser-committed byte. If a subscriber falls behind, the same WebSocket is resynchronized from the ring or a fresh snapshot instead of being disconnected.
 
 On Linux, one sampler reads `/proc` for all terminals every 1.5 seconds. It follows parent PID relationships across the complete process table, tracks the PTY foreground process group and per-process CPU and resident memory, and recognizes supported agent process trees without parsing or delaying terminal bytes. Process termination revalidates the terminal ancestry and process start time before sending SIGTERM. Other operating systems retain normal terminal behavior but do not expose process and agent metadata.
 
-The browser delegates terminal parsing and rendering to xterm.js. Recently viewed renderers remain mounted in a bounded cache so switching panes preserves the screen and scroll position without keeping every historical renderer alive.
+The browser delegates terminal parsing and rendering to xterm.js. It commits resume positions only after xterm.js has parsed the corresponding bytes and suppresses terminal-generated replies while applying snapshots, so historical device queries cannot leak back into a live PTY. One designated browser responds to live device queries when several clients are attached. Recently viewed renderers remain mounted in a bounded cache so switching panes preserves the screen and scroll position without keeping every historical renderer alive.
 
 ## Security and privacy
 
