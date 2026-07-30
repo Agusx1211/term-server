@@ -36,8 +36,9 @@ import type {
   NotificationMode,
   NotificationPosition,
 } from "../lib/notifications";
+import type { TerminalPreviewMode } from "../lib/terminal-preview";
 import { ChangePassword } from "./ChangePassword";
-import type { ThemeName } from "./TerminalPane";
+import type { ThemeName } from "../lib/terminal-theme";
 
 interface SettingsWorkspaceProps {
   active: boolean;
@@ -60,6 +61,7 @@ interface SettingsWorkspaceProps {
   notificationDuration: NotificationDuration;
   tileNewTerminals: boolean;
   confirmTerminalKills: boolean;
+  terminalPreviewMode: TerminalPreviewMode;
   onTheme: (theme: ThemeName) => void;
   onPiChange: (titlesEnabled: boolean, summariesEnabled: boolean, model: string) => void;
   onAgentIntegration: (
@@ -78,6 +80,7 @@ interface SettingsWorkspaceProps {
   onNotificationDurationChange: (duration: NotificationDuration) => void;
   onTileNewTerminalsChange: (enabled: boolean) => void;
   onConfirmTerminalKillsChange: (enabled: boolean) => void;
+  onTerminalPreviewModeChange: (mode: TerminalPreviewMode) => void;
   onPasswordChanged: () => void;
   onLogout: () => void;
 }
@@ -155,6 +158,7 @@ export function SettingsWorkspace({
   notificationDuration,
   tileNewTerminals,
   confirmTerminalKills,
+  terminalPreviewMode,
   onTheme,
   onPiChange,
   onAgentIntegration,
@@ -167,6 +171,7 @@ export function SettingsWorkspace({
   onNotificationDurationChange,
   onTileNewTerminalsChange,
   onConfirmTerminalKillsChange,
+  onTerminalPreviewModeChange,
   onPasswordChanged,
   onLogout,
 }: SettingsWorkspaceProps) {
@@ -220,6 +225,47 @@ export function SettingsWorkspace({
               />
             </label>
             <p class="settings-hint">Turn this off to make every terminal kill action immediate.</p>
+            <fieldset class="terminal-preview-setting">
+              <legend>Hover preview size</legend>
+              <div class="terminal-preview-mode-grid" role="radiogroup">
+                {([
+                  {
+                    mode: "compact",
+                    label: "Compact",
+                    description: "A small card beside the terminal row.",
+                  },
+                  {
+                    mode: "large",
+                    label: "Large",
+                    description: "A centered modal-size preview.",
+                  },
+                ] satisfies Array<{
+                  mode: TerminalPreviewMode;
+                  label: string;
+                  description: string;
+                }>).map(({ mode, label, description }) => (
+                  <label
+                    key={mode}
+                    class={`terminal-preview-mode ${terminalPreviewMode === mode ? "active" : ""}`}
+                  >
+                    <input
+                      type="radio"
+                      name="terminal-preview-mode"
+                      value={mode}
+                      checked={terminalPreviewMode === mode}
+                      onChange={() => onTerminalPreviewModeChange(mode)}
+                    />
+                    <span class={`terminal-preview-mode-icon ${mode}`} aria-hidden="true">
+                      <span />
+                    </span>
+                    <span>
+                      <b>{label}</b>
+                      <small>{description}</small>
+                    </span>
+                  </label>
+                ))}
+              </div>
+            </fieldset>
           </section>
 
           <section class="settings-card settings-card-wide">

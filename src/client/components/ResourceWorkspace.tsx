@@ -21,7 +21,7 @@ import type { FileDocument } from "../../shared/types";
 import { api } from "../lib/api";
 import type { ArtifactDeleteTarget } from "../lib/artifacts";
 import type { ResourceTab } from "../lib/resources";
-import type { ThemeName } from "./TerminalPane";
+import type { ThemeName } from "../lib/terminal-theme";
 
 const LINE_WRAPPING_STORAGE_KEY = "term-server:editor-line-wrapping";
 

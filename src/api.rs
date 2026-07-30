@@ -37,6 +37,7 @@ use uuid::Uuid;
 #[cfg(unix)]
 use crate::broker::BrokerWebSocket;
 use crate::{
+    activity_view::{ActivityView, ActivityViewService},
     agent_integrations::{
         AgentIntegrationAction, AgentIntegrationProvider, AgentIntegrationService,
         AgentIntegrationsConfig,
@@ -47,7 +48,7 @@ use crate::{
     auth::{AuthError, AuthService, LoginLimiter, SESSION_LIFETIME_DAYS},
     build,
     files::{self, FileError},
-    terminal::{CreateTerminal, RenameTerminal, TerminalError},
+    terminal::{CreateTerminal, RenameTerminal, TerminalError, TerminalInfo},
     update::{UpdateConfig, UpdateError, UpdateService, UpdateStatus},
     workspace::{
         SessionBrokerInfo, SessionConnection, TerminalSocketQuery, WorkspaceBackend,
@@ -74,6 +75,7 @@ pub struct AppState {
     pub hostname: String,
     pub updates: Arc<UpdateService>,
     pub agent_integrations: Arc<AgentIntegrationService>,
+    pub activity_views: ActivityViewService,
     pub artifact_skill: Arc<ArtifactSkillService>,
     pub server_control: ServerControl,
 }
@@ -260,6 +262,65 @@ struct ClientConfig {
     build: build::BuildInfo,
     broker: Option<SessionBrokerInfo>,
     updates: UpdateConfig,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClientTerminalInfo {
+    #[serde(flatten)]
+    terminal: TerminalInfo,
+    activity_viewed: ActivityView,
+}
+
+impl ClientTerminalInfo {
+    fn new(terminal: TerminalInfo, activity_views: &ActivityViewService) -> Self {
+        let activity_viewed = activity_views.get(terminal.id);
+        Self {
+            terminal,
+            activity_viewed,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UpdateActivityView {
+    agent_completed_at: Option<u64>,
+    command_completed_at: Option<u64>,
+}
+
+fn validated_activity_view(
+    terminal: &TerminalInfo,
+    request: &UpdateActivityView,
+) -> Result<ActivityView, ApiError> {
+    let agent_completed_at = request.agent_completed_at.unwrap_or_default();
+    let observable_agent_completion = terminal
+        .agent
+        .as_ref()
+        .and_then(|agent| agent.completed_at)
+        .unwrap_or_default();
+    if agent_completed_at > observable_agent_completion {
+        return Err(ApiError::BadRequest(
+            "agent completion watermark is newer than the terminal state".to_owned(),
+        ));
+    }
+
+    let command_completed_at = request.command_completed_at.unwrap_or_default();
+    let observable_command_completion = terminal
+        .command
+        .as_ref()
+        .and_then(|command| command.completed_at)
+        .unwrap_or_default();
+    if command_completed_at > observable_command_completion {
+        return Err(ApiError::BadRequest(
+            "command completion watermark is newer than the terminal state".to_owned(),
+        ));
+    }
+
+    Ok(ActivityView {
+        agent_completed_at,
+        command_completed_at,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -686,9 +747,15 @@ async fn update_pi_config(
 async fn list_terminals(
     State(state): State<AppState>,
     jar: CookieJar,
-) -> Result<Json<Vec<crate::terminal::TerminalInfo>>, ApiError> {
+) -> Result<Json<Vec<ClientTerminalInfo>>, ApiError> {
     require_auth(&jar, &state)?;
-    state.workspace.list().await.map(Json).map_err(Into::into)
+    let terminals = state.workspace.list().await?;
+    Ok(Json(
+        terminals
+            .into_iter()
+            .map(|terminal| ClientTerminalInfo::new(terminal, &state.activity_views))
+            .collect(),
+    ))
 }
 
 async fn create_terminal(
@@ -697,11 +764,14 @@ async fn create_terminal(
     uri: Uri,
     jar: CookieJar,
     Json(body): Json<CreateTerminal>,
-) -> Result<(StatusCode, Json<crate::terminal::TerminalInfo>), ApiError> {
+) -> Result<(StatusCode, Json<ClientTerminalInfo>), ApiError> {
     require_origin(&headers, &uri, &state)?;
     require_auth(&jar, &state)?;
     let terminal = state.workspace.create(body).await?;
-    Ok((StatusCode::CREATED, Json(terminal)))
+    Ok((
+        StatusCode::CREATED,
+        Json(ClientTerminalInfo::new(terminal, &state.activity_views)),
+    ))
 }
 
 async fn rename_terminal(
@@ -711,15 +781,52 @@ async fn rename_terminal(
     uri: Uri,
     jar: CookieJar,
     Json(body): Json<RenameTerminal>,
-) -> Result<Json<crate::terminal::TerminalInfo>, ApiError> {
+) -> Result<Json<ClientTerminalInfo>, ApiError> {
     require_origin(&headers, &uri, &state)?;
     require_auth(&jar, &state)?;
-    state
+    let terminal = state.workspace.rename(id, body).await?;
+    Ok(Json(ClientTerminalInfo::new(
+        terminal,
+        &state.activity_views,
+    )))
+}
+
+async fn update_terminal_activity_view(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+    Json(body): Json<UpdateActivityView>,
+) -> Result<Json<ActivityView>, ApiError> {
+    require_origin(&headers, &uri, &state)?;
+    require_auth(&jar, &state)?;
+    if body.agent_completed_at.is_none() && body.command_completed_at.is_none() {
+        return Err(ApiError::BadRequest(
+            "at least one activity watermark is required".to_owned(),
+        ));
+    }
+    let terminal = state
         .workspace
-        .rename(id, body)
-        .await
+        .list()
+        .await?
+        .into_iter()
+        .find(|terminal| terminal.id == id)
+        .ok_or(ApiError::NotFound)?;
+    let update = validated_activity_view(&terminal, &body)?;
+
+    state
+        .activity_views
+        .update(id, update)
         .map(Json)
-        .map_err(Into::into)
+        .map_err(|error| {
+            tracing::error!(
+                %error,
+                terminal_id = %id,
+                "unable to persist terminal activity view"
+            );
+            ApiError::Internal
+        })
 }
 
 async fn remove_terminal(
@@ -732,6 +839,13 @@ async fn remove_terminal(
     require_origin(&headers, &uri, &state)?;
     require_auth(&jar, &state)?;
     state.workspace.remove(id).await?;
+    if let Err(error) = state.activity_views.remove(id) {
+        tracing::warn!(
+            %error,
+            terminal_id = %id,
+            "unable to remove terminal activity view"
+        );
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -999,11 +1113,12 @@ async fn terminal_socket(
 ) -> Result<Response, ApiError> {
     require_origin(&headers, &uri, &state)?;
     require_auth(&jar, &state)?;
-    let initial_size = query.viewport();
+    let observer = query.observer();
+    let initial_size = if observer { None } else { query.viewport() };
     let sequence = query.sequence();
     let terminal = state
         .workspace
-        .connect_terminal(id, initial_size, sequence)
+        .connect_terminal(id, initial_size, sequence, observer)
         .await?;
     Ok(websocket
         .max_message_size(64 * 1024)
@@ -1013,7 +1128,7 @@ async fn terminal_socket(
         .on_upgrade(move |socket| async move {
             match terminal {
                 SessionConnection::Local(terminal) => {
-                    serve_terminal_socket(socket, terminal, initial_size, sequence).await;
+                    serve_terminal_socket(socket, terminal, initial_size, sequence, observer).await;
                 }
                 #[cfg(unix)]
                 SessionConnection::Broker(broker) => {
@@ -1092,6 +1207,10 @@ pub fn build_router(state: AppState, client_directory: Option<PathBuf>) -> Route
         .route(
             "/terminals/{id}",
             patch(rename_terminal).delete(remove_terminal),
+        )
+        .route(
+            "/terminals/{id}/activity-view",
+            patch(update_terminal_activity_view),
         )
         .route("/terminals/{id}/processes", get(terminal_processes))
         .route(
@@ -1205,6 +1324,7 @@ mod tests {
                 true,
             )),
             agent_integrations: Arc::new(AgentIntegrationService::new(directory.path())),
+            activity_views: ActivityViewService::in_memory(),
             artifact_skill: Arc::new(ArtifactSkillService::new(None, directory.path())),
             server_control: ServerControl::new(Handle::new()),
         }
@@ -1250,6 +1370,124 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn terminal_activity_views_require_authentication() {
+        let response = build_router(test_state().await, None)
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/terminals/{}/activity-view", Uuid::new_v4()))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"agentCompletedAt":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn terminal_activity_views_reject_cross_origin_updates() {
+        let (app, cookie) = authenticated_app().await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/terminals/{}/activity-view", Uuid::new_v4()))
+                    .header(header::HOST, "localhost")
+                    .header(header::ORIGIN, "https://attacker.example")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::from(r#"{"agentCompletedAt":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn terminal_api_exposes_and_accepts_activity_views() {
+        let (app, cookie) = authenticated_app().await;
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/terminals")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::from(r#"{"cwd":"/tmp","shell":"/bin/sh"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let body = to_bytes(created.into_body(), 64 * 1024).await.unwrap();
+        let terminal: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            terminal["activityViewed"],
+            serde_json::json!({"agentCompletedAt": 0, "commandCompletedAt": 0})
+        );
+        let terminal_id = terminal["id"].as_str().unwrap();
+
+        let updated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/terminals/{terminal_id}/activity-view"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::from(
+                        r#"{"agentCompletedAt":0,"commandCompletedAt":0}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.status(), StatusCode::OK);
+        let body = to_bytes(updated.into_body(), 64 * 1024).await.unwrap();
+        let viewed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            viewed,
+            serde_json::json!({"agentCompletedAt": 0, "commandCompletedAt": 0})
+        );
+
+        let future = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/terminals/{terminal_id}/activity-view"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::from(r#"{"commandCompletedAt":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(future.status(), StatusCode::BAD_REQUEST);
+
+        let listed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/terminals")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let body = to_bytes(listed.into_body(), 64 * 1024).await.unwrap();
+        let terminals: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            terminals[0]["activityViewed"],
+            serde_json::json!({"agentCompletedAt": 0, "commandCompletedAt": 0})
+        );
     }
 
     #[tokio::test]

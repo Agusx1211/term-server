@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.7.0 - 2026-07-30
+
+Terminals now have live hover previews, and unread agent and long-command completions stay
+synchronized across browsers and machines.
+
+### Added
+
+- Hovering a terminal in the workspace sidebar opens a live, read-only preview after a short delay.
+- Settings → Terminal behavior selects either a compact card beside the terminal row or a large
+  modal-size preview over the workspace. The choice persists in the browser.
+- Preview renderers receive the terminal's canonical screen, dimensions, and live output without
+  attaching as interactive terminal clients.
+
+### Changed
+
+- Hover previews fit the terminal's existing grid by scaling their local font instead of reporting
+  the preview dimensions to the PTY.
+- Viewing an agent **Ready** state or completed long command advances a server-owned watermark that
+  every connected browser receives on its normal terminal refresh.
+- Completion watermarks are stored atomically in the term-server data directory and survive web
+  process restarts while the private session broker keeps terminals running.
+- Existing per-browser viewed state is migrated to the server on first load after upgrading.
+
+### Fixed
+
+- Opening or closing a hover preview cannot resize the original terminal or affect viewport,
+  controller, and responder selection.
+- A completion acknowledged on one machine no longer remains unread on every other machine.
+- Stale browser requests and out-of-order terminal refreshes cannot move an acknowledgment backward
+  or hide newer work.
+- Starting a new agent lifecycle in the same terminal cannot inherit an unrelated viewed revision
+  and suppress its next **Ready** state.
+- Closing a terminal pane no longer treats later activity as viewed while the pane stays hidden.
+- Interactive alternate-screen applications remain **Live** without an elapsed counter and never
+  create a completed or unread watermark when they exit.
+
+### Security
+
+- Preview sockets use a dedicated read-only observer route. The server rejects input, resize, and
+  focus messages from observers.
+- Completion acknowledgment updates require authentication and a same-origin request.
+- The server rejects watermarks newer than the completion currently observable in the terminal.
+- The persisted activity file is written atomically with owner-only permissions.
+
+### Upgrade notes
+
+- There are no breaking changes, configuration changes, or manual data migrations.
+- This release keeps session broker protocol 3. Updating from `0.6.0` preserves the existing broker
+  and terminal processes, so synchronized completion state works immediately.
+- Hover previews require the `0.7.0` broker observer route. After upgrading, restart the session
+  broker from Settings when existing terminal work can be closed.
+- The release is safe for automatic installation over `0.6.0`; previews remain unavailable until
+  the broker is restarted.
+
 ## 0.6.0 - 2026-07-30
 
 Terminal reconnections now resume from compact canonical state instead of replaying the entire
