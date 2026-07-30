@@ -212,6 +212,7 @@ impl BrokerClient {
         id: Uuid,
         initial_size: Option<(u16, u16)>,
         sequence: Option<u64>,
+        observer: bool,
     ) -> Result<BrokerWebSocket, BrokerError> {
         let stream = UnixStream::connect(self.socket_path.as_ref()).await?;
         let mut query = vec![];
@@ -227,8 +228,9 @@ impl BrokerClient {
         } else {
             format!("?{}", query.join("&"))
         };
+        let endpoint = if observer { "observe" } else { "socket" };
         let (socket, _) = client_async(
-            format!("ws://localhost/terminals/{id}/socket{query}"),
+            format!("ws://localhost/terminals/{id}/{endpoint}{query}"),
             stream,
         )
         .await
@@ -457,6 +459,7 @@ pub async fn run_session_broker(
             post(broker_terminal_agent_event),
         )
         .route("/terminals/{id}/socket", any(broker_terminal_socket))
+        .route("/terminals/{id}/observe", any(broker_terminal_observer))
         .route("/shutdown", axum::routing::post(shutdown_broker))
         .with_state(state);
 
@@ -588,7 +591,24 @@ async fn broker_terminal_socket(
         .write_buffer_size(128 * 1024)
         .max_write_buffer_size(4 * 1024 * 1024)
         .on_upgrade(move |socket| {
-            serve_terminal_socket(socket, terminal, query.viewport(), query.sequence())
+            serve_terminal_socket(socket, terminal, query.viewport(), query.sequence(), false)
+        }))
+}
+
+async fn broker_terminal_observer(
+    State(state): State<BrokerState>,
+    AxumPath(id): AxumPath<Uuid>,
+    Query(query): Query<TerminalSocketQuery>,
+    websocket: WebSocketUpgrade,
+) -> Result<Response, BrokerApiError> {
+    let terminal = state.terminals.get(id).ok_or(BrokerApiError::NotFound)?;
+    Ok(websocket
+        .max_message_size(64 * 1024)
+        .max_frame_size(64 * 1024)
+        .write_buffer_size(128 * 1024)
+        .max_write_buffer_size(4 * 1024 * 1024)
+        .on_upgrade(move |socket| {
+            serve_terminal_socket(socket, terminal, None, query.sequence(), true)
         }))
 }
 
@@ -640,6 +660,33 @@ mod tests {
                 match message.unwrap() {
                     TungsteniteMessage::Text(text) => {
                         let value = serde_json::from_str::<serde_json::Value>(&text).unwrap();
+                        if value["type"] == message_type {
+                            return value;
+                        }
+                    }
+                    TungsteniteMessage::Close(_) => panic!("terminal socket closed"),
+                    _ => {}
+                }
+            }
+            panic!("terminal socket ended before receiving {message_type}");
+        })
+        .await
+        .expect("terminal control message timeout")
+    }
+
+    async fn wait_for_control_without_size(
+        socket: &mut BrokerWebSocket,
+        message_type: &str,
+    ) -> serde_json::Value {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(message) = socket.next().await {
+                match message.unwrap() {
+                    TungsteniteMessage::Text(text) => {
+                        let value = serde_json::from_str::<serde_json::Value>(&text).unwrap();
+                        assert_ne!(
+                            value["type"], "size",
+                            "observer changed the terminal viewport"
+                        );
                         if value["type"] == message_type {
                             return value;
                         }
@@ -748,7 +795,7 @@ mod tests {
         assert_eq!(observed.status, crate::terminal::AgentStatus::Working);
         assert_eq!(observed.activity.unwrap().label, "thinking");
         let mut first = client
-            .terminal_socket(terminal.id, Some((80, 24)), None)
+            .terminal_socket(terminal.id, Some((80, 24)), None, false)
             .await
             .unwrap();
         let size = wait_for_control(&mut first, "size").await;
@@ -788,7 +835,7 @@ mod tests {
                 .any(|candidate| candidate.id == terminal.id)
         );
         let mut second = replacement_client
-            .terminal_socket(terminal.id, Some((80, 24)), Some(initial_sequence))
+            .terminal_socket(terminal.id, Some((80, 24)), Some(initial_sequence), false)
             .await
             .unwrap();
         let size = wait_for_control(&mut second, "size").await;
@@ -817,6 +864,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn observer_sockets_are_read_only_and_do_not_attach_viewports() {
+        let (_directory, server, client) = start_test_broker(1024 * 1024).await;
+        let terminal = client
+            .create(CreateTerminal {
+                path: Some("observer-test".to_owned()),
+                cwd: Some(PathBuf::from("/tmp")),
+                shell: Some("/bin/sh".to_owned()),
+                clone_from: None,
+            })
+            .await
+            .unwrap();
+        let mut controller = client
+            .terminal_socket(terminal.id, Some((120, 40)), None, false)
+            .await
+            .unwrap();
+        wait_for_control(&mut controller, "size").await;
+        wait_for_control(&mut controller, "sync").await;
+        wait_for_control(&mut controller, "synced").await;
+
+        let mut observer = client
+            .terminal_socket(terminal.id, None, None, true)
+            .await
+            .unwrap();
+        let size = wait_for_control(&mut observer, "size").await;
+        assert_eq!(
+            (size["cols"].as_u64(), size["rows"].as_u64()),
+            (Some(120), Some(40))
+        );
+        assert_eq!(size["controller"], false);
+        assert_eq!(size["responder"], false);
+        wait_for_control(&mut observer, "sync").await;
+        wait_for_control(&mut observer, "synced").await;
+        let connected = client
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == terminal.id)
+            .unwrap();
+        assert_eq!(connected.clients, 1);
+
+        for message in [
+            r#"{"type":"resize","cols":20,"rows":5}"#,
+            r#"{"type":"focus","focused":true}"#,
+            r#"{"type":"input","data":"printf 'observer wrote input\\n'\n"}"#,
+        ] {
+            observer
+                .send(TungsteniteMessage::Text(message.into()))
+                .await
+                .unwrap();
+            let error = wait_for_control(&mut observer, "error").await;
+            assert_eq!(error["message"], "observer connections are read-only");
+        }
+
+        controller
+            .send(TungsteniteMessage::Text(r#"{"type":"ping"}"#.into()))
+            .await
+            .unwrap();
+        wait_for_control_without_size(&mut controller, "pong").await;
+
+        client.remove(terminal.id).await.unwrap();
+        client.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("broker shutdown timeout")
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn lagging_clients_resynchronize_without_disconnecting() {
         let (_directory, server, client) = start_test_broker(1024 * 1024).await;
         let terminal = client
@@ -829,7 +945,7 @@ mod tests {
             .await
             .unwrap();
         let mut socket = client
-            .terminal_socket(terminal.id, Some((80, 24)), None)
+            .terminal_socket(terminal.id, Some((80, 24)), None, false)
             .await
             .unwrap();
         wait_for_control(&mut socket, "size").await;

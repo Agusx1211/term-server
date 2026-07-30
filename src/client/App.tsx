@@ -70,6 +70,11 @@ import {
   TERMINAL_FONT_SIZE_STORAGE_KEY,
 } from "./lib/terminal-zoom";
 import {
+  parseTerminalPreviewMode,
+  TERMINAL_PREVIEW_MODE_STORAGE_KEY,
+  type TerminalPreviewMode,
+} from "./lib/terminal-preview";
+import {
   artifactCountsBySession,
   artifactOwnerLabel,
   discoverArtifacts,
@@ -102,7 +107,7 @@ import { TermServerLogo } from "./components/TermServerLogo";
 import { WelcomeSection } from "./components/WelcomeSection";
 import { ResourceTabBar } from "./components/ResourceTabs";
 import type { ResourceTab } from "./lib/resources";
-import type { ThemeName } from "./components/TerminalPane";
+import type { ThemeName } from "./lib/terminal-theme";
 
 const TerminalPane = lazy(() =>
   import("./components/TerminalPane").then((module) => ({ default: module.TerminalPane })),
@@ -238,6 +243,9 @@ const initialConfirmTerminalKills = () =>
 const initialTerminalFontSize = () =>
   parseTerminalFontSize(localStorage.getItem(TERMINAL_FONT_SIZE_STORAGE_KEY));
 
+const initialTerminalPreviewMode = () =>
+  parseTerminalPreviewMode(localStorage.getItem(TERMINAL_PREVIEW_MODE_STORAGE_KEY));
+
 const initialViewedAgentRevisions = () =>
   parseViewedAgentRevisions(localStorage.getItem(VIEWED_AGENT_REVISIONS_STORAGE_KEY));
 
@@ -276,6 +284,7 @@ export function App() {
   const [tileNewTerminals, setTileNewTerminals] = useState(initialTileNewTerminals);
   const [confirmTerminalKills, setConfirmTerminalKills] = useState(initialConfirmTerminalKills);
   const [terminalFontSize, setTerminalFontSize] = useState(initialTerminalFontSize);
+  const [terminalPreviewMode, setTerminalPreviewMode] = useState(initialTerminalPreviewMode);
   const legacyViewedAgentRevisions = useRef(initialViewedAgentRevisions());
   const legacyViewedCommandCompletions = useRef(initialViewedCommandCompletions());
   const [artifacts, setArtifacts] = useState<ArtifactEntry[]>([]);
@@ -1095,6 +1104,11 @@ export function App() {
     localStorage.setItem(CONFIRM_TERMINAL_KILLS_STORAGE_KEY, String(enabled));
   };
 
+  const updateTerminalPreviewMode = (mode: TerminalPreviewMode) => {
+    setTerminalPreviewMode(mode);
+    localStorage.setItem(TERMINAL_PREVIEW_MODE_STORAGE_KEY, mode);
+  };
+
   const waitForServer = async (ready: (nextConfig: ClientConfig) => boolean) => {
     for (let attempt = 0; attempt < 120; attempt += 1) {
       await new Promise((resolve) => window.setTimeout(resolve, 500));
@@ -1237,6 +1251,8 @@ export function App() {
           settingsActive={settingsActive}
           updateAvailable={updateStatus?.state === "available"}
           fileRoot={terminalById.get(activeId ?? "")?.cwd ?? "~"}
+          previewMode={terminalPreviewMode}
+          theme={theme}
           onMobileClose={closeMobileSidebar}
           onNew={(cwd) => void createTerminal(cwd)}
           onOpen={(id) => openTerminal(id)}
@@ -1451,6 +1467,7 @@ export function App() {
                 notificationDuration={notificationDuration}
                 tileNewTerminals={tileNewTerminals}
                 confirmTerminalKills={confirmTerminalKills}
+                terminalPreviewMode={terminalPreviewMode}
                 onTheme={setTheme}
                 onPiChange={(titlesEnabled, summariesEnabled, model) => (
                   void updatePiConfig(titlesEnabled, summariesEnabled, model)
@@ -1469,6 +1486,7 @@ export function App() {
                 onNotificationDurationChange={updateNotificationDuration}
                 onTileNewTerminalsChange={updateTileNewTerminals}
                 onConfirmTerminalKillsChange={updateConfirmTerminalKills}
+                onTerminalPreviewModeChange={updateTerminalPreviewMode}
                 onPasswordChanged={() => showNotice("Password changed; other sessions were signed out")}
                 onLogout={() => void logout()}
               />

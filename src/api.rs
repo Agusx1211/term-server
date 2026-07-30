@@ -1113,11 +1113,12 @@ async fn terminal_socket(
 ) -> Result<Response, ApiError> {
     require_origin(&headers, &uri, &state)?;
     require_auth(&jar, &state)?;
-    let initial_size = query.viewport();
+    let observer = query.observer();
+    let initial_size = if observer { None } else { query.viewport() };
     let sequence = query.sequence();
     let terminal = state
         .workspace
-        .connect_terminal(id, initial_size, sequence)
+        .connect_terminal(id, initial_size, sequence, observer)
         .await?;
     Ok(websocket
         .max_message_size(64 * 1024)
@@ -1127,7 +1128,7 @@ async fn terminal_socket(
         .on_upgrade(move |socket| async move {
             match terminal {
                 SessionConnection::Local(terminal) => {
-                    serve_terminal_socket(socket, terminal, initial_size, sequence).await;
+                    serve_terminal_socket(socket, terminal, initial_size, sequence, observer).await;
                 }
                 #[cfg(unix)]
                 SessionConnection::Broker(broker) => {
