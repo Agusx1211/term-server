@@ -102,6 +102,10 @@ impl TerminalOutputState {
         self.delta.text_tail(maximum_bytes)
     }
 
+    pub fn alternate_screen(&self) -> bool {
+        self.terminal.alternate_screen()
+    }
+
     pub fn mark_exited(&mut self, exit_code: u32) {
         self.exit_code = Some(exit_code);
     }
@@ -265,6 +269,10 @@ impl CanonicalTerminal {
         if let Some(normal) = self.normal_before_alt.as_mut() {
             normal.set_size(rows, cols);
         }
+    }
+
+    fn alternate_screen(&self) -> bool {
+        self.parser.screen().alternate_screen()
     }
 
     fn snapshot(&self) -> Vec<u8> {
@@ -584,6 +592,16 @@ mod tests {
         reconstructed.process(b"\x1b[?1049l");
         assert_history_eq(reconstructed.screen(), terminal.parser.screen());
         assert!(reconstructed.screen().contents().contains("prompt$"));
+    }
+
+    #[test]
+    fn output_state_reports_the_canonical_alternate_screen() {
+        let mut output = TerminalOutputState::new(1024 * 1024, 4, 16);
+        assert!(!output.alternate_screen());
+        output.publish(Bytes::from_static(b"\x1b[?1049hTUI"));
+        assert!(output.alternate_screen());
+        output.publish(Bytes::from_static(b"\x1b[?1049l"));
+        assert!(!output.alternate_screen());
     }
 
     #[test]

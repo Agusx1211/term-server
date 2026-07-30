@@ -1,8 +1,15 @@
 import { describe, expect, it } from "vitest";
-import type { AgentStatus, TerminalInfo } from "../../shared/types";
+import type {
+  AgentStatus,
+  ForegroundCommandStatus,
+  TerminalInfo,
+} from "../../shared/types";
 import { documentTitle } from "./document-title";
 
-const terminal = (agentStatus?: AgentStatus): TerminalInfo => ({
+const terminal = (
+  agentStatus?: AgentStatus,
+  commandStatus?: ForegroundCommandStatus,
+): TerminalInfo => ({
   id: "terminal",
   name: "terminal",
   workspace: "~",
@@ -22,6 +29,15 @@ const terminal = (agentStatus?: AgentStatus): TerminalInfo => ({
         summary: null,
       }
     : null,
+  command: commandStatus
+    ? {
+        name: "backup",
+        status: commandStatus,
+        statusChangedAt: 0,
+        startedAt: 0,
+        completedAt: commandStatus === "completed" ? 1 : null,
+      }
+    : null,
   createdAt: 0,
   pid: 1,
   status: "running",
@@ -30,14 +46,17 @@ const terminal = (agentStatus?: AgentStatus): TerminalInfo => ({
 });
 
 describe("document title", () => {
-  it("counts only agents that are currently working", () => {
+  it("counts working agents and long-running commands", () => {
     expect(documentTitle([
       terminal("working"),
       terminal("working"),
       terminal("idle"),
       terminal("closed"),
+      terminal(undefined, "running"),
+      terminal(undefined, "completed"),
+      terminal(undefined, "live"),
       terminal(),
-    ])).toBe("(2) term-server");
+    ])).toBe("(3) term-server");
   });
 
   it("shows zero when no agents are working", () => {

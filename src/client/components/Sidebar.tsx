@@ -6,6 +6,7 @@ import {
   ChevronDown,
   ChevronRight,
   ChevronsDownUp,
+  CircleCheck,
   CirclePause,
   CircleX,
   Download,
@@ -16,6 +17,7 @@ import {
   PackageOpen,
   Pencil,
   Plus,
+  Radio,
   Search,
   Settings,
   SplitSquareHorizontal,
@@ -23,8 +25,14 @@ import {
   Trash2,
   X,
 } from "lucide-preact";
-import type { AgentInfo, FileEntry, TerminalInfo } from "../../shared/types";
+import type {
+  AgentInfo,
+  FileEntry,
+  ForegroundCommandInfo,
+  TerminalInfo,
+} from "../../shared/types";
 import { agentSubtitle } from "../lib/agent-activity";
+import { commandSubtitle } from "../lib/command-status";
 import { configureTerminalDrag } from "../lib/layout";
 import {
   clampSidebarWidth,
@@ -41,7 +49,7 @@ import { WorkingDuration } from "./WorkingDuration";
 interface SidebarProps {
   terminals: TerminalInfo[];
   activeIds: string[];
-  attentionAgentIds: Set<string>;
+  attentionTerminalIds: Set<string>;
   artifactCounts: ReadonlyMap<string, number>;
   mobileOpen: boolean;
   creating: boolean;
@@ -65,7 +73,7 @@ interface NodeProps {
   depth: number;
   collapsed: Set<string>;
   activeIds: string[];
-  attentionAgentIds: Set<string>;
+  attentionTerminalIds: Set<string>;
   artifactCounts: ReadonlyMap<string, number>;
   onToggle: (path: string) => void;
   onNew: (cwd?: string) => void;
@@ -82,7 +90,7 @@ function TreeNode({
   depth,
   collapsed,
   activeIds,
-  attentionAgentIds,
+  attentionTerminalIds,
   artifactCounts,
   onToggle,
   onNew,
@@ -98,11 +106,16 @@ function TreeNode({
   const terminal = node.terminal;
 
   if (!hasChildren && terminal) {
-    const needsAttention = attentionAgentIds.has(terminal.id);
+    const needsAttention = attentionTerminalIds.has(terminal.id);
     const artifactCount = artifactCounts.get(terminal.id) ?? 0;
+    const activityClass = terminal.agent
+      ? `agent-row agent-${terminal.agent.status}`
+      : terminal.command
+        ? `command-row command-${terminal.command.status}`
+        : "shell-row";
     return (
       <div
-        class={`tree-row terminal-row ${terminal.agent ? `agent-row agent-${terminal.agent.status}` : "shell-row"} ${needsAttention ? "agent-attention" : ""} ${activeIds.includes(terminal.id) ? "active" : ""}`}
+        class={`tree-row terminal-row ${activityClass} ${needsAttention ? "activity-attention" : ""} ${activeIds.includes(terminal.id) ? "active" : ""}`}
         style={{ "--depth": depth, "--workspace-color": terminal.color }}
       >
         <button
@@ -124,7 +137,13 @@ function TreeNode({
           <span class="terminal-copy">
             <span class="terminal-title">{terminal.name}</span>
             <span class="terminal-meta">
-              <span>{terminal.agent ? agentSubtitle(terminal.agent) : terminal.program}</span>
+              <span>
+                {terminal.agent
+                  ? agentSubtitle(terminal.agent)
+                  : terminal.command
+                    ? commandSubtitle(terminal.command)
+                    : terminal.program}
+              </span>
               {artifactCount > 0 && (
                 <span
                   class="terminal-artifact-count"
@@ -136,6 +155,9 @@ function TreeNode({
             </span>
           </span>
           {terminal.agent && <AgentState agent={terminal.agent} needsAttention={needsAttention} />}
+          {!terminal.agent && terminal.command && (
+            <CommandState command={terminal.command} needsAttention={needsAttention} />
+          )}
           {terminal.status === "exited" && <span class="tree-status">{terminal.exitCode ?? "exit"}</span>}
         </button>
         <span class="row-actions">
@@ -189,7 +211,7 @@ function TreeNode({
               depth={depth + 1}
               collapsed={collapsed}
               activeIds={activeIds}
-              attentionAgentIds={attentionAgentIds}
+              attentionTerminalIds={attentionTerminalIds}
               artifactCounts={artifactCounts}
               onToggle={onToggle}
               onNew={onNew}
@@ -226,7 +248,7 @@ const loadSidebarWidth = () => {
 export function Sidebar({
   terminals,
   activeIds,
-  attentionAgentIds,
+  attentionTerminalIds,
   artifactCounts,
   mobileOpen,
   creating,
@@ -386,7 +408,7 @@ export function Sidebar({
                 depth={0}
                 collapsed={query ? new Set() : collapsed}
                 activeIds={activeIds}
-                attentionAgentIds={attentionAgentIds}
+                attentionTerminalIds={attentionTerminalIds}
                 artifactCounts={artifactCounts}
                 onToggle={toggle}
                 onNew={onNew}
@@ -465,12 +487,47 @@ function AgentState({ agent, needsAttention }: { agent: AgentInfo; needsAttentio
         : CircleX;
   return (
     <span
-      class={`agent-status-badge ${needsAttention ? "attention" : agent.status}`}
+      class={`activity-status-badge ${needsAttention ? "attention" : agent.status}`}
       title={agent.summary ?? `${agent.kind} is ${label.toLocaleLowerCase()}`}
       aria-label={agent.status === "working" ? undefined : `${agent.kind} is ${label.toLocaleLowerCase()}`}
     >
       <Icon size={12} strokeWidth={2.2} aria-hidden="true" />
-      {agent.status === "working" ? <WorkingDuration since={agent.statusChangedAt} /> : <span class="agent-status-label">{label}</span>}
+      {agent.status === "working" ? <WorkingDuration since={agent.statusChangedAt} /> : <span class="activity-status-label">{label}</span>}
+    </span>
+  );
+}
+
+function CommandState({
+  command,
+  needsAttention,
+}: {
+  command: ForegroundCommandInfo;
+  needsAttention: boolean;
+}) {
+  const label = command.status === "live" ? "Live" : "Done";
+  const Icon = needsAttention
+    ? Bell
+    : command.status === "running"
+      ? Activity
+      : command.status === "live"
+        ? Radio
+        : CircleCheck;
+  const stateTitle = command.status === "running"
+    ? `${command.name} is running`
+    : command.status === "live"
+      ? `${command.name} is live`
+      : `${command.name} finished`;
+  const title = needsAttention ? `${stateTitle} — unread` : stateTitle;
+  return (
+    <span
+      class={`activity-status-badge ${needsAttention ? "attention" : command.status}`}
+      title={title}
+      aria-label={command.status === "running" ? undefined : title}
+    >
+      <Icon size={12} strokeWidth={2.2} aria-hidden="true" />
+      {command.status === "running"
+        ? <WorkingDuration since={command.startedAt} />
+        : <span class="activity-status-label">{label}</span>}
     </span>
   );
 }

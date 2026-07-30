@@ -144,6 +144,12 @@ running a command, waiting for approval, and compacting context. These updates a
 existing terminal subtitle; working, idle, ready, closed, and completion notifications keep using
 the existing state machine.
 
+Ordinary foreground commands that keep running for at least five seconds also appear in terminal
+rows and headers with an elapsed time. When they finish, they use the same unread badge and
+completion notification preferences as agents. Foreground applications that enter the terminal's
+alternate screen are treated as interactive TUIs instead: they stay marked **Live** without a
+timer and disappear silently when they exit.
+
 The managed packages are additive: they do not edit or replace existing hook files, and uninstalling
 them removes only term-server's package and dedicated local marketplace. They do nothing outside a
 term-server terminal. Events are reduced to a fixed activity category before they reach the private
@@ -277,6 +283,8 @@ The signing private key lives only in the `RELEASE_SIGNING_KEY` GitHub Actions s
 Each terminal owns a native PTY, a bounded VT state model, a short sequenced output ring, and a Tokio broadcast channel. Dedicated blocking-reader threads keep PTY I/O away from the async Axum runtime. A newly mounted renderer receives a compact canonical snapshot of the current screen, scrollback, modes, cursor, and alternate-screen state. An existing renderer resumes from its last parser-committed byte. If a subscriber falls behind, the same WebSocket is resynchronized from the ring or a fresh snapshot instead of being disconnected.
 
 On Linux, one sampler reads `/proc` for all terminals every 1.5 seconds. It follows parent PID relationships across the complete process table, tracks the PTY foreground process group and per-process CPU and resident memory, and recognizes supported agent process trees without parsing or delaying terminal bytes. Process termination revalidates the terminal ancestry and process start time before sending SIGTERM. Other operating systems retain normal terminal behavior but do not expose process and agent metadata.
+
+Foreground command status combines that process-group identity with the canonical VT alternate-screen state. Short commands are ignored, pipelines remain one activity even when their leader exits, and any process group that enters the alternate screen remains classified as an interactive TUI until the whole group leaves the foreground.
 
 The browser delegates terminal parsing and rendering to xterm.js. It commits resume positions only after xterm.js has parsed the corresponding bytes and suppresses terminal-generated replies while applying snapshots, so historical device queries cannot leak back into a live PTY. One designated browser responds to live device queries when several clients are attached. Recently viewed renderers remain mounted in a bounded cache so switching panes preserves the screen and scroll position without keeping every historical renderer alive.
 

@@ -109,7 +109,7 @@ const notificationModes: Array<{
   {
     mode: "off",
     label: "Off",
-    description: "Keep only the unread bell on the agent row.",
+    description: "Keep only unread bells on completed rows.",
     Icon: BellOff,
   },
 ];
@@ -291,7 +291,7 @@ export function SettingsWorkspace({
 
           <section class="settings-card settings-card-wide">
             <header><Bell size={16} /><h2>Completion notifications</h2></header>
-            <p>Choose how agent completion alerts look and behave in this browser.</p>
+            <p>Choose how agent and long-running command completion alerts behave in this browser.</p>
             <div class="notification-mode-grid" role="radiogroup" aria-label="Completion notification delivery">
               {notificationModes.map(({ mode, label, description, Icon }) => (
                 <label key={mode} class={`notification-mode ${notificationMode === mode ? "active" : ""}`}>

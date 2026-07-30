@@ -5,6 +5,7 @@ import {
   Bot,
   ChevronDown,
   ChevronUp,
+  CircleCheck,
   CirclePause,
   CircleX,
   ClipboardCopy,
@@ -15,7 +16,9 @@ import {
   ListTree,
   Maximize2,
   PackageOpen,
+  Radio,
   Search,
+  TerminalSquare,
   Trash2,
   WifiOff,
   X,
@@ -745,6 +748,9 @@ export function TerminalPane({
         {terminal.agent && (
           <PaneAgentState agent={terminal.agent} needsAttention={needsAttention} />
         )}
+        {!terminal.agent && terminal.command && (
+          <PaneCommandState command={terminal.command} needsAttention={needsAttention} />
+        )}
         {artifacts.length > 0 && (
           <button
             class={`pane-artifacts ${artifactsVisible ? "active" : ""}`}
@@ -1022,14 +1028,50 @@ function PaneAgentState({
         : CircleX;
   return (
     <span
-      class={`pane-agent ${needsAttention ? "attention" : agent.status}`}
+      class={`pane-activity ${needsAttention ? "attention" : agent.status}`}
       title={agent.summary ?? `${agent.kind} is ${label.toLocaleLowerCase()}`}
     >
       <Bot size={12} aria-hidden="true" />
-      <span class="pane-agent-kind">{agent.kind}</span>
-      <span class="pane-agent-state">
+      <span class="pane-activity-kind">{agent.kind}</span>
+      <span class="pane-activity-state">
         <Icon size={11} strokeWidth={2.2} aria-hidden="true" />
         {agent.status === "working" ? <WorkingDuration since={agent.statusChangedAt} /> : label}
+      </span>
+    </span>
+  );
+}
+
+function PaneCommandState({
+  command,
+  needsAttention,
+}: {
+  command: NonNullable<TerminalInfo["command"]>;
+  needsAttention: boolean;
+}) {
+  const label = command.status === "live" ? "Live" : "Done";
+  const Icon = needsAttention
+    ? Bell
+    : command.status === "running"
+      ? Activity
+      : command.status === "live"
+        ? Radio
+        : CircleCheck;
+  const stateTitle = command.status === "running"
+    ? `${command.name} is running`
+    : command.status === "live"
+      ? `${command.name} is live`
+      : `${command.name} finished`;
+  const title = needsAttention ? `${stateTitle} — unread` : stateTitle;
+  return (
+    <span
+      class={`pane-activity ${needsAttention ? "attention" : command.status}`}
+      title={title}
+    >
+      <TerminalSquare size={12} aria-hidden="true" />
+      <span class="pane-activity-kind">{command.name}</span>
+      <span class="pane-activity-state">
+        <Icon size={11} strokeWidth={2.2} aria-hidden="true" />
+        {command.status === "running" ? <WorkingDuration since={command.startedAt} /> : label}
       </span>
     </span>
   );

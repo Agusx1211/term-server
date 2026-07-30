@@ -17,6 +17,16 @@ export interface AgentInfo {
   activity?: AgentActivity | null;
 }
 
+export type ForegroundCommandStatus = "running" | "live" | "completed";
+
+export interface ForegroundCommandInfo {
+  name: string;
+  status: ForegroundCommandStatus;
+  statusChangedAt: number;
+  startedAt: number;
+  completedAt: number | null;
+}
+
 export interface TerminalInfo {
   id: string;
   name: string;
@@ -27,6 +37,7 @@ export interface TerminalInfo {
   program: string;
   color: string;
   agent: AgentInfo | null;
+  command: ForegroundCommandInfo | null;
   createdAt: number;
   pid: number | null;
   status: TerminalStatus;
