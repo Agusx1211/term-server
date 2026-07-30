@@ -117,6 +117,7 @@ const ResourceDocuments = lazy(() => import("./components/ResourceWorkspace"));
 const defaultConfig: ClientConfig = {
   scrollbackLines: 200_000,
   maxPanes: 4,
+  cachedTerminals: 6,
   secure: true,
   hostname: "",
   passwordManagedExternally: true,
@@ -729,12 +730,11 @@ export function App() {
 
   useEffect(() => {
     const available = new Set(terminals.map((terminal) => terminal.id));
-    const cacheLimit = Math.max(config.maxPanes, 6);
     setMountedIds((current) => {
-      const next = reconcileMounted(current, paneIds, available, cacheLimit);
+      const next = reconcileMounted(current, paneIds, available, config.cachedTerminals);
       return next.length === current.length && next.every((id, index) => id === current[index]) ? current : next;
     });
-  }, [paneIds, terminals, config.maxPanes]);
+  }, [paneIds, terminals, config.cachedTerminals]);
 
   const markTerminalActivityViewed = (id: string) => {
     const terminal = terminalsRef.current.find((candidate) => candidate.id === id);
