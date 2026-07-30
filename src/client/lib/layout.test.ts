@@ -79,4 +79,10 @@ describe("reconcileMounted", () => {
       reconcileMounted(["old", "one", "two"], ["one", "three"], new Set(["old", "one", "two", "three"]), 3),
     ).toEqual(["two", "one", "three"]);
   });
+
+  it("keeps visible terminals even when the configured cache is smaller", () => {
+    expect(
+      reconcileMounted(["old", "one"], ["one", "two"], new Set(["old", "one", "two"]), 0),
+    ).toEqual(["one", "two"]);
+  });
 });

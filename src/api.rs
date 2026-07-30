@@ -72,6 +72,7 @@ pub struct AppState {
     pub secure_cookie: bool,
     pub scrollback_lines: u32,
     pub max_panes: u8,
+    pub cached_terminals: u16,
     pub hostname: String,
     pub updates: Arc<UpdateService>,
     pub agent_integrations: Arc<AgentIntegrationService>,
@@ -253,6 +254,7 @@ struct SessionResponse {
 struct ClientConfig {
     scrollback_lines: u32,
     max_panes: u8,
+    cached_terminals: u16,
     secure: bool,
     hostname: String,
     password_managed_externally: bool,
@@ -598,6 +600,7 @@ async fn config(
     Ok(Json(ClientConfig {
         scrollback_lines: state.scrollback_lines,
         max_panes: state.max_panes,
+        cached_terminals: state.cached_terminals,
         secure: state.secure,
         hostname: state.hostname.clone(),
         password_managed_externally: state.auth.password_is_externally_managed(),
@@ -1316,6 +1319,7 @@ mod tests {
             secure_cookie: false,
             scrollback_lines: 200_000,
             max_panes: 4,
+            cached_terminals: 6,
             hostname: "test-machine".to_string(),
             updates: Arc::new(UpdateService::new(
                 None,
@@ -1582,6 +1586,7 @@ mod tests {
         let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
         let config: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(config["broker"], serde_json::Value::Null);
+        assert_eq!(config["cachedTerminals"], 6);
         assert_eq!(config["agentIntegrations"]["fallbacksEnabled"], true);
         assert_eq!(config["artifactSkill"]["available"], false);
         assert_eq!(

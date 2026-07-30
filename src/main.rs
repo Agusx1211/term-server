@@ -104,6 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         secure_cookie: cli.secure_cookie,
         scrollback_lines: cli.scrollback_lines,
         max_panes: cli.max_panes,
+        cached_terminals: cli.cached_terminals,
         hostname,
         updates,
         agent_integrations: Arc::new(AgentIntegrationService::new(&cli.data_dir)),
