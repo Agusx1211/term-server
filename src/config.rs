@@ -127,6 +127,10 @@ pub struct Cli {
     #[arg(long, hide = true)]
     pub session_broker: bool,
 
+    /// Unix socket used by the private terminal session broker.
+    #[arg(long, hide = true)]
+    pub broker_socket: Option<PathBuf>,
+
     /// Forward a provider lifecycle event from stdin to the session broker.
     #[arg(long, hide = true, value_name = "PROVIDER")]
     pub agent_event: Option<String>,

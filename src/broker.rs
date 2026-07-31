@@ -1,7 +1,11 @@
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -20,7 +24,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio::{
     net::{UnixListener, UnixStream},
-    sync::Notify,
+    sync::{Mutex, Notify, RwLock},
 };
 use tokio_tungstenite::{WebSocketStream, client_async};
 use uuid::Uuid;
@@ -28,19 +32,22 @@ use uuid::Uuid;
 use crate::{
     agent_events::AgentEvent,
     ai::{PiClientConfig, PiService, UpdatePiSettings},
-    build,
+    build::{self, BuildIdentity},
     config::Cli,
     terminal::{
         CreateTerminal, ProcessInspectorSnapshot, RenameTerminal, TerminalInfo, TerminalManager,
+        normalize_terminal_path,
     },
     workspace::{
-        SessionBrokerInfo, TerminalSocketQuery, WorkspaceError as BrokerError,
-        serve_terminal_socket,
+        SessionBrokerGenerationInfo, SessionBrokerInfo, TerminalSocketQuery,
+        WorkspaceError as BrokerError, serve_terminal_socket,
     },
 };
 
 const PROTOCOL_VERSION: u32 = 3;
 const SOCKET_NAME: &str = "session-broker.sock";
+const BROKER_DIRECTORY: &str = "session-brokers";
+const DRAIN_INTERVAL: Duration = Duration::from_secs(2);
 
 pub type BrokerWebSocket = WebSocketStream<UnixStream>;
 
@@ -51,18 +58,12 @@ struct BrokerSettings {
     replay_bytes: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct HealthResponse {
     protocol_version: u32,
-    build: BrokerBuild,
+    build: BuildIdentity,
     sessions: usize,
-}
-
-#[derive(Debug, Deserialize)]
-struct BrokerBuild {
-    version: String,
-    commit: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -82,42 +83,12 @@ impl BrokerClient {
         }
     }
 
-    pub async fn connect_or_start(cli: &Cli, executable: &Path) -> Result<Self, BrokerError> {
-        tokio::fs::create_dir_all(&cli.data_dir).await?;
-        let client = Self::new(socket_path(&cli.data_dir));
-        let health = match client.health().await {
-            Ok(health) if health.protocol_version != PROTOCOL_VERSION => {
-                tracing::warn!(
-                    expected_protocol = PROTOCOL_VERSION,
-                    actual_protocol = health.protocol_version,
-                    sessions = health.sessions,
-                    "replacing incompatible session broker; existing terminals will close"
-                );
-                client.shutdown().await?;
-                client.start_and_wait(cli, executable).await?
-            }
-            Ok(health) => health,
-            Err(_) => client.start_and_wait(cli, executable).await?,
-        };
-        tracing::info!(
-            broker_version = %health.build.version,
-            broker_commit = %health.build.commit,
-            sessions = health.sessions,
-            socket = %client.socket_path.display(),
-            "connected to terminal session broker"
-        );
-        client
-            .configure(cli.shell.clone(), cli.replay_bytes())
-            .await?;
-        Ok(client)
-    }
-
     async fn start_and_wait(
         &self,
         cli: &Cli,
         executable: &Path,
     ) -> Result<HealthResponse, BrokerError> {
-        spawn_broker(cli, executable)?;
+        spawn_broker(cli, executable, self.socket_path.as_ref())?;
         let mut last_error = None;
         for _ in 0..50 {
             match self.health().await {
@@ -255,18 +226,6 @@ impl BrokerClient {
         ))
     }
 
-    pub async fn info(&self) -> Result<SessionBrokerInfo, BrokerError> {
-        let health = self.health().await?;
-        let restart_required =
-            health.build.version != build::VERSION || health.build.commit != build::COMMIT;
-        Ok(SessionBrokerInfo {
-            version: health.build.version,
-            commit: health.build.commit,
-            sessions: health.sessions,
-            restart_required,
-        })
-    }
-
     async fn get_json<R: DeserializeOwned>(&self, path: &str) -> Result<R, BrokerError> {
         self.send_json::<(), R>(Method::GET, path, None).await
     }
@@ -346,6 +305,397 @@ impl BrokerClient {
     }
 }
 
+#[derive(Debug, Clone)]
+struct BrokerGeneration {
+    client: BrokerClient,
+    build: BuildIdentity,
+    current: bool,
+}
+
+impl BrokerGeneration {
+    fn terminal(&self, mut terminal: TerminalInfo) -> TerminalInfo {
+        terminal.broker = Some(self.build.clone());
+        terminal
+    }
+}
+
+pub struct BrokerPool {
+    current: BrokerGeneration,
+    draining: RwLock<Vec<BrokerGeneration>>,
+    owners: RwLock<HashMap<Uuid, BrokerGeneration>>,
+    create_lock: Mutex<()>,
+    shutting_down: AtomicBool,
+}
+
+impl BrokerPool {
+    pub async fn connect_or_start(cli: &Cli, executable: &Path) -> Result<Arc<Self>, BrokerError> {
+        tokio::fs::create_dir_all(&cli.data_dir).await?;
+        tokio::fs::create_dir_all(cli.data_dir.join(BROKER_DIRECTORY)).await?;
+        let current_path = current_socket_path(&cli.data_dir);
+        let mut compatible = Vec::new();
+
+        for path in broker_socket_paths(&cli.data_dir).await? {
+            let client = BrokerClient::new(path);
+            let Ok(health) = client.health().await else {
+                continue;
+            };
+            if health.protocol_version != PROTOCOL_VERSION {
+                tracing::warn!(
+                    expected_protocol = PROTOCOL_VERSION,
+                    actual_protocol = health.protocol_version,
+                    sessions = health.sessions,
+                    socket = %client.socket_path.display(),
+                    "replacing incompatible session broker; existing terminals will close"
+                );
+                client.shutdown().await?;
+                continue;
+            }
+            compatible.push(BrokerGeneration {
+                client,
+                build: health.build,
+                current: false,
+            });
+        }
+
+        let current_index = compatible
+            .iter()
+            .position(|generation| {
+                generation.client.socket_path.as_ref() == &current_path
+                    && generation.build.is_current()
+            })
+            .or_else(|| {
+                compatible
+                    .iter()
+                    .position(|generation| generation.build.is_current())
+            });
+        let mut current = if let Some(index) = current_index {
+            compatible.remove(index)
+        } else {
+            let client = BrokerClient::new(current_path);
+            let health = client.start_and_wait(cli, executable).await?;
+            BrokerGeneration {
+                client,
+                build: health.build,
+                current: false,
+            }
+        };
+        current.current = true;
+        current
+            .client
+            .configure(cli.shell.clone(), cli.replay_bytes())
+            .await?;
+
+        tracing::info!(
+            broker_version = %current.build.version,
+            broker_commit = %current.build.commit,
+            socket = %current.client.socket_path.display(),
+            draining_brokers = compatible.len(),
+            "connected to current terminal session broker"
+        );
+        for generation in &compatible {
+            tracing::info!(
+                broker_version = %generation.build.version,
+                broker_commit = %generation.build.commit,
+                socket = %generation.client.socket_path.display(),
+                "keeping compatible terminal session broker in draining mode"
+            );
+        }
+
+        let pool = Arc::new(Self {
+            current,
+            draining: RwLock::new(compatible),
+            owners: RwLock::new(HashMap::new()),
+            create_lock: Mutex::new(()),
+            shutting_down: AtomicBool::new(false),
+        });
+        Self::start_reaper(&pool);
+        pool.retire_empty_brokers().await;
+        Ok(pool)
+    }
+
+    fn start_reaper(pool: &Arc<Self>) {
+        let pool = Arc::downgrade(pool);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(DRAIN_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let Some(pool) = pool.upgrade() else {
+                    return;
+                };
+                if pool.shutting_down.load(Ordering::Relaxed) {
+                    return;
+                }
+                pool.retire_empty_brokers().await;
+            }
+        });
+    }
+
+    async fn generations(&self) -> Vec<BrokerGeneration> {
+        let draining = self.draining.read().await;
+        let mut generations = Vec::with_capacity(draining.len() + 1);
+        generations.push(self.current.clone());
+        generations.extend(draining.iter().cloned());
+        generations
+    }
+
+    async fn retire_empty_brokers(&self) {
+        let candidates = self.draining.read().await.clone();
+        for generation in candidates {
+            let Ok(health) = generation.client.health().await else {
+                continue;
+            };
+            if health.sessions != 0 {
+                continue;
+            }
+            {
+                let mut draining = self.draining.write().await;
+                let Some(index) = draining.iter().position(|candidate| {
+                    candidate.client.socket_path == generation.client.socket_path
+                }) else {
+                    continue;
+                };
+                draining.remove(index);
+            }
+            if let Err(error) = generation.client.shutdown().await {
+                self.draining.write().await.push(generation.clone());
+                tracing::warn!(
+                    %error,
+                    socket = %generation.client.socket_path.display(),
+                    "unable to stop drained terminal session broker"
+                );
+            } else {
+                self.owners
+                    .write()
+                    .await
+                    .retain(|_, owner| owner.client.socket_path != generation.client.socket_path);
+                tracing::info!(
+                    broker_version = %generation.build.version,
+                    broker_commit = %generation.build.commit,
+                    "stopped drained terminal session broker"
+                );
+            }
+        }
+    }
+
+    pub async fn list(&self) -> Result<Vec<TerminalInfo>, BrokerError> {
+        let generations = self.generations().await;
+        let mut terminals = Vec::new();
+        let mut owners = HashMap::new();
+        for generation in generations {
+            let listed = match generation.client.list().await {
+                Ok(listed) => listed,
+                Err(error) if !generation.current => {
+                    tracing::warn!(
+                        %error,
+                        broker_version = %generation.build.version,
+                        "draining terminal session broker became unavailable"
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            for terminal in listed {
+                owners.insert(terminal.id, generation.clone());
+                terminals.push(generation.terminal(terminal));
+            }
+        }
+        terminals.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.created_at.cmp(&right.created_at))
+        });
+        *self.owners.write().await = owners;
+        Ok(terminals)
+    }
+
+    async fn owner(&self, id: Uuid) -> Result<BrokerGeneration, BrokerError> {
+        if let Some(owner) = self.owners.read().await.get(&id).cloned() {
+            return Ok(owner);
+        }
+        self.list().await?;
+        self.owners
+            .read()
+            .await
+            .get(&id)
+            .cloned()
+            .ok_or_else(terminal_not_found)
+    }
+
+    pub async fn create(&self, mut request: CreateTerminal) -> Result<TerminalInfo, BrokerError> {
+        let _guard = self.create_lock.lock().await;
+        let terminals = self.list().await?;
+        if let Some(path) = request.path.as_deref() {
+            ensure_unique_terminal_name(path, None, &terminals)?;
+        }
+        if request.cwd.is_none()
+            && let Some(source) = request.clone_from
+        {
+            let terminal = terminals
+                .into_iter()
+                .find(|terminal| terminal.id == source)
+                .ok_or_else(|| BrokerError::Remote {
+                    status: StatusCode::BAD_REQUEST,
+                    message: "the terminal to clone no longer exists".to_owned(),
+                })?;
+            request.cwd = Some(terminal.cwd);
+            request.clone_from = None;
+        }
+        let terminal = self.current.client.create(request).await?;
+        self.owners
+            .write()
+            .await
+            .insert(terminal.id, self.current.clone());
+        Ok(self.current.terminal(terminal))
+    }
+
+    pub async fn rename(
+        &self,
+        id: Uuid,
+        request: RenameTerminal,
+    ) -> Result<TerminalInfo, BrokerError> {
+        let _guard = self.create_lock.lock().await;
+        ensure_unique_terminal_name(&request.path, Some(id), &self.list().await?)?;
+        let generation = self.owner(id).await?;
+        generation
+            .client
+            .rename(id, request)
+            .await
+            .map(|terminal| generation.terminal(terminal))
+    }
+
+    pub async fn remove(&self, id: Uuid) -> Result<(), BrokerError> {
+        let generation = self.owner(id).await?;
+        generation.client.remove(id).await?;
+        self.owners.write().await.remove(&id);
+        Ok(())
+    }
+
+    pub async fn process_inspector(
+        &self,
+        id: Uuid,
+    ) -> Result<ProcessInspectorSnapshot, BrokerError> {
+        self.owner(id).await?.client.process_inspector(id).await
+    }
+
+    pub async fn pi_config(&self) -> Result<PiClientConfig, BrokerError> {
+        self.current.client.pi_config().await
+    }
+
+    pub async fn update_pi(
+        &self,
+        settings: UpdatePiSettings,
+    ) -> Result<PiClientConfig, BrokerError> {
+        let updated = self.current.client.update_pi(settings.clone()).await?;
+        for generation in self.draining.read().await.iter() {
+            if let Err(error) = generation.client.update_pi(settings.clone()).await {
+                tracing::warn!(
+                    %error,
+                    broker_version = %generation.build.version,
+                    "unable to update settings in draining broker"
+                );
+            }
+        }
+        Ok(updated)
+    }
+
+    pub async fn terminal_socket(
+        &self,
+        id: Uuid,
+        initial_size: Option<(u16, u16)>,
+        sequence: Option<u64>,
+        observer: bool,
+    ) -> Result<BrokerWebSocket, BrokerError> {
+        self.owner(id)
+            .await?
+            .client
+            .terminal_socket(id, initial_size, sequence, observer)
+            .await
+    }
+
+    pub async fn info(&self) -> Result<SessionBrokerInfo, BrokerError> {
+        let mut generations = Vec::new();
+        let mut sessions = 0;
+        let mut restart_required = false;
+        for generation in self.generations().await {
+            let health = match generation.client.health().await {
+                Ok(health) => health,
+                Err(error) if !generation.current => {
+                    tracing::warn!(
+                        %error,
+                        broker_version = %generation.build.version,
+                        "draining terminal session broker became unavailable"
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            sessions += health.sessions;
+            restart_required |= !generation.current && health.sessions > 0;
+            generations.push(SessionBrokerGenerationInfo {
+                version: health.build.version,
+                commit: health.build.commit,
+                sessions: health.sessions,
+                current: generation.current,
+            });
+        }
+        Ok(SessionBrokerInfo {
+            version: self.current.build.version.clone(),
+            commit: self.current.build.commit.clone(),
+            sessions,
+            restart_required,
+            generations,
+        })
+    }
+
+    pub async fn shutdown(&self) -> Result<(), BrokerError> {
+        self.shutting_down.store(true, Ordering::Relaxed);
+        let mut first_error = None;
+        for generation in self.generations().await {
+            if let Err(error) = generation.client.shutdown().await
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+fn terminal_not_found() -> BrokerError {
+    BrokerError::Remote {
+        status: StatusCode::NOT_FOUND,
+        message: "terminal not found".to_owned(),
+    }
+}
+
+fn bad_terminal_request(error: impl std::fmt::Display) -> BrokerError {
+    BrokerError::Remote {
+        status: StatusCode::BAD_REQUEST,
+        message: error.to_string(),
+    }
+}
+
+fn ensure_unique_terminal_name(
+    input: &str,
+    except: Option<Uuid>,
+    terminals: &[TerminalInfo],
+) -> Result<(), BrokerError> {
+    let normalized = normalize_terminal_path(input).map_err(bad_terminal_request)?;
+    let name = normalized.rsplit('/').next().unwrap_or(&normalized);
+    if terminals
+        .iter()
+        .any(|terminal| Some(terminal.id) != except && terminal.name == name)
+    {
+        return Err(BrokerError::Remote {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("a terminal already exists at {name}"),
+        });
+    }
+    Ok(())
+}
+
 fn remote_error(status: StatusCode, bytes: &[u8]) -> BrokerError {
     let message = serde_json::from_slice::<ErrorResponse>(bytes)
         .map(|response| response.error)
@@ -353,12 +703,14 @@ fn remote_error(status: StatusCode, bytes: &[u8]) -> BrokerError {
     BrokerError::Remote { status, message }
 }
 
-fn spawn_broker(cli: &Cli, executable: &Path) -> Result<(), BrokerError> {
+fn spawn_broker(cli: &Cli, executable: &Path, socket: &Path) -> Result<(), BrokerError> {
     let mut command = Command::new(executable);
     command
         .arg("--session-broker")
         .arg("--data-dir")
         .arg(&cli.data_dir)
+        .arg("--broker-socket")
+        .arg(socket)
         .arg("--replay-mb")
         .arg(cli.replay_mb.to_string())
         .arg("--log")
@@ -374,8 +726,41 @@ fn spawn_broker(cli: &Cli, executable: &Path) -> Result<(), BrokerError> {
     Ok(())
 }
 
-fn socket_path(data_directory: &Path) -> PathBuf {
+pub fn legacy_socket_path(data_directory: &Path) -> PathBuf {
     data_directory.join(SOCKET_NAME)
+}
+
+fn current_socket_path(data_directory: &Path) -> PathBuf {
+    let version = build::VERSION
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .take(12)
+        .collect::<String>();
+    let commit = build::COMMIT
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .take(16)
+        .collect::<String>();
+    data_directory
+        .join(BROKER_DIRECTORY)
+        .join(format!("{version}-{commit}.sock"))
+}
+
+async fn broker_socket_paths(data_directory: &Path) -> Result<Vec<PathBuf>, BrokerError> {
+    let mut paths = vec![legacy_socket_path(data_directory)];
+    let mut entries = tokio::fs::read_dir(data_directory.join(BROKER_DIRECTORY)).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "sock")
+        {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
 }
 
 #[derive(Clone)]
@@ -412,11 +797,15 @@ impl IntoResponse for BrokerApiError {
 
 pub async fn run_session_broker(
     data_directory: &Path,
+    socket_path: &Path,
     default_shell: Option<String>,
     replay_bytes: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     tokio::fs::create_dir_all(data_directory).await?;
-    let path = socket_path(data_directory);
+    if let Some(parent) = socket_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let path = socket_path.to_owned();
     let listener = match UnixListener::bind(&path) {
         Ok(listener) => listener,
         Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
@@ -626,6 +1015,7 @@ async fn shutdown_broker(State(state): State<BrokerState>) -> StatusCode {
 mod tests {
     use std::path::PathBuf;
 
+    use clap::Parser;
     use futures_util::{SinkExt, StreamExt};
     use tempfile::TempDir;
     use tokio::task::JoinHandle;
@@ -636,15 +1026,49 @@ mod tests {
     async fn start_test_broker(replay_bytes: usize) -> (TempDir, JoinHandle<()>, BrokerClient) {
         let directory = tempfile::tempdir().unwrap();
         let data_directory = directory.path().to_path_buf();
+        let socket = legacy_socket_path(&data_directory);
+        let server_socket = socket.clone();
         let server = tokio::spawn(async move {
-            run_session_broker(&data_directory, Some("/bin/sh".to_owned()), replay_bytes)
-                .await
-                .unwrap();
+            run_session_broker(
+                &data_directory,
+                &server_socket,
+                Some("/bin/sh".to_owned()),
+                replay_bytes,
+            )
+            .await
+            .unwrap();
         });
-        let client = BrokerClient::new(socket_path(directory.path()));
+        let client = BrokerClient::new(socket);
         for _ in 0..50 {
             if client.health().await.is_ok() {
                 return (directory, server, client);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("test broker did not start");
+    }
+
+    async fn start_test_broker_at(
+        data_directory: &Path,
+        socket: PathBuf,
+        replay_bytes: usize,
+    ) -> (JoinHandle<()>, BrokerClient) {
+        let server_data = data_directory.to_path_buf();
+        let server_socket = socket.clone();
+        let server = tokio::spawn(async move {
+            run_session_broker(
+                &server_data,
+                &server_socket,
+                Some("/bin/sh".to_owned()),
+                replay_bytes,
+            )
+            .await
+            .unwrap();
+        });
+        let client = BrokerClient::new(socket);
+        for _ in 0..50 {
+            if client.health().await.is_ok() {
+                return (server, client);
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -759,11 +1183,10 @@ mod tests {
     #[tokio::test]
     async fn sessions_survive_web_client_reconnections() {
         let (directory, server, client) = start_test_broker(1024 * 1024).await;
-        let broker = client.info().await.unwrap();
-        assert_eq!(broker.version, build::VERSION);
-        assert_eq!(broker.commit, build::COMMIT);
+        let broker = client.health().await.unwrap();
+        assert_eq!(broker.build.version, build::VERSION);
+        assert_eq!(broker.build.commit, build::COMMIT);
         assert_eq!(broker.sessions, 0);
-        assert!(!broker.restart_required);
 
         let terminal = client
             .create(CreateTerminal {
@@ -826,7 +1249,7 @@ mod tests {
         wait_for_output(&mut first, "before-restart").await;
         first.close(None).await.unwrap();
 
-        let replacement_client = BrokerClient::new(socket_path(directory.path()));
+        let replacement_client = BrokerClient::new(legacy_socket_path(directory.path()));
         assert!(
             replacement_client
                 .list()
@@ -861,6 +1284,160 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), server)
             .await
             .expect("broker shutdown timeout")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn compatible_broker_generations_drain_without_moving_existing_terminals() {
+        let directory = tempfile::tempdir().unwrap();
+        let (legacy_server, legacy) = start_test_broker_at(
+            directory.path(),
+            legacy_socket_path(directory.path()),
+            1024 * 1024,
+        )
+        .await;
+        let old_terminal = legacy
+            .create(CreateTerminal {
+                path: Some("old-generation".to_owned()),
+                cwd: Some(PathBuf::from("/tmp")),
+                shell: Some("/bin/sh".to_owned()),
+                clone_from: None,
+            })
+            .await
+            .unwrap();
+        let current_path = current_socket_path(directory.path());
+        let (current_server, current) =
+            start_test_broker_at(directory.path(), current_path, 1024 * 1024).await;
+        let cli = Cli::try_parse_from([
+            "term-server",
+            "--data-dir",
+            directory.path().to_str().unwrap(),
+            "--shell",
+            "/bin/sh",
+        ])
+        .unwrap();
+        let pool = BrokerPool::connect_or_start(&cli, Path::new("/unused"))
+            .await
+            .unwrap();
+
+        let info = pool.info().await.unwrap();
+        assert_eq!(info.sessions, 1);
+        assert!(info.restart_required);
+        assert_eq!(info.generations.len(), 2);
+        assert_eq!(
+            info.generations
+                .iter()
+                .filter(|generation| generation.current)
+                .count(),
+            1
+        );
+
+        let listed = pool.list().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, old_terminal.id);
+        assert_eq!(listed[0].broker.as_ref(), Some(&BuildIdentity::current()));
+
+        let new_terminal = pool
+            .create(CreateTerminal {
+                path: Some("new-generation".to_owned()),
+                cwd: Some(PathBuf::from("/tmp")),
+                shell: Some("/bin/sh".to_owned()),
+                clone_from: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            current
+                .list()
+                .await
+                .unwrap()
+                .iter()
+                .any(|terminal| terminal.id == new_terminal.id)
+        );
+        assert!(
+            !legacy
+                .list()
+                .await
+                .unwrap()
+                .iter()
+                .any(|terminal| terminal.id == new_terminal.id)
+        );
+        let duplicate = pool
+            .create(CreateTerminal {
+                path: Some("old-generation".to_owned()),
+                cwd: Some(PathBuf::from("/tmp")),
+                shell: Some("/bin/sh".to_owned()),
+                clone_from: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(duplicate.status(), Some(StatusCode::BAD_REQUEST));
+        let duplicate = pool
+            .rename(
+                new_terminal.id,
+                RenameTerminal {
+                    path: "old-generation".to_owned(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(duplicate.status(), Some(StatusCode::BAD_REQUEST));
+
+        let cloned = pool
+            .create(CreateTerminal {
+                path: Some("cloned-from-old".to_owned()),
+                cwd: None,
+                shell: Some("/bin/sh".to_owned()),
+                clone_from: Some(old_terminal.id),
+            })
+            .await
+            .unwrap();
+        assert_eq!(cloned.cwd, PathBuf::from("/tmp"));
+        assert!(
+            current
+                .list()
+                .await
+                .unwrap()
+                .iter()
+                .any(|terminal| terminal.id == cloned.id)
+        );
+
+        let renamed = pool
+            .rename(
+                old_terminal.id,
+                RenameTerminal {
+                    path: "renamed-old".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(renamed.name, "renamed-old");
+        pool.remove(old_terminal.id).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(6), async {
+            loop {
+                if legacy.health().await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("draining broker did not stop");
+        let info = pool.info().await.unwrap();
+        assert!(!info.restart_required);
+        assert_eq!(info.generations.len(), 1);
+
+        pool.remove(new_terminal.id).await.unwrap();
+        pool.remove(cloned.id).await.unwrap();
+        pool.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), legacy_server)
+            .await
+            .expect("legacy broker shutdown timeout")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), current_server)
+            .await
+            .expect("current broker shutdown timeout")
             .unwrap();
     }
 

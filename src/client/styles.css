@@ -593,6 +593,12 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
 .pane-path { min-width: 0; display: flex; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .pane-path span { overflow: hidden; text-overflow: ellipsis; }
 .pane-path b { padding: 0 3px; color: var(--subtle); font-weight: normal; }
+.pane-broker-warning {
+  height: 18px; flex: none; display: inline-flex; align-items: center; gap: 4px; padding: 0 5px;
+  border: 1px solid color-mix(in srgb, #d29922 42%, var(--border)); border-radius: 3px;
+  background: color-mix(in srgb, #d29922 10%, var(--panel)); color: #d29922;
+  font-size: 8.5px; font-weight: 700; white-space: nowrap;
+}
 .pane-activity {
   --activity-color: var(--muted); height: 20px; display: inline-flex; align-items: center; gap: 4px; flex: none; padding: 0 3px 0 6px;
   border: 1px solid color-mix(in srgb, var(--activity-color) 48%, var(--border)); border-radius: 4px;

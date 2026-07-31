@@ -20,6 +20,7 @@ import {
   RefreshCw,
   Search,
   TerminalSquare,
+  TriangleAlert,
   Trash2,
   WifiOff,
   X,
@@ -48,6 +49,7 @@ import {
   transformTerminalInput,
   type TerminalModifiers,
 } from "../lib/mobile-terminal";
+import { TerminalKeypressGuard } from "../lib/terminal-keypress";
 import {
   DEFAULT_TERMINAL_FONT_SIZE,
   MAX_TERMINAL_FONT_SIZE,
@@ -337,6 +339,10 @@ export function TerminalPane({
     };
     reportTerminalViewport.current = reportViewport;
 
+    const keypressGuard = new TerminalKeypressGuard();
+    const keyDisposable = term.onKey(({ domEvent }) => {
+      keypressGuard.markHandled(domEvent);
+    });
     const dataDisposable = term.onData((data) => {
       if (!acceptingInput || parsingOutput && !responder) return;
       if (parsingOutput) {
@@ -369,7 +375,7 @@ export function TerminalPane({
         void navigator.clipboard?.readText().then((value) => term.paste(value)).catch(() => onNotice("Clipboard permission was denied"));
         return false;
       }
-      return true;
+      return keypressGuard.shouldProcess(event);
     });
 
     const writeTerminal = (data: Uint8Array, commit?: number) => new Promise<void>((resolve, reject) => {
@@ -554,6 +560,7 @@ export function TerminalPane({
       observer.disconnect();
       imagePreviews.clear();
       disposeTouchScroll();
+      keyDisposable.dispose();
       dataDisposable.dispose();
       scrollDisposable.dispose();
       fileLinksDisposable.dispose();
@@ -761,6 +768,18 @@ export function TerminalPane({
         </span>
         <span class="terminal-color" style={{ background: terminal.color }} />
         <TerminalPath path={terminal.path} />
+        {terminal.broker && (
+          terminal.broker.version !== config.build.version
+          || terminal.broker.commit !== config.build.commit
+        ) && (
+          <span
+            class="pane-broker-warning"
+            title={`This terminal is still running on broker v${terminal.broker.version} (${terminal.broker.commit.slice(0, 12)}). New terminals use v${config.build.version}. Close it when convenient to retire the older broker.`}
+          >
+            <TriangleAlert size={11} />
+            Broker v{terminal.broker.version}
+          </span>
+        )}
         {terminal.agent && (
           <PaneAgentState agent={terminal.agent} needsAttention={needsAttention} />
         )}

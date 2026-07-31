@@ -24,6 +24,7 @@ import type {
   UpdateStatus,
 } from "../shared/types";
 import { api, ApiError } from "./lib/api";
+import { withBrokerSessions } from "./lib/broker-generations";
 import {
   agentNeedsAttention,
   parseViewedAgentRevisions,
@@ -457,7 +458,12 @@ export function App() {
         && runningTerminals.some((terminal) => terminal.id === activeIdRef.current)
         ? activeIdRef.current
         : runningTerminals[0]?.id;
-      setConfig(nextConfig);
+      setConfig({
+        ...nextConfig,
+        broker: nextConfig.broker
+          ? withBrokerSessions(nextConfig.broker, runningTerminals)
+          : null,
+      });
       setTerminals(runningTerminals);
       setWorkspaceLoaded(true);
       setLayout((current) => {
@@ -546,11 +552,10 @@ export function App() {
         .then(([next, artifacts]) => {
           const running = next.filter((terminal) => terminal.status === "running");
           setTerminals((current) => mergeTerminalActivityViews(running, current));
-          setConfig((current) => (
-            current.broker && current.broker.sessions !== running.length
-              ? { ...current, broker: { ...current.broker, sessions: running.length } }
-              : current
-          ));
+          setConfig((current) => ({
+            ...current,
+            broker: current.broker ? withBrokerSessions(current.broker, running) : null,
+          }));
           const available = new Set(running.map((terminal) => terminal.id));
           setLayout((current) => pruneLayout(current, available));
           syncArtifacts(artifacts, activeIdRef.current, running);
@@ -1033,7 +1038,12 @@ export function App() {
 
   const updateTerminal = (next: TerminalInfo) => {
     setTerminals((current) => current.map((terminal) => (
-      terminal.id === next.id ? withActivityView(next, activityView(terminal)) : terminal
+      terminal.id === next.id
+        ? withActivityView(
+            { ...next, broker: next.broker ?? terminal.broker },
+            activityView(terminal),
+          )
+        : terminal
     )));
   };
 
