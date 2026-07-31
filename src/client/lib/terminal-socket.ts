@@ -1,5 +1,12 @@
 export type TerminalSocketCloseCause = "backlog" | "protocol-error" | "timeout";
 
+export const TERMINAL_STREAM_PROTOCOL = 1;
+
+export function addTerminalStreamProtocol(url: URL): URL {
+  url.searchParams.set("stream", String(TERMINAL_STREAM_PROTOCOL));
+  return url;
+}
+
 const CLOSE_DETAILS: Record<TerminalSocketCloseCause, { code: number; reason: string }> = {
   backlog: { code: 4003, reason: "Terminal renderer fell behind" },
   "protocol-error": { code: 4002, reason: "Invalid terminal stream" },

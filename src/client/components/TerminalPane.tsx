@@ -49,14 +49,13 @@ import {
   transformTerminalInput,
   type TerminalModifiers,
 } from "../lib/mobile-terminal";
-import { TerminalKeypressGuard } from "../lib/terminal-keypress";
 import {
   DEFAULT_TERMINAL_FONT_SIZE,
   MAX_TERMINAL_FONT_SIZE,
   MIN_TERMINAL_FONT_SIZE,
   terminalZoomPercent,
 } from "../lib/terminal-zoom";
-import { closeTerminalSocket } from "../lib/terminal-socket";
+import { addTerminalStreamProtocol, closeTerminalSocket } from "../lib/terminal-socket";
 import {
   TERMINAL_FRAME_OUTPUT,
   TerminalRenderBacklog,
@@ -339,10 +338,6 @@ export function TerminalPane({
     };
     reportTerminalViewport.current = reportViewport;
 
-    const keypressGuard = new TerminalKeypressGuard();
-    const keyDisposable = term.onKey(({ domEvent }) => {
-      keypressGuard.markHandled(domEvent);
-    });
     const dataDisposable = term.onData((data) => {
       if (!acceptingInput || parsingOutput && !responder) return;
       if (parsingOutput) {
@@ -375,7 +370,7 @@ export function TerminalPane({
         void navigator.clipboard?.readText().then((value) => term.paste(value)).catch(() => onNotice("Clipboard permission was denied"));
         return false;
       }
-      return keypressGuard.shouldProcess(event);
+      return true;
     });
 
     const writeTerminal = (data: Uint8Array, commit?: number) => new Promise<void>((resolve, reject) => {
@@ -402,7 +397,9 @@ export function TerminalPane({
       term.options.disableStdin = true;
       setConnection(recoveringOutput ? "recovering" : "connecting");
       const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-      const url = new URL(`${protocol}//${location.host}/api/terminals/${terminal.id}/socket`);
+      const url = addTerminalStreamProtocol(
+        new URL(`${protocol}//${location.host}/api/terminals/${terminal.id}/socket`),
+      );
       const size = proposedViewport();
       if (size) {
         url.searchParams.set("cols", String(size.cols));
@@ -560,7 +557,6 @@ export function TerminalPane({
       observer.disconnect();
       imagePreviews.clear();
       disposeTouchScroll();
-      keyDisposable.dispose();
       dataDisposable.dispose();
       scrollDisposable.dispose();
       fileLinksDisposable.dispose();
