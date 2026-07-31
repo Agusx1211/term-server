@@ -53,6 +53,8 @@ export interface TerminalInfo {
   status: TerminalStatus;
   exitCode: number | null;
   clients: number;
+  /** Present on REST responses; broker-ready messages omit it. */
+  broker?: BuildInfo | null;
   /** Present on REST responses; broker-ready messages from older patch releases omit it. */
   activityViewed?: ActivityView;
 }
@@ -108,6 +110,12 @@ export interface BuildInfo {
 export interface SessionBrokerInfo extends BuildInfo {
   sessions: number;
   restartRequired: boolean;
+  generations: SessionBrokerGenerationInfo[];
+}
+
+export interface SessionBrokerGenerationInfo extends BuildInfo {
+  sessions: number;
+  current: boolean;
 }
 
 export interface UpdateConfig {

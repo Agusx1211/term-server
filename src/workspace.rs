@@ -26,11 +26,21 @@ const TERMINAL_FRAME_OUTPUT: u8 = 1;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SessionBrokerGenerationInfo {
+    pub version: String,
+    pub commit: String,
+    pub sessions: usize,
+    pub current: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionBrokerInfo {
     pub version: String,
     pub commit: String,
     pub sessions: usize,
     pub restart_required: bool,
+    pub generations: Vec<SessionBrokerGenerationInfo>,
 }
 
 #[derive(Debug, Error)]
@@ -65,7 +75,7 @@ pub enum WorkspaceBackend {
         pi: Arc<PiService>,
     },
     #[cfg(unix)]
-    Broker(Arc<crate::broker::BrokerClient>),
+    Broker(Arc<crate::broker::BrokerPool>),
 }
 
 pub enum SessionConnection {
@@ -80,8 +90,8 @@ impl WorkspaceBackend {
     }
 
     #[cfg(unix)]
-    pub fn broker(client: crate::broker::BrokerClient) -> Self {
-        Self::Broker(Arc::new(client))
+    pub fn broker(pool: Arc<crate::broker::BrokerPool>) -> Self {
+        Self::Broker(pool)
     }
 
     pub async fn list(&self) -> Result<Vec<TerminalInfo>, WorkspaceError> {

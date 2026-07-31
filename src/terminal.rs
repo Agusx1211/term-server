@@ -22,6 +22,7 @@ use crate::{
     agent_events::{AgentActivity, AgentEvent, AgentEventKind},
     ai::{PiRequest, PiService, PiTaskKind},
     artifacts,
+    build::BuildIdentity,
     terminal_state::{SequencedOutput, TerminalOutputState, TerminalSync},
 };
 
@@ -119,6 +120,8 @@ pub struct TerminalInfo {
     pub status: TerminalStatus,
     pub exit_code: Option<u32>,
     pub clients: usize,
+    #[serde(default)]
+    pub broker: Option<BuildIdentity>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1787,6 +1790,7 @@ impl TerminalManager {
                 status: TerminalStatus::Running,
                 exit_code: None,
                 clients: 0,
+                broker: None,
             }),
             master: Mutex::new(pair.master),
             writer: Mutex::new(writer),

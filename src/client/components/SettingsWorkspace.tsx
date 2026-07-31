@@ -182,6 +182,9 @@ export function SettingsWorkspace({
   onLogout,
 }: SettingsWorkspaceProps) {
   const systemPermission = typeof Notification === "undefined" ? "unsupported" : Notification.permission;
+  const outdatedBrokers = broker?.generations.filter(
+    (generation) => !generation.current && generation.sessions > 0,
+  ) ?? [];
   const updatePreviewSettings = (changes: Partial<TerminalPreviewSettings>) => {
     onTerminalPreviewSettingsChange({ ...terminalPreviewSettings, ...changes });
   };
@@ -613,19 +616,21 @@ export function SettingsWorkspace({
                   <div class="settings-broker-warning-title">
                     <TriangleAlert size={15} />
                     <span>
-                      <strong>Session broker update pending</strong>
+                      <strong>Older session brokers still active</strong>
                       <small>
-                        Broker v{broker.version} · {broker.commit.slice(0, 12)}
+                        {outdatedBrokers.map((generation) => (
+                          `v${generation.version} · ${generation.commit.slice(0, 12)}`
+                        )).join(", ")}
                       </small>
                     </span>
                   </div>
                   <p>
-                    The server is newer than the process managing terminal sessions. Restart the
-                    broker to activate its fixes and features.
+                    New terminals use v{broker.version}. Existing terminals stay on their original
+                    broker until they close.
                   </p>
-                  {broker.sessions > 0 && (
+                  {outdatedBrokers.length > 0 && (
                     <p class="settings-broker-terminal-warning">
-                      Restarting will close {broker.sessions} open terminal{broker.sessions === 1 ? "" : "s"}.
+                      Restarting now will close all {broker.sessions} open terminal{broker.sessions === 1 ? "" : "s"}.
                     </p>
                   )}
                   <button
@@ -634,7 +639,7 @@ export function SettingsWorkspace({
                     disabled={restartingBroker}
                   >
                     <RefreshCw class={restartingBroker ? "spin" : ""} size={14} />
-                    {restartingBroker ? "Restarting…" : "Restart session broker"}
+                    {restartingBroker ? "Restarting…" : "Restart all session brokers"}
                   </button>
                 </div>
               )}

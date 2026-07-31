@@ -20,6 +20,7 @@ import {
   RefreshCw,
   Search,
   TerminalSquare,
+  TriangleAlert,
   Trash2,
   WifiOff,
   X,
@@ -761,6 +762,18 @@ export function TerminalPane({
         </span>
         <span class="terminal-color" style={{ background: terminal.color }} />
         <TerminalPath path={terminal.path} />
+        {terminal.broker && (
+          terminal.broker.version !== config.build.version
+          || terminal.broker.commit !== config.build.commit
+        ) && (
+          <span
+            class="pane-broker-warning"
+            title={`This terminal is still running on broker v${terminal.broker.version} (${terminal.broker.commit.slice(0, 12)}). New terminals use v${config.build.version}. Close it when convenient to retire the older broker.`}
+          >
+            <TriangleAlert size={11} />
+            Broker v{terminal.broker.version}
+          </span>
+        )}
         {terminal.agent && (
           <PaneAgentState agent={terminal.agent} needsAttention={needsAttention} />
         )}
