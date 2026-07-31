@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   TERMINAL_FRAME_OUTPUT,
   TERMINAL_FRAME_SNAPSHOT,
+  TerminalRenderBacklog,
   TerminalStreamState,
   decodeTerminalFrame,
 } from "./terminal-stream";
@@ -66,5 +67,43 @@ describe("terminal stream protocol", () => {
       /gap/,
     );
     expect(() => state.finish(8)).toThrow(/unexpected/);
+  });
+
+  it("forgets stale resume state before a fresh snapshot", () => {
+    const state = new TerminalStreamState();
+    state.begin("snapshot", 10);
+    state.accept(decodeTerminalFrame(frame(TERMINAL_FRAME_SNAPSHOT, 10n, [1])));
+    state.finish(10);
+    state.restart();
+    expect(state.resumeSequence).toBeUndefined();
+    expect(state.synchronizing).toBe(false);
+    expect(state.begin("snapshot", 20)).toBe(true);
+  });
+});
+
+describe("terminal renderer backlog", () => {
+  it("bounds queued output by size and sustained parser delay", () => {
+    const backlog = new TerminalRenderBacklog();
+    expect(backlog.enqueue(64 * 1024, 1_000)).toBe(false);
+    expect(backlog.enqueue(64 * 1024, 2_501)).toBe(true);
+    expect(backlog.pendingBytes).toBe(128 * 1024);
+
+    backlog.reset();
+    expect(backlog.enqueue(512 * 1024, 3_000)).toBe(false);
+    expect(backlog.enqueue(1, 3_001)).toBe(true);
+
+    backlog.reset();
+    for (let index = 0; index < 128; index += 1) {
+      expect(backlog.enqueue(1, 4_000)).toBe(false);
+    }
+    expect(backlog.enqueue(1, 4_000)).toBe(true);
+  });
+
+  it("clears its age once xterm catches up", () => {
+    const backlog = new TerminalRenderBacklog();
+    backlog.enqueue(64 * 1024, 1_000);
+    backlog.settle(64 * 1024);
+    expect(backlog.pendingBytes).toBe(0);
+    expect(backlog.enqueue(64 * 1024, 10_000)).toBe(false);
   });
 });

@@ -108,6 +108,7 @@ import { TermServerLogo } from "./components/TermServerLogo";
 import { WelcomeSection } from "./components/WelcomeSection";
 import { ResourceTabBar } from "./components/ResourceTabs";
 import type { ResourceTab } from "./lib/resources";
+import type { TerminalStreamIssue } from "./lib/terminal-stream";
 import type { ThemeName } from "./lib/terminal-theme";
 
 const TerminalPane = lazy(() =>
@@ -291,6 +292,8 @@ export function App() {
   const [terminalFontSize, setTerminalFontSize] = useState(initialTerminalFontSize);
   const [terminalPreviewSettings, setTerminalPreviewSettings] =
     useState(initialTerminalPreviewSettings);
+  const [terminalStreamIssues, setTerminalStreamIssues] =
+    useState(new Map<string, TerminalStreamIssue>());
   const legacyViewedAgentRevisions = useRef(initialViewedAgentRevisions());
   const legacyViewedCommandCompletions = useRef(initialViewedCommandCompletions());
   const [artifacts, setArtifacts] = useState<ArtifactEntry[]>([]);
@@ -323,6 +326,21 @@ export function App() {
   const showNotice = (message: string) => {
     setNotice(message);
     window.setTimeout(() => setNotice((current) => (current === message ? "" : current)), 2400);
+  };
+
+  const updateTerminalStreamIssue = (id: string, issue?: TerminalStreamIssue) => {
+    setTerminalStreamIssues((current) => {
+      const previous = current.get(id);
+      if (
+        previous?.kind === issue?.kind
+        && previous?.pendingBytes === issue?.pendingBytes
+      ) return current;
+      if (!issue && !previous) return current;
+      const next = new Map(current);
+      if (issue) next.set(id, issue);
+      else next.delete(id);
+      return next;
+    });
   };
 
   const updateTerminalFontSize = (value: number) => {
@@ -1190,6 +1208,7 @@ export function App() {
       setAuthenticated(false);
       setWorkspaceLoaded(false);
       setTerminals([]);
+      setTerminalStreamIssues(new Map());
       setLayout(null);
       setMountedIds([]);
       setArtifacts([]);
@@ -1212,6 +1231,20 @@ export function App() {
     );
   }
   if (!authenticated) return <Login onAuthenticated={() => void loadWorkspace()} />;
+
+  const recoveringStreams = [...terminalStreamIssues].filter(([, issue]) => issue.kind === "recovering");
+  const reconnectingStreams = [...terminalStreamIssues].filter(([, issue]) => issue.kind === "reconnecting");
+  const streamIssueTitle = [...recoveringStreams, ...reconnectingStreams]
+    .map(([id, issue]) => {
+      const name = terminalById.get(id)?.name ?? "Terminal";
+      const backlog = issue.pendingBytes
+        ? `, ${Math.ceil(issue.pendingBytes / 1024).toLocaleString()} KiB of stale redraws discarded`
+        : "";
+      return issue.kind === "recovering"
+        ? `${name}: loading current terminal state${backlog}`
+        : `${name}: reconnecting terminal stream`;
+    })
+    .join("\n");
 
   return (
     <div class="workbench">
@@ -1348,6 +1381,7 @@ export function App() {
                     onDragEnd={finishDrag}
                     onExit={() => forgetTerminal(terminal.id)}
                     onUpdate={updateTerminal}
+                    onStreamIssue={(issue) => updateTerminalStreamIssue(terminal.id, issue)}
                     onNotice={showNotice}
                     onFontSizeChange={updateTerminalFontSize}
                     onOpenFile={(target) => void openResource(target)}
@@ -1502,6 +1536,16 @@ export function App() {
       <footer class="statusbar">
         <span class="statusbar-group statusbar-left">
           <span class="statusbar-item statusbar-connected"><span class="status-dot online" /> Connected</span>
+          {recoveringStreams.length > 0 ? (
+            <span class="statusbar-item statusbar-stream-issue" title={streamIssueTitle} role="status" aria-live="polite">
+              <LoaderCircle class="spin" size={12} />
+              Recovering output for {recoveringStreams.length} terminal{recoveringStreams.length === 1 ? "" : "s"}
+            </span>
+          ) : reconnectingStreams.length > 0 ? (
+            <span class="statusbar-item statusbar-stream-issue disconnected" title={streamIssueTitle} role="status" aria-live="polite">
+              Reconnecting {reconnectingStreams.length} terminal{reconnectingStreams.length === 1 ? "" : "s"}
+            </span>
+          ) : null}
           {config.hostname && (
             <span class="statusbar-item statusbar-host" title="Server hostname">
               {config.hostname}

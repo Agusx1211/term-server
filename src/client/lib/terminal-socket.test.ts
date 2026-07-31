@@ -3,6 +3,7 @@ import { closeTerminalSocket, type TerminalSocketCloseCause } from "./terminal-s
 
 describe("terminal WebSocket close handling", () => {
   it.each([
+    ["backlog", 4003, "Terminal renderer fell behind"],
     ["protocol-error", 4002, "Invalid terminal stream"],
     ["timeout", 4001, "Terminal connection timed out"],
   ] satisfies [TerminalSocketCloseCause, number, string][])(

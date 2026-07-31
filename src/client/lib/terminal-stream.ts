@@ -1,6 +1,10 @@
 export const TERMINAL_FRAME_SNAPSHOT = 0;
 export const TERMINAL_FRAME_OUTPUT = 1;
 const TERMINAL_FRAME_HEADER_BYTES = 9;
+const MAX_RENDER_BACKLOG_BYTES = 512 * 1024;
+const MAX_RENDER_BACKLOG_AGE_MS = 1_500;
+const MAX_RENDER_BACKLOG_FRAMES = 128;
+const MIN_AGED_RENDER_BACKLOG_BYTES = 64 * 1024;
 
 export interface TerminalFrame {
   kind: number;
@@ -9,6 +13,45 @@ export interface TerminalFrame {
 }
 
 export type TerminalSyncMode = "snapshot" | "resume";
+
+export interface TerminalStreamIssue {
+  kind: "recovering" | "reconnecting";
+  pendingBytes?: number;
+}
+
+export class TerminalRenderBacklog {
+  private bytes = 0;
+  private frames = 0;
+  private pendingSince?: number;
+
+  get pendingBytes(): number {
+    return this.bytes;
+  }
+
+  enqueue(bytes: number, now = Date.now()): boolean {
+    if (bytes <= 0) return false;
+    if (this.bytes === 0) this.pendingSince = now;
+    this.bytes += bytes;
+    this.frames += 1;
+    return this.frames > MAX_RENDER_BACKLOG_FRAMES
+      || this.bytes > MAX_RENDER_BACKLOG_BYTES
+      || this.bytes >= MIN_AGED_RENDER_BACKLOG_BYTES
+        && now - (this.pendingSince ?? now) > MAX_RENDER_BACKLOG_AGE_MS;
+  }
+
+  settle(bytes: number): void {
+    if (bytes <= 0) return;
+    this.bytes = Math.max(0, this.bytes - bytes);
+    this.frames = Math.max(0, this.frames - 1);
+    if (this.bytes === 0) this.pendingSince = undefined;
+  }
+
+  reset(): void {
+    this.bytes = 0;
+    this.frames = 0;
+    this.pendingSince = undefined;
+  }
+}
 
 export function decodeTerminalFrame(buffer: ArrayBuffer): TerminalFrame {
   if (buffer.byteLength < TERMINAL_FRAME_HEADER_BYTES) {
@@ -39,6 +82,14 @@ export class TerminalStreamState {
 
   get resumeSequence(): number | undefined {
     return this.committedSequence;
+  }
+
+  restart(): void {
+    this.committedSequence = undefined;
+    this.receivedSequence = undefined;
+    this.syncMode = undefined;
+    this.syncTarget = undefined;
+    this.snapshotReceived = false;
   }
 
   begin(mode: TerminalSyncMode, target: number): boolean {

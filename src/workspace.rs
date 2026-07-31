@@ -403,11 +403,16 @@ pub(crate) async fn serve_terminal_socket(
                             continue;
                         }
                         if output.sequence > sent_sequence {
+                            tracing::debug!(
+                                expected_sequence = sent_sequence,
+                                output_sequence = output.sequence,
+                                "terminal stream gap detected; sending current snapshot"
+                            );
                             match synchronize_terminal(
                                 &mut sender,
                                 &terminal,
                                 client_id,
-                                Some(sent_sequence),
+                                None,
                             ).await {
                                 Ok(Some((next_events, sequence))) => {
                                     events = next_events;
@@ -434,12 +439,17 @@ pub(crate) async fn serve_terminal_socket(
                             .expect("serializable terminal size");
                         if sender.send(Message::Text(message.into())).await.is_err() { break; }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::debug!(
+                            skipped,
+                            sent_sequence,
+                            "terminal stream lagged; sending current snapshot"
+                        );
                         match synchronize_terminal(
                             &mut sender,
                             &terminal,
                             client_id,
-                            Some(sent_sequence),
+                            None,
                         ).await {
                             Ok(Some((next_events, sequence))) => {
                                 events = next_events;

@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.7.2 - 2026-07-31
+
+High-frequency TUIs no longer leave background terminal panes replaying stale redraws
+indefinitely, and stream recovery is now visible in the workspace.
+
+### Added
+
+- Terminal pane headers show **Catching up** while the renderer loads current terminal state.
+- The bottom status bar reports how many terminal streams are recovering or reconnecting. Its
+  tooltip identifies the affected terminals and, when available, how much stale output was
+  discarded.
+
+### Changed
+
+- Browser renderers bound their pending xterm.js work by bytes, age, and frame count. When a
+  renderer cannot keep up, it drops obsolete queued redraws and reconnects from a fresh canonical
+  snapshot.
+- Server-side lag recovery now skips directly to the current canonical snapshot instead of
+  replaying retained output that is already stale.
+
+### Fixed
+
+- Websocket messages can no longer accumulate in an unbounded browser Promise chain while xterm.js
+  is throttled or parsing a redraw-heavy TUI.
+- A slow terminal consumer now converges on the current screen instead of repeatedly falling
+  further behind while replaying old deltas.
+- Terminal stream disconnects are visible outside the pane instead of being represented only by
+  the small connection dot.
+
+### Upgrade notes
+
+- There are no breaking changes, configuration changes, data migrations, or broker protocol
+  changes.
+- The browser-side recovery takes effect after the updated client loads. Restart the session broker
+  from Settings at a convenient time to apply server-side snapshot recovery to existing
+  installations; restarting the broker closes open terminals.
+- The release is safe for automatic installation over `0.7.1`.
+
 ## 0.7.1 - 2026-07-30
 
 Live terminal previews can now be disabled and tuned for each browser.
