@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.7.4 - 2026-07-31
+
+Compatible updates now preserve existing terminal sessions, and Linux Chromium browsers no longer
+duplicate or interleave typed characters.
+
+### Added
+
+- Terminal headers and Settings identify terminals connected to an older session broker generation.
+
+### Changed
+
+- Compatible session broker builds coexist during updates. Existing terminals stay on their
+  original broker, new terminals use the current build, and drained brokers exit after their final
+  terminal closes.
+- Cloning, rename and remove operations, process inspection, WebSocket routing, Pi settings, and
+  duplicate-name checks work across broker generations.
+- Protocol-incompatible upgrades retain the existing forced-restart behavior.
+
+### Fixed
+
+- Linux Chromium keyboard event sequences no longer send both a handled `keydown` and its matching
+  `keypress` to the terminal, preventing duplicated or interleaved input.
+
+### Upgrade notes
+
+- There are no breaking changes, configuration changes, data migrations, or broker protocol
+  changes.
+- Automatic installation over `0.7.3` is safe. Existing terminals continue on the previous broker
+  until they close, while new terminals use `0.7.4`.
+- Reload the browser client to apply the keyboard input fix.
+
 ## 0.7.3 - 2026-07-31
 
 Codex and similar normal-screen TUIs now keep their transcript intact when a browser renderer

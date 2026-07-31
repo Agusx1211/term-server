@@ -1,6 +1,6 @@
 [package]
 name = "term-server"
-version = "0.7.3"
+version = "0.7.4"
 edition = "2024"
 description = "A fast, secure, web-based terminal workspace"
 license = "MIT"
