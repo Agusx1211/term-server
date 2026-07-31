@@ -12,7 +12,7 @@ use std::{
 use axum_server::Handle;
 use clap::Parser;
 #[cfg(unix)]
-use term_server::broker::{BrokerClient, run_session_broker};
+use term_server::broker::{BrokerClient, BrokerPool, legacy_socket_path, run_session_broker};
 use term_server::{
     activity_view::ActivityViewService,
     agent_events::read_hook_event,
@@ -50,7 +50,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cli.session_broker {
         #[cfg(unix)]
         {
-            return run_session_broker(&cli.data_dir, cli.shell.clone(), cli.replay_bytes()).await;
+            let socket = cli
+                .broker_socket
+                .clone()
+                .unwrap_or_else(|| legacy_socket_path(&cli.data_dir));
+            return run_session_broker(
+                &cli.data_dir,
+                &socket,
+                cli.shell.clone(),
+                cli.replay_bytes(),
+            )
+            .await;
         }
         #[cfg(not(unix))]
         return Err("the terminal session broker requires Unix sockets".into());
@@ -173,7 +183,7 @@ async fn load_workspace(
     executable: &Path,
 ) -> Result<WorkspaceBackend, Box<dyn std::error::Error>> {
     Ok(WorkspaceBackend::broker(
-        BrokerClient::connect_or_start(cli, executable).await?,
+        BrokerPool::connect_or_start(cli, executable).await?,
     ))
 }
 

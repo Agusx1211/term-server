@@ -1697,6 +1697,7 @@ mod tests {
             commit: "old".to_owned(),
             sessions: 2,
             restart_required: true,
+            generations: vec![],
         };
         assert!(matches!(
             validate_broker_restart(&broker, false),
@@ -1722,6 +1723,7 @@ mod tests {
             commit: build::COMMIT.to_owned(),
             sessions: 0,
             restart_required: false,
+            generations: vec![],
         };
         assert!(matches!(
             validate_broker_restart(&broker, false),
