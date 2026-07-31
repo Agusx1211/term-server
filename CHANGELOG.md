@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.7.5 - 2026-07-31
+
+Terminal pages left open across the `0.5.0` to `0.6.0` stream protocol transition now stop
+cleanly instead of rendering binary frame metadata as typed characters.
+
+### Changed
+
+- Browser terminal and live-preview WebSockets identify support for framed terminal output.
+- The `0.7.4` keypress workaround has been removed. xterm.js handles keyboard events directly
+  again because the reported character interleaving came from a stale stream client, not duplicate
+  Linux keyboard events.
+
+### Fixed
+
+- Servers reject incompatible browser clients before sending framed terminal output, preventing
+  sequence bytes such as `H`, `I`, `J`, and `K` from appearing between typed characters.
+- A stale browser page now receives an upgrade-required response instead of silently corrupting
+  terminal output after a server update.
+
+### Upgrade notes
+
+- There are no configuration changes, data migrations, or session broker protocol changes.
+- Automatic installation over `0.7.4` is safe and existing terminal sessions remain open.
+- Browser tabs opened before the update must be reloaded once. Incompatible tabs now disconnect
+  instead of rendering corrupted terminal output.
+
 ## 0.7.4 - 2026-07-31
 
 Compatible updates now preserve existing terminal sessions, and Linux Chromium browsers no longer
