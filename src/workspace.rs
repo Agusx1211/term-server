@@ -19,6 +19,8 @@ use crate::{
     terminal_state::{SequencedOutput, SyncMode, TerminalSync},
 };
 
+pub(crate) const TERMINAL_STREAM_PROTOCOL: u8 = 1;
+
 const TERMINAL_FRAME_HEADER_BYTES: usize = 9;
 const TERMINAL_FRAME_PAYLOAD_BYTES: usize = 60 * 1024;
 const TERMINAL_FRAME_SNAPSHOT: u8 = 0;
@@ -292,6 +294,7 @@ pub(crate) struct TerminalSocketQuery {
     cols: Option<u16>,
     rows: Option<u16>,
     sequence: Option<u64>,
+    stream: Option<u8>,
     #[serde(default)]
     observer: bool,
 }
@@ -303,6 +306,10 @@ impl TerminalSocketQuery {
 
     pub(crate) fn sequence(&self) -> Option<u64> {
         self.sequence
+    }
+
+    pub(crate) fn stream_protocol(&self) -> Option<u8> {
+        self.stream
     }
 
     pub(crate) fn observer(&self) -> bool {

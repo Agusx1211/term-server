@@ -56,7 +56,7 @@ import {
   MIN_TERMINAL_FONT_SIZE,
   terminalZoomPercent,
 } from "../lib/terminal-zoom";
-import { closeTerminalSocket } from "../lib/terminal-socket";
+import { addTerminalStreamProtocol, closeTerminalSocket } from "../lib/terminal-socket";
 import {
   TERMINAL_FRAME_OUTPUT,
   TerminalRenderBacklog,
@@ -402,7 +402,9 @@ export function TerminalPane({
       term.options.disableStdin = true;
       setConnection(recoveringOutput ? "recovering" : "connecting");
       const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-      const url = new URL(`${protocol}//${location.host}/api/terminals/${terminal.id}/socket`);
+      const url = addTerminalStreamProtocol(
+        new URL(`${protocol}//${location.host}/api/terminals/${terminal.id}/socket`),
+      );
       const size = proposedViewport();
       if (size) {
         url.searchParams.set("cols", String(size.cols));
