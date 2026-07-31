@@ -732,6 +732,7 @@ mod tests {
                     TungsteniteMessage::Text(text) => {
                         let value = serde_json::from_str::<serde_json::Value>(&text).unwrap();
                         if value["type"] == "sync" {
+                            assert_eq!(value["mode"], "snapshot");
                             resynchronized = true;
                         }
                     }

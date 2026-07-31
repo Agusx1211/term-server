@@ -611,8 +611,13 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
   background: color-mix(in srgb, var(--artifact) 14%, var(--panel));
 }
 .connection { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); }
-.connection.connecting { background: #d29922; }
+.connection.connecting, .connection.recovering { background: #d29922; }
 .connection.disconnected, .connection.exited { background: var(--danger); }
+.pane-stream-status {
+  height: 18px; flex: none; display: inline-flex; align-items: center; gap: 4px; padding: 0 5px;
+  border-radius: 3px; background: color-mix(in srgb, #d29922 14%, transparent); color: #d29922;
+  font-size: 8.5px; font-weight: 700; letter-spacing: .025em; text-transform: uppercase;
+}
 .pane-spacer { flex: 1; }
 .pane-action { width: 24px; height: 23px; border-radius: 3px; color: var(--muted); }
 .pane-action.active { background: var(--selected); color: var(--foreground); }
@@ -921,6 +926,8 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
 .statusbar-right { margin-left: auto; justify-content: flex-end; }
 .statusbar-host { padding-left: 10px; border-left: 1px solid color-mix(in srgb, currentColor 28%, transparent); }
 .statusbar-build { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.statusbar-stream-issue { color: #e3b341; }
+.statusbar-stream-issue.disconnected { color: #f47067; }
 
 .loading-screen { height: 100%; display: flex; align-items: center; justify-content: center; gap: 10px; background: var(--editor); color: var(--muted); }
 .login-shell { height: 100%; overflow: auto; display: grid; place-items: center; padding: 28px; background: radial-gradient(circle at 50% 25%, color-mix(in srgb, var(--accent) 10%, var(--editor)), var(--editor) 48%); }

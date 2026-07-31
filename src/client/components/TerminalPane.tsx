@@ -17,6 +17,7 @@ import {
   Maximize2,
   PackageOpen,
   Radio,
+  RefreshCw,
   Search,
   TerminalSquare,
   Trash2,
@@ -54,7 +55,14 @@ import {
   terminalZoomPercent,
 } from "../lib/terminal-zoom";
 import { closeTerminalSocket } from "../lib/terminal-socket";
-import { TerminalStreamState, decodeTerminalFrame } from "../lib/terminal-stream";
+import {
+  TERMINAL_FRAME_OUTPUT,
+  TerminalRenderBacklog,
+  TerminalStreamState,
+  decodeTerminalFrame,
+  type TerminalFrame,
+  type TerminalStreamIssue,
+} from "../lib/terminal-stream";
 import {
   mixedTerminalBackground,
   terminalTheme,
@@ -80,6 +88,7 @@ interface TerminalPaneProps {
   onDragEnd: () => void;
   onExit: () => void;
   onUpdate: (terminal: TerminalInfo) => void;
+  onStreamIssue: (issue?: TerminalStreamIssue) => void;
   onNotice: (message: string) => void;
   onFontSizeChange: (fontSize: number) => void;
   onOpenFile: (target: FileTarget) => void;
@@ -140,6 +149,7 @@ export function TerminalPane({
   onDragEnd,
   onExit,
   onUpdate,
+  onStreamIssue,
   onNotice,
   onFontSizeChange,
   onOpenFile,
@@ -158,9 +168,11 @@ export function TerminalPane({
   const reportTerminalViewport = useRef<() => void>();
   const terminalState = useRef(terminal);
   const openFile = useRef(onOpenFile);
+  const streamIssue = useRef(onStreamIssue);
   const modifiers = useRef<TerminalModifiers>(NO_TERMINAL_MODIFIERS);
   terminalState.current = terminal;
   openFile.current = onOpenFile;
+  streamIssue.current = onStreamIssue;
   const [processesOpen, setProcessesOpen] = useState(false);
   const knownArtifactIds = useRef(new Set(artifacts.map((artifact) => artifact.id)));
   const [artifactsOpen, setArtifactsOpen] = useState(artifacts.length > 0);
@@ -172,7 +184,9 @@ export function TerminalPane({
   const [scrolledBack, setScrolledBack] = useState(false);
   const [imagePreview, setImagePreview] = useState<{ file: FileEntry; left: number; top: number }>();
   const [terminalSize, setTerminalSize] = useState({ focused: false, controller: false });
-  const [connection, setConnection] = useState<"connecting" | "connected" | "disconnected" | "exited">(
+  const [connection, setConnection] = useState<
+    "connecting" | "connected" | "recovering" | "disconnected" | "exited"
+  >(
     terminal.status === "exited" ? "exited" : "connecting",
   );
   const artifactSignature = artifacts.map((artifact) => artifact.id).join("\u0000");
@@ -291,11 +305,21 @@ export function TerminalPane({
       if (socket.current?.readyState === WebSocket.OPEN) socket.current.send(JSON.stringify(message));
     };
     const stream = new TerminalStreamState();
+    const backlog = new TerminalRenderBacklog();
     let acceptingInput = false;
     let parsingOutput = false;
     let responder = false;
     let messageQueue = Promise.resolve();
     let lastServerMessage = Date.now();
+    let hasSynced = false;
+    let recoveringOutput = false;
+    let reportedIssue = "";
+    const reportStreamIssue = (issue?: TerminalStreamIssue) => {
+      const key = issue ? `${issue.kind}:${issue.pendingBytes ?? 0}` : "";
+      if (key === reportedIssue) return;
+      reportedIssue = key;
+      streamIssue.current(issue);
+    };
     const proposedViewport = () => {
       if (!container.current?.clientWidth || !container.current.clientHeight) return;
       try {
@@ -370,7 +394,7 @@ export function TerminalPane({
       if (disposed || exited.current) return;
       acceptingInput = false;
       term.options.disableStdin = true;
-      setConnection("connecting");
+      setConnection(recoveringOutput ? "recovering" : "connecting");
       const protocol = location.protocol === "https:" ? "wss:" : "ws:";
       const url = new URL(`${protocol}//${location.host}/api/terminals/${terminal.id}/socket`);
       const size = proposedViewport();
@@ -382,6 +406,24 @@ export function TerminalPane({
       if (resumeSequence !== undefined) url.searchParams.set("sequence", String(resumeSequence));
       const next = new WebSocket(url);
       let protocolFailed = false;
+      let abandoned = false;
+      const failProtocol = (error: unknown) => {
+        if (protocolFailed || abandoned) return;
+        protocolFailed = true;
+        acceptingInput = false;
+        term.options.disableStdin = true;
+        onNotice(error instanceof Error ? error.message : "Invalid terminal stream");
+        closeTerminalSocket(next, "protocol-error");
+      };
+      const recoverBacklog = () => {
+        abandoned = true;
+        recoveringOutput = true;
+        acceptingInput = false;
+        term.options.disableStdin = true;
+        reportStreamIssue({ kind: "recovering", pendingBytes: backlog.pendingBytes });
+        setConnection("recovering");
+        closeTerminalSocket(next, "backlog");
+      };
       next.binaryType = "arraybuffer";
       socket.current = next;
       next.addEventListener("open", () => {
@@ -389,52 +431,80 @@ export function TerminalPane({
         reportViewport();
       });
       next.addEventListener("message", (event) => {
-        if (protocolFailed) return;
+        if (protocolFailed || abandoned) return;
         lastServerMessage = Date.now();
-        messageQueue = messageQueue.then(async () => {
-          if (protocolFailed) return;
-          const binary = event.data instanceof Blob ? await event.data.arrayBuffer() : event.data;
-          if (binary instanceof ArrayBuffer) {
-            const frame = decodeTerminalFrame(binary);
-            const commit = stream.accept(frame);
-            await writeTerminal(frame.data, commit);
+        let eagerFrame: TerminalFrame | undefined;
+        let queuedBytes = 0;
+        if (event.data instanceof ArrayBuffer) {
+          try {
+            eagerFrame = decodeTerminalFrame(event.data);
+          } catch (error) {
+            failProtocol(error);
             return;
           }
-          const message = JSON.parse(String(event.data)) as ServerTerminalMessage;
-          if (message.type === "ready") onUpdate(message.terminal);
-          if (message.type === "size") {
-            term.resize(message.cols, message.rows);
-            responder = message.responder;
-            setTerminalSize({ focused: message.focused, controller: message.controller });
+          if (eagerFrame.kind === TERMINAL_FRAME_OUTPUT) {
+            queuedBytes = eagerFrame.data.byteLength;
+            if (backlog.enqueue(queuedBytes)) {
+              recoverBacklog();
+              return;
+            }
           }
-          if (message.type === "sync") {
-            acceptingInput = false;
-            term.options.disableStdin = true;
-            if (stream.begin(message.mode, message.sequence)) term.reset();
+        }
+        messageQueue = messageQueue.then(async () => {
+          try {
+            if (protocolFailed || abandoned) return;
+            const binary = event.data instanceof Blob ? await event.data.arrayBuffer() : event.data;
+            if (binary instanceof ArrayBuffer) {
+              const frame = eagerFrame ?? decodeTerminalFrame(binary);
+              const commit = stream.accept(frame);
+              await writeTerminal(frame.data, commit);
+              return;
+            }
+            const message = JSON.parse(String(event.data)) as ServerTerminalMessage;
+            if (message.type === "ready") onUpdate(message.terminal);
+            if (message.type === "size") {
+              term.resize(message.cols, message.rows);
+              responder = message.responder;
+              setTerminalSize({ focused: message.focused, controller: message.controller });
+            }
+            if (message.type === "sync") {
+              acceptingInput = false;
+              term.options.disableStdin = true;
+              if (hasSynced && !recoveringOutput) {
+                recoveringOutput = true;
+                reportStreamIssue({ kind: "recovering" });
+              }
+              if (hasSynced || recoveringOutput) {
+                setConnection("recovering");
+              }
+              if (stream.begin(message.mode, message.sequence)) term.reset();
+            }
+            if (message.type === "synced") {
+              stream.finish(message.sequence);
+              hasSynced = true;
+              recoveringOutput = false;
+              acceptingInput = true;
+              term.options.disableStdin = false;
+              attempts = 0;
+              reportStreamIssue();
+              setConnection("connected");
+              reportViewport();
+              term.focus();
+            }
+            if (message.type === "exit") {
+              exited.current = true;
+              acceptingInput = false;
+              term.options.disableStdin = true;
+              reportStreamIssue();
+              setConnection("exited");
+              onExit();
+            }
+            if (message.type === "error") onNotice(message.message);
+          } finally {
+            backlog.settle(queuedBytes);
           }
-          if (message.type === "synced") {
-            stream.finish(message.sequence);
-            acceptingInput = true;
-            term.options.disableStdin = false;
-            attempts = 0;
-            setConnection("connected");
-            reportViewport();
-            term.focus();
-          }
-          if (message.type === "exit") {
-            exited.current = true;
-            acceptingInput = false;
-            term.options.disableStdin = true;
-            setConnection("exited");
-            onExit();
-          }
-          if (message.type === "error") onNotice(message.message);
         }).catch((error) => {
-          protocolFailed = true;
-          acceptingInput = false;
-          term.options.disableStdin = true;
-          onNotice(error instanceof Error ? error.message : "Invalid terminal stream");
-          closeTerminalSocket(next, "protocol-error");
+          failProtocol(error);
         });
       });
       next.addEventListener("close", () => {
@@ -443,11 +513,19 @@ export function TerminalPane({
         term.options.disableStdin = true;
         if (socket.current === next) socket.current = undefined;
         setTerminalSize({ focused: false, controller: false });
-        setConnection("disconnected");
+        if (!recoveringOutput) {
+          reportStreamIssue({ kind: "reconnecting" });
+          setConnection("disconnected");
+        }
         attempts += 1;
         void messageQueue.then(() => {
           if (disposed || exited.current) return;
-          reconnectTimer.current = window.setTimeout(connect, Math.min(5000, 250 * 2 ** attempts));
+          backlog.reset();
+          if (recoveringOutput) stream.restart();
+          reconnectTimer.current = window.setTimeout(
+            connect,
+            recoveringOutput ? 0 : Math.min(5000, 250 * 2 ** attempts),
+          );
         });
       });
       next.addEventListener("error", () => next.close());
@@ -480,6 +558,7 @@ export function TerminalPane({
       scrollDisposable.dispose();
       fileLinksDisposable.dispose();
       searchResultsDisposable.dispose();
+      reportStreamIssue();
       socket.current?.close(1000, "Pane closed");
       socket.current = undefined;
       reportTerminalViewport.current = undefined;
@@ -704,6 +783,11 @@ export function TerminalPane({
           </button>
         )}
         <span class={`connection ${connection}`} title={connection} />
+        {connection === "recovering" && (
+          <span class="pane-stream-status" title="Loading the current terminal state after falling behind or reconnecting">
+            <RefreshCw class="spin" size={11} /> Catching up
+          </span>
+        )}
         <span class="pane-spacer" />
         <span class="desktop-pane-actions">
           <button
