@@ -196,6 +196,7 @@ impl DeltaBuffer {
 
 struct CanonicalTerminal {
     parser: vt100::Parser,
+    scrollback_rows: usize,
     normal_before_alt: Option<vt100::Screen>,
     alternate_entry: Option<AlternateEntry>,
     sequence: EscapeSequence,
@@ -206,6 +207,7 @@ impl CanonicalTerminal {
     fn new(rows: u16, cols: u16, scrollback_rows: usize) -> Self {
         Self {
             parser: vt100::Parser::new(rows, cols, scrollback_rows),
+            scrollback_rows,
             normal_before_alt: None,
             alternate_entry: None,
             sequence: EscapeSequence::Ground,
@@ -217,23 +219,27 @@ impl CanonicalTerminal {
         let mut start = 0;
         for (index, byte) in bytes.iter().copied().enumerate() {
             let completed = self.observe_byte(byte);
-            let Some(mode) = completed else {
+            let Some(sequence) = completed else {
                 continue;
             };
             self.parser.process(&bytes[start..index]);
-            if let Some(entry) = mode.entry()
+            if let Some(entry) = sequence.alternate_mode.entry()
                 && !self.parser.screen().alternate_screen()
             {
                 self.normal_before_alt = Some(self.parser.screen().clone());
                 self.alternate_entry = Some(entry);
             }
             self.parser.process(&bytes[index..=index]);
-            if mode == AlternateMode::Enter1047 {
+            if sequence.alternate_mode == AlternateMode::Enter1047 {
                 self.parser.process(b"\x1b[?47h");
-            } else if mode == AlternateMode::Exit1047 {
+            } else if sequence.alternate_mode == AlternateMode::Exit1047 {
                 self.parser.process(b"\x1b[?47l");
             }
-            if mode.exits_alternate() && !self.parser.screen().alternate_screen() {
+            if sequence.erase_scrollback && !self.parser.screen().alternate_screen() {
+                self.clear_scrollback();
+            }
+            if sequence.alternate_mode.exits_alternate() && !self.parser.screen().alternate_screen()
+            {
                 self.normal_before_alt = None;
                 self.alternate_entry = None;
             }
@@ -242,7 +248,7 @@ impl CanonicalTerminal {
         self.parser.process(&bytes[start..]);
     }
 
-    fn observe_byte(&mut self, byte: u8) -> Option<AlternateMode> {
+    fn observe_byte(&mut self, byte: u8) -> Option<CompletedSequence> {
         let was_tracking = self.sequence != EscapeSequence::Ground || !self.pending.is_empty();
         let was_ground = self.sequence == EscapeSequence::Ground;
         self.sequence = self.sequence.advance(byte);
@@ -261,7 +267,19 @@ impl CanonicalTerminal {
             return None;
         }
         let completed = std::mem::take(&mut self.pending);
-        Some(alternate_mode(&completed))
+        Some(CompletedSequence {
+            alternate_mode: alternate_mode(&completed),
+            erase_scrollback: erases_scrollback(&completed),
+        })
+    }
+
+    fn clear_scrollback(&mut self) {
+        // vt100 does not expose a saved-line purge. Replaying only the live
+        // state into a fresh parser preserves the screen and drops its history.
+        let (rows, cols) = self.parser.screen().size();
+        let visible_state = self.parser.screen().state_formatted();
+        self.parser = vt100::Parser::new(rows, cols, self.scrollback_rows);
+        self.parser.process(&visible_state);
     }
 
     fn resize(&mut self, rows: u16, cols: u16) {
@@ -295,6 +313,12 @@ impl CanonicalTerminal {
         snapshot.extend_from_slice(&self.pending);
         snapshot
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CompletedSequence {
+    alternate_mode: AlternateMode,
+    erase_scrollback: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -427,6 +451,10 @@ fn alternate_mode(sequence: &[u8]) -> AlternateMode {
         (b'l', 1049) => AlternateMode::Exit1049,
         _ => AlternateMode::None,
     }
+}
+
+fn erases_scrollback(sequence: &[u8]) -> bool {
+    matches!(sequence, b"\x1b[3J" | b"\x9b3J")
 }
 
 fn snapshot_screen(screen: &vt100::Screen) -> Vec<u8> {
@@ -571,6 +599,67 @@ mod tests {
         let mut reconstructed = vt100::Parser::new(3, 10, 20);
         reconstructed.process(&snapshot);
         assert_history_eq(reconstructed.screen(), terminal.parser.screen());
+    }
+
+    #[test]
+    fn top_anchored_scroll_region_preserves_history() {
+        let mut terminal = CanonicalTerminal::new(5, 20, 20);
+        terminal.process(b"\x1b[1;4r\x1b[4;1H");
+        for line in 0..8 {
+            terminal.process(format!("transcript {line}\r\n").as_bytes());
+        }
+
+        let mut screen = terminal.parser.screen().clone();
+        screen.set_scrollback(usize::MAX);
+        assert_eq!(screen.scrollback(), 8);
+        assert!(screen.contents().contains("transcript 0"));
+
+        let mut reconstructed = vt100::Parser::new(5, 20, 20);
+        reconstructed.process(&terminal.snapshot());
+        assert_history_eq(reconstructed.screen(), terminal.parser.screen());
+    }
+
+    #[test]
+    fn erase_saved_lines_keeps_the_visible_screen_and_input_modes() {
+        let mut terminal = CanonicalTerminal::new(3, 20, 20);
+        for line in 0..8 {
+            terminal.process(format!("old line {line}\r\n").as_bytes());
+        }
+        terminal.process(b"\x1b[31mvisible\x1b[?25l\x1b[?2004h");
+        let expected = terminal.parser.screen().clone();
+
+        terminal.process(b"\x1b[3J");
+
+        assert_screen_eq(terminal.parser.screen(), &expected);
+        let mut screen = terminal.parser.screen().clone();
+        screen.set_scrollback(usize::MAX);
+        assert_eq!(screen.scrollback(), 0);
+    }
+
+    #[test]
+    fn codex_resize_replay_replaces_old_history() {
+        let mut terminal = CanonicalTerminal::new(5, 20, 20);
+        terminal.process(b"\x1b[1;4r\x1b[4;1H");
+        for line in 0..6 {
+            terminal.process(format!("old transcript {line}\r\n").as_bytes());
+        }
+
+        terminal.process(b"\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[3");
+        terminal.process(b"J\x1b[H\x1b[1;4r\x1b[4;1H");
+        for line in 0..6 {
+            terminal.process(format!("new transcript {line}\r\n").as_bytes());
+        }
+
+        let snapshot = terminal.snapshot();
+        let mut reconstructed = vt100::Parser::new(5, 20, 20);
+        reconstructed.process(&snapshot);
+        assert_history_eq(reconstructed.screen(), terminal.parser.screen());
+
+        let mut screen = reconstructed.screen().clone();
+        screen.set_scrollback(usize::MAX);
+        assert_eq!(screen.scrollback(), 6);
+        assert!(!screen.contents().contains("old transcript"));
+        assert!(screen.contents().contains("new transcript 0"));
     }
 
     #[test]
