@@ -10,7 +10,7 @@ import {
   terminalPreviewFontSize,
   type TerminalPreviewMode,
 } from "../lib/terminal-preview";
-import { closeTerminalSocket } from "../lib/terminal-socket";
+import { addTerminalStreamProtocol, closeTerminalSocket } from "../lib/terminal-socket";
 import { TerminalStreamState, decodeTerminalFrame } from "../lib/terminal-stream";
 import {
   mixedTerminalBackground,
@@ -99,7 +99,9 @@ export function TerminalPreview({
     );
 
     const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-    const url = new URL(`${protocol}//${location.host}/api/terminals/${terminal.id}/socket`);
+    const url = addTerminalStreamProtocol(
+      new URL(`${protocol}//${location.host}/api/terminals/${terminal.id}/socket`),
+    );
     url.searchParams.set("observer", "true");
     const socket = new WebSocket(url);
     socket.binaryType = "arraybuffer";

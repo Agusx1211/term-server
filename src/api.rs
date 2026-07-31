@@ -51,8 +51,8 @@ use crate::{
     terminal::{CreateTerminal, RenameTerminal, TerminalError, TerminalInfo},
     update::{UpdateConfig, UpdateError, UpdateService, UpdateStatus},
     workspace::{
-        SessionBrokerInfo, SessionConnection, TerminalSocketQuery, WorkspaceBackend,
-        WorkspaceError, serve_terminal_socket,
+        SessionBrokerInfo, SessionConnection, TERMINAL_STREAM_PROTOCOL, TerminalSocketQuery,
+        WorkspaceBackend, WorkspaceError, serve_terminal_socket,
     },
 };
 #[cfg(unix)]
@@ -142,6 +142,8 @@ pub enum ApiError {
     #[error("{0}")]
     BadRequest(String),
     #[error("{0}")]
+    UpgradeRequired(String),
+    #[error("{0}")]
     Conflict(String),
     #[error("{0}")]
     PayloadTooLarge(String),
@@ -167,6 +169,7 @@ impl IntoResponse for ApiError {
                 (StatusCode::NOT_FOUND, None)
             }
             Self::BadRequest(_) => (StatusCode::BAD_REQUEST, None),
+            Self::UpgradeRequired(_) => (StatusCode::UPGRADE_REQUIRED, None),
             Self::Conflict(_) => (StatusCode::CONFLICT, None),
             Self::PayloadTooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, None),
             Self::BadGateway(_) => (StatusCode::BAD_GATEWAY, None),
@@ -1116,6 +1119,7 @@ async fn terminal_socket(
 ) -> Result<Response, ApiError> {
     require_origin(&headers, &uri, &state)?;
     require_auth(&jar, &state)?;
+    require_terminal_stream_protocol(query.stream_protocol())?;
     let observer = query.observer();
     let initial_size = if observer { None } else { query.viewport() };
     let sequence = query.sequence();
@@ -1139,6 +1143,15 @@ async fn terminal_socket(
                 }
             }
         }))
+}
+
+fn require_terminal_stream_protocol(protocol: Option<u8>) -> Result<(), ApiError> {
+    if protocol == Some(TERMINAL_STREAM_PROTOCOL) {
+        return Ok(());
+    }
+    Err(ApiError::UpgradeRequired(
+        "terminal client is out of date; reload the page".to_owned(),
+    ))
 }
 
 #[cfg(unix)]
@@ -1374,6 +1387,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn terminal_socket_rejects_outdated_stream_clients() {
+        for protocol in [None, Some(0), Some(2)] {
+            let error = require_terminal_stream_protocol(protocol).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "terminal client is out of date; reload the page"
+            );
+            assert_eq!(error.into_response().status(), StatusCode::UPGRADE_REQUIRED);
+        }
+        assert!(require_terminal_stream_protocol(Some(TERMINAL_STREAM_PROTOCOL)).is_ok());
     }
 
     #[tokio::test]

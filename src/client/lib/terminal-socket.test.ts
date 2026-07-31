@@ -1,5 +1,18 @@
 import { describe, expect, it, vi } from "vitest";
-import { closeTerminalSocket, type TerminalSocketCloseCause } from "./terminal-socket";
+import {
+  addTerminalStreamProtocol,
+  closeTerminalSocket,
+  TERMINAL_STREAM_PROTOCOL,
+  type TerminalSocketCloseCause,
+} from "./terminal-socket";
+
+describe("terminal stream negotiation", () => {
+  it("marks sockets as consumers of framed terminal output", () => {
+    const url = addTerminalStreamProtocol(new URL("wss://terminal.test/api/terminals/1/socket"));
+
+    expect(url.searchParams.get("stream")).toBe(String(TERMINAL_STREAM_PROTOCOL));
+  });
+});
 
 describe("terminal WebSocket close handling", () => {
   it.each([
