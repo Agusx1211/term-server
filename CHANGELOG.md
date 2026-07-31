@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.7.3 - 2026-07-31
+
+Codex and similar normal-screen TUIs now keep their transcript intact when a browser renderer
+recovers after a resize or a period in the background.
+
+### Changed
+
+- Canonical terminal state now follows xterm behavior when a TUI scrolls a top-anchored region
+  while keeping a composer, status bar, or footer fixed.
+
+### Fixed
+
+- Snapshot recovery preserves rows inserted through a partial scroll region instead of returning
+  only the current viewport.
+- `CSI 3J` clears saved lines in canonical state, so a TUI resize replay replaces stale history
+  instead of retaining or duplicating it.
+- Codex resize replay remains reconstructable when its clear sequence is split across output
+  frames.
+
+### Upgrade notes
+
+- There are no breaking changes, configuration changes, data migrations, or broker protocol
+  changes.
+- Restart the session broker from Settings at a convenient time to apply the canonical terminal
+  fix to existing sessions; restarting the broker closes open terminals.
+- The release is safe for automatic installation over `0.7.2`.
+
 ## 0.7.2 - 2026-07-31
 
 High-frequency TUIs no longer leave background terminal panes replaying stale redraws
