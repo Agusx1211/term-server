@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use bytes::Bytes;
 
 const DELTA_BUDGET_DIVISOR: usize = 4;
+const MIN_RESERVED_VIEWPORT_COLS: usize = 128;
 const MAX_VIEWPORT_COLS: usize = 500;
 const CELL_BYTES: usize = std::mem::size_of::<vt100::Cell>();
 const MAX_PENDING_SEQUENCE_BYTES: usize = 64 * 1024;
@@ -47,6 +48,7 @@ pub struct TerminalSync {
 pub struct TerminalOutputState {
     sequence: u64,
     delta: DeltaBuffer,
+    state_bytes: usize,
     terminal: CanonicalTerminal,
     exit_code: Option<u32>,
 }
@@ -55,11 +57,11 @@ impl TerminalOutputState {
     pub fn new(maximum_bytes: usize, rows: u16, cols: u16) -> Self {
         let delta_bytes = (maximum_bytes / DELTA_BUDGET_DIVISOR).max(64 * 1024);
         let state_bytes = maximum_bytes.saturating_sub(delta_bytes);
-        let scrollback_rows = state_bytes / (MAX_VIEWPORT_COLS * CELL_BYTES);
         Self {
             sequence: 0,
             delta: DeltaBuffer::new(delta_bytes),
-            terminal: CanonicalTerminal::new(rows, cols, scrollback_rows),
+            state_bytes,
+            terminal: CanonicalTerminal::new(rows, cols, scrollback_capacity(state_bytes, cols)),
             exit_code: None,
         }
     }
@@ -76,7 +78,8 @@ impl TerminalOutputState {
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
-        self.terminal.resize(rows, cols);
+        self.terminal
+            .resize(rows, cols, scrollback_capacity(self.state_bytes, cols));
     }
 
     pub fn sync(&self, requested_sequence: Option<u64>) -> TerminalSync {
@@ -282,7 +285,14 @@ impl CanonicalTerminal {
         self.parser.process(&visible_state);
     }
 
-    fn resize(&mut self, rows: u16, cols: u16) {
+    fn resize(&mut self, rows: u16, cols: u16, scrollback_rows: usize) {
+        if self.scrollback_rows != scrollback_rows {
+            let (current_rows, current_cols) = self.parser.screen().size();
+            let snapshot = self.snapshot();
+            let mut resized = Self::new(current_rows, current_cols, scrollback_rows);
+            resized.process(&snapshot);
+            *self = resized;
+        }
         self.parser.screen_mut().set_size(rows, cols);
         if let Some(normal) = self.normal_before_alt.as_mut() {
             normal.set_size(rows, cols);
@@ -457,6 +467,13 @@ fn erases_scrollback(sequence: &[u8]) -> bool {
     matches!(sequence, b"\x1b[3J" | b"\x9b3J")
 }
 
+fn scrollback_capacity(state_bytes: usize, cols: u16) -> usize {
+    let reserved_cols = usize::from(cols)
+        .next_power_of_two()
+        .clamp(MIN_RESERVED_VIEWPORT_COLS, MAX_VIEWPORT_COLS);
+    state_bytes / (reserved_cols * CELL_BYTES)
+}
+
 fn snapshot_screen(screen: &vt100::Screen) -> Vec<u8> {
     let mut source = screen.clone();
     source.set_scrollback(usize::MAX);
@@ -571,6 +588,42 @@ mod tests {
         assert_eq!(old.mode, SyncMode::Snapshot);
         assert!(old.output.is_empty());
         assert!(old.snapshot.unwrap().len() < 4 * 1024);
+    }
+
+    #[test]
+    fn default_reconnect_budget_retains_typical_terminal_history() {
+        let mut state = TerminalOutputState::new(16 * 1024 * 1024, 10, 100);
+        for line in 0..2_000 {
+            state.publish(Bytes::from(format!("away-{line:04}\r\n")));
+        }
+
+        let snapshot = state.sync(None).snapshot.unwrap();
+        let mut reconstructed = vt100::Parser::new(10, 100, 200_000);
+        reconstructed.process(&snapshot);
+        reconstructed.screen_mut().set_scrollback(usize::MAX);
+
+        assert!(reconstructed.screen().contents().contains("away-0000"));
+    }
+
+    #[test]
+    fn resize_rebalances_scrollback_within_the_state_budget() {
+        let mut state = TerminalOutputState::new(16 * 1024 * 1024, 10, 100);
+        let initial_capacity = state.terminal.scrollback_rows;
+        for line in 0..2_000 {
+            state.publish(Bytes::from(format!("line-{line:04}\r\n")));
+        }
+
+        state.resize(10, 500);
+
+        assert!(state.terminal.scrollback_rows < initial_capacity);
+        assert_eq!(
+            state.terminal.scrollback_rows,
+            scrollback_capacity(state.state_bytes, 500)
+        );
+        let snapshot = state.sync(None).snapshot.unwrap();
+        let mut reconstructed = vt100::Parser::new(10, 500, 200_000);
+        reconstructed.process(&snapshot);
+        assert!(reconstructed.screen().contents().contains("line-1999"));
     }
 
     #[test]
