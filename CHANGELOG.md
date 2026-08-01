@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.7.6 - 2026-08-01
+
+Terminals reopened after the browser was closed now retain substantially more of the output produced
+while no renderer was connected.
+
+### Changed
+
+- Canonical reconnect history is sized from the terminal's actual width in bounded buckets instead
+  of reserving every row for the maximum 500-column viewport.
+- Width changes rebalance retained history so typical terminals gain capacity without exceeding the
+  configured reconnect-state memory budget.
+
+### Fixed
+
+- A fresh browser connection no longer loses most detached terminal output because of an overly
+  conservative server-side row limit. With the default 16 MiB budget, a typical terminal now keeps
+  about four times as many reconnect-history rows.
+
+### Upgrade notes
+
+- There are no breaking changes, configuration changes, data migrations, or session broker protocol
+  changes.
+- Automatic installation over `0.7.5` is safe. Existing terminals continue on their current broker
+  generation and keep its previous history limit; newly created terminals use the expanded reconnect
+  history immediately.
+
 ## 0.7.5 - 2026-07-31
 
 Terminal pages left open across the `0.5.0` to `0.6.0` stream protocol transition now stop
