@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.8.0 - 2026-08-03
+
+Terminal rendering and interaction now remain stable across resizes, reconnects, background panes,
+and demanding full-screen terminal applications.
+
+### Added
+
+- Browser terminals use a generated Unicode 17 width table that exactly matches the server's
+  canonical terminal, including combining characters and modern emoji.
+- The server answers standard terminal identity, status, cursor-position, mode, and window-size
+  queries even while no browser renderer is connected.
+- Development servers now start with an isolated temporary data directory and session broker by
+  default, protecting the production instance on the same machine.
+
+### Changed
+
+- Canonical reconnect state reflows complete logical lines and preserves scroll margins, origin and
+  insert modes, saved cursors and attributes, alternate-screen state, split UTF-8 input, and pending
+  autowrap.
+- Terminal input uses bounded asynchronous writes and raw WebSocket frames, allowing mouse reports
+  and large pastes without blocking the runtime or corrupting bytes.
+- Hidden cached panes detach from their terminal streams and reconnect when shown. Viewport updates
+  now settle before resize and include cell-grid pixel dimensions.
+- Live previews account for every framed output byte before acknowledging their backlog.
+- WebSocket streams have bounded send times and liveness leases, and the container image now
+  includes a UTF-8 locale and common terminal definitions.
+
+### Fixed
+
+- Resizing or reconnecting no longer loses, shifts, duplicates, or incorrectly unwraps text,
+  including content inside scrolling regions and alternate-screen TUIs.
+- Real keystrokes and paste data are no longer dropped while xterm.js is parsing output, and binary
+  mouse input is forwarded without UTF-8 conversion.
+- Browser and server character widths no longer drift on emoji, combining marks, or newer Unicode
+  code points.
+- Output and resize events can no longer be reordered, interrupted PTY reads no longer look like
+  EOF, and slow PTY writes no longer block unrelated terminal work.
+- Background panes no longer steal focus or accumulate stale output, and resize storms are
+  coalesced.
+- SGR true-color sequences containing zero-valued RGB components no longer reset terminal
+  attributes, and cursor-position reports respect origin mode.
+
+### Upgrade notes
+
+- This release intentionally advances the session broker protocol. Updating closes existing
+  terminal sessions; no configuration or data migration is required.
+- Browser terminal stream compatibility also advances. Tabs opened before the update must be
+  reloaded once and will disconnect cleanly instead of sending duplicate query responses.
+- Automatic installation over `0.7.6` is otherwise safe. Newly opened terminals use the corrected
+  rendering, input, and reconnect behavior immediately.
+
 ## 0.7.6 - 2026-08-01
 
 Terminals reopened after the browser was closed now retain substantially more of the output produced

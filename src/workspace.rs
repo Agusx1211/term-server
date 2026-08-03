@@ -1,10 +1,10 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     extract::ws::{Message, WebSocket},
     http::StatusCode,
 };
-use futures_util::{SinkExt, StreamExt, stream::SplitSink};
+use futures_util::{Sink, SinkExt, StreamExt, stream::SplitSink};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -13,18 +13,23 @@ use crate::{
     ai::{PiClientConfig, PiService, UpdatePiSettings},
     terminal::{
         CreateTerminal, ProcessInspectorSnapshot, ProcessSignalError, RenameTerminal,
-        TerminalEvent, TerminalInfo, TerminalManager, TerminalSession, TerminalSizeState,
-        terminate_descendant_process,
+        TerminalError, TerminalEvent, TerminalInfo, TerminalManager, TerminalSession,
+        TerminalSizeState, TerminalViewport, terminate_descendant_process,
     },
     terminal_state::{SequencedOutput, SyncMode, TerminalSync},
 };
 
-pub(crate) const TERMINAL_STREAM_PROTOCOL: u8 = 1;
+pub(crate) const TERMINAL_STREAM_PROTOCOL: u8 = 2;
 
 const TERMINAL_FRAME_HEADER_BYTES: usize = 9;
 const TERMINAL_FRAME_PAYLOAD_BYTES: usize = 60 * 1024;
 const TERMINAL_FRAME_SNAPSHOT: u8 = 0;
 const TERMINAL_FRAME_OUTPUT: u8 = 1;
+const TERMINAL_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+const TERMINAL_INPUT_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+const TERMINAL_INPUT_RETRY_INTERVAL: Duration = Duration::from_millis(5);
+const TERMINAL_CLIENT_LEASE: Duration = Duration::from_secs(90);
+const TERMINAL_LEASE_CHECK_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -243,7 +248,7 @@ impl WorkspaceBackend {
     pub async fn connect_terminal(
         &self,
         id: Uuid,
-        initial_size: Option<(u16, u16)>,
+        initial_size: Option<TerminalViewport>,
         sequence: Option<u64>,
         observer: bool,
     ) -> Result<SessionConnection, WorkspaceError> {
@@ -293,6 +298,10 @@ fn process_signal_error(error: ProcessSignalError) -> WorkspaceError {
 pub(crate) struct TerminalSocketQuery {
     cols: Option<u16>,
     rows: Option<u16>,
+    #[serde(rename = "pixelWidth")]
+    pixel_width: Option<u16>,
+    #[serde(rename = "pixelHeight")]
+    pixel_height: Option<u16>,
     sequence: Option<u64>,
     stream: Option<u8>,
     #[serde(default)]
@@ -300,8 +309,15 @@ pub(crate) struct TerminalSocketQuery {
 }
 
 impl TerminalSocketQuery {
-    pub(crate) fn viewport(&self) -> Option<(u16, u16)> {
-        self.cols.zip(self.rows)
+    pub(crate) fn viewport(&self) -> Option<TerminalViewport> {
+        self.cols.zip(self.rows).map(|(cols, rows)| {
+            TerminalViewport::new(
+                cols,
+                rows,
+                self.pixel_width.unwrap_or(0),
+                self.pixel_height.unwrap_or(0),
+            )
+        })
     }
 
     pub(crate) fn sequence(&self) -> Option<u64> {
@@ -320,9 +336,20 @@ impl TerminalSocketQuery {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum TerminalClientMessage {
-    Input { data: String },
-    Resize { cols: u16, rows: u16 },
-    Focus { focused: bool },
+    Input {
+        data: String,
+    },
+    Resize {
+        cols: u16,
+        rows: u16,
+        #[serde(rename = "pixelWidth", default)]
+        pixel_width: u16,
+        #[serde(rename = "pixelHeight", default)]
+        pixel_height: u16,
+    },
+    Focus {
+        focused: bool,
+    },
     Ping,
 }
 
@@ -380,7 +407,7 @@ fn size_message(state: TerminalSizeState, client_id: Uuid) -> TerminalServerMess
 pub(crate) async fn serve_terminal_socket(
     mut socket: WebSocket,
     terminal: Arc<TerminalSession>,
-    initial_size: Option<(u16, u16)>,
+    initial_size: Option<TerminalViewport>,
     requested_sequence: Option<u64>,
     observer: bool,
 ) {
@@ -402,7 +429,10 @@ pub(crate) async fn serve_terminal_socket(
         terminal: Box::new(terminal.info()),
     })
     .expect("serializable terminal");
-    if socket.send(Message::Text(ready.into())).await.is_err() {
+    if send_socket_message(&mut socket, Message::Text(ready.into()))
+        .await
+        .is_err()
+    {
         return;
     }
     let (mut sender, mut receiver) = socket.split();
@@ -411,8 +441,17 @@ pub(crate) async fn serve_terminal_socket(
     else {
         return;
     };
+    let mut last_client_message = tokio::time::Instant::now();
+    let mut lease_check = tokio::time::interval(TERMINAL_LEASE_CHECK_INTERVAL);
+    lease_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
+            _ = lease_check.tick() => {
+                if last_client_message.elapsed() > TERMINAL_CLIENT_LEASE {
+                    tracing::debug!(%client_id, "terminal client lease expired");
+                    break;
+                }
+            }
             event = events.recv() => {
                 match event {
                     Ok(TerminalEvent::Output(output)) => {
@@ -448,13 +487,13 @@ pub(crate) async fn serve_terminal_socket(
                     Ok(TerminalEvent::Exit(exit_code)) => {
                         let message = serde_json::to_string(&TerminalServerMessage::Exit { exit_code })
                             .expect("serializable exit");
-                        let _ = sender.send(Message::Text(message.into())).await;
+                        let _ = send_socket_message(&mut sender, Message::Text(message.into())).await;
                         break;
                     }
                     Ok(TerminalEvent::Size(size)) => {
                         let message = serde_json::to_string(&size_message(size, client_id))
                             .expect("serializable terminal size");
-                        if sender.send(Message::Text(message.into())).await.is_err() { break; }
+                        if send_socket_message(&mut sender, Message::Text(message.into())).await.is_err() { break; }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                         tracing::debug!(
@@ -480,28 +519,26 @@ pub(crate) async fn serve_terminal_socket(
             }
             incoming = receiver.next() => {
                 let Some(Ok(message)) = incoming else { break; };
+                last_client_message = tokio::time::Instant::now();
                 match message {
                     Message::Text(text) => match serde_json::from_str::<TerminalClientMessage>(&text) {
                         Ok(TerminalClientMessage::Ping) => {
                             let pong = serde_json::to_string(&TerminalServerMessage::Pong)
                                 .expect("serializable pong");
-                            if sender.send(Message::Text(pong.into())).await.is_err() { break; }
+                            if send_socket_message(&mut sender, Message::Text(pong.into())).await.is_err() { break; }
                         }
                         Ok(_) if observer => {
                             let error = serde_json::to_string(&TerminalServerMessage::Error {
                                 message: "observer connections are read-only",
                             })
                             .expect("serializable error");
-                            if sender.send(Message::Text(error.into())).await.is_err() { break; }
+                            if send_socket_message(&mut sender, Message::Text(error.into())).await.is_err() { break; }
                         }
                         Ok(TerminalClientMessage::Input { data }) if data.len() <= 64 * 1024 => {
-                            if let Err(error) = terminal.write(data.as_bytes()) {
-                                tracing::debug!(%error, "terminal input failed");
-                                break;
-                            }
+                            if forward_terminal_input(&mut sender, &terminal, data.as_bytes()).await.is_err() { break; }
                         }
-                        Ok(TerminalClientMessage::Resize { cols, rows }) => {
-                            if terminal.resize_client(client_id, cols, rows).is_err() { break; }
+                        Ok(TerminalClientMessage::Resize { cols, rows, pixel_width, pixel_height }) => {
+                            if terminal.resize_client(client_id, cols, rows, pixel_width, pixel_height).is_err() { break; }
                         }
                         Ok(TerminalClientMessage::Focus { focused }) => {
                             if terminal.focus_client(client_id, focused).is_err() { break; }
@@ -511,18 +548,61 @@ pub(crate) async fn serve_terminal_socket(
                                 message: "invalid terminal message",
                             })
                             .expect("serializable error");
-                            if sender.send(Message::Text(error.into())).await.is_err() { break; }
+                            if send_socket_message(&mut sender, Message::Text(error.into())).await.is_err() { break; }
                         }
                     },
+                    Message::Binary(_) if observer => {
+                        let error = serde_json::to_string(&TerminalServerMessage::Error {
+                            message: "observer connections are read-only",
+                        })
+                        .expect("serializable error");
+                        if send_socket_message(&mut sender, Message::Text(error.into())).await.is_err() { break; }
+                    }
+                    Message::Binary(data) if !data.is_empty() => {
+                        if forward_terminal_input(&mut sender, &terminal, &data).await.is_err() { break; }
+                    }
                     Message::Close(_) => break,
                     Message::Ping(payload) => {
-                        if sender.send(Message::Pong(payload)).await.is_err() { break; }
+                        if send_socket_message(&mut sender, Message::Pong(payload)).await.is_err() { break; }
                     }
                     _ => {}
                 }
             }
         }
     }
+}
+
+async fn write_terminal_input(
+    terminal: &TerminalSession,
+    data: &[u8],
+) -> Result<(), TerminalError> {
+    let deadline = tokio::time::Instant::now() + TERMINAL_INPUT_WAIT_TIMEOUT;
+    loop {
+        match terminal.write(data) {
+            Err(TerminalError::InputQueueFull) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(TERMINAL_INPUT_RETRY_INTERVAL).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+async fn forward_terminal_input(
+    sender: &mut SplitSink<WebSocket, Message>,
+    terminal: &TerminalSession,
+    data: &[u8],
+) -> Result<(), ()> {
+    let Err(error) = write_terminal_input(terminal, data).await else {
+        return Ok(());
+    };
+    tracing::debug!(%error, "terminal input failed");
+    let recoverable = matches!(
+        error,
+        TerminalError::InputQueueFull | TerminalError::InputTooLarge
+    );
+    let message = error.to_string();
+    send_terminal_control(sender, TerminalServerMessage::Error { message: &message }).await?;
+    if recoverable { Ok(()) } else { Err(()) }
 }
 
 async fn synchronize_terminal(
@@ -597,10 +677,7 @@ async fn send_terminal_bytes(
         frame.push(kind);
         frame.extend_from_slice(&sequence.to_be_bytes());
         frame.extend_from_slice(chunk);
-        sender
-            .send(Message::Binary(frame.into()))
-            .await
-            .map_err(|_| ())?;
+        send_socket_message(sender, Message::Binary(frame.into())).await?;
         if kind == TERMINAL_FRAME_OUTPUT {
             sequence += chunk.len() as u64;
         }
@@ -613,8 +690,15 @@ async fn send_terminal_control(
     message: TerminalServerMessage<'_>,
 ) -> Result<(), ()> {
     let message = serde_json::to_string(&message).expect("serializable terminal control message");
-    sender
-        .send(Message::Text(message.into()))
+    send_socket_message(sender, Message::Text(message.into())).await
+}
+
+async fn send_socket_message<S>(sender: &mut S, message: Message) -> Result<(), ()>
+where
+    S: Sink<Message> + Unpin,
+{
+    tokio::time::timeout(TERMINAL_SEND_TIMEOUT, sender.send(message))
         .await
+        .map_err(|_| ())?
         .map_err(|_| ())
 }
