@@ -36,7 +36,7 @@ use crate::{
     config::Cli,
     terminal::{
         CreateTerminal, ProcessInspectorSnapshot, RenameTerminal, TerminalInfo, TerminalManager,
-        normalize_terminal_path,
+        TerminalViewport, normalize_terminal_path,
     },
     workspace::{
         SessionBrokerGenerationInfo, SessionBrokerInfo, TerminalSocketQuery,
@@ -44,7 +44,7 @@ use crate::{
     },
 };
 
-const PROTOCOL_VERSION: u32 = 3;
+const PROTOCOL_VERSION: u32 = 4;
 const SOCKET_NAME: &str = "session-broker.sock";
 const BROKER_DIRECTORY: &str = "session-brokers";
 const DRAIN_INTERVAL: Duration = Duration::from_secs(2);
@@ -181,15 +181,17 @@ impl BrokerClient {
     pub async fn terminal_socket(
         &self,
         id: Uuid,
-        initial_size: Option<(u16, u16)>,
+        initial_size: Option<TerminalViewport>,
         sequence: Option<u64>,
         observer: bool,
     ) -> Result<BrokerWebSocket, BrokerError> {
         let stream = UnixStream::connect(self.socket_path.as_ref()).await?;
         let mut query = vec![];
-        if let Some((cols, rows)) = initial_size {
-            query.push(format!("cols={cols}"));
-            query.push(format!("rows={rows}"));
+        if let Some(viewport) = initial_size {
+            query.push(format!("cols={}", viewport.cols));
+            query.push(format!("rows={}", viewport.rows));
+            query.push(format!("pixelWidth={}", viewport.pixel_width));
+            query.push(format!("pixelHeight={}", viewport.pixel_height));
         }
         if let Some(sequence) = sequence {
             query.push(format!("sequence={sequence}"));
@@ -603,7 +605,7 @@ impl BrokerPool {
     pub async fn terminal_socket(
         &self,
         id: Uuid,
-        initial_size: Option<(u16, u16)>,
+        initial_size: Option<TerminalViewport>,
         sequence: Option<u64>,
         observer: bool,
     ) -> Result<BrokerWebSocket, BrokerError> {
@@ -1219,7 +1221,12 @@ mod tests {
         assert_eq!(observed.status, crate::terminal::AgentStatus::Working);
         assert_eq!(observed.activity.unwrap().label, "thinking");
         let mut first = client
-            .terminal_socket(terminal.id, Some((80, 24)), None, false)
+            .terminal_socket(
+                terminal.id,
+                Some(TerminalViewport::new(80, 24, 800, 480)),
+                None,
+                false,
+            )
             .await
             .unwrap();
         let size = wait_for_control(&mut first, "size").await;
@@ -1241,8 +1248,8 @@ mod tests {
         let focused = wait_for_control(&mut first, "size").await;
         assert_eq!(focused["controller"], true);
         first
-            .send(TungsteniteMessage::Text(
-                r#"{"type":"input","data":"printf 'before-restart\\n'\n"}"#.into(),
+            .send(TungsteniteMessage::Binary(
+                b"printf 'before-restart\\n'\n".to_vec().into(),
             ))
             .await
             .unwrap();
@@ -1259,7 +1266,12 @@ mod tests {
                 .any(|candidate| candidate.id == terminal.id)
         );
         let mut second = replacement_client
-            .terminal_socket(terminal.id, Some((80, 24)), Some(initial_sequence), false)
+            .terminal_socket(
+                terminal.id,
+                Some(TerminalViewport::new(80, 24, 800, 480)),
+                Some(initial_sequence),
+                false,
+            )
             .await
             .unwrap();
         let size = wait_for_control(&mut second, "size").await;
@@ -1454,7 +1466,12 @@ mod tests {
             .await
             .unwrap();
         let mut controller = client
-            .terminal_socket(terminal.id, Some((120, 40)), None, false)
+            .terminal_socket(
+                terminal.id,
+                Some(TerminalViewport::new(120, 40, 1200, 800)),
+                None,
+                false,
+            )
             .await
             .unwrap();
         wait_for_control(&mut controller, "size").await;
@@ -1495,6 +1512,12 @@ mod tests {
             let error = wait_for_control(&mut observer, "error").await;
             assert_eq!(error["message"], "observer connections are read-only");
         }
+        observer
+            .send(TungsteniteMessage::Binary(b"raw input".to_vec().into()))
+            .await
+            .unwrap();
+        let error = wait_for_control(&mut observer, "error").await;
+        assert_eq!(error["message"], "observer connections are read-only");
 
         controller
             .send(TungsteniteMessage::Text(r#"{"type":"ping"}"#.into()))
@@ -1523,7 +1546,12 @@ mod tests {
             .await
             .unwrap();
         let mut socket = client
-            .terminal_socket(terminal.id, Some((80, 24)), None, false)
+            .terminal_socket(
+                terminal.id,
+                Some(TerminalViewport::new(80, 24, 800, 480)),
+                None,
+                false,
+            )
             .await
             .unwrap();
         wait_for_control(&mut socket, "size").await;

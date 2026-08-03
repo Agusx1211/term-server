@@ -1,6 +1,6 @@
 {
   "name": "term-server",
-  "version": "0.7.6",
+  "version": "0.8.0",
   "description": "A fast, secure, Rust-powered web terminal workspace.",
   "type": "module",
   "private": true,
@@ -17,8 +17,10 @@
   "scripts": {
     "clean": "node scripts/clean.mjs",
     "dev": "concurrently -k -n server,client -c blue,magenta \"npm:dev:server\" \"npm:dev:client\"",
-    "dev:server": "TERM_SERVER_PASSWORD=development cargo run -- --no-https --no-client --port 8090",
+    "dev:server": "bash scripts/dev-server.sh",
     "dev:client": "vite",
+    "generate:terminal-unicode": "node scripts/generate-terminal-unicode.mjs",
+    "check:terminal-unicode": "node scripts/generate-terminal-unicode.mjs --check",
     "build": "npm run clean && npm run build:server && npm run build:client",
     "build:server": "cargo build --release",
     "build:client": "vite build",
@@ -28,7 +30,7 @@
     "test": "cargo test && vitest run",
     "test:web": "vitest run",
     "test:watch": "vitest",
-    "check": "cargo fmt --check && cargo clippy --all-targets -- -D warnings && npm run typecheck && npm test && npm run build:client"
+    "check": "cargo fmt --check && cargo clippy --all-targets -- -D warnings && npm run typecheck && npm run check:terminal-unicode && npm test && npm run build:client"
   },
   "dependencies": {
     "@codemirror/language": "^6.12.4",
@@ -46,6 +48,7 @@
   },
   "devDependencies": {
     "@preact/preset-vite": "^2.10.6",
+    "@xterm/headless": "^6.0.0",
     "concurrently": "9.2.4",
     "typescript": "^7.0.2",
     "vite": "^8.1.5",

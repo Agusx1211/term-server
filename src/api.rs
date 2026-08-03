@@ -1169,12 +1169,12 @@ async fn proxy_terminal_socket(socket: WebSocket, broker: BrokerWebSocket) {
                     BrokerMessage::Binary(bytes) => Message::Binary(bytes.to_vec().into()),
                     BrokerMessage::Close(_) => Message::Close(None),
                     BrokerMessage::Ping(payload) => {
-                        if broker_sender.send(BrokerMessage::Pong(payload)).await.is_err() { break; }
+                        if proxy_send(&mut broker_sender, BrokerMessage::Pong(payload)).await.is_err() { break; }
                         continue;
                     }
                     BrokerMessage::Pong(_) | BrokerMessage::Frame(_) => continue,
                 };
-                if browser_sender.send(outgoing).await.is_err() { break; }
+                if proxy_send(&mut browser_sender, outgoing).await.is_err() { break; }
             }
             message = browser_receiver.next() => {
                 let Some(Ok(message)) = message else { break; };
@@ -1183,15 +1183,26 @@ async fn proxy_terminal_socket(socket: WebSocket, broker: BrokerWebSocket) {
                     Message::Binary(bytes) => BrokerMessage::Binary(bytes.to_vec().into()),
                     Message::Close(_) => BrokerMessage::Close(None),
                     Message::Ping(payload) => {
-                        if browser_sender.send(Message::Pong(payload)).await.is_err() { break; }
+                        if proxy_send(&mut browser_sender, Message::Pong(payload)).await.is_err() { break; }
                         continue;
                     }
                     Message::Pong(_) => continue,
                 };
-                if broker_sender.send(outgoing).await.is_err() { break; }
+                if proxy_send(&mut broker_sender, outgoing).await.is_err() { break; }
             }
         }
     }
+}
+
+#[cfg(unix)]
+async fn proxy_send<S, M>(sender: &mut S, message: M) -> Result<(), ()>
+where
+    S: futures_util::Sink<M> + Unpin,
+{
+    tokio::time::timeout(std::time::Duration::from_secs(10), sender.send(message))
+        .await
+        .map_err(|_| ())?
+        .map_err(|_| ())
 }
 
 async fn api_not_found() -> ApiError {
@@ -1391,7 +1402,7 @@ mod tests {
 
     #[test]
     fn terminal_socket_rejects_outdated_stream_clients() {
-        for protocol in [None, Some(0), Some(2)] {
+        for protocol in [None, Some(0), Some(1), Some(3)] {
             let error = require_terminal_stream_protocol(protocol).unwrap_err();
             assert_eq!(
                 error.to_string(),

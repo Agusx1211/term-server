@@ -255,7 +255,13 @@ export interface SaveFileRequest extends FileTarget {
 
 export type ClientTerminalMessage =
   | { type: "input"; data: string }
-  | { type: "resize"; cols: number; rows: number }
+  | {
+      type: "resize";
+      cols: number;
+      rows: number;
+      pixelWidth: number;
+      pixelHeight: number;
+    }
   | { type: "focus"; focused: boolean }
   | { type: "ping" };
 

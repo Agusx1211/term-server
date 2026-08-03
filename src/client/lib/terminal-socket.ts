@@ -1,6 +1,6 @@
 export type TerminalSocketCloseCause = "backlog" | "protocol-error" | "timeout";
 
-export const TERMINAL_STREAM_PROTOCOL = 1;
+export const TERMINAL_STREAM_PROTOCOL = 2;
 
 export function addTerminalStreamProtocol(url: URL): URL {
   url.searchParams.set("stream", String(TERMINAL_STREAM_PROTOCOL));
