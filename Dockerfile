@@ -20,7 +20,7 @@ RUN TERM_SERVER_BUILD_COMMIT="$TERM_SERVER_BUILD_COMMIT" cargo build --release -
 
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y ca-certificates curl tini \
+    && apt-get install --no-install-recommends -y ca-certificates curl ncurses-base tini \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 term-server \
     && useradd --uid 10001 --gid term-server --create-home --shell /bin/bash term-server \
@@ -28,7 +28,10 @@ RUN apt-get update \
 COPY --from=backend /build/target/release/term-server /usr/local/bin/term-server
 COPY --from=web /build/dist/client /usr/share/term-server/client
 
-ENV TERM_SERVER_HOST=0.0.0.0 \
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    TERM=xterm-256color \
+    TERM_SERVER_HOST=0.0.0.0 \
     TERM_SERVER_PORT=8090 \
     TERM_SERVER_DATA_DIR=/data \
     TERM_SERVER_CLIENT_DIR=/usr/share/term-server/client

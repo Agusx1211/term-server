@@ -255,7 +255,7 @@ npm ci
 npm run dev
 ```
 
-Vite listens on `http://127.0.0.1:5173`, proxies the API on port 8090, uses the password `development`, and disables HTTPS. Do not expose the development server.
+Vite listens on `http://127.0.0.1:5173`, proxies the API on port 8090, uses the password `development`, and disables HTTPS. The API uses a fresh temporary data directory and isolated session broker for each run. Do not expose the development server.
 
 Before submitting a change:
 

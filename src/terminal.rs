@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
@@ -11,7 +11,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -48,9 +48,16 @@ const REPORTED_WORKING_FRESH_MILLIS: u64 = 5_000;
 const NATIVE_EVENT_FRESH_MILLIS: u64 = 15_000;
 const LONG_RUNNING_COMMAND_MILLIS: u64 = 5_000;
 const MAX_CAPTURED_PROMPT_CHARS: usize = 16_000;
-const DEFAULT_VIEWPORT_SIZE: ViewportSize = ViewportSize {
+const MAX_TERMINAL_INPUT_BYTES: usize = 64 * 1024;
+const TERMINAL_INPUT_QUEUE_BYTES: usize = 1024 * 1024;
+const TERMINAL_INPUT_QUEUE_MESSAGES: usize = 64;
+const TERMINAL_RESPONSE_QUEUE_BYTES: usize = 64 * 1024;
+const TERMINAL_RESPONSE_QUEUE_MESSAGES: usize = 256;
+const DEFAULT_VIEWPORT_SIZE: TerminalViewport = TerminalViewport {
     cols: 100,
     rows: 30,
+    pixel_width: 0,
+    pixel_height: 0,
 };
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -150,6 +157,10 @@ pub enum TerminalError {
     CloneSourceNotFound,
     #[error("unable to start {shell}: {message}")]
     Spawn { shell: String, message: String },
+    #[error("terminal input exceeds the 64 KiB message limit")]
+    InputTooLarge,
+    #[error("terminal input queue is full; wait for the terminal to catch up")]
+    InputQueueFull,
     #[error("terminal I/O failed: {0}")]
     Io(String),
 }
@@ -175,28 +186,34 @@ pub enum TerminalEvent {
 pub struct TerminalSizeState {
     pub cols: u16,
     pub rows: u16,
+    pub pixel_width: u16,
+    pub pixel_height: u16,
     pub focused_client: Option<Uuid>,
     pub responder_client: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ViewportSize {
-    cols: u16,
-    rows: u16,
+pub struct TerminalViewport {
+    pub cols: u16,
+    pub rows: u16,
+    pub pixel_width: u16,
+    pub pixel_height: u16,
 }
 
-impl ViewportSize {
-    fn new(cols: u16, rows: u16) -> Self {
+impl TerminalViewport {
+    pub fn new(cols: u16, rows: u16, pixel_width: u16, pixel_height: u16) -> Self {
         Self {
             cols: cols.clamp(2, 500),
             rows: rows.clamp(1, 300),
+            pixel_width,
+            pixel_height,
         }
     }
 }
 
 #[derive(Debug)]
 struct ClientViewports {
-    sizes: HashMap<Uuid, Option<ViewportSize>>,
+    sizes: HashMap<Uuid, Option<TerminalViewport>>,
     focused_client: Option<Uuid>,
     responder_client: Option<Uuid>,
     published: TerminalSizeState,
@@ -211,6 +228,8 @@ impl Default for ClientViewports {
             published: TerminalSizeState {
                 cols: DEFAULT_VIEWPORT_SIZE.cols,
                 rows: DEFAULT_VIEWPORT_SIZE.rows,
+                pixel_width: DEFAULT_VIEWPORT_SIZE.pixel_width,
+                pixel_height: DEFAULT_VIEWPORT_SIZE.pixel_height,
                 focused_client: None,
                 responder_client: None,
             },
@@ -219,7 +238,7 @@ impl Default for ClientViewports {
 }
 
 impl ClientViewports {
-    fn attach(&mut self, client_id: Uuid, size: Option<ViewportSize>) {
+    fn attach(&mut self, client_id: Uuid, size: Option<TerminalViewport>) {
         self.sizes.insert(client_id, size);
         self.responder_client.get_or_insert(client_id);
     }
@@ -234,7 +253,7 @@ impl ClientViewports {
         }
     }
 
-    fn resize(&mut self, client_id: Uuid, size: ViewportSize) {
+    fn resize(&mut self, client_id: Uuid, size: TerminalViewport) {
         if let Some(current) = self.sizes.get_mut(&client_id) {
             *current = Some(size);
         }
@@ -257,18 +276,24 @@ impl ClientViewports {
                 self.sizes
                     .values()
                     .filter_map(|size| *size)
-                    .reduce(|smallest, size| ViewportSize {
+                    .reduce(|smallest, size| TerminalViewport {
                         cols: smallest.cols.min(size.cols),
                         rows: smallest.rows.min(size.rows),
+                        pixel_width: smallest.pixel_width.min(size.pixel_width),
+                        pixel_height: smallest.pixel_height.min(size.pixel_height),
                     })
             })
-            .unwrap_or(ViewportSize {
+            .unwrap_or(TerminalViewport {
                 cols: self.published.cols,
                 rows: self.published.rows,
+                pixel_width: self.published.pixel_width,
+                pixel_height: self.published.pixel_height,
             });
         TerminalSizeState {
             cols: size.cols,
             rows: size.rows,
+            pixel_width: size.pixel_width,
+            pixel_height: size.pixel_height,
             focused_client: self.focused_client,
             responder_client: self.responder_client,
         }
@@ -923,10 +948,170 @@ struct RefreshOutcome {
     summary: Option<(u64, PiRequest)>,
 }
 
+#[derive(Debug, Default)]
+struct TerminalInputState {
+    messages: VecDeque<Bytes>,
+    queued_bytes: usize,
+    responses: VecDeque<Bytes>,
+    response_bytes: usize,
+    closed: bool,
+    failure: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct TerminalInputShared {
+    state: Mutex<TerminalInputState>,
+    ready: Condvar,
+}
+
+struct TerminalInputQueue {
+    shared: Arc<TerminalInputShared>,
+}
+
+struct TerminalInputReceiver {
+    shared: Arc<TerminalInputShared>,
+}
+
+impl TerminalInputQueue {
+    fn spawn(id: Uuid, writer: Box<dyn Write + Send>) -> Result<Self, TerminalError> {
+        let (queue, receiver) = terminal_input_channel();
+        thread::Builder::new()
+            .name(format!("terminal-input-{id}"))
+            .spawn(move || {
+                if let Err(error) = run_terminal_input_writer(writer, receiver) {
+                    tracing::debug!(%error, "terminal input writer failed");
+                }
+            })
+            .map_err(|error| TerminalError::Io(error.to_string()))?;
+        Ok(queue)
+    }
+
+    fn enqueue(&self, data: &[u8], accepted: impl FnOnce()) -> Result<(), TerminalError> {
+        if data.len() > MAX_TERMINAL_INPUT_BYTES {
+            return Err(TerminalError::InputTooLarge);
+        }
+        self.enqueue_message(Bytes::copy_from_slice(data), accepted)
+    }
+
+    fn enqueue_unobserved(&self, message: Bytes) -> Result<(), TerminalError> {
+        if message.len() > MAX_TERMINAL_INPUT_BYTES {
+            return Err(TerminalError::InputTooLarge);
+        }
+        let mut state = self.shared.state.lock();
+        Self::check_open(&state)?;
+        if state.responses.len() >= TERMINAL_RESPONSE_QUEUE_MESSAGES
+            || state.response_bytes.saturating_add(message.len()) > TERMINAL_RESPONSE_QUEUE_BYTES
+        {
+            return Err(TerminalError::InputQueueFull);
+        }
+        state.response_bytes += message.len();
+        state.responses.push_back(message);
+        drop(state);
+        self.shared.ready.notify_one();
+        Ok(())
+    }
+
+    fn enqueue_message(
+        &self,
+        message: Bytes,
+        accepted: impl FnOnce(),
+    ) -> Result<(), TerminalError> {
+        let mut state = self.shared.state.lock();
+        Self::check_open(&state)?;
+        if state.messages.len() >= TERMINAL_INPUT_QUEUE_MESSAGES
+            || state.queued_bytes.saturating_add(message.len()) > TERMINAL_INPUT_QUEUE_BYTES
+        {
+            return Err(TerminalError::InputQueueFull);
+        }
+        // The worker cannot observe this message until the accepted-input
+        // bookkeeping is complete and the queue lock is released.
+        accepted();
+        state.queued_bytes += message.len();
+        state.messages.push_back(message);
+        drop(state);
+        self.shared.ready.notify_one();
+        Ok(())
+    }
+
+    fn check_open(state: &TerminalInputState) -> Result<(), TerminalError> {
+        if let Some(error) = &state.failure {
+            return Err(TerminalError::Io(format!(
+                "terminal input writer stopped: {error}"
+            )));
+        }
+        if state.closed {
+            return Err(TerminalError::Io(
+                "terminal input writer stopped".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for TerminalInputQueue {
+    fn drop(&mut self) {
+        self.shared.state.lock().closed = true;
+        self.shared.ready.notify_all();
+    }
+}
+
+impl TerminalInputReceiver {
+    fn receive(&self) -> Option<Bytes> {
+        let mut state = self.shared.state.lock();
+        loop {
+            if let Some(message) = state.responses.pop_front() {
+                state.response_bytes -= message.len();
+                return Some(message);
+            }
+            if let Some(message) = state.messages.pop_front() {
+                state.queued_bytes -= message.len();
+                return Some(message);
+            }
+            if state.closed || state.failure.is_some() {
+                return None;
+            }
+            self.shared.ready.wait(&mut state);
+        }
+    }
+
+    fn fail(&self, error: &std::io::Error) {
+        let mut state = self.shared.state.lock();
+        state.messages.clear();
+        state.queued_bytes = 0;
+        state.responses.clear();
+        state.response_bytes = 0;
+        state.failure = Some(error.to_string());
+        self.shared.ready.notify_all();
+    }
+}
+
+fn terminal_input_channel() -> (TerminalInputQueue, TerminalInputReceiver) {
+    let shared = Arc::new(TerminalInputShared::default());
+    (
+        TerminalInputQueue {
+            shared: shared.clone(),
+        },
+        TerminalInputReceiver { shared },
+    )
+}
+
+fn run_terminal_input_writer<W: Write>(
+    mut writer: W,
+    receiver: TerminalInputReceiver,
+) -> std::io::Result<()> {
+    while let Some(message) = receiver.receive() {
+        if let Err(error) = writer.write_all(&message).and_then(|()| writer.flush()) {
+            receiver.fail(&error);
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 pub struct TerminalSession {
     info: RwLock<TerminalInfo>,
     master: Mutex<Box<dyn MasterPty + Send>>,
-    writer: Mutex<Box<dyn Write + Send>>,
+    input: TerminalInputQueue,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     output: Mutex<TerminalOutputState>,
     events: broadcast::Sender<TerminalEvent>,
@@ -996,14 +1181,9 @@ impl TerminalSession {
     pub fn attach(
         &self,
         client_id: Uuid,
-        size: Option<(u16, u16)>,
+        size: Option<TerminalViewport>,
     ) -> Result<TerminalSizeState, TerminalError> {
-        self.update_viewports(|viewports| {
-            viewports.attach(
-                client_id,
-                size.map(|(cols, rows)| ViewportSize::new(cols, rows)),
-            );
-        })
+        self.update_viewports(|viewports| viewports.attach(client_id, size))
     }
 
     pub fn detach(&self, client_id: Uuid) {
@@ -1017,9 +1197,14 @@ impl TerminalSession {
         client_id: Uuid,
         cols: u16,
         rows: u16,
+        pixel_width: u16,
+        pixel_height: u16,
     ) -> Result<TerminalSizeState, TerminalError> {
         self.update_viewports(|viewports| {
-            viewports.resize(client_id, ViewportSize::new(cols, rows));
+            viewports.resize(
+                client_id,
+                TerminalViewport::new(cols, rows, pixel_width, pixel_height),
+            );
         })
     }
 
@@ -1035,6 +1220,11 @@ impl TerminalSession {
         if self.info.read().status != TerminalStatus::Running {
             return Ok(());
         }
+        self.input
+            .enqueue(data, || self.observe_accepted_input(data))
+    }
+
+    fn observe_accepted_input(&self, data: &[u8]) {
         let now = current_millis();
         let input = self.activity.lock().prompt_capture.observe(data);
         if input.submitted {
@@ -1076,11 +1266,6 @@ impl TerminalSession {
                 }
             }
         }
-        let mut writer = self.writer.lock();
-        writer
-            .write_all(data)
-            .and_then(|()| writer.flush())
-            .map_err(|error| TerminalError::Io(error.to_string()))
     }
 
     fn live_agent_observation(&self) -> Option<AgentObservation> {
@@ -1100,8 +1285,17 @@ impl TerminalSession {
         let mut viewports = self.viewports.lock();
         update(&mut viewports);
         let state = viewports.state();
-        let size_changed =
-            (state.cols, state.rows) != (viewports.published.cols, viewports.published.rows);
+        let size_changed = (
+            state.cols,
+            state.rows,
+            state.pixel_width,
+            state.pixel_height,
+        ) != (
+            viewports.published.cols,
+            viewports.published.rows,
+            viewports.published.pixel_width,
+            viewports.published.pixel_height,
+        );
         let publish = state != viewports.published;
         let running = self.info.read().status == TerminalStatus::Running;
         // Serialize controller/responder changes and resize redraws with PTY
@@ -1114,14 +1308,19 @@ impl TerminalSession {
                 .resize(PtySize {
                     cols: state.cols,
                     rows: state.rows,
-                    pixel_width: 0,
-                    pixel_height: 0,
+                    pixel_width: state.pixel_width,
+                    pixel_height: state.pixel_height,
                 })
                 .map_err(|error| TerminalError::Io(error.to_string()))?;
             output
                 .as_mut()
                 .expect("output state locked for resize")
-                .resize(state.rows, state.cols);
+                .resize(
+                    state.rows,
+                    state.cols,
+                    state.pixel_width,
+                    state.pixel_height,
+                );
         }
         viewports.published = state;
         if publish {
@@ -1142,8 +1341,18 @@ impl TerminalSession {
         self.signals.lock().observe(&bytes, now);
         self.output_bytes
             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-        let output = self.output.lock().publish(bytes);
+        // Keep the canonical mutation and its event ordered against resize,
+        // which publishes Size while holding this same lock.
+        let mut state = self.output.lock();
+        let output = state.publish(bytes);
+        let responses = state.drain_responses();
         let _ = self.events.send(TerminalEvent::Output(output));
+        drop(state);
+        for response in responses {
+            if let Err(error) = self.input.enqueue_unobserved(response) {
+                tracing::warn!(%error, "terminal query response could not be queued");
+            }
+        }
     }
 
     fn exited(&self, exit_code: u32) {
@@ -1735,8 +1944,8 @@ impl TerminalManager {
             .openpty(PtySize {
                 rows: DEFAULT_VIEWPORT_SIZE.rows,
                 cols: DEFAULT_VIEWPORT_SIZE.cols,
-                pixel_width: 0,
-                pixel_height: 0,
+                pixel_width: DEFAULT_VIEWPORT_SIZE.pixel_width,
+                pixel_height: DEFAULT_VIEWPORT_SIZE.pixel_height,
             })
             .map_err(|error| TerminalError::Spawn {
                 shell: shell.clone(),
@@ -1768,6 +1977,7 @@ impl TerminalManager {
             .master
             .take_writer()
             .map_err(|error| TerminalError::Io(error.to_string()))?;
+        let input = TerminalInputQueue::spawn(id, writer)?;
         let killer = child.clone_killer();
         let (events, _) = broadcast::channel(256);
         let session = Arc::new(TerminalSession {
@@ -1793,7 +2003,7 @@ impl TerminalManager {
                 broker: None,
             }),
             master: Mutex::new(pair.master),
-            writer: Mutex::new(writer),
+            input,
             killer: Mutex::new(killer),
             output: Mutex::new(TerminalOutputState::new(
                 self.replay_bytes.load(Ordering::Relaxed),
@@ -1895,11 +2105,20 @@ pub(crate) fn terminate_descendant_process(
 }
 
 fn read_output(mut reader: Box<dyn Read + Send>, session: Arc<TerminalSession>) {
+    read_output_chunks(reader.as_mut(), |bytes| session.publish(bytes));
+}
+
+fn read_output_chunks<R: Read + ?Sized>(reader: &mut R, mut publish: impl FnMut(Bytes)) {
     let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         match reader.read(&mut buffer) {
-            Ok(0) | Err(_) => break,
-            Ok(count) => session.publish(Bytes::copy_from_slice(&buffer[..count])),
+            Ok(0) => break,
+            Ok(count) => publish(Bytes::copy_from_slice(&buffer[..count])),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                tracing::debug!(%error, "terminal output read failed");
+                break;
+            }
         }
     }
 }
@@ -2583,7 +2802,262 @@ pub fn validate_working_directory(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        collections::VecDeque,
+        io,
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
+
     use super::*;
+
+    struct RecordingWriter {
+        output: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.output.lock().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct BlockingWriter {
+        output: Arc<Mutex<Vec<u8>>>,
+        started: Option<mpsc::Sender<()>>,
+        release: mpsc::Receiver<()>,
+    }
+
+    impl Write for BlockingWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if let Some(started) = self.started.take() {
+                started.send(()).unwrap();
+                self.release.recv().unwrap();
+            }
+            self.output.lock().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn spawn_test_input_writer<W: Write + Send + 'static>(
+        writer: W,
+    ) -> (TerminalInputQueue, thread::JoinHandle<io::Result<()>>) {
+        let (queue, receiver) = terminal_input_channel();
+        let worker = thread::spawn(move || run_terminal_input_writer(writer, receiver));
+        (queue, worker)
+    }
+
+    #[test]
+    fn terminal_input_writer_preserves_message_order() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let (queue, worker) = spawn_test_input_writer(RecordingWriter {
+            output: output.clone(),
+        });
+
+        queue.enqueue(b"first", || {}).unwrap();
+        queue.enqueue(b"-second", || {}).unwrap();
+        queue.enqueue(b"-third", || {}).unwrap();
+        drop(queue);
+        worker.join().unwrap().unwrap();
+
+        assert_eq!(&*output.lock(), b"first-second-third");
+    }
+
+    #[test]
+    fn terminal_input_enqueue_does_not_wait_for_a_blocked_writer() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (queue, worker) = spawn_test_input_writer(BlockingWriter {
+            output: output.clone(),
+            started: Some(started_tx),
+            release: release_rx,
+        });
+        queue.enqueue(b"blocked", || {}).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        queue.enqueue(b"queued", || {}).unwrap();
+        assert!(output.lock().is_empty());
+
+        release_tx.send(()).unwrap();
+        drop(queue);
+        worker.join().unwrap().unwrap();
+        assert_eq!(&*output.lock(), b"blockedqueued");
+    }
+
+    #[test]
+    fn terminal_input_queue_rejects_overload_without_accepting_it() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (queue, worker) = spawn_test_input_writer(BlockingWriter {
+            output,
+            started: Some(started_tx),
+            release: release_rx,
+        });
+        let accepted = AtomicUsize::new(0);
+        queue
+            .enqueue(b"blocked", || {
+                accepted.fetch_add(1, Ordering::Relaxed);
+            })
+            .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let message = vec![b'x'; MAX_TERMINAL_INPUT_BYTES];
+        for _ in 0..TERMINAL_INPUT_QUEUE_BYTES / MAX_TERMINAL_INPUT_BYTES {
+            queue
+                .enqueue(&message, || {
+                    accepted.fetch_add(1, Ordering::Relaxed);
+                })
+                .unwrap();
+        }
+        let accepted_before_rejection = accepted.load(Ordering::Relaxed);
+
+        let error = queue
+            .enqueue(b"overload", || {
+                accepted.fetch_add(1, Ordering::Relaxed);
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, TerminalError::InputQueueFull));
+        assert_eq!(
+            error.to_string(),
+            "terminal input queue is full; wait for the terminal to catch up"
+        );
+        assert_eq!(accepted.load(Ordering::Relaxed), accepted_before_rejection);
+        release_tx.send(()).unwrap();
+        drop(queue);
+        worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn terminal_query_responses_bypass_saturated_user_input_queue() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (queue, worker) = spawn_test_input_writer(BlockingWriter {
+            output: output.clone(),
+            started: Some(started_tx),
+            release: release_rx,
+        });
+        queue.enqueue(b"blocked", || {}).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let message = vec![b'x'; MAX_TERMINAL_INPUT_BYTES];
+        for _ in 0..TERMINAL_INPUT_QUEUE_BYTES / MAX_TERMINAL_INPUT_BYTES {
+            queue.enqueue(&message, || {}).unwrap();
+        }
+
+        let response = queue.enqueue_unobserved(Bytes::from_static(b"RESPONSE"));
+
+        release_tx.send(()).unwrap();
+        drop(queue);
+        worker.join().unwrap().unwrap();
+        response.unwrap();
+        assert!(output.lock().starts_with(b"blockedRESPONSE"));
+    }
+
+    #[test]
+    fn server_terminal_query_response_uses_the_input_writer() {
+        let manager = TerminalManager::new(Some("/bin/sh".to_owned()), 1024 * 1024);
+        let info = manager
+            .create(CreateTerminal {
+                path: Some("server-query-response".to_owned()),
+                cwd: Some(PathBuf::from("/tmp")),
+                shell: Some("/bin/sh".to_owned()),
+                clone_from: None,
+            })
+            .unwrap();
+        let session = manager.get(info.id).unwrap();
+        let (mut events, _, _, _) = session.subscribe(None);
+        session
+            .write(
+                concat!(
+                    r#"stty raw -echo; printf '\033[5n'; response=$(dd bs=1 count=4 2>/dev/null); stty sane; if [ "$response" = "$(printf '\033[0n')" ]; then printf '\nSERVER-%s-PASS\n' QUERY; fi"#,
+                    "\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut output = Vec::new();
+        while Instant::now() < deadline {
+            match events.try_recv() {
+                Ok(TerminalEvent::Output(chunk)) => {
+                    output.extend_from_slice(&chunk.bytes);
+                    if output
+                        .windows(b"SERVER-QUERY-PASS".len())
+                        .any(|window| window == b"SERVER-QUERY-PASS")
+                    {
+                        break;
+                    }
+                }
+                Ok(_) | Err(broadcast::error::TryRecvError::Empty) => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(broadcast::error::TryRecvError::Closed) => break,
+            }
+        }
+
+        assert!(
+            output
+                .windows(b"SERVER-QUERY-PASS".len())
+                .any(|window| window == b"SERVER-QUERY-PASS"),
+            "shell did not receive the server query response: {}",
+            String::from_utf8_lossy(&output)
+        );
+        assert!(manager.remove(info.id));
+    }
+
+    enum ReadStep {
+        Interrupted,
+        Bytes(&'static [u8]),
+        Eof,
+    }
+
+    struct ScriptedReader {
+        steps: VecDeque<ReadStep>,
+    }
+
+    impl Read for ScriptedReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            match self.steps.pop_front().unwrap_or(ReadStep::Eof) {
+                ReadStep::Interrupted => Err(io::Error::from(io::ErrorKind::Interrupted)),
+                ReadStep::Bytes(bytes) => {
+                    buffer[..bytes.len()].copy_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+                ReadStep::Eof => Ok(0),
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_output_reader_retries_interrupted_reads() {
+        let mut reader = ScriptedReader {
+            steps: VecDeque::from([
+                ReadStep::Interrupted,
+                ReadStep::Bytes(b"first "),
+                ReadStep::Interrupted,
+                ReadStep::Bytes(b"second"),
+                ReadStep::Eof,
+            ]),
+        };
+        let mut output = Vec::new();
+
+        read_output_chunks(&mut reader, |bytes| output.extend_from_slice(&bytes));
+
+        assert_eq!(output, b"first second");
+        assert!(reader.steps.is_empty());
+    }
 
     fn foreground(group: i32, name: &str) -> ForegroundObservation {
         ForegroundObservation {
@@ -2765,13 +3239,15 @@ mod tests {
         let mobile = Uuid::from_u128(2);
         let mut viewports = ClientViewports::default();
 
-        viewports.attach(desktop, Some(ViewportSize::new(180, 50)));
-        viewports.attach(mobile, Some(ViewportSize::new(60, 22)));
+        viewports.attach(desktop, Some(TerminalViewport::new(180, 50, 1800, 1000)));
+        viewports.attach(mobile, Some(TerminalViewport::new(60, 22, 600, 440)));
         assert_eq!(
             viewports.state(),
             TerminalSizeState {
                 cols: 60,
                 rows: 22,
+                pixel_width: 600,
+                pixel_height: 440,
                 focused_client: None,
                 responder_client: Some(desktop),
             }
@@ -2783,6 +3259,8 @@ mod tests {
             TerminalSizeState {
                 cols: 60,
                 rows: 22,
+                pixel_width: 600,
+                pixel_height: 440,
                 focused_client: Some(mobile),
                 responder_client: Some(mobile),
             }
@@ -2794,12 +3272,14 @@ mod tests {
             TerminalSizeState {
                 cols: 180,
                 rows: 50,
+                pixel_width: 1800,
+                pixel_height: 1000,
                 focused_client: Some(desktop),
                 responder_client: Some(desktop),
             }
         );
 
-        viewports.resize(mobile, ViewportSize::new(40, 16));
+        viewports.resize(mobile, TerminalViewport::new(40, 16, 400, 320));
         assert_eq!((viewports.state().cols, viewports.state().rows), (180, 50));
 
         viewports.detach(desktop);
@@ -2808,6 +3288,8 @@ mod tests {
             TerminalSizeState {
                 cols: 40,
                 rows: 16,
+                pixel_width: 400,
+                pixel_height: 320,
                 focused_client: None,
                 responder_client: Some(mobile),
             }
@@ -2820,6 +3302,8 @@ mod tests {
             TerminalSizeState {
                 cols: 40,
                 rows: 16,
+                pixel_width: 400,
+                pixel_height: 320,
                 focused_client: None,
                 responder_client: None,
             }
@@ -2830,9 +3314,20 @@ mod tests {
     fn terminal_size_clamps_untrusted_client_dimensions() {
         let client = Uuid::from_u128(1);
         let mut viewports = ClientViewports::default();
-        viewports.attach(client, Some(ViewportSize::new(0, u16::MAX)));
+        viewports.attach(
+            client,
+            Some(TerminalViewport::new(0, u16::MAX, u16::MAX, u16::MAX)),
+        );
 
-        assert_eq!((viewports.state().cols, viewports.state().rows), (2, 300));
+        assert_eq!(
+            (
+                viewports.state().cols,
+                viewports.state().rows,
+                viewports.state().pixel_width,
+                viewports.state().pixel_height,
+            ),
+            (2, 300, u16::MAX, u16::MAX)
+        );
     }
 
     #[test]
@@ -3025,7 +3520,9 @@ mod tests {
         assert_eq!(info.workspace, "~");
         let session = manager.get(info.id).unwrap();
         let client_id = Uuid::new_v4();
-        session.attach(client_id, Some((80, 24))).unwrap();
+        session
+            .attach(client_id, Some(TerminalViewport::new(80, 24, 800, 480)))
+            .unwrap();
         session.write(b"printf 'hello-from-pty\\n'\n").unwrap();
         session.write(b"cd /tmp\n").unwrap();
         let moved = (0..100).find_map(|_| {

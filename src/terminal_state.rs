@@ -7,6 +7,7 @@ const MIN_RESERVED_VIEWPORT_COLS: usize = 128;
 const MAX_VIEWPORT_COLS: usize = 500;
 const CELL_BYTES: usize = std::mem::size_of::<vt100::Cell>();
 const MAX_PENDING_SEQUENCE_BYTES: usize = 64 * 1024;
+const MAX_TRACKED_SGR_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SequencedOutput {
@@ -77,9 +78,24 @@ impl TerminalOutputState {
         output
     }
 
-    pub fn resize(&mut self, rows: u16, cols: u16) {
+    pub fn resize(&mut self, rows: u16, cols: u16, pixel_width: u16, pixel_height: u16) {
+        self.terminal.resize(
+            rows,
+            cols,
+            scrollback_capacity(self.state_bytes, cols),
+            pixel_width,
+            pixel_height,
+        );
+    }
+
+    /// Drains replies to terminal status/device queries observed in published
+    /// output. The caller must write these bytes back to the PTY exactly once.
+    pub fn drain_responses(&mut self) -> Vec<Bytes> {
         self.terminal
-            .resize(rows, cols, scrollback_capacity(self.state_bytes, cols));
+            .drain_responses()
+            .into_iter()
+            .map(Bytes::from)
+            .collect()
     }
 
     pub fn sync(&self, requested_sequence: Option<u64>) -> TerminalSync {
@@ -201,9 +217,16 @@ struct CanonicalTerminal {
     parser: vt100::Parser,
     scrollback_rows: usize,
     normal_before_alt: Option<vt100::Screen>,
+    normal_execution_before_alt: Option<ExecutionState>,
     alternate_entry: Option<AlternateEntry>,
+    execution: ExecutionState,
     sequence: EscapeSequence,
     pending: Vec<u8>,
+    utf8_pending: Vec<u8>,
+    utf8_expected: u8,
+    responses: VecDeque<Vec<u8>>,
+    pixel_width: u16,
+    pixel_height: u16,
 }
 
 impl CanonicalTerminal {
@@ -212,9 +235,16 @@ impl CanonicalTerminal {
             parser: vt100::Parser::new(rows, cols, scrollback_rows),
             scrollback_rows,
             normal_before_alt: None,
+            normal_execution_before_alt: None,
             alternate_entry: None,
+            execution: ExecutionState::new(rows),
             sequence: EscapeSequence::Ground,
             pending: Vec::new(),
+            utf8_pending: Vec::new(),
+            utf8_expected: 0,
+            responses: VecDeque::new(),
+            pixel_width: 0,
+            pixel_height: 0,
         }
     }
 
@@ -230,6 +260,7 @@ impl CanonicalTerminal {
                 && !self.parser.screen().alternate_screen()
             {
                 self.normal_before_alt = Some(self.parser.screen().clone());
+                self.normal_execution_before_alt = Some(self.execution.clone());
                 self.alternate_entry = Some(entry);
             }
             self.parser.process(&bytes[index..=index]);
@@ -241,10 +272,24 @@ impl CanonicalTerminal {
             if sequence.erase_scrollback && !self.parser.screen().alternate_screen() {
                 self.clear_scrollback();
             }
+            self.execution
+                .observe(&sequence.bytes, self.parser.screen());
+            if let Some(response) = terminal_query_response(
+                &sequence.bytes,
+                self.parser.screen(),
+                &self.execution,
+                self.pixel_width,
+                self.pixel_height,
+            ) {
+                self.responses.push_back(response);
+            }
             if sequence.alternate_mode.exits_alternate() && !self.parser.screen().alternate_screen()
             {
                 self.normal_before_alt = None;
                 self.alternate_entry = None;
+                if let Some(execution) = self.normal_execution_before_alt.take() {
+                    self.execution = execution;
+                }
             }
             start = index + 1;
         }
@@ -252,6 +297,31 @@ impl CanonicalTerminal {
     }
 
     fn observe_byte(&mut self, byte: u8) -> Option<CompletedSequence> {
+        if self.sequence == EscapeSequence::Ground {
+            if self.utf8_expected > 0 {
+                if byte & 0b1100_0000 == 0b1000_0000 {
+                    self.utf8_pending.push(byte);
+                    self.utf8_expected -= 1;
+                    if self.utf8_expected == 0 {
+                        self.utf8_pending.clear();
+                    }
+                    return None;
+                }
+                self.utf8_pending.clear();
+                self.utf8_expected = 0;
+            }
+            self.utf8_expected = match byte {
+                0xc2..=0xdf => 1,
+                0xe0..=0xef => 2,
+                0xf0..=0xf4 => 3,
+                _ => 0,
+            };
+            if self.utf8_expected > 0 {
+                self.utf8_pending.clear();
+                self.utf8_pending.push(byte);
+                return None;
+            }
+        }
         let was_tracking = self.sequence != EscapeSequence::Ground || !self.pending.is_empty();
         let was_ground = self.sequence == EscapeSequence::Ground;
         self.sequence = self.sequence.advance(byte);
@@ -273,6 +343,7 @@ impl CanonicalTerminal {
         Some(CompletedSequence {
             alternate_mode: alternate_mode(&completed),
             erase_scrollback: erases_scrollback(&completed),
+            bytes: completed,
         })
     }
 
@@ -285,17 +356,68 @@ impl CanonicalTerminal {
         self.parser.process(&visible_state);
     }
 
-    fn resize(&mut self, rows: u16, cols: u16, scrollback_rows: usize) {
-        if self.scrollback_rows != scrollback_rows {
-            let (current_rows, current_cols) = self.parser.screen().size();
-            let snapshot = self.snapshot();
-            let mut resized = Self::new(current_rows, current_cols, scrollback_rows);
-            resized.process(&snapshot);
-            *self = resized;
+    fn resize(
+        &mut self,
+        rows: u16,
+        cols: u16,
+        scrollback_rows: usize,
+        pixel_width: u16,
+        pixel_height: u16,
+    ) {
+        if self.parser.screen().size() == (rows, cols) && self.scrollback_rows == scrollback_rows {
+            self.pixel_width = pixel_width;
+            self.pixel_height = pixel_height;
+            return;
         }
-        self.parser.screen_mut().set_size(rows, cols);
-        if let Some(normal) = self.normal_before_alt.as_mut() {
-            normal.set_size(rows, cols);
+        // panoptes-vt100's set_size truncates physical rows and drops bottom
+        // rows. Replaying the logical snapshot at the target dimensions lets
+        // wrapping and scrollback behave like a terminal receiving the same
+        // output at that size, preserving completed wrapped lines and content
+        // displaced by a height shrink.
+        let snapshot = self.resize_snapshot(rows, cols);
+        let mut resized = Self::new(rows, cols, scrollback_rows);
+        resized.process(&snapshot);
+        resized.responses.clear();
+        resized.pixel_width = pixel_width;
+        resized.pixel_height = pixel_height;
+        *self = resized;
+    }
+
+    fn resize_snapshot(&self, rows: u16, cols: u16) -> Vec<u8> {
+        if self.parser.screen().alternate_screen() {
+            let mut output = Vec::new();
+            if let Some(normal) = self.normal_before_alt.as_ref() {
+                let plan = reflow_plan(normal, rows, cols);
+                output.extend_from_slice(&plan.bytes);
+                let mut execution = self
+                    .normal_execution_before_alt
+                    .clone()
+                    .unwrap_or_else(|| ExecutionState::new(rows));
+                execution.remap_positions(&plan);
+                execution.write_restore_at(&mut output, plan.cursor, plan.pending_wrap.as_ref());
+            }
+            output.extend_from_slice(
+                self.alternate_entry
+                    .unwrap_or(AlternateEntry::Mode1049)
+                    .sequence(),
+            );
+            let plan = reflow_plan(self.parser.screen(), rows, cols);
+            output.extend_from_slice(&plan.bytes);
+            let mut execution = self.execution.clone();
+            execution.remap_positions(&plan);
+            execution.write_restore_at(&mut output, plan.cursor, plan.pending_wrap.as_ref());
+            output.extend_from_slice(&self.pending);
+            output.extend_from_slice(&self.utf8_pending);
+            output
+        } else {
+            let plan = reflow_plan(self.parser.screen(), rows, cols);
+            let mut output = plan.bytes.clone();
+            let mut execution = self.execution.clone();
+            execution.remap_positions(&plan);
+            execution.write_restore_at(&mut output, plan.cursor, plan.pending_wrap.as_ref());
+            output.extend_from_slice(&self.pending);
+            output.extend_from_slice(&self.utf8_pending);
+            output
         }
     }
 
@@ -305,30 +427,479 @@ impl CanonicalTerminal {
 
     fn snapshot(&self) -> Vec<u8> {
         let mut snapshot = if self.parser.screen().alternate_screen() {
-            let mut bytes = self
-                .normal_before_alt
-                .as_ref()
-                .map(snapshot_screen)
-                .unwrap_or_default();
+            let mut bytes = match (
+                self.normal_before_alt.as_ref(),
+                self.normal_execution_before_alt.as_ref(),
+            ) {
+                (Some(screen), Some(execution)) => {
+                    snapshot_screen_with_execution(screen, execution)
+                }
+                (Some(screen), None) => snapshot_screen(screen),
+                _ => Vec::new(),
+            };
             bytes.extend_from_slice(
                 self.alternate_entry
                     .unwrap_or(AlternateEntry::Mode1049)
                     .sequence(),
             );
             bytes.extend_from_slice(&self.parser.screen().state_formatted());
+            self.execution
+                .write_restore(&mut bytes, self.parser.screen());
             bytes
         } else {
-            snapshot_screen(self.parser.screen())
+            snapshot_screen_with_execution(self.parser.screen(), &self.execution)
         };
         snapshot.extend_from_slice(&self.pending);
+        snapshot.extend_from_slice(&self.utf8_pending);
         snapshot
+    }
+
+    fn drain_responses(&mut self) -> Vec<Vec<u8>> {
+        self.responses.drain(..).collect()
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExecutionState {
+    rows: u16,
+    scroll_region: Option<(u16, u16)>,
+    origin_mode: bool,
+    insert_mode: bool,
+    auto_wrap_mode: bool,
+    reverse_wrap_mode: bool,
+    focus_mode: bool,
+    alternate_scroll_mode: bool,
+    pixel_mouse_mode: bool,
+    cursor_style: u16,
+    attrs: Vec<Vec<u8>>,
+    attrs_bytes: usize,
+    saved_cursor: Option<SavedCursor>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SavedCursor {
+    row: u16,
+    col: u16,
+    origin_mode: bool,
+    attrs: Vec<Vec<u8>>,
+}
+
+impl ExecutionState {
+    fn new(rows: u16) -> Self {
+        Self {
+            rows,
+            scroll_region: None,
+            origin_mode: false,
+            insert_mode: false,
+            auto_wrap_mode: true,
+            reverse_wrap_mode: false,
+            focus_mode: false,
+            alternate_scroll_mode: false,
+            pixel_mouse_mode: false,
+            cursor_style: 0,
+            attrs: Vec::new(),
+            attrs_bytes: 0,
+            saved_cursor: None,
+        }
+    }
+
+    fn reset_screen(&mut self, rows: u16) {
+        *self = Self::new(rows);
+    }
+
+    fn observe(&mut self, sequence: &[u8], screen: &vt100::Screen) {
+        self.rows = screen.size().0;
+        if matches!(sequence, b"\x1bc") {
+            self.reset_screen(self.rows);
+            return;
+        }
+        let Some((parameters, intermediates, final_byte)) = csi_parts(sequence) else {
+            match sequence {
+                b"\x1b7" => self.save_cursor(screen),
+                b"\x1b8" => self.restore_cursor(),
+                _ => {}
+            }
+            return;
+        };
+
+        match (intermediates, final_byte) {
+            (b"", b'r') => {
+                let params = numeric_params(parameters);
+                let top = params.first().copied().flatten().unwrap_or(1).max(1);
+                let bottom = params
+                    .get(1)
+                    .copied()
+                    .flatten()
+                    .unwrap_or(self.rows)
+                    .min(self.rows);
+                self.scroll_region = (top < bottom).then_some((top - 1, bottom - 1));
+            }
+            (b"", b'h' | b'l') => {
+                let enabled = final_byte == b'h';
+                if !parameters.starts_with(b"?") {
+                    for mode in numeric_params(parameters).into_iter().flatten() {
+                        if mode == 4 {
+                            self.insert_mode = enabled;
+                        }
+                    }
+                } else {
+                    for mode in numeric_params(&parameters[1..]).into_iter().flatten() {
+                        match mode {
+                            6 => self.origin_mode = enabled,
+                            7 => self.auto_wrap_mode = enabled,
+                            45 => self.reverse_wrap_mode = enabled,
+                            1004 => self.focus_mode = enabled,
+                            1007 => self.alternate_scroll_mode = enabled,
+                            1016 => self.pixel_mouse_mode = enabled,
+                            // Deliberately do not persist synchronized output
+                            // (?2026). A snapshot with a missing reset could
+                            // otherwise leave a reconnect permanently frozen.
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            (b" ", b'q') => {
+                self.cursor_style = numeric_params(parameters)
+                    .first()
+                    .copied()
+                    .flatten()
+                    .unwrap_or(0)
+                    .min(6);
+            }
+            (b"", b'm') => self.observe_sgr(sequence, parameters),
+            (b"", b's') if parameters.is_empty() => self.save_cursor(screen),
+            (b"", b'u') if parameters.is_empty() => self.restore_cursor(),
+            (b"!", b'p') => self.reset_screen(self.rows),
+            _ => {}
+        }
+    }
+
+    fn observe_sgr(&mut self, sequence: &[u8], parameters: &[u8]) {
+        let params = numeric_params(parameters);
+        if sgr_resets(parameters) {
+            self.attrs.clear();
+            self.attrs_bytes = 0;
+        }
+        if parameters.is_empty() || (params.len() == 1 && params[0].unwrap_or(0) == 0) {
+            return;
+        }
+        if self.attrs_bytes.saturating_add(sequence.len()) > MAX_TRACKED_SGR_BYTES {
+            // Stay bounded under hostile output. Cell rendering still comes
+            // from vt100; only saved-cursor restoration may lose old attrs.
+            self.attrs.clear();
+            self.attrs_bytes = 0;
+        }
+        self.attrs.push(sequence.to_vec());
+        self.attrs_bytes += sequence.len();
+    }
+
+    fn save_cursor(&mut self, screen: &vt100::Screen) {
+        let (row, col) = screen.cursor_position();
+        self.saved_cursor = Some(SavedCursor {
+            row,
+            col,
+            origin_mode: self.origin_mode,
+            attrs: self.attrs.clone(),
+        });
+    }
+
+    fn restore_cursor(&mut self) {
+        if let Some(saved) = &self.saved_cursor {
+            self.origin_mode = saved.origin_mode;
+            self.attrs = saved.attrs.clone();
+            self.attrs_bytes = self.attrs.iter().map(Vec::len).sum();
+        }
+    }
+
+    fn write_restore(&self, output: &mut Vec<u8>, screen: &vt100::Screen) {
+        let pending_wrap = pending_wrap_cell(screen);
+        self.write_restore_at(output, screen.cursor_position(), pending_wrap.as_ref());
+    }
+
+    fn write_restore_at(
+        &self,
+        output: &mut Vec<u8>,
+        cursor: (u16, u16),
+        pending_wrap: Option<&PendingWrap>,
+    ) {
+        if let Some(saved) = &self.saved_cursor {
+            self.write_scroll_region(output);
+            write_dec_mode(output, 6, saved.origin_mode);
+            output.extend_from_slice(b"\x1b[m");
+            for attrs in &saved.attrs {
+                output.extend_from_slice(attrs);
+            }
+            self.write_cursor_position(output, saved.row, saved.col, saved.origin_mode);
+            output.extend_from_slice(b"\x1b7");
+        }
+
+        write_ansi_mode(output, 4, self.insert_mode);
+        write_dec_mode(output, 7, self.auto_wrap_mode);
+        write_dec_mode(output, 45, self.reverse_wrap_mode);
+        write_dec_mode(output, 1004, self.focus_mode);
+        write_dec_mode(output, 1007, self.alternate_scroll_mode);
+        write_dec_mode(output, 1016, self.pixel_mouse_mode);
+        self.write_scroll_region(output);
+        write_dec_mode(output, 6, self.origin_mode);
+        output.extend_from_slice(format!("\x1b[{} q", self.cursor_style).as_bytes());
+        let (row, col) = cursor;
+        if let Some(pending_wrap) = pending_wrap {
+            self.write_cursor_position(output, row, pending_wrap.start_col, self.origin_mode);
+            output.extend_from_slice(&pending_wrap.bytes);
+            self.write_attrs(output);
+        } else {
+            self.write_attrs(output);
+            self.write_cursor_position(output, row, col, self.origin_mode);
+        }
+    }
+
+    fn write_attrs(&self, output: &mut Vec<u8>) {
+        output.extend_from_slice(b"\x1b[m");
+        for attrs in &self.attrs {
+            output.extend_from_slice(attrs);
+        }
+    }
+
+    fn remap_positions(&mut self, plan: &ReflowPlan) {
+        self.rows = plan.rows;
+        self.scroll_region = self.scroll_region.and_then(|(top, bottom)| {
+            let bottom = bottom.min(plan.rows.saturating_sub(1));
+            (top < bottom).then_some((top, bottom))
+        });
+        if let Some(saved) = self.saved_cursor.as_mut() {
+            (saved.row, saved.col) = plan.map_position(saved.row, saved.col);
+        }
+    }
+
+    fn write_scroll_region(&self, output: &mut Vec<u8>) {
+        if let Some((top, bottom)) = self.scroll_region {
+            output.extend_from_slice(format!("\x1b[{};{}r", top + 1, bottom + 1).as_bytes());
+        } else {
+            output.extend_from_slice(b"\x1b[r");
+        }
+    }
+
+    fn write_cursor_position(&self, output: &mut Vec<u8>, row: u16, col: u16, origin_mode: bool) {
+        let row = if origin_mode {
+            row.saturating_sub(self.scroll_region.map_or(0, |(top, _)| top))
+        } else {
+            row
+        };
+        output.extend_from_slice(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
+    }
+}
+
+fn write_ansi_mode(output: &mut Vec<u8>, mode: u16, enabled: bool) {
+    output.extend_from_slice(format!("\x1b[{mode}{}", if enabled { 'h' } else { 'l' }).as_bytes());
+}
+
+fn write_dec_mode(output: &mut Vec<u8>, mode: u16, enabled: bool) {
+    output.extend_from_slice(format!("\x1b[?{mode}{}", if enabled { 'h' } else { 'l' }).as_bytes());
+}
+
+fn csi_parts(sequence: &[u8]) -> Option<(&[u8], &[u8], u8)> {
+    let body = if sequence.starts_with(b"\x1b[") {
+        &sequence[2..]
+    } else if sequence.starts_with(b"\x9b") {
+        &sequence[1..]
+    } else {
+        return None;
+    };
+    let (&final_byte, before_final) = body.split_last()?;
+    if !(0x40..=0x7e).contains(&final_byte) {
+        return None;
+    }
+    let intermediate_start = before_final
+        .iter()
+        .position(|byte| (0x20..=0x2f).contains(byte))
+        .unwrap_or(before_final.len());
+    Some((
+        &before_final[..intermediate_start],
+        &before_final[intermediate_start..],
+        final_byte,
+    ))
+}
+
+fn numeric_params(parameters: &[u8]) -> Vec<Option<u16>> {
+    if parameters.is_empty() {
+        return Vec::new();
+    }
+    parameters
+        .split(|byte| *byte == b';')
+        .map(|parameter| {
+            if parameter.is_empty() {
+                None
+            } else {
+                std::str::from_utf8(parameter).ok()?.parse().ok()
+            }
+        })
+        .collect()
+}
+
+fn sgr_resets(parameters: &[u8]) -> bool {
+    if parameters.is_empty() {
+        return true;
+    }
+    let parameters = parameters.split(|byte| *byte == b';').collect::<Vec<_>>();
+    let mut index = 0;
+    while index < parameters.len() {
+        let value = std::str::from_utf8(parameters[index])
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok());
+        match value {
+            None if parameters[index].is_empty() => return true,
+            Some(0) => return true,
+            Some(38 | 48 | 58) => {
+                let color_mode = parameters
+                    .get(index + 1)
+                    .and_then(|value| std::str::from_utf8(value).ok())
+                    .and_then(|value| value.parse::<u16>().ok());
+                index += match color_mode {
+                    Some(2) => 5,
+                    Some(5) => 3,
+                    _ => 1,
+                };
+            }
+            _ => index += 1,
+        }
+    }
+    false
+}
+
+fn terminal_query_response(
+    sequence: &[u8],
+    screen: &vt100::Screen,
+    execution: &ExecutionState,
+    pixel_width: u16,
+    pixel_height: u16,
+) -> Option<Vec<u8>> {
+    if sequence == b"\x1bZ" {
+        return Some(b"\x1b[?1;2c".to_vec());
+    }
+    let (parameters, intermediates, final_byte) = csi_parts(sequence)?;
+    if intermediates == b"$" && final_byte == b'p' {
+        let private = parameters.starts_with(b"?");
+        let mode = numeric_params(if private {
+            &parameters[1..]
+        } else {
+            parameters
+        })
+        .first()
+        .copied()
+        .flatten()?;
+        let status = terminal_mode_status(mode, private, screen, execution);
+        return Some(
+            format!(
+                "\x1b[{}{};{}$y",
+                if private { "?" } else { "" },
+                mode,
+                status
+            )
+            .into_bytes(),
+        );
+    }
+    if !intermediates.is_empty() {
+        return None;
+    }
+    match (parameters, final_byte) {
+        (b"" | b"0", b'c') => Some(b"\x1b[?1;2c".to_vec()),
+        (b">" | b">0", b'c') => Some(b"\x1b[>0;276;0c".to_vec()),
+        (b"5", b'n') => Some(b"\x1b[0n".to_vec()),
+        (b"6", b'n') | (b"?6", b'n') => {
+            let (row, col) = screen.cursor_position();
+            let row = if execution.origin_mode {
+                row.saturating_sub(execution.scroll_region.map_or(0, |(top, _)| top))
+            } else {
+                row
+            };
+            Some(
+                format!(
+                    "\x1b[{}{};{}R",
+                    if parameters.starts_with(b"?") {
+                        "?"
+                    } else {
+                        ""
+                    },
+                    row + 1,
+                    col + 1
+                )
+                .into_bytes(),
+            )
+        }
+        (b"18", b't') => {
+            let (rows, cols) = screen.size();
+            Some(format!("\x1b[8;{rows};{cols}t").into_bytes())
+        }
+        (b"14", b't') => Some(format!("\x1b[4;{pixel_height};{pixel_width}t").into_bytes()),
+        (b"16", b't') => {
+            let (rows, cols) = screen.size();
+            let cell_height = pixel_height.checked_div(rows).unwrap_or(0);
+            let cell_width = pixel_width.checked_div(cols).unwrap_or(0);
+            Some(format!("\x1b[6;{cell_height};{cell_width}t").into_bytes())
+        }
+        _ => None,
+    }
+}
+
+fn terminal_mode_status(
+    mode: u16,
+    private: bool,
+    screen: &vt100::Screen,
+    execution: &ExecutionState,
+) -> u8 {
+    let enabled = if private {
+        match mode {
+            1 => formatted_mode_enabled(screen, b"\x1b[?1h"),
+            6 => execution.origin_mode,
+            7 => execution.auto_wrap_mode,
+            9 => matches!(
+                screen.mouse_protocol_mode(),
+                vt100::MouseProtocolMode::Press
+            ),
+            25 => !screen.hide_cursor(),
+            45 => execution.reverse_wrap_mode,
+            47 | 1047 | 1049 => screen.alternate_screen(),
+            66 => formatted_mode_enabled(screen, b"\x1b="),
+            1000 => matches!(
+                screen.mouse_protocol_mode(),
+                vt100::MouseProtocolMode::PressRelease
+            ),
+            1002 => matches!(
+                screen.mouse_protocol_mode(),
+                vt100::MouseProtocolMode::ButtonMotion
+            ),
+            1003 => matches!(
+                screen.mouse_protocol_mode(),
+                vt100::MouseProtocolMode::AnyMotion
+            ),
+            1004 => execution.focus_mode,
+            1007 => execution.alternate_scroll_mode,
+            1016 => execution.pixel_mouse_mode,
+            2004 => formatted_mode_enabled(screen, b"\x1b[?2004h"),
+            _ => return 0,
+        }
+    } else {
+        match mode {
+            4 => execution.insert_mode,
+            _ => return 0,
+        }
+    };
+    if enabled { 1 } else { 2 }
+}
+
+fn formatted_mode_enabled(screen: &vt100::Screen, enabled_sequence: &[u8]) -> bool {
+    screen
+        .input_mode_formatted()
+        .windows(enabled_sequence.len())
+        .any(|bytes| bytes == enabled_sequence)
+}
+
+#[derive(Debug, Clone)]
 struct CompletedSequence {
     alternate_mode: AlternateMode,
     erase_scrollback: bool,
+    bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -474,6 +1045,196 @@ fn scrollback_capacity(state_bytes: usize, cols: u16) -> usize {
     state_bytes / (reserved_cols * CELL_BYTES)
 }
 
+#[derive(Debug)]
+struct ReflowPlan {
+    bytes: Vec<u8>,
+    rows: u16,
+    cols: u16,
+    source_cols: u16,
+    history_rows: usize,
+    groups: Vec<ReflowGroup>,
+    total_rows: usize,
+    cursor: (u16, u16),
+    pending_wrap: Option<PendingWrap>,
+}
+
+#[derive(Debug)]
+struct ReflowGroup {
+    source_start: usize,
+    source_end: usize,
+    target_start: usize,
+}
+
+impl ReflowPlan {
+    fn map_position(&self, row: u16, col: u16) -> (u16, u16) {
+        let source_row = self.history_rows + usize::from(row);
+        let Some(group) = self
+            .groups
+            .iter()
+            .find(|group| (group.source_start..=group.source_end).contains(&source_row))
+        else {
+            return (
+                row.min(self.rows.saturating_sub(1)),
+                col.min(self.cols.saturating_sub(1)),
+            );
+        };
+        let offset =
+            (source_row - group.source_start) * usize::from(self.source_cols) + usize::from(col);
+        let pending_wrap = col >= self.source_cols && offset.is_multiple_of(usize::from(self.cols));
+        let target_row =
+            group.target_start + offset / usize::from(self.cols) - usize::from(pending_wrap);
+        let viewport_base = self.total_rows.saturating_sub(usize::from(self.rows));
+        (
+            u16::try_from(target_row.saturating_sub(viewport_base))
+                .unwrap_or(u16::MAX)
+                .min(self.rows.saturating_sub(1)),
+            if pending_wrap {
+                self.cols
+            } else {
+                u16::try_from(offset % usize::from(self.cols)).unwrap()
+            },
+        )
+    }
+}
+
+struct ReflowRow {
+    bytes: Vec<u8>,
+    wrapped: bool,
+    content_width: usize,
+}
+
+#[derive(Clone, Debug)]
+struct PendingWrap {
+    start_col: u16,
+    width: u16,
+    bytes: Vec<u8>,
+}
+
+fn reflow_plan(screen: &vt100::Screen, rows: u16, cols: u16) -> ReflowPlan {
+    let mut source = screen.clone();
+    let (_, source_cols) = source.size();
+    source.set_scrollback(usize::MAX);
+    let history_rows = source.scrollback();
+    let mut source_rows = Vec::with_capacity(history_rows + usize::from(source.size().0));
+
+    for offset in (1..=history_rows).rev() {
+        source.set_scrollback(offset);
+        let bytes = source
+            .rows_formatted(0, source_cols)
+            .next()
+            .unwrap_or_default();
+        source_rows.push(ReflowRow {
+            bytes,
+            wrapped: source.row_wrapped(0),
+            content_width: row_content_width(&source, 0, source_cols),
+        });
+    }
+
+    source.set_scrollback(0);
+    let formatted_rows = source.rows_formatted(0, source_cols).collect::<Vec<_>>();
+    let cursor_row = usize::from(source.cursor_position().0);
+    let mut last_live_row = cursor_row;
+    for (row, bytes) in formatted_rows.iter().enumerate() {
+        if !bytes.is_empty()
+            || source.row_wrapped(u16::try_from(row).unwrap())
+            || row_content_width(&source, u16::try_from(row).unwrap(), source_cols) > 0
+        {
+            last_live_row = row;
+        }
+    }
+    for (row, bytes) in formatted_rows
+        .into_iter()
+        .enumerate()
+        .take(last_live_row + 1)
+    {
+        let row = u16::try_from(row).unwrap();
+        source_rows.push(ReflowRow {
+            bytes,
+            wrapped: source.row_wrapped(row),
+            content_width: row_content_width(&source, row, source_cols),
+        });
+    }
+
+    let mut output = b"\x1b[m\x1b[H\x1b[J".to_vec();
+    let mut groups = Vec::new();
+    let mut group_start = 0;
+    let mut group_width = 0;
+    let mut target_start = 0;
+    for (index, row) in source_rows.iter().enumerate() {
+        output.extend_from_slice(&row.bytes);
+        group_width += if row.wrapped {
+            usize::from(source_cols)
+        } else {
+            row.content_width
+        };
+        if !row.wrapped || index + 1 == source_rows.len() {
+            let target_height = group_width.div_ceil(usize::from(cols)).max(1);
+            groups.push(ReflowGroup {
+                source_start: group_start,
+                source_end: index,
+                target_start,
+            });
+            target_start += target_height;
+            group_start = index + 1;
+            group_width = 0;
+            if index + 1 != source_rows.len() {
+                output.extend_from_slice(b"\r\n");
+            }
+        }
+    }
+
+    let mut plan = ReflowPlan {
+        bytes: output,
+        rows,
+        cols,
+        source_cols,
+        history_rows,
+        groups,
+        total_rows: target_start,
+        cursor: (0, 0),
+        pending_wrap: None,
+    };
+    let (cursor_row, cursor_col) = screen.cursor_position();
+    plan.cursor = plan.map_position(cursor_row, cursor_col);
+    if plan.cursor.1 == cols {
+        plan.pending_wrap = pending_wrap_cell(screen).map(|mut pending_wrap| {
+            pending_wrap.start_col = cols.saturating_sub(pending_wrap.width);
+            pending_wrap
+        });
+    }
+    plan
+}
+
+fn row_content_width(screen: &vt100::Screen, row: u16, cols: u16) -> usize {
+    (0..cols)
+        .rev()
+        .find_map(|col| {
+            let cell = screen.cell(row, col)?;
+            (cell.has_contents() || cell.is_wide_continuation()).then_some(usize::from(col) + 1)
+        })
+        .unwrap_or(0)
+}
+
+fn pending_wrap_cell(screen: &vt100::Screen) -> Option<PendingWrap> {
+    let (rows, cols) = screen.size();
+    let (row, col) = screen.cursor_position();
+    if row >= rows || col < cols || cols == 0 {
+        return None;
+    }
+    let last_col = cols - 1;
+    let continuation = screen.cell(row, last_col)?.is_wide_continuation();
+    let width = if continuation { 2.min(cols) } else { 1 };
+    let start_col = cols - width;
+    let bytes = screen
+        .rows_formatted(start_col, width)
+        .nth(usize::from(row))?;
+    (!bytes.is_empty()).then_some(PendingWrap {
+        start_col,
+        width,
+        bytes,
+    })
+}
+
 fn snapshot_screen(screen: &vt100::Screen) -> Vec<u8> {
     let mut source = screen.clone();
     source.set_scrollback(usize::MAX);
@@ -506,6 +1267,12 @@ fn snapshot_screen(screen: &vt100::Screen) -> Vec<u8> {
     ));
     source.set_scrollback(0);
     snapshot.extend_from_slice(&source.state_formatted());
+    snapshot
+}
+
+fn snapshot_screen_with_execution(screen: &vt100::Screen, execution: &ExecutionState) -> Vec<u8> {
+    let mut snapshot = snapshot_screen(screen);
+    execution.write_restore(&mut snapshot, screen);
     snapshot
 }
 
@@ -613,7 +1380,7 @@ mod tests {
             state.publish(Bytes::from(format!("line-{line:04}\r\n")));
         }
 
-        state.resize(10, 500);
+        state.resize(10, 500, 0, 0);
 
         assert!(state.terminal.scrollback_rows < initial_capacity);
         assert_eq!(
@@ -766,6 +1533,263 @@ mod tests {
                 .snapshot()
                 .windows(4)
                 .any(|bytes| bytes == b"\x1b[6n")
+        );
+    }
+
+    #[test]
+    fn resize_reflows_completed_lines_at_narrower_and_wider_widths() {
+        let mut terminal = CanonicalTerminal::new(4, 5, 20);
+        terminal.process(b"abcdefghij\r\nEND");
+
+        terminal.resize(4, 4, 20, 0, 0);
+        assert_eq!(terminal.parser.screen().contents(), "abcdefghij\nEND");
+        assert!(terminal.parser.screen().row_wrapped(0));
+        assert!(terminal.parser.screen().row_wrapped(1));
+        assert!(!terminal.parser.screen().row_wrapped(2));
+        assert_eq!(terminal.parser.screen().cursor_position(), (3, 3));
+
+        terminal.resize(4, 8, 20, 0, 0);
+        assert_eq!(terminal.parser.screen().contents(), "abcdefghij\nEND");
+        assert!(terminal.parser.screen().row_wrapped(0));
+        assert!(!terminal.parser.screen().row_wrapped(1));
+        assert_eq!(terminal.parser.screen().cursor_position(), (2, 3));
+    }
+
+    #[test]
+    fn resize_moves_height_shrunk_content_into_scrollback_and_restores_it() {
+        let mut terminal = CanonicalTerminal::new(3, 10, 20);
+        terminal.process(b"one\r\ntwo\r\nthree");
+
+        terminal.resize(2, 10, 20, 0, 0);
+        let mut shrunken = terminal.parser.screen().clone();
+        shrunken.set_scrollback(usize::MAX);
+        assert_eq!(shrunken.scrollback(), 1);
+        assert_eq!(shrunken.contents(), "one\ntwo");
+        assert_eq!(terminal.parser.screen().contents(), "two\nthree");
+        assert_eq!(terminal.parser.screen().cursor_position(), (1, 5));
+
+        terminal.resize(4, 10, 20, 0, 0);
+        assert_eq!(terminal.parser.screen().scrollback(), 0);
+        assert_eq!(terminal.parser.screen().contents(), "one\ntwo\nthree");
+        assert_eq!(terminal.parser.screen().cursor_position(), (2, 5));
+    }
+
+    #[test]
+    fn snapshot_and_height_resize_preserve_delayed_autowrap() {
+        let mut terminal = CanonicalTerminal::new(3, 5, 20);
+        terminal.process(b"\x1b[31mabcde\x1b[32m");
+        assert_eq!(terminal.parser.screen().cursor_position(), (0, 5));
+
+        let mut reconstructed = CanonicalTerminal::new(3, 5, 20);
+        reconstructed.process(&terminal.snapshot());
+        assert_screen_eq(reconstructed.parser.screen(), terminal.parser.screen());
+        assert_eq!(reconstructed.parser.screen().cursor_position(), (0, 5));
+
+        terminal.process(b"Z");
+        reconstructed.process(b"Z");
+        assert_screen_eq(reconstructed.parser.screen(), terminal.parser.screen());
+        assert!(reconstructed.parser.screen().row_wrapped(0));
+        assert_eq!(
+            reconstructed.parser.screen().cell(1, 0).unwrap().contents(),
+            "Z"
+        );
+        assert_eq!(reconstructed.parser.screen().cursor_position(), (1, 1));
+
+        let mut resized = CanonicalTerminal::new(3, 5, 20);
+        resized.process(b"abcde");
+        resized.resize(2, 5, 20, 0, 0);
+        assert_eq!(resized.parser.screen().cursor_position(), (0, 5));
+        resized.process(b"Z");
+        assert!(resized.parser.screen().row_wrapped(0));
+        assert_eq!(resized.parser.screen().cell(1, 0).unwrap().contents(), "Z");
+    }
+
+    #[test]
+    fn snapshots_preserve_every_utf8_split_without_treating_continuations_as_c1() {
+        for character in ['؛', '\u{0810}', '😀'] {
+            let encoded = character.to_string().into_bytes();
+            assert!((2..=4).contains(&encoded.len()));
+            for split in 1..encoded.len() {
+                let mut terminal = CanonicalTerminal::new(3, 20, 0);
+                terminal.process(b"before-");
+                terminal.process(&encoded[..split]);
+                assert_eq!(terminal.sequence, EscapeSequence::Ground);
+                assert!(terminal.pending.is_empty());
+                assert_eq!(terminal.utf8_pending, encoded[..split]);
+
+                let mut reconstructed = CanonicalTerminal::new(3, 20, 0);
+                reconstructed.process(&terminal.snapshot());
+                terminal.process(&encoded[split..]);
+                reconstructed.process(&encoded[split..]);
+
+                assert_screen_eq(reconstructed.parser.screen(), terminal.parser.screen());
+                assert!(terminal.drain_responses().is_empty());
+                assert!(reconstructed.drain_responses().is_empty());
+                assert_eq!(
+                    terminal.parser.screen().contents(),
+                    format!("before-{character}")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_restores_scroll_region_origin_and_saved_cursor_for_continuation() {
+        let mut terminal = CanonicalTerminal::new(6, 12, 20);
+        terminal.process(b"\x1b[2;5r\x1b[?6h\x1b[2;4H\x1b[31m\x1b7");
+        terminal.process(b"\x1b[m\x1b[1;1Hcurrent");
+
+        let mut reconstructed = CanonicalTerminal::new(6, 12, 20);
+        reconstructed.process(&terminal.snapshot());
+        terminal.process(b"\x1b8X\r\nnext");
+        reconstructed.process(b"\x1b8X\r\nnext");
+
+        assert_screen_eq(reconstructed.parser.screen(), terminal.parser.screen());
+        assert_eq!(reconstructed.execution, terminal.execution);
+    }
+
+    #[test]
+    fn snapshot_reemits_common_tui_execution_modes_but_not_synchronized_output() {
+        let mut terminal = CanonicalTerminal::new(6, 12, 20);
+        terminal.process(
+            b"\x1b[2;5r\x1b[?6h\x1b[4h\x1b[?7l\x1b[?45h\x1b[?1004h\x1b[?1007h\x1b[?1016h\x1b[5 q\x1b[?2026h",
+        );
+        let snapshot = terminal.snapshot();
+        assert!(!snapshot.windows(8).any(|bytes| bytes == b"\x1b[?2026h"));
+
+        let mut reconstructed = CanonicalTerminal::new(6, 12, 20);
+        reconstructed.process(&snapshot);
+        assert_eq!(reconstructed.execution, terminal.execution);
+    }
+
+    #[test]
+    fn snapshot_does_not_mistake_zero_rgb_components_for_sgr_reset() {
+        let mut terminal = CanonicalTerminal::new(3, 12, 20);
+        terminal.process(b"\x1b[1;44m\x1b[38;2;0;128;255mX");
+
+        let mut reconstructed = CanonicalTerminal::new(3, 12, 20);
+        reconstructed.process(&terminal.snapshot());
+        terminal.process(b"Y");
+        reconstructed.process(b"Y");
+
+        assert_screen_eq(reconstructed.parser.screen(), terminal.parser.screen());
+        assert!(reconstructed.parser.screen().cell(0, 1).unwrap().bold());
+        assert_eq!(
+            reconstructed.parser.screen().cell(0, 1).unwrap().bgcolor(),
+            vt100::Color::Idx(4)
+        );
+    }
+
+    #[test]
+    fn terminal_queries_are_answered_once_at_their_exact_boundary() {
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"\x1bZ", b"\x1b[?1;2c"),
+            (b"\x1b[c", b"\x1b[?1;2c"),
+            (b"\x1b[0c", b"\x1b[?1;2c"),
+            (b"\x1b[>c", b"\x1b[>0;276;0c"),
+            (b"\x1b[>0c", b"\x1b[>0;276;0c"),
+            (b"\x1b[5n", b"\x1b[0n"),
+            (b"\x1b[4$p", b"\x1b[4;2$y"),
+            (b"\x1b[?7$p", b"\x1b[?7;1$y"),
+            (b"\x1b[?2026$p", b"\x1b[?2026;0$y"),
+            (b"\x1b[18t", b"\x1b[8;5;20t"),
+            (b"\x1b[14t", b"\x1b[4;0;0t"),
+            (b"\x1b[16t", b"\x1b[6;0;0t"),
+        ];
+        for &(query, expected) in cases {
+            for split in 1..query.len() {
+                let mut state = TerminalOutputState::new(1024 * 1024, 5, 20);
+                state.publish(Bytes::copy_from_slice(&query[..split]));
+                assert!(state.drain_responses().is_empty());
+                state.publish(Bytes::copy_from_slice(&query[split..]));
+                assert_eq!(
+                    state.drain_responses(),
+                    vec![Bytes::copy_from_slice(expected)]
+                );
+                assert!(state.drain_responses().is_empty());
+                assert!(
+                    !state
+                        .sync(None)
+                        .snapshot
+                        .unwrap()
+                        .windows(query.len())
+                        .any(|bytes| bytes == query)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mode_queries_report_tracked_state_across_split_boundaries() {
+        let cases: &[(&[u8], &[u8], &[u8])] = &[
+            (b"\x1b[4h", b"\x1b[4$p", b"\x1b[4;1$y"),
+            (b"\x1b[?6h", b"\x1b[?6$p", b"\x1b[?6;1$y"),
+            (b"\x1b[?7l", b"\x1b[?7$p", b"\x1b[?7;2$y"),
+            (b"\x1b[?45h", b"\x1b[?45$p", b"\x1b[?45;1$y"),
+            (b"\x1b[?1004h", b"\x1b[?1004$p", b"\x1b[?1004;1$y"),
+            (b"\x1b[?1007h", b"\x1b[?1007$p", b"\x1b[?1007;1$y"),
+            (b"\x1b[?1016h", b"\x1b[?1016$p", b"\x1b[?1016;1$y"),
+        ];
+        for &(setup, query, expected) in cases {
+            for split in 1..query.len() {
+                let mut state = TerminalOutputState::new(1024 * 1024, 5, 20);
+                state.publish(Bytes::copy_from_slice(setup));
+                state.publish(Bytes::copy_from_slice(&query[..split]));
+                assert!(state.drain_responses().is_empty());
+                state.publish(Bytes::copy_from_slice(&query[split..]));
+                assert_eq!(
+                    state.drain_responses(),
+                    vec![Bytes::copy_from_slice(expected)]
+                );
+                assert!(state.drain_responses().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn cursor_position_queries_use_the_position_at_sequence_completion() {
+        let mut state = TerminalOutputState::new(1024 * 1024, 5, 20);
+        state.publish(Bytes::from_static(b"\x1b[3;4H\x1b[6"));
+        assert!(state.drain_responses().is_empty());
+        state.publish(Bytes::from_static(b"n\x1b[?6n"));
+        assert_eq!(
+            state.drain_responses(),
+            vec![
+                Bytes::from_static(b"\x1b[3;4R"),
+                Bytes::from_static(b"\x1b[?3;4R")
+            ]
+        );
+    }
+
+    #[test]
+    fn cursor_position_queries_respect_origin_mode() {
+        let mut state = TerminalOutputState::new(1024 * 1024, 8, 20);
+        state.publish(Bytes::from_static(
+            b"\x1b[3;7r\x1b[?6h\x1b[2;4H\x1b[6n\x1b[?6n",
+        ));
+
+        assert_eq!(
+            state.drain_responses(),
+            vec![
+                Bytes::from_static(b"\x1b[2;4R"),
+                Bytes::from_static(b"\x1b[?2;4R")
+            ]
+        );
+    }
+
+    #[test]
+    fn window_queries_report_the_current_pixel_and_cell_dimensions() {
+        let mut state = TerminalOutputState::new(1024 * 1024, 24, 80);
+        state.resize(24, 80, 800, 480);
+        state.publish(Bytes::from_static(b"\x1b[14t\x1b[16t\x1b[18t"));
+
+        assert_eq!(
+            state.drain_responses(),
+            vec![
+                Bytes::from_static(b"\x1b[4;480;800t"),
+                Bytes::from_static(b"\x1b[6;20;10t"),
+                Bytes::from_static(b"\x1b[8;24;80t"),
+            ]
         );
     }
 

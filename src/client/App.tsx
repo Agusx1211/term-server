@@ -1380,6 +1380,7 @@ export function App() {
                     theme={theme}
                     fontSize={terminalFontSize}
                     active={visible && terminal.id === activeId && !activeResource && !settingsActive}
+                    visible={visible}
                     onActivate={() => setActiveId(terminal.id)}
                     onClose={() => closePane(terminal.id)}
                     onRemove={() => void removeTerminal(terminal)}

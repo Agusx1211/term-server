@@ -202,10 +202,24 @@ fn valid_update_channel(value: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::{CommandFactory, FromArgMatches};
+
+    fn parse_without_environment(arguments: impl IntoIterator<Item = &'static str>) -> Cli {
+        let argument_ids = Cli::command()
+            .get_arguments()
+            .map(|argument| argument.get_id().clone())
+            .collect::<Vec<_>>();
+        let command = argument_ids
+            .into_iter()
+            .fold(Cli::command(), |command, id| {
+                command.mut_arg(id, |argument| argument.env(None::<&str>))
+            });
+        Cli::from_arg_matches(&command.try_get_matches_from(arguments).unwrap()).unwrap()
+    }
 
     #[test]
     fn defaults_to_secure_local_binding() {
-        let cli = Cli::try_parse_from(["term-server"]).unwrap();
+        let cli = parse_without_environment(["term-server"]);
         assert_eq!(cli.host, "127.0.0.1");
         assert_eq!(cli.port, 8090);
         assert!(cli.is_https());

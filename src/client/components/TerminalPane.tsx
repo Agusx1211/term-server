@@ -57,6 +57,13 @@ import {
 } from "../lib/terminal-zoom";
 import { addTerminalStreamProtocol, closeTerminalSocket } from "../lib/terminal-socket";
 import {
+  encodeTerminalBinary,
+  encodeTerminalText,
+  sendTerminalChunks,
+  terminalDataDisposition,
+  trackTerminalUserInput,
+} from "../lib/terminal-input";
+import {
   TERMINAL_FRAME_OUTPUT,
   TerminalRenderBacklog,
   TerminalStreamState,
@@ -64,6 +71,11 @@ import {
   type TerminalFrame,
   type TerminalStreamIssue,
 } from "../lib/terminal-stream";
+import {
+  createSettledTask,
+  terminalViewportSize,
+} from "../lib/terminal-viewport";
+import { PanoptesUnicode17Addon } from "../lib/terminal-unicode";
 import {
   mixedTerminalBackground,
   terminalTheme,
@@ -79,6 +91,7 @@ interface TerminalPaneProps {
   theme: ThemeName;
   fontSize: number;
   active: boolean;
+  visible: boolean;
   needsAttention: boolean;
   artifacts: ArtifactEntry[];
   onActivate: () => void;
@@ -140,6 +153,7 @@ export function TerminalPane({
   theme,
   fontSize,
   active,
+  visible,
   needsAttention,
   artifacts,
   onActivate,
@@ -167,13 +181,18 @@ export function TerminalPane({
   const exited = useRef(terminal.status === "exited");
   const reconnectTimer = useRef<number>();
   const reportTerminalViewport = useRef<() => void>();
+  const setTerminalVisibility = useRef<(visible: boolean) => void>();
   const terminalState = useRef(terminal);
   const openFile = useRef(onOpenFile);
   const streamIssue = useRef(onStreamIssue);
+  const activeState = useRef(active);
+  const visibleState = useRef(visible);
   const modifiers = useRef<TerminalModifiers>(NO_TERMINAL_MODIFIERS);
   terminalState.current = terminal;
   openFile.current = onOpenFile;
   streamIssue.current = onStreamIssue;
+  activeState.current = active;
+  visibleState.current = visible;
   const [processesOpen, setProcessesOpen] = useState(false);
   const knownArtifactIds = useRef(new Set(artifacts.map((artifact) => artifact.id)));
   const [artifactsOpen, setArtifactsOpen] = useState(artifacts.length > 0);
@@ -210,7 +229,6 @@ export function TerminalPane({
     if (!container.current) return;
     let disposed = false;
     let attempts = 0;
-    let resizeFrame = 0;
     const fit = new FitAddon();
     const search = new SearchAddon({ highlightLimit: 1000 });
     const term = new XTerm({
@@ -233,6 +251,7 @@ export function TerminalPane({
     searchAddon.current = search;
     term.loadAddon(fit);
     term.loadAddon(search);
+    term.loadAddon(new PanoptesUnicode17Addon());
     const searchResultsDisposable = search.onDidChangeResults(({ resultIndex, resultCount }) => {
       setSearchResults({ index: resultIndex, count: resultCount });
     });
@@ -305,6 +324,18 @@ export function TerminalPane({
     const send = (message: ClientTerminalMessage) => {
       if (socket.current?.readyState === WebSocket.OPEN) socket.current.send(JSON.stringify(message));
     };
+    const sendTextInput = (data: string) => {
+      const current = socket.current;
+      if (current?.readyState === WebSocket.OPEN) {
+        sendTerminalChunks(current, encodeTerminalText(data));
+      }
+    };
+    const sendBinaryInput = (data: string) => {
+      const current = socket.current;
+      if (current?.readyState === WebSocket.OPEN) {
+        sendTerminalChunks(current, encodeTerminalBinary(data));
+      }
+    };
     const stream = new TerminalStreamState();
     const backlog = new TerminalRenderBacklog();
     let acceptingInput = false;
@@ -315,6 +346,7 @@ export function TerminalPane({
     let hasSynced = false;
     let recoveringOutput = false;
     let reportedIssue = "";
+    let suspendSocket: (() => void) | undefined;
     const reportStreamIssue = (issue?: TerminalStreamIssue) => {
       const key = issue ? `${issue.kind}:${issue.pendingBytes ?? 0}` : "";
       if (key === reportedIssue) return;
@@ -324,31 +356,59 @@ export function TerminalPane({
     const proposedViewport = () => {
       if (!container.current?.clientWidth || !container.current.clientHeight) return;
       try {
-        return fit.proposeDimensions();
+        const proposed = fit.proposeDimensions();
+        const screen = term.element?.querySelector<HTMLElement>(".xterm-screen");
+        if (!proposed || !screen) return;
+        const bounds = screen.getBoundingClientRect();
+        return terminalViewportSize(proposed, {
+          cols: term.cols,
+          rows: term.rows,
+          pixelWidth: bounds.width,
+          pixelHeight: bounds.height,
+        });
       } catch {
         // The pane may be between layout states.
       }
     };
-    const reportViewport = () => {
-      cancelAnimationFrame(resizeFrame);
-      resizeFrame = requestAnimationFrame(() => {
-        const size = proposedViewport();
-        if (size) send({ type: "resize", cols: size.cols, rows: size.rows });
-      });
-    };
+    let reportedViewport = "";
+    const viewportReporter = createSettledTask(() => {
+      if (!visibleState.current) return;
+      const size = proposedViewport();
+      if (!size) return;
+      const key = `${size.cols}x${size.rows}@${size.pixelWidth}x${size.pixelHeight}`;
+      if (key === reportedViewport) return;
+      reportedViewport = key;
+      send({ type: "resize", ...size });
+    });
+    const reportViewport = viewportReporter.schedule;
     reportTerminalViewport.current = reportViewport;
 
+    // xterm's public onData event omits its internal wasUserInput bit. Track that
+    // bit so a pending asynchronous parser write cannot make a real keystroke
+    // look like a device-query response. The server owns common terminal-query
+    // replies; one elected browser still handles replies that need browser state.
+    const inputSource = trackTerminalUserInput(term);
     const dataDisposable = term.onData((data) => {
-      if (!acceptingInput || parsingOutput && !responder) return;
-      if (parsingOutput) {
-        send({ type: "input", data });
+      const disposition = terminalDataDisposition({
+        acceptingInput,
+        data,
+        parsingOutput,
+        responder,
+        userInput: inputSource.consume(),
+      });
+      if (disposition === "ignore") return;
+      if (disposition === "response") {
+        sendTextInput(data);
         return;
       }
       const currentModifiers = modifiers.current;
-      send({ type: "input", data: transformTerminalInput(data, currentModifiers) });
+      sendTextInput(transformTerminalInput(data, currentModifiers));
       if (currentModifiers.alt || currentModifiers.ctrl) {
         updateMobileModifiers(NO_TERMINAL_MODIFIERS);
       }
+    });
+    const binaryDisposable = term.onBinary((data) => {
+      if (acceptingInput) sendBinaryInput(data);
     });
     const scrollDisposable = term.onScroll((position) => {
       setScrolledBack(position < term.buffer.active.baseY);
@@ -367,6 +427,7 @@ export function TerminalPane({
         return false;
       }
       if (modifier && event.shiftKey && event.code === "KeyV" && event.type === "keydown") {
+        event.preventDefault();
         void navigator.clipboard?.readText().then((value) => term.paste(value)).catch(() => onNotice("Clipboard permission was denied"));
         return false;
       }
@@ -392,8 +453,9 @@ export function TerminalPane({
     });
 
     const connect = () => {
-      if (disposed || exited.current) return;
+      if (disposed || exited.current || !visibleState.current) return;
       acceptingInput = false;
+      responder = false;
       term.options.disableStdin = true;
       setConnection(recoveringOutput ? "recovering" : "connecting");
       const protocol = location.protocol === "https:" ? "wss:" : "ws:";
@@ -404,6 +466,9 @@ export function TerminalPane({
       if (size) {
         url.searchParams.set("cols", String(size.cols));
         url.searchParams.set("rows", String(size.rows));
+        url.searchParams.set("pixelWidth", String(size.pixelWidth));
+        url.searchParams.set("pixelHeight", String(size.pixelHeight));
+        reportedViewport = `${size.cols}x${size.rows}@${size.pixelWidth}x${size.pixelHeight}`;
       }
       const resumeSequence = stream.resumeSequence;
       if (resumeSequence !== undefined) url.searchParams.set("sequence", String(resumeSequence));
@@ -427,6 +492,14 @@ export function TerminalPane({
         setConnection("recovering");
         closeTerminalSocket(next, "backlog");
       };
+      const suspend = () => {
+        if (abandoned) return;
+        abandoned = true;
+        acceptingInput = false;
+        term.options.disableStdin = true;
+        next.close(1000, "Pane cached");
+      };
+      suspendSocket = suspend;
       next.binaryType = "arraybuffer";
       socket.current = next;
       next.addEventListener("open", () => {
@@ -468,11 +541,12 @@ export function TerminalPane({
             if (message.type === "size") {
               term.resize(message.cols, message.rows);
               responder = message.responder;
+              if (!acceptingInput) term.options.disableStdin = !responder;
               setTerminalSize({ focused: message.focused, controller: message.controller });
             }
             if (message.type === "sync") {
               acceptingInput = false;
-              term.options.disableStdin = true;
+              term.options.disableStdin = !responder;
               if (hasSynced && !recoveringOutput) {
                 recoveringOutput = true;
                 reportStreamIssue({ kind: "recovering" });
@@ -492,7 +566,7 @@ export function TerminalPane({
               reportStreamIssue();
               setConnection("connected");
               reportViewport();
-              term.focus();
+              if (activeState.current && visibleState.current) term.focus();
             }
             if (message.type === "exit") {
               exited.current = true;
@@ -515,7 +589,17 @@ export function TerminalPane({
         acceptingInput = false;
         term.options.disableStdin = true;
         if (socket.current === next) socket.current = undefined;
+        if (suspendSocket === suspend) suspendSocket = undefined;
         setTerminalSize({ focused: false, controller: false });
+        if (!visibleState.current) {
+          reportStreamIssue();
+          setConnection("connecting");
+          void messageQueue.then(() => {
+            backlog.reset();
+            if (recoveringOutput) stream.restart();
+          });
+          return;
+        }
         if (!recoveringOutput) {
           reportStreamIssue({ kind: "reconnecting" });
           setConnection("disconnected");
@@ -534,6 +618,26 @@ export function TerminalPane({
       next.addEventListener("error", () => next.close());
     };
 
+    setTerminalVisibility.current = (nextVisible) => {
+      visibleState.current = nextVisible;
+      if (!nextVisible) {
+        viewportReporter.cancel();
+        if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
+        reconnectTimer.current = undefined;
+        reportStreamIssue();
+        term.blur();
+        suspendSocket?.();
+        return;
+      }
+      void messageQueue.then(() => {
+        if (disposed || exited.current || !visibleState.current) return;
+        const current = socket.current;
+        if (!current || current.readyState === WebSocket.CLOSED) connect();
+        reportViewport();
+        if (hasSynced && activeState.current) term.focus();
+      });
+    };
+
     const keepaliveTimer = window.setInterval(() => {
       const current = socket.current;
       if (current?.readyState !== WebSocket.OPEN) return;
@@ -546,18 +650,20 @@ export function TerminalPane({
 
     const observer = new ResizeObserver(reportViewport);
     observer.observe(container.current);
-    connect();
+    if (visibleState.current) connect();
     reportViewport();
 
     return () => {
       disposed = true;
-      cancelAnimationFrame(resizeFrame);
+      viewportReporter.cancel();
       clearInterval(keepaliveTimer);
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
       observer.disconnect();
       imagePreviews.clear();
       disposeTouchScroll();
       dataDisposable.dispose();
+      inputSource.dispose();
+      binaryDisposable.dispose();
       scrollDisposable.dispose();
       fileLinksDisposable.dispose();
       searchResultsDisposable.dispose();
@@ -565,11 +671,29 @@ export function TerminalPane({
       socket.current?.close(1000, "Pane closed");
       socket.current = undefined;
       reportTerminalViewport.current = undefined;
+      setTerminalVisibility.current = undefined;
       term.dispose();
       xterm.current = undefined;
       searchAddon.current = undefined;
     };
   }, [terminal.id, config.scrollbackLines]);
+
+  useEffect(() => {
+    setTerminalVisibility.current?.(visible);
+  }, [visible]);
+
+  useEffect(() => {
+    activeState.current = active;
+    visibleState.current = visible;
+    const term = xterm.current;
+    if (!term) return;
+    if (!active || !visible) {
+      term.blur();
+      return;
+    }
+    const frame = requestAnimationFrame(() => term.focus());
+    return () => cancelAnimationFrame(frame);
+  }, [active, visible]);
 
   useEffect(() => {
     const term = xterm.current;

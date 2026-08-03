@@ -10,8 +10,14 @@ import {
   terminalPreviewFontSize,
   type TerminalPreviewMode,
 } from "../lib/terminal-preview";
+import { PanoptesUnicode17Addon } from "../lib/terminal-unicode";
 import { addTerminalStreamProtocol, closeTerminalSocket } from "../lib/terminal-socket";
-import { TerminalStreamState, decodeTerminalFrame } from "../lib/terminal-stream";
+import {
+  TerminalRenderBacklog,
+  TerminalStreamState,
+  decodeTerminalFrame,
+  type TerminalFrame,
+} from "../lib/terminal-stream";
 import {
   mixedTerminalBackground,
   terminalTheme,
@@ -49,6 +55,7 @@ export function TerminalPreview({
     let rows = 24;
     let lastServerMessage = Date.now();
     const term = new XTerm({
+      allowProposedApi: true,
       cols,
       rows,
       cursorBlink: false,
@@ -62,6 +69,7 @@ export function TerminalPreview({
       theme: terminalTheme(theme, terminal.color),
     });
     xterm.current = term;
+    term.loadAddon(new PanoptesUnicode17Addon());
     term.open(host);
 
     const fitExistingGrid = () => {
@@ -80,6 +88,8 @@ export function TerminalPreview({
     fitExistingGrid();
 
     const stream = new TerminalStreamState();
+    const backlog = new TerminalRenderBacklog();
+    let abandoned = false;
     let messageQueue = Promise.resolve();
     const writeTerminal = (data: Uint8Array, commit?: number) => new Promise<void>(
       (resolve, reject) => {
@@ -112,37 +122,62 @@ export function TerminalPreview({
     };
 
     socket.addEventListener("message", (event) => {
+      if (abandoned) return;
       lastServerMessage = Date.now();
-      messageQueue = messageQueue.then(async () => {
-        if (disposed) return;
-        const binary = event.data instanceof Blob ? await event.data.arrayBuffer() : event.data;
-        if (binary instanceof ArrayBuffer) {
-          const frame = decodeTerminalFrame(binary);
-          await writeTerminal(frame.data, stream.accept(frame));
+      let eagerFrame: TerminalFrame | undefined;
+      let queuedBytes = 0;
+      if (event.data instanceof ArrayBuffer) {
+        try {
+          eagerFrame = decodeTerminalFrame(event.data);
+        } catch (error) {
+          abandoned = true;
+          showUnavailable(error instanceof Error ? error.message : "Preview unavailable");
+          closeTerminalSocket(socket, "protocol-error");
           return;
         }
-        const control = JSON.parse(String(event.data)) as ServerTerminalMessage;
-        if (control.type === "size") {
-          cols = control.cols;
-          rows = control.rows;
-          term.resize(cols, rows);
-          fitExistingGrid();
+        queuedBytes = eagerFrame.data.byteLength;
+        if (backlog.enqueue(queuedBytes)) {
+          abandoned = true;
+          showUnavailable("Preview renderer fell behind");
+          closeTerminalSocket(socket, "backlog");
+          return;
         }
-        if (control.type === "sync" && stream.begin(control.mode, control.sequence)) {
-          term.reset();
+      }
+      messageQueue = messageQueue.then(async () => {
+        try {
+          if (disposed || abandoned) return;
+          const binary = event.data instanceof Blob ? await event.data.arrayBuffer() : event.data;
+          if (binary instanceof ArrayBuffer) {
+            const frame = eagerFrame ?? decodeTerminalFrame(binary);
+            await writeTerminal(frame.data, stream.accept(frame));
+            return;
+          }
+          const control = JSON.parse(String(event.data)) as ServerTerminalMessage;
+          if (control.type === "size") {
+            cols = control.cols;
+            rows = control.rows;
+            term.resize(cols, rows);
+            fitExistingGrid();
+          }
+          if (control.type === "sync" && stream.begin(control.mode, control.sequence)) {
+            term.reset();
+          }
+          if (control.type === "synced") {
+            stream.finish(control.sequence);
+            term.scrollToBottom();
+            setConnection("connected");
+            setMessage("Live");
+          }
+          if (control.type === "exit") {
+            showUnavailable(`Process exited with code ${control.exitCode}`);
+          }
+          if (control.type === "error") throw new Error(control.message);
+        } finally {
+          backlog.settle(queuedBytes);
         }
-        if (control.type === "synced") {
-          stream.finish(control.sequence);
-          term.scrollToBottom();
-          setConnection("connected");
-          setMessage("Live");
-        }
-        if (control.type === "exit") {
-          showUnavailable(`Process exited with code ${control.exitCode}`);
-        }
-        if (control.type === "error") throw new Error(control.message);
       }).catch((error) => {
         if (disposed) return;
+        abandoned = true;
         showUnavailable(error instanceof Error ? error.message : "Preview unavailable");
         closeTerminalSocket(socket, "protocol-error");
       });
@@ -165,6 +200,7 @@ export function TerminalPreview({
       disposed = true;
       clearInterval(keepaliveTimer);
       resizeObserver.disconnect();
+      backlog.reset();
       socket.close(1000, "Preview closed");
       term.dispose();
       xterm.current = undefined;
