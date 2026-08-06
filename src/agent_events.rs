@@ -47,6 +47,11 @@ impl AgentEventKind {
 pub struct AgentEvent {
     pub provider: String,
     pub kind: AgentEventKind,
+    /// A provider-supplied conversation title. omp generates one from the
+    /// first message and forwards it so term-server reuses it instead of
+    /// generating its own; other providers leave this `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 impl AgentEvent {
@@ -55,6 +60,7 @@ impl AgentEvent {
             "codex" => "codex",
             "claude" => "claude",
             "pi" => "pi",
+            "omp" => "omp",
             _ => return None,
         };
         let name = input
@@ -81,6 +87,11 @@ impl AgentEvent {
         Some(Self {
             provider: provider.to_owned(),
             kind,
+            title: input
+                .get("title")
+                .and_then(Value::as_str)
+                .map(|title| title.trim().to_owned())
+                .filter(|title| !title.is_empty()),
         })
     }
 }
@@ -154,6 +165,7 @@ mod tests {
             AgentEvent {
                 provider: "codex".to_owned(),
                 kind: AgentEventKind::RunningCommand,
+                title: None,
             }
         );
         assert!(
@@ -185,6 +197,31 @@ mod tests {
             .unwrap();
             assert_eq!(event.kind, expected);
         }
+    }
+
+    #[test]
+    fn forwards_omp_lifecycle_and_title() {
+        let activity = AgentEvent::from_hook_input(
+            "omp",
+            &serde_json::json!({ "hook_event_name": "tool_execution_start", "tool_name": "edit" }),
+        )
+        .unwrap();
+        assert_eq!(activity.provider, "omp");
+        assert_eq!(activity.kind, AgentEventKind::EditingFiles);
+        assert_eq!(activity.title, None);
+
+        let titled = AgentEvent::from_hook_input(
+            "OMP",
+            &serde_json::json!({
+                "hook_event_name": "agent_start",
+                "title": "  fix checkout latency  "
+            }),
+        )
+        .unwrap();
+        assert_eq!(titled.kind, AgentEventKind::Thinking);
+        assert_eq!(titled.title.as_deref(), Some("fix checkout latency"));
+        // The title is absent from the wire shape when unset.
+        assert!(!serde_json::to_string(&activity).unwrap().contains("title"));
     }
 
     #[test]
