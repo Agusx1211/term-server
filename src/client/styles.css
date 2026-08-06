@@ -239,6 +239,8 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
 .tree-row:hover .row-actions, .row-actions.always { display: flex; }
 .row-action { width: 22px; height: 22px; color: var(--muted); border-radius: 3px; }
 .row-action.danger:hover { color: var(--danger); }
+.row-action.pushover-bell.active { color: var(--accent); }
+.row-action.pushover-bell.active:hover { color: var(--accent-hover); }
 .workspace-add { display: grid; margin-right: 4px; }
 .terminal-here { width: auto; padding: 0 4px; display: flex; gap: 4px; }
 .sidebar-empty { height: 180px; padding: 46px 20px 0; display: flex; flex-direction: column; align-items: center; gap: 9px; text-align: center; color: var(--muted); font-size: 12px; }
@@ -470,6 +472,27 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
   display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px;
 }
 .debug-recording-actions .settings-update-action { width: auto; padding: 0 12px; }
+
+.pushover-field { display: flex; flex-direction: column; gap: 4px; margin: 10px 0 4px; }
+.pushover-field > span { color: var(--muted); font-size: 10px; font-weight: 600; }
+.pushover-field input {
+  padding: 6px 8px; border: 1px solid var(--border); border-radius: 3px;
+  background: var(--panel); color: var(--foreground); font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.pushover-field input:focus { outline: none; border-color: var(--accent); }
+.pushover-field + .settings-update-action { width: auto; margin: 10px 0 4px; padding: 0 14px; }
+.pushover-mode-grid { display: grid; grid-template-columns: 1fr; gap: 8px; margin-top: 12px; }
+.pushover-mode {
+  display: flex; align-items: flex-start; gap: 10px; padding: 9px 11px;
+  border: 1px solid var(--border); border-radius: 4px; background: var(--panel); cursor: pointer;
+}
+.pushover-mode:hover { border-color: var(--border-strong); background: var(--hover); }
+.pushover-mode.active { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 9%, var(--panel)); color: var(--accent); }
+.pushover-mode input { accent-color: var(--accent); margin-top: 1px; }
+.pushover-mode span { display: flex; flex-direction: column; gap: 2px; }
+.pushover-mode b { color: var(--foreground); font-size: 11px; font-weight: 650; }
+.pushover-mode small { color: var(--subtle); font-size: 9.5px; line-height: 1.35; }
+.pushover-mode.active b { color: var(--foreground); }
 .settings-update-action:disabled { opacity: .6; cursor: default; }
 .settings-password { width: 100%; min-height: 38px; padding: 0 10px; color: var(--muted); border: 1px solid var(--border); }
 .settings-password:disabled { opacity: .6; cursor: default; }
