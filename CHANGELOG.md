@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.8.3 - 2026-08-06
+
+### Added
+
+- Debug recording now captures the rendered terminal state alongside the byte stream: the xterm
+  viewport (buffer lines, cursor, viewport offset), a PNG screenshot of the terminal canvas, the
+  active renderer (WebGL loaded, context loss, device pixel ratio), and pane visibility changes.
+  This localizes a rendering bug to the client model versus the paint layer. Capture only runs while
+  a recording is active.
+- OMP (the agent harness) is now a first-class agent integration alongside Codex, Claude Code, and
+  Pi, installable from the settings panel, with native lifecycle activity reported to the dashboard.
+- OMP conversations reuse the title OMP already generates from the first message, so term-server no
+  longer generates its own title for OMP sessions.
+
 ## 0.8.2 - 2026-08-06
 
 ### Fixed

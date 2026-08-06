@@ -156,7 +156,7 @@ export interface UpdatePiConfig {
   model: string;
 }
 
-export type AgentIntegrationProvider = "codex" | "claude" | "pi";
+export type AgentIntegrationProvider = "codex" | "claude" | "pi" | "omp";
 export type AgentIntegrationState =
   | "unavailable"
   | "notInstalled"

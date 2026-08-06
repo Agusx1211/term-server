@@ -1212,6 +1212,7 @@ mod tests {
                 &AgentEvent {
                     provider: "codex".to_owned(),
                     kind: crate::agent_events::AgentEventKind::Thinking,
+                    title: None,
                 },
             )
             .await
