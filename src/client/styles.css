@@ -447,6 +447,29 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
 .settings-update-action.broker-restart:hover:not(:disabled) {
   border-color: var(--broker-warning); background: color-mix(in srgb, var(--broker-warning) 10%, var(--hover)); color: var(--foreground);
 }
+
+.debug-recording-status {
+  display: flex; align-items: flex-start; gap: 10px; margin: 6px 0 4px;
+}
+.debug-recording-status > span:last-child { display: flex; flex-direction: column; gap: 2px; }
+.debug-recording-status b { color: var(--foreground); font-size: 11px; font-weight: 650; }
+.debug-recording-status small { color: var(--subtle); font-size: 9.5px; }
+.debug-recording-dot {
+  width: 10px; height: 10px; border-radius: 50%; background: var(--subtle); flex: none; margin-top: 2px;
+}
+.debug-recording-dot.active {
+  background: var(--danger);
+  animation: debug-recording-pulse 1.6s ease-in-out infinite;
+}
+@keyframes debug-recording-pulse {
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--danger) 55%, transparent); }
+  70% { box-shadow: 0 0 0 7px transparent; }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+.debug-recording-actions {
+  display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px;
+}
+.debug-recording-actions .settings-update-action { width: auto; padding: 0 12px; }
 .settings-update-action:disabled { opacity: .6; cursor: default; }
 .settings-password { width: 100%; min-height: 38px; padding: 0 10px; color: var(--muted); border: 1px solid var(--border); }
 .settings-password:disabled { opacity: .6; cursor: default; }

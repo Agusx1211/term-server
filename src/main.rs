@@ -21,6 +21,7 @@ use term_server::{
     artifact_skill::ArtifactSkillService,
     auth::{LoginLimiter, load_auth},
     config::Cli,
+    debug_recording::DebugRecordingManager,
     tls::load_tls,
     update::UpdateService,
     workspace::WorkspaceBackend,
@@ -121,6 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         activity_views: ActivityViewService::new(&cli.data_dir),
         artifact_skill: Arc::new(ArtifactSkillService::discover()),
         server_control: server_control.clone(),
+        debug_recording: Arc::new(DebugRecordingManager::new()),
     };
     let app = build_router(state, client_directory);
     tokio::spawn(shutdown_signal(server_control.clone()));

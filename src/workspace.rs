@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use crate::{
     ai::{PiClientConfig, PiService, UpdatePiSettings},
+    debug_recording::DebugRecordingManager,
     terminal::{
         CreateTerminal, ProcessInspectorSnapshot, ProcessSignalError, RenameTerminal,
         TerminalError, TerminalEvent, TerminalInfo, TerminalManager, TerminalSession,
@@ -410,8 +411,21 @@ pub(crate) async fn serve_terminal_socket(
     initial_size: Option<TerminalViewport>,
     requested_sequence: Option<u64>,
     observer: bool,
+    recorder: Option<&DebugRecordingManager>,
 ) {
     let client_id = Uuid::new_v4();
+    let terminal_id = terminal.info().id;
+    if let Some(recorder) = recorder {
+        recorder.connect(&terminal_id);
+        recorder.note(
+            &terminal_id,
+            if observer {
+                "observer attached"
+            } else {
+                "client attached"
+            },
+        );
+    }
     let _attachment = if observer {
         None
     } else {
@@ -436,8 +450,14 @@ pub(crate) async fn serve_terminal_socket(
         return;
     }
     let (mut sender, mut receiver) = socket.split();
-    let Ok(Some((mut events, mut sent_sequence))) =
-        synchronize_terminal(&mut sender, &terminal, client_id, requested_sequence).await
+    let Ok(Some((mut events, mut sent_sequence))) = synchronize_terminal(
+        &mut sender,
+        &terminal,
+        client_id,
+        requested_sequence,
+        recorder,
+    )
+    .await
     else {
         return;
     };
@@ -469,6 +489,7 @@ pub(crate) async fn serve_terminal_socket(
                                 &terminal,
                                 client_id,
                                 None,
+                                recorder,
                             ).await {
                                 Ok(Some((next_events, sequence))) => {
                                     events = next_events;
@@ -481,16 +502,22 @@ pub(crate) async fn serve_terminal_socket(
                         let Some(output) = output.slice_from(sent_sequence) else {
                             continue;
                         };
-                        if send_terminal_output(&mut sender, &output).await.is_err() { break; }
+                        if send_terminal_output(&mut sender, &output, terminal_id, recorder).await.is_err() { break; }
                         sent_sequence = output.end_sequence();
                     }
                     Ok(TerminalEvent::Exit(exit_code)) => {
+                        if let Some(recorder) = recorder {
+                            recorder.control(&terminal_id, serde_json::json!({ "type": "exit", "exit_code": exit_code }));
+                        }
                         let message = serde_json::to_string(&TerminalServerMessage::Exit { exit_code })
                             .expect("serializable exit");
                         let _ = send_socket_message(&mut sender, Message::Text(message.into())).await;
                         break;
                     }
                     Ok(TerminalEvent::Size(size)) => {
+                        if let Some(recorder) = recorder {
+                            recorder.control(&terminal_id, serde_json::json!({ "type": "size", "cols": size.cols, "rows": size.rows, "focused": size.focused_client.is_some(), "controller": size.focused_client == Some(client_id), "responder": size.responder_client == Some(client_id) }));
+                        }
                         let message = serde_json::to_string(&size_message(size, client_id))
                             .expect("serializable terminal size");
                         if send_socket_message(&mut sender, Message::Text(message.into())).await.is_err() { break; }
@@ -506,6 +533,7 @@ pub(crate) async fn serve_terminal_socket(
                             &terminal,
                             client_id,
                             None,
+                            recorder,
                         ).await {
                             Ok(Some((next_events, sequence))) => {
                                 events = next_events;
@@ -535,9 +563,15 @@ pub(crate) async fn serve_terminal_socket(
                             if send_socket_message(&mut sender, Message::Text(error.into())).await.is_err() { break; }
                         }
                         Ok(TerminalClientMessage::Input { data }) if data.len() <= 64 * 1024 => {
-                            if forward_terminal_input(&mut sender, &terminal, data.as_bytes()).await.is_err() { break; }
+                            if let Some(recorder) = recorder {
+                                recorder.input(&terminal_id, data.as_bytes());
+                            }
+                            if forward_terminal_input(&mut sender, &terminal, data.as_bytes(), terminal_id, recorder).await.is_err() { break; }
                         }
                         Ok(TerminalClientMessage::Resize { cols, rows, pixel_width, pixel_height }) => {
+                            if let Some(recorder) = recorder {
+                                recorder.resize(&terminal_id, cols, rows, pixel_width, pixel_height);
+                            }
                             if terminal.resize_client(client_id, cols, rows, pixel_width, pixel_height).is_err() { break; }
                         }
                         Ok(TerminalClientMessage::Focus { focused }) => {
@@ -559,7 +593,10 @@ pub(crate) async fn serve_terminal_socket(
                         if send_socket_message(&mut sender, Message::Text(error.into())).await.is_err() { break; }
                     }
                     Message::Binary(data) if !data.is_empty() => {
-                        if forward_terminal_input(&mut sender, &terminal, &data).await.is_err() { break; }
+                        if let Some(recorder) = recorder {
+                            recorder.input(&terminal_id, &data);
+                        }
+                        if forward_terminal_input(&mut sender, &terminal, &data, terminal_id, recorder).await.is_err() { break; }
                     }
                     Message::Close(_) => break,
                     Message::Ping(payload) => {
@@ -569,6 +606,9 @@ pub(crate) async fn serve_terminal_socket(
                 }
             }
         }
+    }
+    if let Some(recorder) = recorder {
+        recorder.disconnect(&terminal_id, "socket closed");
     }
 }
 
@@ -591,6 +631,8 @@ async fn forward_terminal_input(
     sender: &mut SplitSink<WebSocket, Message>,
     terminal: &TerminalSession,
     data: &[u8],
+    terminal_id: Uuid,
+    recorder: Option<&DebugRecordingManager>,
 ) -> Result<(), ()> {
     let Err(error) = write_terminal_input(terminal, data).await else {
         return Ok(());
@@ -601,7 +643,13 @@ async fn forward_terminal_input(
         TerminalError::InputQueueFull | TerminalError::InputTooLarge
     );
     let message = error.to_string();
-    send_terminal_control(sender, TerminalServerMessage::Error { message: &message }).await?;
+    send_terminal_control(
+        sender,
+        TerminalServerMessage::Error { message: &message },
+        terminal_id,
+        recorder,
+    )
+    .await?;
     if recoverable { Ok(()) } else { Err(()) }
 }
 
@@ -610,12 +658,20 @@ async fn synchronize_terminal(
     terminal: &TerminalSession,
     client_id: Uuid,
     requested_sequence: Option<u64>,
+    recorder: Option<&DebugRecordingManager>,
 ) -> Result<Option<(tokio::sync::broadcast::Receiver<TerminalEvent>, u64)>, ()> {
+    let terminal_id = terminal.info().id;
     let (events, sync, size, exit_code) = terminal.subscribe(requested_sequence);
-    send_terminal_control(sender, size_message(size, client_id)).await?;
-    let sequence = send_terminal_sync(sender, sync).await?;
+    send_terminal_control(sender, size_message(size, client_id), terminal_id, recorder).await?;
+    let sequence = send_terminal_sync(sender, sync, terminal_id, recorder).await?;
     if let Some(exit_code) = exit_code {
-        send_terminal_control(sender, TerminalServerMessage::Exit { exit_code }).await?;
+        send_terminal_control(
+            sender,
+            TerminalServerMessage::Exit { exit_code },
+            terminal_id,
+            recorder,
+        )
+        .await?;
         return Ok(None);
     }
     Ok(Some((events, sequence)))
@@ -624,6 +680,8 @@ async fn synchronize_terminal(
 async fn send_terminal_sync(
     sender: &mut SplitSink<WebSocket, Message>,
     sync: TerminalSync,
+    terminal_id: Uuid,
+    recorder: Option<&DebugRecordingManager>,
 ) -> Result<u64, ()> {
     let mode = match sync.mode {
         SyncMode::Snapshot => "snapshot",
@@ -635,19 +693,31 @@ async fn send_terminal_sync(
             mode,
             sequence: sync.sequence,
         },
+        terminal_id,
+        recorder,
     )
     .await?;
     if let Some(snapshot) = sync.snapshot {
-        send_terminal_bytes(sender, TERMINAL_FRAME_SNAPSHOT, sync.sequence, &snapshot).await?;
+        send_terminal_bytes(
+            sender,
+            TERMINAL_FRAME_SNAPSHOT,
+            sync.sequence,
+            &snapshot,
+            terminal_id,
+            recorder,
+        )
+        .await?;
     }
     for output in sync.output {
-        send_terminal_output(sender, &output).await?;
+        send_terminal_output(sender, &output, terminal_id, recorder).await?;
     }
     send_terminal_control(
         sender,
         TerminalServerMessage::Synced {
             sequence: sync.sequence,
         },
+        terminal_id,
+        recorder,
     )
     .await?;
     Ok(sync.sequence)
@@ -656,12 +726,16 @@ async fn send_terminal_sync(
 async fn send_terminal_output(
     sender: &mut SplitSink<WebSocket, Message>,
     output: &SequencedOutput,
+    terminal_id: Uuid,
+    recorder: Option<&DebugRecordingManager>,
 ) -> Result<(), ()> {
     send_terminal_bytes(
         sender,
         TERMINAL_FRAME_OUTPUT,
         output.sequence,
         &output.bytes,
+        terminal_id,
+        recorder,
     )
     .await
 }
@@ -671,7 +745,16 @@ async fn send_terminal_bytes(
     kind: u8,
     mut sequence: u64,
     bytes: &[u8],
+    terminal_id: Uuid,
+    recorder: Option<&DebugRecordingManager>,
 ) -> Result<(), ()> {
+    if let Some(recorder) = recorder {
+        match kind {
+            TERMINAL_FRAME_SNAPSHOT => recorder.snapshot(&terminal_id, sequence, bytes),
+            TERMINAL_FRAME_OUTPUT => recorder.output(&terminal_id, sequence, bytes),
+            _ => {}
+        }
+    }
     for chunk in bytes.chunks(TERMINAL_FRAME_PAYLOAD_BYTES) {
         let mut frame = Vec::with_capacity(TERMINAL_FRAME_HEADER_BYTES + chunk.len());
         frame.push(kind);
@@ -688,7 +771,14 @@ async fn send_terminal_bytes(
 async fn send_terminal_control(
     sender: &mut SplitSink<WebSocket, Message>,
     message: TerminalServerMessage<'_>,
+    terminal_id: Uuid,
+    recorder: Option<&DebugRecordingManager>,
 ) -> Result<(), ()> {
+    if let Some(recorder) = recorder
+        && let Ok(value) = serde_json::to_value(&message)
+    {
+        recorder.control(&terminal_id, value);
+    }
     let message = serde_json::to_string(&message).expect("serializable terminal control message");
     send_socket_message(sender, Message::Text(message.into())).await
 }

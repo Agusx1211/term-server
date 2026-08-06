@@ -23,6 +23,8 @@ import type {
   SessionBrokerInfo,
   UpdateStatus,
   ReleaseInfo,
+  DebugRecordingStatus,
+  DebugRecordingExport,
 } from "../../shared/types";
 
 export class ApiError extends Error {
@@ -131,4 +133,12 @@ export const api = {
     request<FileDocument>("/api/files/content", { method: "PUT", body: JSON.stringify(file) }),
   previewFileUrl: (target: FileTarget) => `/api/files/raw?${fileQuery(target)}`,
   downloadFileUrl: (target: FileTarget) => `/api/files/download?${fileQuery(target)}`,
+  debugRecording: () => request<DebugRecordingStatus>("/api/debug/recording"),
+  debugRecordingControl: (action: "start" | "stop" | "clear") =>
+    request<DebugRecordingStatus>("/api/debug/recording", {
+      method: "POST",
+      body: JSON.stringify({ action }),
+    }),
+  debugRecordingExport: () =>
+    request<DebugRecordingExport>("/api/debug/recording/export"),
 };
