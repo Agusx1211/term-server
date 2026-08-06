@@ -3,6 +3,7 @@ import { lazy, Suspense } from "preact/compat";
 import {
   Activity,
   Bell,
+  BellOff,
   Bot,
   ChevronDown,
   ChevronRight,
@@ -30,8 +31,11 @@ import type {
   AgentInfo,
   FileEntry,
   ForegroundCommandInfo,
+  PushoverConfig,
+  PushoverMode,
   TerminalInfo,
 } from "../../shared/types";
+import { pushoverBellEnabled, setPushoverBell } from "../lib/pushover";
 import { agentSubtitle } from "../lib/agent-activity";
 import { commandSubtitle } from "../lib/command-status";
 import { configureTerminalDrag } from "../lib/layout";
@@ -68,6 +72,7 @@ interface SidebarProps {
   updateAvailable: boolean;
   fileRoot: string;
   previewSettings: TerminalPreviewSettings;
+  pushover: PushoverConfig;
   theme: ThemeName;
   onMobileClose: () => void;
   onNew: (cwd?: string) => void;
@@ -88,6 +93,9 @@ interface NodeProps {
   activeIds: string[];
   attentionTerminalIds: Set<string>;
   artifactCounts: ReadonlyMap<string, number>;
+  pushoverEnabled: boolean;
+  pushoverMode: PushoverMode;
+  onTogglePushoverBell: (terminalId: string) => void;
   onPreview: (terminal: TerminalInfo, row: HTMLElement, pointerType: string) => void;
   onPreviewLeave: () => void;
   onToggle: (path: string) => void;
@@ -107,6 +115,9 @@ function TreeNode({
   activeIds,
   attentionTerminalIds,
   artifactCounts,
+  pushoverEnabled,
+  pushoverMode,
+  onTogglePushoverBell,
   onPreview,
   onPreviewLeave,
   onToggle,
@@ -182,6 +193,19 @@ function TreeNode({
           {terminal.status === "exited" && <span class="tree-status">{terminal.exitCode ?? "exit"}</span>}
         </button>
         <span class="row-actions">
+          {pushoverEnabled && (() => {
+            const bellOn = pushoverBellEnabled(terminal.id, pushoverMode);
+            return (
+              <button
+                class={`row-action pushover-bell ${bellOn ? "active" : ""}`}
+                onClick={() => onTogglePushoverBell(terminal.id)}
+                aria-label={bellOn ? `Disable Pushover alerts for ${terminal.name}` : `Enable Pushover alerts for ${terminal.name}`}
+                title={bellOn ? `Pushover on — click to mute ${terminal.name}` : `Pushover off — click to alert for ${terminal.name}`}
+              >
+                {bellOn ? <Bell size={13} /> : <BellOff size={13} />}
+              </button>
+            );
+          })()}
           <button class="row-action" onClick={() => onRename(terminal)} aria-label={`Rename ${terminal.name}`}>
             <Pencil size={13} />
           </button>
@@ -234,6 +258,9 @@ function TreeNode({
               activeIds={activeIds}
               attentionTerminalIds={attentionTerminalIds}
               artifactCounts={artifactCounts}
+              pushoverEnabled={pushoverEnabled}
+              pushoverMode={pushoverMode}
+              onTogglePushoverBell={onTogglePushoverBell}
               onPreview={onPreview}
               onPreviewLeave={onPreviewLeave}
               onToggle={onToggle}
@@ -279,6 +306,7 @@ export function Sidebar({
   updateAvailable,
   fileRoot,
   previewSettings,
+  pushover,
   theme,
   onMobileClose,
   onNew,
@@ -295,6 +323,7 @@ export function Sidebar({
   const [collapsed, setCollapsed] = useState(loadCollapsed);
   const [filesOpen, setFilesOpen] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth);
+  const [, setPushoverBellsTick] = useState(0);
   const sidebarWidthRef = useRef(sidebarWidth);
   const resizeStart = useRef<{ pointerId: number; x: number; width: number }>();
   const previewTimer = useRef<number>();
@@ -412,6 +441,11 @@ export function Sidebar({
     updateSidebarWidth(clampSidebarWidth(DEFAULT_SIDEBAR_WIDTH, window.innerWidth), true);
   };
 
+  const togglePushoverBell = (terminalId: string) => {
+    setPushoverBell(terminalId, !pushoverBellEnabled(terminalId, pushover.mode));
+    setPushoverBellsTick((tick) => tick + 1);
+  };
+
   const toggle = (path: string) => {
     const next = new Set(collapsed);
     if (next.has(path)) next.delete(path);
@@ -486,6 +520,9 @@ export function Sidebar({
                 activeIds={activeIds}
                 attentionTerminalIds={attentionTerminalIds}
                 artifactCounts={artifactCounts}
+                pushoverEnabled={pushover.enabled}
+                pushoverMode={pushover.mode}
+                onTogglePushoverBell={togglePushoverBell}
                 onPreview={beginPreview}
                 onPreviewLeave={leavePreview}
                 onToggle={toggle}

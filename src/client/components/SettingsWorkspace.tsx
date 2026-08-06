@@ -1,3 +1,4 @@
+import { useEffect, useState } from "preact/hooks";
 import {
   Activity,
   Bell,
@@ -15,10 +16,12 @@ import {
   Shield,
   Sparkles,
   SplitSquareHorizontal,
+  Square,
   Sun,
   RefreshCw,
   Trash2,
   TriangleAlert,
+  Video,
 } from "lucide-preact";
 import type {
   AgentIntegrationAction,
@@ -27,7 +30,10 @@ import type {
   ArtifactSkillAction,
   ArtifactSkillConfig,
   BuildInfo,
+  DebugRecordingStatus,
   PiConfig,
+  PushoverConfig,
+  PushoverMode,
   SessionBrokerInfo,
   UpdateConfig,
   UpdateStatus,
@@ -68,6 +74,10 @@ interface SettingsWorkspaceProps {
   tileNewTerminals: boolean;
   confirmTerminalKills: boolean;
   terminalPreviewSettings: TerminalPreviewSettings;
+  recording: DebugRecordingStatus | null;
+  frontendRecordingEvents: number;
+  recordingBusy: boolean;
+  pushover: PushoverConfig;
   onTheme: (theme: ThemeName) => void;
   onPiChange: (titlesEnabled: boolean, summariesEnabled: boolean, model: string) => void;
   onAgentIntegration: (
@@ -87,6 +97,11 @@ interface SettingsWorkspaceProps {
   onTileNewTerminalsChange: (enabled: boolean) => void;
   onConfirmTerminalKillsChange: (enabled: boolean) => void;
   onTerminalPreviewSettingsChange: (settings: TerminalPreviewSettings) => void;
+  onRecordingStart: () => void;
+  onRecordingStop: () => void;
+  onRecordingDownload: () => void;
+  onRecordingClear: () => void;
+  onPushoverChange: (changes: { userKey?: string; appKey?: string; mode?: PushoverMode }) => void;
   onPasswordChanged: () => void;
   onLogout: () => void;
 }
@@ -133,6 +148,22 @@ const notificationPositions: Array<{
   { position: "bottom-right", label: "Bottom right" },
 ];
 
+function formatDebugBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+}
+
+function formatDebugDuration(startedAt: number, stoppedAt: number | null): string {
+  const end = stoppedAt ?? Date.now();
+  const seconds = Math.max(0, Math.floor((end - startedAt) / 1000));
+  const minutes = Math.floor(seconds / 60);
+  const remaining = seconds % 60;
+  if (minutes === 0) return `${remaining}s`;
+  return `${minutes}m ${remaining}s`;
+}
+
 const notificationDurations: Array<{
   duration: NotificationDuration;
   label: string;
@@ -165,6 +196,10 @@ export function SettingsWorkspace({
   tileNewTerminals,
   confirmTerminalKills,
   terminalPreviewSettings,
+  recording,
+  frontendRecordingEvents,
+  recordingBusy,
+  pushover,
   onTheme,
   onPiChange,
   onAgentIntegration,
@@ -178,6 +213,11 @@ export function SettingsWorkspace({
   onTileNewTerminalsChange,
   onConfirmTerminalKillsChange,
   onTerminalPreviewSettingsChange,
+  onRecordingStart,
+  onRecordingStop,
+  onRecordingDownload,
+  onRecordingClear,
+  onPushoverChange,
   onPasswordChanged,
   onLogout,
 }: SettingsWorkspaceProps) {
@@ -188,6 +228,13 @@ export function SettingsWorkspace({
   const updatePreviewSettings = (changes: Partial<TerminalPreviewSettings>) => {
     onTerminalPreviewSettingsChange({ ...terminalPreviewSettings, ...changes });
   };
+  const [pushoverUserKey, setPushoverUserKey] = useState(pushover.userKey);
+  const [pushoverAppKey, setPushoverAppKey] = useState(pushover.appKey);
+  useEffect(() => {
+    setPushoverUserKey(pushover.userKey);
+    setPushoverAppKey(pushover.appKey);
+  }, [pushover.userKey, pushover.appKey]);
+  const pushoverKeysDirty = pushoverUserKey !== pushover.userKey || pushoverAppKey !== pushover.appKey;
 
   return (
     <section class={`settings-workspace ${active ? "visible" : ""}`} aria-hidden={!active}>
@@ -685,6 +732,154 @@ export function SettingsWorkspace({
                 </p>
               )}
             </div>
+          </section>
+
+          <section class="settings-card settings-card-wide">
+            <header><Video size={16} /><h2>Debug recording</h2></header>
+            <p>
+              Capture everything needed to debug terminal rendering problems. If a
+              terminal starts rendering the wrong text, start a recording, reproduce
+              the issue, then stop and download the trace. Recording is off by
+              default and only captures while active, so it has no steady-state cost.
+            </p>
+            <div class="debug-recording-status">
+              <span
+                class={`debug-recording-dot ${recording?.active ? "active" : ""}`}
+                aria-hidden="true"
+              />
+              <span>
+                <b>{recording?.active ? "Recording" : "Not recording"}</b>
+                {recording?.active && recording.startedAt != null
+                  ? <small>Started {formatDebugDuration(recording.startedAt, null)} ago</small>
+                  : recording?.startedAt != null && recording.stoppedAt != null
+                    ? <small>Ran for {formatDebugDuration(recording.startedAt, recording.stoppedAt)}</small>
+                    : <small>No recording captured yet</small>}
+              </span>
+            </div>
+            {(recording && (recording.events > 0 || recording.active)) && (
+              <p class="settings-hint">
+                Server: {recording.events} events · {formatDebugBytes(recording.bytes)}
+                {recording.truncated ? " · truncated" : ""}.
+                Browser: {frontendRecordingEvents} events.
+              </p>
+            )}
+            <div class="debug-recording-actions">
+              {recording?.active ? (
+                <button
+                  class="settings-update-action danger"
+                  onClick={onRecordingStop}
+                  disabled={recordingBusy}
+                >
+                  <Square size={14} /> Stop recording
+                </button>
+              ) : (
+                <button
+                  class="settings-update-action primary"
+                  onClick={onRecordingStart}
+                  disabled={recordingBusy}
+                >
+                  <Video size={14} /> Start recording
+                </button>
+              )}
+              {recording && (recording.events > 0 || recording.active) && (
+                <button
+                  class="settings-update-action"
+                  onClick={onRecordingDownload}
+                  disabled={recordingBusy}
+                >
+                  <Download size={14} /> Download recording
+                </button>
+              )}
+              {recording && !recording.active && recording.events > 0 && (
+                <button
+                  class="settings-update-action danger"
+                  onClick={onRecordingClear}
+                  disabled={recordingBusy}
+                >
+                  <Trash2 size={14} /> Discard
+                </button>
+              )}
+            </div>
+            <p class="settings-hint">
+              The download is a single JSON file combining the server-side and
+              browser-side traces, so the exact bytes sent and what the terminal
+              rendered can be compared side by side.
+            </p>
+          </section>
+
+          <section class="settings-card settings-card-wide">
+            <header><Bell size={16} /><h2>Pushover notifications</h2></header>
+            <p>
+              Get a mobile push notification when an agent finishes. Configure the
+              Pushover user and application keys, then choose how much to be told.
+            </p>
+            <label class="pushover-field">
+              <span>User key</span>
+              <input
+                type="text"
+                value={pushoverUserKey}
+                onInput={(event) => setPushoverUserKey(event.currentTarget.value)}
+                placeholder="Pushover user key"
+                autocomplete="off"
+                spellcheck={false}
+              />
+            </label>
+            <label class="pushover-field">
+              <span>Application key</span>
+              <input
+                type="password"
+                value={pushoverAppKey}
+                onInput={(event) => setPushoverAppKey(event.currentTarget.value)}
+                placeholder="Pushover application key"
+                autocomplete="off"
+                spellcheck={false}
+              />
+            </label>
+            <button
+              class="settings-update-action primary"
+              onClick={() => onPushoverChange({ userKey: pushoverUserKey, appKey: pushoverAppKey })}
+              disabled={!pushoverKeysDirty}
+            >
+              Save keys
+            </button>
+            <div class="pushover-mode-grid" role="radiogroup" aria-label="Pushover notification scope">
+              {([
+                {
+                  mode: "off" as const,
+                  label: "Off",
+                  description: "Do not send Pushover alerts.",
+                },
+                {
+                  mode: "select" as const,
+                  label: "Select",
+                  description: "Notify only for terminals you turn on in the sidebar.",
+                },
+                {
+                  mode: "all" as const,
+                  label: "All",
+                  description: "Notify for every terminal; turn specific ones off in the sidebar.",
+                },
+              ] satisfies Array<{ mode: PushoverMode; label: string; description: string }>).map(({ mode, label, description }) => (
+                <label key={mode} class={`pushover-mode ${pushover.mode === mode ? "active" : ""}`}>
+                  <input
+                    type="radio"
+                    name="pushover-mode"
+                    value={mode}
+                    checked={pushover.mode === mode}
+                    onChange={() => onPushoverChange({ mode })}
+                  />
+                  <span>
+                    <b>{label}</b>
+                    <small>{description}</small>
+                  </span>
+                </label>
+              ))}
+            </div>
+            <p class="settings-hint">
+              {pushover.configured
+                ? "Keys are saved. When enabled, alerts include the host, agent, directory, and terminal title."
+                : "Add your Pushover keys and choose a scope to begin receiving alerts."}
+            </p>
           </section>
 
           <section class="settings-card">

@@ -97,6 +97,7 @@ export interface ClientConfig {
   pi: PiConfig;
   agentIntegrations: AgentIntegrationsConfig;
   artifactSkill: ArtifactSkillConfig;
+  pushover: PushoverConfig;
   build: BuildInfo;
   broker: SessionBrokerInfo | null;
   updates: UpdateConfig;
@@ -251,6 +252,60 @@ export interface FileTarget {
 export interface SaveFileRequest extends FileTarget {
   content: string;
   version: string;
+}
+
+export interface DebugRecordingStatus {
+  active: boolean;
+  id: string | null;
+  startedAt: number | null;
+  stoppedAt: number | null;
+  events: number;
+  bytes: number;
+  truncated: boolean;
+}
+
+export interface DebugRecordedEvent {
+  ts: number;
+  terminal: string;
+  type: "output" | "input" | "control" | "snapshot" | "connect" | "disconnect" | "resize";
+  sequence?: number;
+  data?: string;
+  message?: unknown;
+  reason?: string;
+  cols?: number;
+  rows?: number;
+  pixelWidth?: number;
+  pixelHeight?: number;
+}
+
+export interface DebugRecordingExport {
+  format: string;
+  version: string;
+  id: string;
+  startedAt: number;
+  stoppedAt: number | null;
+  truncated: boolean;
+  server: {
+    version: string;
+    commit: string;
+  };
+  events: DebugRecordedEvent[];
+}
+
+export type PushoverMode = "off" | "select" | "all";
+
+export interface PushoverConfig {
+  configured: boolean;
+  userKey: string;
+  appKey: string;
+  mode: PushoverMode;
+  enabled: boolean;
+}
+
+export interface UpdatePushoverConfig {
+  userKey?: string;
+  appKey?: string;
+  mode?: PushoverMode;
 }
 
 export type ClientTerminalMessage =

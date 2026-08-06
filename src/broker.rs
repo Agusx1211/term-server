@@ -982,7 +982,14 @@ async fn broker_terminal_socket(
         .write_buffer_size(128 * 1024)
         .max_write_buffer_size(4 * 1024 * 1024)
         .on_upgrade(move |socket| {
-            serve_terminal_socket(socket, terminal, query.viewport(), query.sequence(), false)
+            serve_terminal_socket(
+                socket,
+                terminal,
+                query.viewport(),
+                query.sequence(),
+                false,
+                None,
+            )
         }))
 }
 
@@ -999,7 +1006,7 @@ async fn broker_terminal_observer(
         .write_buffer_size(128 * 1024)
         .max_write_buffer_size(4 * 1024 * 1024)
         .on_upgrade(move |socket| {
-            serve_terminal_socket(socket, terminal, None, query.sequence(), true)
+            serve_terminal_socket(socket, terminal, None, query.sequence(), true, None)
         }))
 }
 

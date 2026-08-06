@@ -14,10 +14,14 @@ import type {
   AgentIntegrationAction,
   AgentIntegrationProvider,
   ArtifactSkillAction,
+  AgentInfo,
   ArtifactEntry,
   ClientConfig,
+  DebugRecordingExport,
+  DebugRecordingStatus,
   FileEntry,
   FileTarget,
+  PushoverMode,
   ReleaseInfo,
   TerminalInfo,
   UpdateActivityView,
@@ -25,6 +29,16 @@ import type {
 } from "../shared/types";
 import { api, ApiError } from "./lib/api";
 import { withBrokerSessions } from "./lib/broker-generations";
+import { buildPushoverMessage, pushoverBellEnabled } from "./lib/pushover";
+import {
+  debugRecordingEventCount,
+  debugRecordingTruncated,
+  isDebugRecordingActive,
+  resetDebugRecording,
+  startDebugRecording,
+  stopDebugRecording,
+  takeFrontendRecording,
+} from "./lib/debug-recording";
 import {
   agentNeedsAttention,
   parseViewedAgentRevisions,
@@ -141,6 +155,13 @@ const defaultConfig: ClientConfig = {
     source: null,
     message: null,
     providers: [],
+  },
+  pushover: {
+    configured: false,
+    userKey: "",
+    appKey: "",
+    mode: "off",
+    enabled: false,
   },
   build: {
     version: "unknown",
@@ -295,6 +316,9 @@ export function App() {
     useState(initialTerminalPreviewSettings);
   const [terminalStreamIssues, setTerminalStreamIssues] =
     useState(new Map<string, TerminalStreamIssue>());
+  const [recordingStatus, setRecordingStatus] = useState<DebugRecordingStatus | null>(null);
+  const [frontendRecordingEvents, setFrontendRecordingEvents] = useState(0);
+  const [recordingBusy, setRecordingBusy] = useState(false);
   const legacyViewedAgentRevisions = useRef(initialViewedAgentRevisions());
   const legacyViewedCommandCompletions = useRef(initialViewedCommandCompletions());
   const [artifacts, setArtifacts] = useState<ArtifactEntry[]>([]);
@@ -318,6 +342,8 @@ export function App() {
   const mobileMenuButton = useRef<HTMLButtonElement>(null);
   const terminalsRef = useRef(terminals);
   terminalsRef.current = terminals;
+  const configRef = useRef(config);
+  configRef.current = config;
   const activeIdRef = useRef(activeId);
   activeIdRef.current = activeId;
   const paneIds = useMemo(() => idsFromLayout(layout), [layout]);
@@ -612,6 +638,7 @@ export function App() {
         showToast: showCompletionToast,
         onOpen: () => openTerminal(terminal.id),
       });
+      maybeSendPushover(terminal, agent);
       deliveredAgentEvents.current.set(terminalId, event);
     };
 
@@ -1089,6 +1116,26 @@ export function App() {
     }
   };
 
+  const updatePushoverConfig = async (changes: { userKey?: string; appKey?: string; mode?: PushoverMode }) => {
+    try {
+      const pushover = await api.updatePushoverConfig(changes);
+      setConfig((current) => ({ ...current, pushover }));
+      showNotice("Pushover settings updated");
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : "Unable to update Pushover settings");
+    }
+  };
+
+  const maybeSendPushover = (terminal: TerminalInfo, agent: AgentInfo) => {
+    const pushover = configRef.current.pushover;
+    if (!pushover.enabled) return;
+    if (!pushoverBellEnabled(terminal.id, pushover.mode)) return;
+    const { title, message } = buildPushoverMessage(terminal, agent, configRef.current.hostname);
+    void api.pushoverSend({ title, message }).catch(() => {
+      // A failed push notification is non-blocking; never surface it.
+    });
+  };
+
   const updateNotificationMode = async (mode: NotificationMode) => {
     if (includesSystemNotifications(mode)) {
       if (typeof Notification === "undefined") {
@@ -1211,6 +1258,125 @@ export function App() {
     }
   };
 
+  const refreshRecordingStatus = async (): Promise<DebugRecordingStatus | null> => {
+    try {
+      const status = await api.debugRecording();
+      // Keep the client-side capture flag aligned with the server (e.g. after
+      // a page reload while the server was left recording).
+      if (status.active && !isDebugRecordingActive()) startDebugRecording();
+      if (!status.active && isDebugRecordingActive()) stopDebugRecording();
+      setRecordingStatus(status);
+      return status;
+    } catch (error) {
+      if (!(error instanceof ApiError && error.status === 404)) {
+        showNotice(error instanceof Error ? error.message : "Unable to read debug recording state");
+      }
+      return null;
+    }
+  };
+
+  const refreshFrontendRecordingCount = () => {
+    setFrontendRecordingEvents(debugRecordingEventCount());
+  };
+
+  const startRecording = async () => {
+    setRecordingBusy(true);
+    startDebugRecording();
+    try {
+      const status = await api.debugRecordingControl("start");
+      setRecordingStatus(status);
+      refreshFrontendRecordingCount();
+      showNotice("Debug recording started");
+    } catch (error) {
+      stopDebugRecording();
+      showNotice(error instanceof Error ? error.message : "Unable to start debug recording");
+    } finally {
+      setRecordingBusy(false);
+    }
+  };
+
+  const stopRecording = async () => {
+    setRecordingBusy(true);
+    stopDebugRecording();
+    refreshFrontendRecordingCount();
+    try {
+      const status = await api.debugRecordingControl("stop");
+      setRecordingStatus(status);
+      showNotice("Debug recording stopped");
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : "Unable to stop debug recording");
+    } finally {
+      setRecordingBusy(false);
+    }
+  };
+
+  const downloadRecording = async () => {
+    setRecordingBusy(true);
+    stopDebugRecording();
+    let backend: DebugRecordingExport;
+    try {
+      // Stop first so the server-side export includes the final events.
+      const status = await api.debugRecording();
+      if (status.active) {
+        await api.debugRecordingControl("stop");
+      }
+      backend = await api.debugRecordingExport();
+      setRecordingStatus(await api.debugRecording());
+    } catch (error) {
+      setRecordingBusy(false);
+      showNotice(error instanceof Error ? error.message : "Unable to export debug recording");
+      return;
+    }
+    const frontend = takeFrontendRecording();
+    setFrontendRecordingEvents(0);
+    const payload = {
+      ...backend,
+      client: {
+        url: location.href,
+        recordedAt: Date.now(),
+        truncated: frontend.truncated || debugRecordingTruncated(),
+        events: frontend.events,
+      },
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `term-server-debug-${backend.id.slice(0, 8)}.json`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+    setRecordingBusy(false);
+    showNotice("Debug recording downloaded");
+  };
+
+  const clearRecording = async () => {
+    setRecordingBusy(true);
+    resetDebugRecording();
+    refreshFrontendRecordingCount();
+    try {
+      const status = await api.debugRecordingControl("clear");
+      setRecordingStatus(status);
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : "Unable to clear debug recording");
+    } finally {
+      setRecordingBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!authenticated) return;
+    void refreshRecordingStatus();
+  }, [authenticated]);
+
+  useEffect(() => {
+    if (!recordingStatus?.active) return;
+    const timer = window.setInterval(() => {
+      void refreshRecordingStatus();
+      refreshFrontendRecordingCount();
+    }, 1_000);
+    return () => window.clearInterval(timer);
+  }, [recordingStatus?.active]);
+
   const logout = async () => {
     try {
       await api.logout();
@@ -1227,6 +1393,9 @@ export function App() {
       knownArtifactIds.current.clear();
       artifactsInitialized.current = false;
       setUpdateStatus(null);
+      resetDebugRecording();
+      setFrontendRecordingEvents(0);
+      setRecordingStatus(null);
       setSettingsOpen(false);
       setSettingsActive(false);
     }
@@ -1300,6 +1469,7 @@ export function App() {
           updateAvailable={updateStatus?.state === "available"}
           fileRoot={terminalById.get(activeId ?? "")?.cwd ?? "~"}
           previewSettings={terminalPreviewSettings}
+          pushover={config.pushover}
           theme={theme}
           onMobileClose={closeMobileSidebar}
           onNew={(cwd) => void createTerminal(cwd)}
@@ -1518,6 +1688,10 @@ export function App() {
                 tileNewTerminals={tileNewTerminals}
                 confirmTerminalKills={confirmTerminalKills}
                 terminalPreviewSettings={terminalPreviewSettings}
+                recording={recordingStatus}
+                frontendRecordingEvents={frontendRecordingEvents}
+                recordingBusy={recordingBusy}
+                pushover={config.pushover}
                 onTheme={setTheme}
                 onPiChange={(titlesEnabled, summariesEnabled, model) => (
                   void updatePiConfig(titlesEnabled, summariesEnabled, model)
@@ -1537,6 +1711,11 @@ export function App() {
                 onTileNewTerminalsChange={updateTileNewTerminals}
                 onConfirmTerminalKillsChange={updateConfirmTerminalKills}
                 onTerminalPreviewSettingsChange={updateTerminalPreviewSettings}
+                onRecordingStart={() => void startRecording()}
+                onRecordingStop={() => void stopRecording()}
+                onRecordingDownload={() => void downloadRecording()}
+                onRecordingClear={() => void clearRecording()}
+                onPushoverChange={(changes) => void updatePushoverConfig(changes)}
                 onPasswordChanged={() => showNotice("Password changed; other sessions were signed out")}
                 onLogout={() => void logout()}
               />

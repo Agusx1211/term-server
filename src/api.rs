@@ -47,7 +47,12 @@ use crate::{
     artifacts,
     auth::{AuthError, AuthService, LoginLimiter, SESSION_LIFETIME_DAYS},
     build,
+    debug_recording::{
+        DebugRecordingAction, DebugRecordingControl, DebugRecordingExport, DebugRecordingManager,
+        DebugRecordingStatus,
+    },
     files::{self, FileError},
+    pushover::{PushoverConfig, PushoverNotification, PushoverService, UpdatePushoverConfig},
     terminal::{CreateTerminal, RenameTerminal, TerminalError, TerminalInfo},
     update::{UpdateConfig, UpdateError, UpdateService, UpdateStatus},
     workspace::{
@@ -79,6 +84,8 @@ pub struct AppState {
     pub activity_views: ActivityViewService,
     pub artifact_skill: Arc<ArtifactSkillService>,
     pub server_control: ServerControl,
+    pub debug_recording: Arc<DebugRecordingManager>,
+    pub pushover: Arc<PushoverService>,
 }
 
 #[derive(Clone)]
@@ -264,6 +271,7 @@ struct ClientConfig {
     pi: PiClientConfig,
     agent_integrations: AgentIntegrationsConfig,
     artifact_skill: ArtifactSkillConfig,
+    pushover: PushoverConfig,
     build: build::BuildInfo,
     broker: Option<SessionBrokerInfo>,
     updates: UpdateConfig,
@@ -610,6 +618,7 @@ async fn config(
         pi,
         agent_integrations,
         artifact_skill: state.artifact_skill.status(),
+        pushover: state.pushover.client_config(),
         build: build::info(),
         broker,
         updates: state.updates.config(),
@@ -748,6 +757,47 @@ async fn update_pi_config(
         .await
         .map(Json)
         .map_err(Into::into)
+}
+
+async fn pushover_config(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> Result<Json<PushoverConfig>, ApiError> {
+    require_auth(&jar, &state)?;
+    Ok(Json(state.pushover.client_config()))
+}
+
+async fn update_pushover_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+    Json(body): Json<UpdatePushoverConfig>,
+) -> Result<Json<PushoverConfig>, ApiError> {
+    require_origin(&headers, &uri, &state)?;
+    require_auth(&jar, &state)?;
+    let config = state.pushover.update(body).map_err(|error| {
+        tracing::error!(%error, "unable to persist pushover config");
+        ApiError::Internal
+    })?;
+    Ok(Json(config))
+}
+
+async fn pushover_send(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+    Json(body): Json<PushoverNotification>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_origin(&headers, &uri, &state)?;
+    require_auth(&jar, &state)?;
+    state
+        .pushover
+        .send(body)
+        .await
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 async fn list_terminals(
@@ -1135,11 +1185,19 @@ async fn terminal_socket(
         .on_upgrade(move |socket| async move {
             match terminal {
                 SessionConnection::Local(terminal) => {
-                    serve_terminal_socket(socket, terminal, initial_size, sequence, observer).await;
+                    serve_terminal_socket(
+                        socket,
+                        terminal,
+                        initial_size,
+                        sequence,
+                        observer,
+                        Some(&state.debug_recording),
+                    )
+                    .await;
                 }
                 #[cfg(unix)]
                 SessionConnection::Broker(broker) => {
-                    proxy_terminal_socket(socket, *broker).await;
+                    proxy_terminal_socket(socket, id, *broker, &state.debug_recording).await;
                 }
             }
         }))
@@ -1155,9 +1213,15 @@ fn require_terminal_stream_protocol(protocol: Option<u8>) -> Result<(), ApiError
 }
 
 #[cfg(unix)]
-async fn proxy_terminal_socket(socket: WebSocket, broker: BrokerWebSocket) {
+async fn proxy_terminal_socket(
+    socket: WebSocket,
+    terminal_id: Uuid,
+    broker: BrokerWebSocket,
+    recorder: &DebugRecordingManager,
+) {
     use tokio_tungstenite::tungstenite::Message as BrokerMessage;
 
+    recorder.connect(&terminal_id);
     let (mut browser_sender, mut browser_receiver) = socket.split();
     let (mut broker_sender, mut broker_receiver) = broker.split();
     loop {
@@ -1165,8 +1229,14 @@ async fn proxy_terminal_socket(socket: WebSocket, broker: BrokerWebSocket) {
             message = broker_receiver.next() => {
                 let Some(Ok(message)) = message else { break; };
                 let outgoing = match message {
-                    BrokerMessage::Text(text) => Message::Text(text.to_string().into()),
-                    BrokerMessage::Binary(bytes) => Message::Binary(bytes.to_vec().into()),
+                    BrokerMessage::Text(text) => {
+                        record_broker_control(recorder, &terminal_id, &text);
+                        Message::Text(text.to_string().into())
+                    }
+                    BrokerMessage::Binary(bytes) => {
+                        record_broker_frame(recorder, &terminal_id, &bytes);
+                        Message::Binary(bytes.to_vec().into())
+                    }
                     BrokerMessage::Close(_) => Message::Close(None),
                     BrokerMessage::Ping(payload) => {
                         if proxy_send(&mut broker_sender, BrokerMessage::Pong(payload)).await.is_err() { break; }
@@ -1179,8 +1249,14 @@ async fn proxy_terminal_socket(socket: WebSocket, broker: BrokerWebSocket) {
             message = browser_receiver.next() => {
                 let Some(Ok(message)) = message else { break; };
                 let outgoing = match message {
-                    Message::Text(text) => BrokerMessage::Text(text.to_string().into()),
-                    Message::Binary(bytes) => BrokerMessage::Binary(bytes.to_vec().into()),
+                    Message::Text(text) => {
+                        record_browser_message(recorder, &terminal_id, &text);
+                        BrokerMessage::Text(text.to_string().into())
+                    }
+                    Message::Binary(bytes) => {
+                        recorder.input(&terminal_id, &bytes);
+                        BrokerMessage::Binary(bytes.to_vec().into())
+                    }
                     Message::Close(_) => BrokerMessage::Close(None),
                     Message::Ping(payload) => {
                         if proxy_send(&mut browser_sender, Message::Pong(payload)).await.is_err() { break; }
@@ -1191,6 +1267,44 @@ async fn proxy_terminal_socket(socket: WebSocket, broker: BrokerWebSocket) {
                 if proxy_send(&mut broker_sender, outgoing).await.is_err() { break; }
             }
         }
+    }
+    recorder.disconnect(&terminal_id, "socket closed");
+}
+
+#[cfg(unix)]
+fn record_broker_control(recorder: &DebugRecordingManager, terminal_id: &Uuid, text: &str) {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+        recorder.control(terminal_id, value);
+    }
+}
+
+#[cfg(unix)]
+fn record_browser_message(recorder: &DebugRecordingManager, terminal_id: &Uuid, text: &str) {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+        recorder.control(
+            terminal_id,
+            serde_json::json!({
+                "type": "client",
+                "message": value,
+            }),
+        );
+    }
+}
+
+#[cfg(unix)]
+fn record_broker_frame(recorder: &DebugRecordingManager, terminal_id: &Uuid, bytes: &[u8]) {
+    // Terminal frames carry a 1-byte kind followed by an 8-byte big-endian
+    // sequence and then the payload.
+    if bytes.len() < 9 {
+        return;
+    }
+    let kind = bytes[0];
+    let sequence = u64::from_be_bytes(bytes[1..9].try_into().expect("frame sequence"));
+    let payload = &bytes[9..];
+    match kind {
+        0 => recorder.snapshot(terminal_id, sequence, payload),
+        1 => recorder.output(terminal_id, sequence, payload),
+        _ => {}
     }
 }
 
@@ -1203,6 +1317,40 @@ where
         .await
         .map_err(|_| ())?
         .map_err(|_| ())
+}
+
+async fn debug_recording_status(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> Result<Json<DebugRecordingStatus>, ApiError> {
+    require_auth(&jar, &state)?;
+    Ok(Json(state.debug_recording.status()))
+}
+
+async fn debug_recording_control(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Json(body): Json<DebugRecordingControl>,
+) -> Result<Json<DebugRecordingStatus>, ApiError> {
+    require_auth(&jar, &state)?;
+    let status = match body.action {
+        DebugRecordingAction::Start => state.debug_recording.start(),
+        DebugRecordingAction::Stop => state.debug_recording.stop(),
+        DebugRecordingAction::Clear => {
+            state.debug_recording.clear();
+            state.debug_recording.status()
+        }
+    };
+    Ok(Json(status))
+}
+
+async fn debug_recording_export(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> Result<Json<DebugRecordingExport>, ApiError> {
+    require_auth(&jar, &state)?;
+    let export = state.debug_recording.export().ok_or(ApiError::NotFound)?;
+    Ok(Json(export))
 }
 
 async fn api_not_found() -> ApiError {
@@ -1218,6 +1366,11 @@ pub fn build_router(state: AppState, client_directory: Option<PathBuf>) -> Route
         .route("/password", patch(change_password))
         .route("/config", get(config))
         .route("/config/pi", patch(update_pi_config))
+        .route(
+            "/config/pushover",
+            get(pushover_config).patch(update_pushover_config),
+        )
+        .route("/pushover/send", post(pushover_send))
         .route("/config/artifact-skill", get(artifact_skill))
         .route(
             "/config/artifact-skill/{provider}",
@@ -1229,6 +1382,11 @@ pub fn build_router(state: AppState, client_directory: Option<PathBuf>) -> Route
             patch(update_agent_integration),
         )
         .route("/broker/restart", post(restart_broker))
+        .route(
+            "/debug/recording",
+            get(debug_recording_status).post(debug_recording_control),
+        )
+        .route("/debug/recording/export", get(debug_recording_export))
         .route("/update", get(update_status).post(install_update))
         .route("/terminals", get(list_terminals).post(create_terminal))
         .route(
@@ -1355,6 +1513,8 @@ mod tests {
             activity_views: ActivityViewService::in_memory(),
             artifact_skill: Arc::new(ArtifactSkillService::new(None, directory.path())),
             server_control: ServerControl::new(Handle::new()),
+            debug_recording: Arc::new(DebugRecordingManager::new()),
+            pushover: Arc::new(PushoverService::new(directory.path())),
         }
     }
 
@@ -1633,6 +1793,232 @@ mod tests {
                 .len(),
             3
         );
+    }
+
+    #[tokio::test]
+    async fn debug_recording_lifecycle_and_export() {
+        let state = test_state().await;
+        let app = build_router(state.clone(), None);
+
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))))
+                    .body(Body::from(r#"{"password":"testing-password"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cookie = login
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/debug/recording")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let start = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/debug/recording")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(Body::from(r#"{"action":"start"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::OK);
+
+        // Record an event directly against the shared manager to simulate traffic.
+        let id = Uuid::new_v4();
+        state.debug_recording.output(&id, 0, b"hello world");
+
+        let status = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/debug/recording")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        let body = to_bytes(status.into_body(), 1024 * 1024).await.unwrap();
+        let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status["active"], true);
+        assert_eq!(status["events"], 1);
+
+        let stop = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/debug/recording")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(Body::from(r#"{"action":"stop"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stop.status(), StatusCode::OK);
+        let body = to_bytes(stop.into_body(), 1024 * 1024).await.unwrap();
+        let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status["active"], false);
+
+        let export = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/debug/recording/export")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(export.status(), StatusCode::OK);
+        let body = to_bytes(export.into_body(), 1024 * 1024).await.unwrap();
+        let export: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(export["format"], "term-server-debug-recording");
+        assert_eq!(export["server"]["version"], crate::build::VERSION);
+        let events = export["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], "output");
+        assert_eq!(events[0]["terminal"], id.to_string());
+    }
+
+    #[tokio::test]
+    async fn pushover_config_and_send_lifecycle() {
+        let (app, cookie) = authenticated_app().await;
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config/pushover")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let get = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config/pushover")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get.status(), StatusCode::OK);
+        let body = to_bytes(get.into_body(), 1024 * 1024).await.unwrap();
+        let config: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(config["configured"], false);
+        assert_eq!(config["mode"], "off");
+
+        // Sending while unconfigured fails without making a network request.
+        let send = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/pushover/send")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(Body::from(r#"{"message":"hello"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(send.status(), StatusCode::BAD_REQUEST);
+
+        // Configure keys but keep the mode off.
+        let patch = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/config/pushover")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(Body::from(
+                        r#"{"userKey":"user-1","appKey":"app-1","mode":"off"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(patch.status(), StatusCode::OK);
+        let body = to_bytes(patch.into_body(), 1024 * 1024).await.unwrap();
+        let config: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(config["configured"], true);
+        assert_eq!(config["enabled"], false);
+        assert_eq!(config["userKey"], "user-1");
+
+        // Sending while the mode is off also fails without a network request.
+        let send_off = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/pushover/send")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(Body::from(r#"{"message":"hello"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(send_off.status(), StatusCode::BAD_REQUEST);
+
+        // Switching the mode to all enables alerts.
+        let patch_all = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/config/pushover")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::from(r#"{"mode":"all"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(patch_all.status(), StatusCode::OK);
+        let body = to_bytes(patch_all.into_body(), 1024 * 1024).await.unwrap();
+        let config: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(config["enabled"], true);
+        assert_eq!(config["mode"], "all");
     }
 
     #[tokio::test]

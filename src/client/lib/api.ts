@@ -23,6 +23,10 @@ import type {
   SessionBrokerInfo,
   UpdateStatus,
   ReleaseInfo,
+  DebugRecordingStatus,
+  DebugRecordingExport,
+  PushoverConfig,
+  UpdatePushoverConfig,
 } from "../../shared/types";
 
 export class ApiError extends Error {
@@ -131,4 +135,23 @@ export const api = {
     request<FileDocument>("/api/files/content", { method: "PUT", body: JSON.stringify(file) }),
   previewFileUrl: (target: FileTarget) => `/api/files/raw?${fileQuery(target)}`,
   downloadFileUrl: (target: FileTarget) => `/api/files/download?${fileQuery(target)}`,
+  debugRecording: () => request<DebugRecordingStatus>("/api/debug/recording"),
+  debugRecordingControl: (action: "start" | "stop" | "clear") =>
+    request<DebugRecordingStatus>("/api/debug/recording", {
+      method: "POST",
+      body: JSON.stringify({ action }),
+    }),
+  debugRecordingExport: () =>
+    request<DebugRecordingExport>("/api/debug/recording/export"),
+  pushoverConfig: () => request<PushoverConfig>("/api/config/pushover"),
+  updatePushoverConfig: (config: UpdatePushoverConfig) =>
+    request<PushoverConfig>("/api/config/pushover", {
+      method: "PATCH",
+      body: JSON.stringify(config),
+    }),
+  pushoverSend: (notification: { title?: string; message: string }) =>
+    request<{ ok: true }>("/api/pushover/send", {
+      method: "POST",
+      body: JSON.stringify(notification),
+    }),
 };
