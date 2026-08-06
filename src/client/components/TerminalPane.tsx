@@ -57,6 +57,12 @@ import {
 } from "../lib/terminal-zoom";
 import { addTerminalStreamProtocol, closeTerminalSocket } from "../lib/terminal-socket";
 import {
+  encodeBytesBase64,
+  encodeTextBase64,
+  isDebugRecordingActive,
+  recordDebugEvent,
+} from "../lib/debug-recording";
+import {
   encodeTerminalBinary,
   encodeTerminalText,
   sendTerminalChunks,
@@ -325,12 +331,18 @@ export function TerminalPane({
       if (socket.current?.readyState === WebSocket.OPEN) socket.current.send(JSON.stringify(message));
     };
     const sendTextInput = (data: string) => {
+      if (isDebugRecordingActive()) {
+        recordDebugEvent(terminal.id, { type: "input", data: encodeTextBase64(data) });
+      }
       const current = socket.current;
       if (current?.readyState === WebSocket.OPEN) {
         sendTerminalChunks(current, encodeTerminalText(data));
       }
     };
     const sendBinaryInput = (data: string) => {
+      if (isDebugRecordingActive()) {
+        recordDebugEvent(terminal.id, { type: "input", data: encodeTextBase64(data) });
+      }
       const current = socket.current;
       if (current?.readyState === WebSocket.OPEN) {
         sendTerminalChunks(current, encodeTerminalBinary(data));
@@ -378,6 +390,13 @@ export function TerminalPane({
       const key = `${size.cols}x${size.rows}@${size.pixelWidth}x${size.pixelHeight}`;
       if (key === reportedViewport) return;
       reportedViewport = key;
+      recordDebugEvent(terminal.id, {
+        type: "resize",
+        cols: size.cols,
+        rows: size.rows,
+        pixelWidth: size.pixelWidth,
+        pixelHeight: size.pixelHeight,
+      });
       send({ type: "resize", ...size });
     });
     const reportViewport = viewportReporter.schedule;
@@ -435,6 +454,9 @@ export function TerminalPane({
     });
 
     const writeTerminal = (data: Uint8Array, commit?: number) => new Promise<void>((resolve, reject) => {
+      if (isDebugRecordingActive()) {
+        recordDebugEvent(terminal.id, { type: "write", data: encodeBytesBase64(data) });
+      }
       parsingOutput = true;
       try {
         term.write(data, () => {
@@ -458,6 +480,8 @@ export function TerminalPane({
       responder = false;
       term.options.disableStdin = true;
       setConnection(recoveringOutput ? "recovering" : "connecting");
+      recordDebugEvent(terminal.id, { type: "connect" });
+      recordDebugEvent(terminal.id, { type: "state", state: recoveringOutput ? "recovering" : "connecting" });
       const protocol = location.protocol === "https:" ? "wss:" : "ws:";
       const url = addTerminalStreamProtocol(
         new URL(`${protocol}//${location.host}/api/terminals/${terminal.id}/socket`),
@@ -532,19 +556,41 @@ export function TerminalPane({
             const binary = event.data instanceof Blob ? await event.data.arrayBuffer() : event.data;
             if (binary instanceof ArrayBuffer) {
               const frame = eagerFrame ?? decodeTerminalFrame(binary);
+              if (isDebugRecordingActive()) {
+                recordDebugEvent(terminal.id, {
+                  type: "output",
+                  sequence: frame.sequence,
+                  data: encodeBytesBase64(frame.data),
+                });
+              }
               const commit = stream.accept(frame);
               await writeTerminal(frame.data, commit);
               return;
             }
             const message = JSON.parse(String(event.data)) as ServerTerminalMessage;
-            if (message.type === "ready") onUpdate(message.terminal);
+            if (message.type === "ready") {
+              recordDebugEvent(terminal.id, { type: "control", message });
+              onUpdate(message.terminal);
+            }
             if (message.type === "size") {
+              recordDebugEvent(terminal.id, {
+                type: "size",
+                cols: message.cols,
+                rows: message.rows,
+                controller: message.controller,
+                responder: message.responder,
+              });
               term.resize(message.cols, message.rows);
               responder = message.responder;
               if (!acceptingInput) term.options.disableStdin = !responder;
               setTerminalSize({ focused: message.focused, controller: message.controller });
             }
             if (message.type === "sync") {
+              recordDebugEvent(terminal.id, {
+                type: "sync",
+                mode: message.mode,
+                sequence: message.sequence,
+              });
               acceptingInput = false;
               term.options.disableStdin = !responder;
               if (hasSynced && !recoveringOutput) {
@@ -557,6 +603,7 @@ export function TerminalPane({
               if (stream.begin(message.mode, message.sequence)) term.reset();
             }
             if (message.type === "synced") {
+              recordDebugEvent(terminal.id, { type: "synced", sequence: message.sequence });
               stream.finish(message.sequence);
               hasSynced = true;
               recoveringOutput = false;
@@ -569,6 +616,7 @@ export function TerminalPane({
               if (activeState.current && visibleState.current) term.focus();
             }
             if (message.type === "exit") {
+              recordDebugEvent(terminal.id, { type: "control", message });
               exited.current = true;
               acceptingInput = false;
               term.options.disableStdin = true;
@@ -576,7 +624,10 @@ export function TerminalPane({
               setConnection("exited");
               onExit();
             }
-            if (message.type === "error") onNotice(message.message);
+            if (message.type === "error") {
+              recordDebugEvent(terminal.id, { type: "notice", message: message.message });
+              onNotice(message.message);
+            }
           } finally {
             backlog.settle(queuedBytes);
           }
@@ -585,6 +636,7 @@ export function TerminalPane({
         });
       });
       next.addEventListener("close", () => {
+        recordDebugEvent(terminal.id, { type: "disconnect", cause: "close" });
         if (disposed || exited.current) return;
         acceptingInput = false;
         term.options.disableStdin = true;
