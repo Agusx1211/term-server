@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- OMP (the agent harness) is now a first-class agent integration alongside Codex, Claude Code, and
+  Pi, installable from the settings panel, with native lifecycle activity reported to the dashboard.
+- OMP conversations reuse the title OMP already generates from the first message, so term-server no
+  longer generates its own title for OMP sessions.
+
 ## 0.8.2 - 2026-08-06
 
 ### Fixed

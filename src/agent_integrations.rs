@@ -23,6 +23,9 @@ const CLAUDE_HOOKS: &str = include_str!("../integrations/claude/hooks/hooks.json
 const PI_MANIFEST: &str = include_str!("../integrations/pi/package.json");
 const PI_EXTENSION: &str =
     include_str!("../integrations/pi/extensions/term-server-agent-events.ts");
+const OMP_PACKAGE: &str = include_str!("../integrations/omp/package.json");
+const OMP_EXTENSION: &str =
+    include_str!("../integrations/omp/extensions/term-server-agent-events.ts");
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -30,6 +33,7 @@ pub enum AgentIntegrationProvider {
     Codex,
     Claude,
     Pi,
+    Omp,
 }
 
 impl AgentIntegrationProvider {
@@ -38,6 +42,7 @@ impl AgentIntegrationProvider {
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::Pi => "pi",
+            Self::Omp => "omp",
         }
     }
 
@@ -46,6 +51,7 @@ impl AgentIntegrationProvider {
             Self::Codex => "Codex",
             Self::Claude => "Claude Code",
             Self::Pi => "Pi",
+            Self::Omp => "OMP",
         }
     }
 }
@@ -96,13 +102,14 @@ impl AgentIntegrationService {
     }
 
     pub async fn status(&self) -> AgentIntegrationsConfig {
-        let (codex, claude, pi) = tokio::join!(
+        let (codex, claude, pi, omp) = tokio::join!(
             self.provider_status(AgentIntegrationProvider::Codex),
             self.provider_status(AgentIntegrationProvider::Claude),
             self.provider_status(AgentIntegrationProvider::Pi),
+            self.provider_status(AgentIntegrationProvider::Omp),
         );
         AgentIntegrationsConfig {
-            providers: vec![codex, claude, pi],
+            providers: vec![codex, claude, pi, omp],
             fallbacks_enabled: true,
         }
     }
@@ -141,6 +148,7 @@ impl AgentIntegrationService {
             AgentIntegrationProvider::Codex => self.codex_status(&executable).await,
             AgentIntegrationProvider::Claude => self.claude_status(&executable).await,
             AgentIntegrationProvider::Pi => self.pi_status(&executable).await,
+            AgentIntegrationProvider::Omp => self.omp_status(&executable).await,
         };
         result.unwrap_or_else(|message| {
             status(
@@ -214,6 +222,25 @@ impl AgentIntegrationService {
             installed,
             installed,
             self.assets_current(AgentIntegrationProvider::Pi),
+        ))
+    }
+
+    async fn omp_status(&self, executable: &Path) -> Result<AgentIntegrationStatus, String> {
+        let marketplace_root = self.provider_root(AgentIntegrationProvider::Omp);
+        let source = omp_marketplace_source(executable).await;
+        let registered = source
+            .as_ref()
+            .is_some_and(|source| paths_match(source, &marketplace_root));
+        let collision = source.is_some() && !registered;
+        let plugins = command_json(executable, ["plugin", "list", "--json"]).await?;
+        let installed = omp_plugin_installed(&plugins);
+        Ok(classify_status(
+            AgentIntegrationProvider::Omp,
+            registered,
+            collision,
+            installed,
+            installed,
+            self.assets_current(AgentIntegrationProvider::Omp),
         ))
     }
 
@@ -313,6 +340,38 @@ impl AgentIntegrationService {
                 )
                 .await?;
             }
+            AgentIntegrationProvider::Omp => {
+                let marketplace_root = self.provider_root(provider);
+                match omp_marketplace_source(executable).await {
+                    None => {
+                        run_command(
+                            executable,
+                            [
+                                OsString::from("plugin"),
+                                OsString::from("marketplace"),
+                                OsString::from("add"),
+                                marketplace_root.into_os_string(),
+                            ],
+                        )
+                        .await?;
+                    }
+                    Some(source) if paths_match(&source, &marketplace_root) => {}
+                    Some(_) => {
+                        return Err(format!(
+                            "a different provider marketplace already uses the {MARKETPLACE_NAME} name"
+                        ));
+                    }
+                }
+                let plugins = command_json(executable, ["plugin", "list", "--json"]).await?;
+                if omp_plugin_installed(&plugins) {
+                    run_command(
+                        executable,
+                        ["plugin", "uninstall", PLUGIN_SELECTOR, "--scope", "user"],
+                    )
+                    .await?;
+                }
+                run_command(executable, ["plugin", "install", PLUGIN_SELECTOR]).await?;
+            }
         }
         Ok(())
     }
@@ -394,6 +453,27 @@ impl AgentIntegrationService {
                     .await?;
                 }
             }
+            AgentIntegrationProvider::Omp => {
+                let plugins = command_json(executable, ["plugin", "list", "--json"]).await?;
+                if omp_plugin_installed(&plugins) {
+                    run_command(
+                        executable,
+                        ["plugin", "uninstall", PLUGIN_SELECTOR, "--scope", "user"],
+                    )
+                    .await?;
+                }
+                let marketplace_root = self.provider_root(provider);
+                if omp_marketplace_source(executable)
+                    .await
+                    .is_some_and(|source| paths_match(&source, &marketplace_root))
+                {
+                    run_command(
+                        executable,
+                        ["plugin", "marketplace", "remove", MARKETPLACE_NAME],
+                    )
+                    .await?;
+                }
+            }
         }
         let root = self.provider_root(provider);
         if root.is_dir() {
@@ -449,6 +529,25 @@ impl AgentIntegrationService {
                 )
                 .await?;
             }
+            AgentIntegrationProvider::Omp => {
+                write_asset(
+                    &root.join(format!("plugins/{PLUGIN_NAME}/package.json")),
+                    OMP_PACKAGE,
+                )
+                .await?;
+                write_asset(
+                    &root.join(format!(
+                        "plugins/{PLUGIN_NAME}/extensions/term-server-agent-events.ts"
+                    )),
+                    OMP_EXTENSION,
+                )
+                .await?;
+                write_json(
+                    &root.join(".omp-plugin/marketplace.json"),
+                    &omp_marketplace(),
+                )
+                .await?;
+            }
         }
         Ok(())
     }
@@ -458,6 +557,7 @@ impl AgentIntegrationService {
             AgentIntegrationProvider::Codex => "codex-marketplace",
             AgentIntegrationProvider::Claude => "claude-marketplace",
             AgentIntegrationProvider::Pi => "pi",
+            AgentIntegrationProvider::Omp => "omp-marketplace",
         })
     }
 
@@ -488,6 +588,13 @@ impl AgentIntegrationService {
                 ("package.json", PI_MANIFEST),
                 ("extensions/term-server-agent-events.ts", PI_EXTENSION),
             ],
+            AgentIntegrationProvider::Omp => &[
+                ("plugins/term-server-agent-events/package.json", OMP_PACKAGE),
+                (
+                    "plugins/term-server-agent-events/extensions/term-server-agent-events.ts",
+                    OMP_EXTENSION,
+                ),
+            ],
         };
         let assets_current = assets.iter().all(|(path, expected)| {
             std::fs::read_to_string(root.join(path)).is_ok_and(|content| content == *expected)
@@ -502,6 +609,10 @@ impl AgentIntegrationService {
                 &claude_marketplace(),
             ),
             AgentIntegrationProvider::Pi => true,
+            AgentIntegrationProvider::Omp => json_file_matches(
+                &root.join(".omp-plugin/marketplace.json"),
+                &omp_marketplace(),
+            ),
         };
         assets_current && marketplace_current
     }
@@ -536,6 +647,48 @@ fn claude_marketplace() -> Value {
             "source": format!("./plugins/{PLUGIN_NAME}")
         }]
     })
+}
+
+fn omp_marketplace() -> Value {
+    serde_json::json!({
+        "name": MARKETPLACE_NAME,
+        "owner": { "name": "term-server" },
+        "plugins": [{
+            "name": PLUGIN_NAME,
+            "description": "Reports OMP lifecycle activity to term-server.",
+            "source": format!("./plugins/{PLUGIN_NAME}")
+        }]
+    })
+}
+
+/// `omp plugin marketplace list` does not emit JSON, so parse the human listing
+/// to recover the registered source directory for our marketplace name, if any.
+async fn omp_marketplace_source(executable: &Path) -> Option<PathBuf> {
+    let output = run_command(executable, ["plugin", "marketplace", "list"])
+        .await
+        .ok()?;
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| {
+            let trimmed = line.trim();
+            let rest = trimmed.strip_prefix(MARKETPLACE_NAME)?;
+            if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+                return None;
+            }
+            let source = PathBuf::from(rest.trim());
+            (!source.as_os_str().is_empty()).then_some(source)
+        })
+}
+
+fn omp_plugin_installed(plugins: &Value) -> bool {
+    plugins
+        .get("marketplace")
+        .and_then(Value::as_array)
+        .is_some_and(|installed| {
+            installed
+                .iter()
+                .any(|entry| entry.get("id").and_then(Value::as_str) == Some(PLUGIN_SELECTOR))
+        })
 }
 
 fn json_file_matches(path: &Path, expected: &Value) -> bool {

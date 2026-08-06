@@ -734,6 +734,12 @@ fn title_contains_word(title: &str, expected: &str) -> bool {
         .any(|word| word == expected)
 }
 
+/// Pi and OMP are fullscreen TUI agents that signal activity through redraws
+/// rather than sustained CPU, so output deltas alone count as active work.
+fn redraws_signal_activity(agent_kind: &str) -> bool {
+    matches!(agent_kind, "pi" | "omp")
+}
+
 fn select_agent_status(
     agent_kind: &str,
     current: AgentStatus,
@@ -746,7 +752,8 @@ fn select_agent_status(
     if input_submitted_at == 0 {
         return AgentStatus::Idle;
     }
-    let (submission_working_millis, quiet_samples_to_idle) = if agent_kind == "pi" {
+    let (submission_working_millis, quiet_samples_to_idle) = if redraws_signal_activity(agent_kind)
+    {
         (PI_SUBMISSION_WORKING_MILLIS, PI_QUIET_SAMPLES_TO_IDLE)
     } else {
         (SUBMISSION_WORKING_MILLIS, QUIET_SAMPLES_TO_IDLE)
@@ -774,7 +781,7 @@ fn select_agent_status(
 }
 
 fn agent_sample_active(agent_kind: &str, cpu_delta: u64, output_delta: u64) -> bool {
-    if agent_kind == "pi" {
+    if redraws_signal_activity(agent_kind) {
         output_delta > 0
     } else {
         cpu_delta >= MEANINGFUL_CPU_TICKS || output_delta >= MEANINGFUL_OUTPUT_BYTES
@@ -1720,6 +1727,17 @@ impl TerminalSession {
                 self.pi_request(PiTaskKind::Summary, &info, &agent_kind, None),
             ));
         }
+        if let Some(title) = event.title
+            && activity.automatic_name
+        {
+            // A provider (omp) already titled this conversation; adopt it and stop
+            // term-server's own generation so a stale Pi result can't overwrite it.
+            activity.pending_title_prompt = None;
+            activity.title_in_flight_revision = None;
+            activity.generated_title = Some(title.clone());
+            info.name = title;
+            info.path = terminal_path(&info.workspace, &info.name);
+        }
         outcome
     }
 
@@ -2628,6 +2646,9 @@ fn agent_kind(process: &ProcessInfo) -> Option<String> {
             .any(|token| token == "pi" || token.contains("pi-coding-agent"))
     {
         return Some("pi".to_owned());
+    }
+    if tokens.iter().any(|token| token == "omp") {
+        return Some("omp".to_owned());
     }
     None
 }
@@ -3594,6 +3615,7 @@ mod tests {
                 AgentEvent {
                     provider: "codex".to_owned(),
                     kind,
+                    title: None,
                 },
                 pi.clone(),
             ));
@@ -3622,6 +3644,7 @@ mod tests {
             AgentEvent {
                 provider: "codex".to_owned(),
                 kind: AgentEventKind::Completed,
+                title: None,
             },
             pi.clone(),
         ));
@@ -3636,6 +3659,7 @@ mod tests {
             AgentEvent {
                 provider: "codex".to_owned(),
                 kind: AgentEventKind::Closed,
+                title: None,
             },
             pi,
         ));
@@ -3643,6 +3667,52 @@ mod tests {
         assert_eq!(closed.status, AgentStatus::Closed);
         assert_eq!(closed.revision, 3);
         assert!(closed.activity.is_none());
+        assert!(manager.remove(info.id));
+    }
+
+    #[test]
+    fn omp_title_is_adopted_and_suppresses_term_server_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = TerminalManager {
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            default_shell: RwLock::new(Some("/bin/sh".into())),
+            replay_bytes: AtomicUsize::new(1024 * 1024),
+            home_directory: directory.path().to_path_buf(),
+            agent_event_socket: None,
+            executable: None,
+        };
+        let info = manager
+            .create(CreateTerminal {
+                path: None,
+                cwd: None,
+                shell: None,
+                clone_from: None,
+            })
+            .unwrap();
+        let pi = Arc::new(PiService::new(directory.path()));
+
+        // omp forwards its own conversation title alongside a lifecycle event.
+        assert!(manager.apply_agent_event(
+            info.id,
+            AgentEvent {
+                provider: "omp".to_owned(),
+                kind: AgentEventKind::Thinking,
+                title: Some("checkout latency fix".to_owned()),
+            },
+            pi,
+        ));
+
+        let session = manager.get(info.id).unwrap();
+        let activity = session.activity.lock();
+        assert_eq!(
+            activity.generated_title.as_deref(),
+            Some("checkout latency fix")
+        );
+        // term-server must not queue or await its own title once omp has supplied one.
+        assert!(activity.pending_title_prompt.is_none());
+        assert!(activity.title_in_flight_revision.is_none());
+        drop(activity);
+        assert_eq!(session.info().name, "checkout latency fix");
         assert!(manager.remove(info.id));
     }
 
@@ -3671,6 +3741,10 @@ mod tests {
         assert_eq!(
             agent_kind(&process("node", &["node", "/opt/pi-coding-agent/dist.js"])).as_deref(),
             Some("pi")
+        );
+        assert_eq!(
+            agent_kind(&process("/home/user/.local/bin/omp", &["omp"])).as_deref(),
+            Some("omp")
         );
     }
 
