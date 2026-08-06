@@ -521,11 +521,11 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    if (!authenticated || !config.updates.enabled) return;
+    if (!authenticated || !config.updates?.enabled) return;
     void checkForUpdates();
     const timer = window.setInterval(() => void checkForUpdates(), 6 * 60 * 60 * 1000);
     return () => clearInterval(timer);
-  }, [authenticated, config.updates.enabled, config.updates.channel]);
+  }, [authenticated, config.updates?.enabled, config.updates?.channel]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
