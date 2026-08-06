@@ -580,6 +580,12 @@ export function TerminalPane({
                 controller: message.controller,
                 responder: message.responder,
               });
+              // A resize reflows the local buffer, which may no longer match the
+              // server's canonical model at the committed sequence. Drop the
+              // resume baseline so the next reconnect pulls a fresh snapshot.
+              if (message.cols !== term.cols || message.rows !== term.rows) {
+                stream.invalidateResume();
+              }
               term.resize(message.cols, message.rows);
               responder = message.responder;
               if (!acceptingInput) term.options.disableStdin = !responder;

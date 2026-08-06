@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.8.2 - 2026-08-06
+
+### Fixed
+
+- Terminals no longer render duplicated or stale content after a resize followed by a
+  reconnect (switching tabs, a background pane returning, or a dropped socket). A resize
+  reflows the browser terminal buffer away from the server's canonical state, so the next
+  reconnect now pulls a fresh snapshot instead of resuming delta output onto a stale grid.
+
+## 0.8.1 - 2026-08-06
+
+### Added
+
+- On-demand debug recording: start a recording from Settings, reproduce a terminal
+  rendering problem, then stop and download a single JSON trace combining the server-side
+  byte stream and the browser-side view for side-by-side comparison. Recording is off by
+  default and only captures while active, so it has no steady-state cost.
+- Pushover notifications: configure Pushover user and application keys and a delivery scope
+  (off, select, or all). In select and all modes a per-terminal bell in the sidebar (on by
+  default for all, off by default for select) controls which terminals are included. When an
+  agent finishes, a Pushover alert is sent with the host, agent kind, working directory, and
+  terminal title.
+
 ## 0.8.0 - 2026-08-03
 
 Terminal rendering and interaction now remain stable across resizes, reconnects, background panes,
