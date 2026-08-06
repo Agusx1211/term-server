@@ -1,3 +1,4 @@
+import { useEffect, useState } from "preact/hooks";
 import {
   Activity,
   Bell,
@@ -31,6 +32,8 @@ import type {
   BuildInfo,
   DebugRecordingStatus,
   PiConfig,
+  PushoverConfig,
+  PushoverMode,
   SessionBrokerInfo,
   UpdateConfig,
   UpdateStatus,
@@ -74,6 +77,7 @@ interface SettingsWorkspaceProps {
   recording: DebugRecordingStatus | null;
   frontendRecordingEvents: number;
   recordingBusy: boolean;
+  pushover: PushoverConfig;
   onTheme: (theme: ThemeName) => void;
   onPiChange: (titlesEnabled: boolean, summariesEnabled: boolean, model: string) => void;
   onAgentIntegration: (
@@ -97,6 +101,7 @@ interface SettingsWorkspaceProps {
   onRecordingStop: () => void;
   onRecordingDownload: () => void;
   onRecordingClear: () => void;
+  onPushoverChange: (changes: { userKey?: string; appKey?: string; mode?: PushoverMode }) => void;
   onPasswordChanged: () => void;
   onLogout: () => void;
 }
@@ -194,6 +199,7 @@ export function SettingsWorkspace({
   recording,
   frontendRecordingEvents,
   recordingBusy,
+  pushover,
   onTheme,
   onPiChange,
   onAgentIntegration,
@@ -211,6 +217,7 @@ export function SettingsWorkspace({
   onRecordingStop,
   onRecordingDownload,
   onRecordingClear,
+  onPushoverChange,
   onPasswordChanged,
   onLogout,
 }: SettingsWorkspaceProps) {
@@ -221,6 +228,13 @@ export function SettingsWorkspace({
   const updatePreviewSettings = (changes: Partial<TerminalPreviewSettings>) => {
     onTerminalPreviewSettingsChange({ ...terminalPreviewSettings, ...changes });
   };
+  const [pushoverUserKey, setPushoverUserKey] = useState(pushover.userKey);
+  const [pushoverAppKey, setPushoverAppKey] = useState(pushover.appKey);
+  useEffect(() => {
+    setPushoverUserKey(pushover.userKey);
+    setPushoverAppKey(pushover.appKey);
+  }, [pushover.userKey, pushover.appKey]);
+  const pushoverKeysDirty = pushoverUserKey !== pushover.userKey || pushoverAppKey !== pushover.appKey;
 
   return (
     <section class={`settings-workspace ${active ? "visible" : ""}`} aria-hidden={!active}>
@@ -790,6 +804,81 @@ export function SettingsWorkspace({
               The download is a single JSON file combining the server-side and
               browser-side traces, so the exact bytes sent and what the terminal
               rendered can be compared side by side.
+            </p>
+          </section>
+
+          <section class="settings-card settings-card-wide">
+            <header><Bell size={16} /><h2>Pushover notifications</h2></header>
+            <p>
+              Get a mobile push notification when an agent finishes. Configure the
+              Pushover user and application keys, then choose how much to be told.
+            </p>
+            <label class="pushover-field">
+              <span>User key</span>
+              <input
+                type="text"
+                value={pushoverUserKey}
+                onInput={(event) => setPushoverUserKey(event.currentTarget.value)}
+                placeholder="Pushover user key"
+                autocomplete="off"
+                spellcheck={false}
+              />
+            </label>
+            <label class="pushover-field">
+              <span>Application key</span>
+              <input
+                type="password"
+                value={pushoverAppKey}
+                onInput={(event) => setPushoverAppKey(event.currentTarget.value)}
+                placeholder="Pushover application key"
+                autocomplete="off"
+                spellcheck={false}
+              />
+            </label>
+            <button
+              class="settings-update-action primary"
+              onClick={() => onPushoverChange({ userKey: pushoverUserKey, appKey: pushoverAppKey })}
+              disabled={!pushoverKeysDirty}
+            >
+              Save keys
+            </button>
+            <div class="pushover-mode-grid" role="radiogroup" aria-label="Pushover notification scope">
+              {([
+                {
+                  mode: "off" as const,
+                  label: "Off",
+                  description: "Do not send Pushover alerts.",
+                },
+                {
+                  mode: "select" as const,
+                  label: "Select",
+                  description: "Notify only for terminals you turn on in the sidebar.",
+                },
+                {
+                  mode: "all" as const,
+                  label: "All",
+                  description: "Notify for every terminal; turn specific ones off in the sidebar.",
+                },
+              ] satisfies Array<{ mode: PushoverMode; label: string; description: string }>).map(({ mode, label, description }) => (
+                <label key={mode} class={`pushover-mode ${pushover.mode === mode ? "active" : ""}`}>
+                  <input
+                    type="radio"
+                    name="pushover-mode"
+                    value={mode}
+                    checked={pushover.mode === mode}
+                    onChange={() => onPushoverChange({ mode })}
+                  />
+                  <span>
+                    <b>{label}</b>
+                    <small>{description}</small>
+                  </span>
+                </label>
+              ))}
+            </div>
+            <p class="settings-hint">
+              {pushover.configured
+                ? "Keys are saved. When enabled, alerts include the host, agent, directory, and terminal title."
+                : "Add your Pushover keys and choose a scope to begin receiving alerts."}
             </p>
           </section>
 

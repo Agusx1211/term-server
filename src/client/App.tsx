@@ -14,12 +14,14 @@ import type {
   AgentIntegrationAction,
   AgentIntegrationProvider,
   ArtifactSkillAction,
+  AgentInfo,
   ArtifactEntry,
   ClientConfig,
   DebugRecordingExport,
   DebugRecordingStatus,
   FileEntry,
   FileTarget,
+  PushoverMode,
   ReleaseInfo,
   TerminalInfo,
   UpdateActivityView,
@@ -27,6 +29,7 @@ import type {
 } from "../shared/types";
 import { api, ApiError } from "./lib/api";
 import { withBrokerSessions } from "./lib/broker-generations";
+import { buildPushoverMessage, pushoverBellEnabled } from "./lib/pushover";
 import {
   debugRecordingEventCount,
   debugRecordingTruncated,
@@ -152,6 +155,13 @@ const defaultConfig: ClientConfig = {
     source: null,
     message: null,
     providers: [],
+  },
+  pushover: {
+    configured: false,
+    userKey: "",
+    appKey: "",
+    mode: "off",
+    enabled: false,
   },
   build: {
     version: "unknown",
@@ -332,6 +342,8 @@ export function App() {
   const mobileMenuButton = useRef<HTMLButtonElement>(null);
   const terminalsRef = useRef(terminals);
   terminalsRef.current = terminals;
+  const configRef = useRef(config);
+  configRef.current = config;
   const activeIdRef = useRef(activeId);
   activeIdRef.current = activeId;
   const paneIds = useMemo(() => idsFromLayout(layout), [layout]);
@@ -626,6 +638,7 @@ export function App() {
         showToast: showCompletionToast,
         onOpen: () => openTerminal(terminal.id),
       });
+      maybeSendPushover(terminal, agent);
       deliveredAgentEvents.current.set(terminalId, event);
     };
 
@@ -1103,6 +1116,26 @@ export function App() {
     }
   };
 
+  const updatePushoverConfig = async (changes: { userKey?: string; appKey?: string; mode?: PushoverMode }) => {
+    try {
+      const pushover = await api.updatePushoverConfig(changes);
+      setConfig((current) => ({ ...current, pushover }));
+      showNotice("Pushover settings updated");
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : "Unable to update Pushover settings");
+    }
+  };
+
+  const maybeSendPushover = (terminal: TerminalInfo, agent: AgentInfo) => {
+    const pushover = configRef.current.pushover;
+    if (!pushover.enabled) return;
+    if (!pushoverBellEnabled(terminal.id, pushover.mode)) return;
+    const { title, message } = buildPushoverMessage(terminal, agent, configRef.current.hostname);
+    void api.pushoverSend({ title, message }).catch(() => {
+      // A failed push notification is non-blocking; never surface it.
+    });
+  };
+
   const updateNotificationMode = async (mode: NotificationMode) => {
     if (includesSystemNotifications(mode)) {
       if (typeof Notification === "undefined") {
@@ -1436,6 +1469,7 @@ export function App() {
           updateAvailable={updateStatus?.state === "available"}
           fileRoot={terminalById.get(activeId ?? "")?.cwd ?? "~"}
           previewSettings={terminalPreviewSettings}
+          pushover={config.pushover}
           theme={theme}
           onMobileClose={closeMobileSidebar}
           onNew={(cwd) => void createTerminal(cwd)}
@@ -1657,6 +1691,7 @@ export function App() {
                 recording={recordingStatus}
                 frontendRecordingEvents={frontendRecordingEvents}
                 recordingBusy={recordingBusy}
+                pushover={config.pushover}
                 onTheme={setTheme}
                 onPiChange={(titlesEnabled, summariesEnabled, model) => (
                   void updatePiConfig(titlesEnabled, summariesEnabled, model)
@@ -1680,6 +1715,7 @@ export function App() {
                 onRecordingStop={() => void stopRecording()}
                 onRecordingDownload={() => void downloadRecording()}
                 onRecordingClear={() => void clearRecording()}
+                onPushoverChange={(changes) => void updatePushoverConfig(changes)}
                 onPasswordChanged={() => showNotice("Password changed; other sessions were signed out")}
                 onLogout={() => void logout()}
               />

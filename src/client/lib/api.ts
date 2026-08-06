@@ -25,6 +25,8 @@ import type {
   ReleaseInfo,
   DebugRecordingStatus,
   DebugRecordingExport,
+  PushoverConfig,
+  UpdatePushoverConfig,
 } from "../../shared/types";
 
 export class ApiError extends Error {
@@ -141,4 +143,15 @@ export const api = {
     }),
   debugRecordingExport: () =>
     request<DebugRecordingExport>("/api/debug/recording/export"),
+  pushoverConfig: () => request<PushoverConfig>("/api/config/pushover"),
+  updatePushoverConfig: (config: UpdatePushoverConfig) =>
+    request<PushoverConfig>("/api/config/pushover", {
+      method: "PATCH",
+      body: JSON.stringify(config),
+    }),
+  pushoverSend: (notification: { title?: string; message: string }) =>
+    request<{ ok: true }>("/api/pushover/send", {
+      method: "POST",
+      body: JSON.stringify(notification),
+    }),
 };

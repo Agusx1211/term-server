@@ -12,6 +12,7 @@ pub mod build;
 pub mod config;
 pub mod debug_recording;
 pub mod files;
+pub mod pushover;
 pub mod terminal;
 mod terminal_state;
 pub mod tls;

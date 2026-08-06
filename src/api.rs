@@ -52,6 +52,7 @@ use crate::{
         DebugRecordingStatus,
     },
     files::{self, FileError},
+    pushover::{PushoverConfig, PushoverNotification, PushoverService, UpdatePushoverConfig},
     terminal::{CreateTerminal, RenameTerminal, TerminalError, TerminalInfo},
     update::{UpdateConfig, UpdateError, UpdateService, UpdateStatus},
     workspace::{
@@ -84,6 +85,7 @@ pub struct AppState {
     pub artifact_skill: Arc<ArtifactSkillService>,
     pub server_control: ServerControl,
     pub debug_recording: Arc<DebugRecordingManager>,
+    pub pushover: Arc<PushoverService>,
 }
 
 #[derive(Clone)]
@@ -269,6 +271,7 @@ struct ClientConfig {
     pi: PiClientConfig,
     agent_integrations: AgentIntegrationsConfig,
     artifact_skill: ArtifactSkillConfig,
+    pushover: PushoverConfig,
     build: build::BuildInfo,
     broker: Option<SessionBrokerInfo>,
     updates: UpdateConfig,
@@ -615,6 +618,7 @@ async fn config(
         pi,
         agent_integrations,
         artifact_skill: state.artifact_skill.status(),
+        pushover: state.pushover.client_config(),
         build: build::info(),
         broker,
         updates: state.updates.config(),
@@ -753,6 +757,47 @@ async fn update_pi_config(
         .await
         .map(Json)
         .map_err(Into::into)
+}
+
+async fn pushover_config(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> Result<Json<PushoverConfig>, ApiError> {
+    require_auth(&jar, &state)?;
+    Ok(Json(state.pushover.client_config()))
+}
+
+async fn update_pushover_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+    Json(body): Json<UpdatePushoverConfig>,
+) -> Result<Json<PushoverConfig>, ApiError> {
+    require_origin(&headers, &uri, &state)?;
+    require_auth(&jar, &state)?;
+    let config = state.pushover.update(body).map_err(|error| {
+        tracing::error!(%error, "unable to persist pushover config");
+        ApiError::Internal
+    })?;
+    Ok(Json(config))
+}
+
+async fn pushover_send(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+    Json(body): Json<PushoverNotification>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_origin(&headers, &uri, &state)?;
+    require_auth(&jar, &state)?;
+    state
+        .pushover
+        .send(body)
+        .await
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 async fn list_terminals(
@@ -1321,6 +1366,11 @@ pub fn build_router(state: AppState, client_directory: Option<PathBuf>) -> Route
         .route("/password", patch(change_password))
         .route("/config", get(config))
         .route("/config/pi", patch(update_pi_config))
+        .route(
+            "/config/pushover",
+            get(pushover_config).patch(update_pushover_config),
+        )
+        .route("/pushover/send", post(pushover_send))
         .route("/config/artifact-skill", get(artifact_skill))
         .route(
             "/config/artifact-skill/{provider}",
@@ -1464,6 +1514,7 @@ mod tests {
             artifact_skill: Arc::new(ArtifactSkillService::new(None, directory.path())),
             server_control: ServerControl::new(Handle::new()),
             debug_recording: Arc::new(DebugRecordingManager::new()),
+            pushover: Arc::new(PushoverService::new(directory.path())),
         }
     }
 
@@ -1859,6 +1910,115 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["type"], "output");
         assert_eq!(events[0]["terminal"], id.to_string());
+    }
+
+    #[tokio::test]
+    async fn pushover_config_and_send_lifecycle() {
+        let (app, cookie) = authenticated_app().await;
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config/pushover")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let get = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config/pushover")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get.status(), StatusCode::OK);
+        let body = to_bytes(get.into_body(), 1024 * 1024).await.unwrap();
+        let config: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(config["configured"], false);
+        assert_eq!(config["mode"], "off");
+
+        // Sending while unconfigured fails without making a network request.
+        let send = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/pushover/send")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(Body::from(r#"{"message":"hello"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(send.status(), StatusCode::BAD_REQUEST);
+
+        // Configure keys but keep the mode off.
+        let patch = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/config/pushover")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(Body::from(
+                        r#"{"userKey":"user-1","appKey":"app-1","mode":"off"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(patch.status(), StatusCode::OK);
+        let body = to_bytes(patch.into_body(), 1024 * 1024).await.unwrap();
+        let config: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(config["configured"], true);
+        assert_eq!(config["enabled"], false);
+        assert_eq!(config["userKey"], "user-1");
+
+        // Sending while the mode is off also fails without a network request.
+        let send_off = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/pushover/send")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(Body::from(r#"{"message":"hello"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(send_off.status(), StatusCode::BAD_REQUEST);
+
+        // Switching the mode to all enables alerts.
+        let patch_all = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/config/pushover")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::from(r#"{"mode":"all"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(patch_all.status(), StatusCode::OK);
+        let body = to_bytes(patch_all.into_body(), 1024 * 1024).await.unwrap();
+        let config: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(config["enabled"], true);
+        assert_eq!(config["mode"], "all");
     }
 
     #[tokio::test]

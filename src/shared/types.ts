@@ -97,6 +97,7 @@ export interface ClientConfig {
   pi: PiConfig;
   agentIntegrations: AgentIntegrationsConfig;
   artifactSkill: ArtifactSkillConfig;
+  pushover: PushoverConfig;
   build: BuildInfo;
   broker: SessionBrokerInfo | null;
   updates: UpdateConfig;
@@ -289,6 +290,22 @@ export interface DebugRecordingExport {
     commit: string;
   };
   events: DebugRecordedEvent[];
+}
+
+export type PushoverMode = "off" | "select" | "all";
+
+export interface PushoverConfig {
+  configured: boolean;
+  userKey: string;
+  appKey: string;
+  mode: PushoverMode;
+  enabled: boolean;
+}
+
+export interface UpdatePushoverConfig {
+  userKey?: string;
+  appKey?: string;
+  mode?: PushoverMode;
 }
 
 export type ClientTerminalMessage =
