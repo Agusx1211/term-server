@@ -14,6 +14,12 @@
 - OMP conversations reuse the title OMP already generates from the first message, so term-server no
   longer generates its own title for OMP sessions.
 
+### Fixed
+
+- The client no longer throws when reading update settings before the workspace configuration
+  loads (for example in development builds), because the update-check effect now tolerates a missing
+  `updates` block.
+
 ## 0.8.2 - 2026-08-06
 
 ### Fixed
