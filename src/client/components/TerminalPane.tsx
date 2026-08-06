@@ -60,6 +60,7 @@ import {
   encodeBytesBase64,
   encodeTextBase64,
   isDebugRecordingActive,
+  onDebugRecordingChange,
   recordDebugEvent,
 } from "../lib/debug-recording";
 import {
@@ -316,14 +317,92 @@ export function TerminalPane({
         callback(links.length ? links : undefined);
       },
     });
+    // Renderer state for debug recording. xterm does not expose the active
+    // renderer, so we track whether WebGL loaded and capture the rendered
+    // output (buffer model + canvas) ourselves while a recording is active.
+    let rendererKind: "webgl" | "canvas" | "dom" = "dom";
+    let webglLoaded = false;
+    let webglContextLost = false;
+    const RENDER_SAMPLE_MS = 250;
+    const SCREENSHOT_SAMPLE_MS = 1000;
+    let lastRenderSample = 0;
+    let lastScreenshotSample = 0;
+    const recordRenderer = (): void => {
+      if (!isDebugRecordingActive()) return;
+      recordDebugEvent(terminal.id, {
+        type: "renderer",
+        renderer: rendererKind,
+        webglLoaded,
+        contextLost: webglContextLost,
+        dpr: window.devicePixelRatio || 1,
+      });
+    };
+    const captureRenderModel = (): void => {
+      if (!isDebugRecordingActive()) return;
+      const buffer = term.buffer.active;
+      const rows = term.rows;
+      const top = buffer.viewportY;
+      const lines: string[] = [];
+      for (let index = 0; index < rows; index += 1) {
+        const line = buffer.getLine(top + index);
+        lines.push(line ? line.translateToString(true) : "");
+      }
+      recordDebugEvent(terminal.id, {
+        type: "render",
+        cols: term.cols,
+        rows,
+        cursorX: buffer.cursorX,
+        cursorY: buffer.cursorY,
+        viewportY: top,
+        lines,
+      });
+    };
+    const captureScreenshot = (): void => {
+      if (!isDebugRecordingActive()) return;
+      const canvas = term.element?.querySelector<HTMLCanvasElement>("canvas");
+      if (!canvas) return;
+      let dataUrl: string | null = null;
+      try {
+        dataUrl = canvas.toDataURL("image/png");
+      } catch {
+        // The WebGL drawing buffer may already be cleared; skip this sample.
+      }
+      if (!dataUrl) return;
+      recordDebugEvent(terminal.id, {
+        type: "screenshot",
+        dataUrl,
+        width: canvas.width,
+        height: canvas.height,
+      });
+    };
+    const captureRenderState = (force = false): void => {
+      if (!isDebugRecordingActive()) return;
+      const now = Date.now();
+      if (force || now - lastRenderSample >= RENDER_SAMPLE_MS) {
+        lastRenderSample = now;
+        captureRenderModel();
+      }
+      if (force || now - lastScreenshotSample >= SCREENSHOT_SAMPLE_MS) {
+        lastScreenshotSample = now;
+        captureScreenshot();
+      }
+    };
     void import("@xterm/addon-webgl").then(({ WebglAddon }) => {
       if (disposed) return;
       try {
         const webgl = new WebglAddon();
-        webgl.onContextLoss(() => webgl.dispose());
+        webgl.onContextLoss(() => {
+          webgl.dispose();
+          webglContextLost = true;
+          recordRenderer();
+        });
         term.loadAddon(webgl);
+        rendererKind = "webgl";
+        webglLoaded = true;
+        recordRenderer();
       } catch {
         // xterm's built-in renderer is the compatibility fallback.
+        recordRenderer();
       }
     });
 
@@ -590,6 +669,7 @@ export function TerminalPane({
               responder = message.responder;
               if (!acceptingInput) term.options.disableStdin = !responder;
               setTerminalSize({ focused: message.focused, controller: message.controller });
+              captureRenderState(true);
             }
             if (message.type === "sync") {
               recordDebugEvent(terminal.id, {
@@ -620,6 +700,7 @@ export function TerminalPane({
               setConnection("connected");
               reportViewport();
               if (activeState.current && visibleState.current) term.focus();
+              captureRenderState(true);
             }
             if (message.type === "exit") {
               recordDebugEvent(terminal.id, { type: "control", message });
@@ -678,6 +759,7 @@ export function TerminalPane({
 
     setTerminalVisibility.current = (nextVisible) => {
       visibleState.current = nextVisible;
+      recordDebugEvent(terminal.id, { type: "visibility", visible: nextVisible });
       if (!nextVisible) {
         viewportReporter.cancel();
         if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
@@ -711,10 +793,36 @@ export function TerminalPane({
     if (visibleState.current) connect();
     reportViewport();
 
+    // Debug recording: capture the rendered state (xterm model + canvas) only
+    // while a recording is active. onRender fires with a fresh WebGL buffer; the
+    // interval covers idle periods when no output is being drawn.
+    const renderDisposable = term.onRender(() => captureRenderState(false));
+    let captureTimer: number | undefined;
+    const startCapture = (): void => {
+      if (captureTimer !== undefined) return;
+      recordRenderer();
+      captureRenderState(true);
+      captureTimer = window.setInterval(() => captureRenderState(false), 1000);
+    };
+    const stopCapture = (): void => {
+      if (captureTimer !== undefined) {
+        clearInterval(captureTimer);
+        captureTimer = undefined;
+      }
+    };
+    const recordingDisposable = onDebugRecordingChange((active) => {
+      if (active) startCapture();
+      else stopCapture();
+    });
+    if (isDebugRecordingActive()) startCapture();
+
     return () => {
       disposed = true;
       viewportReporter.cancel();
       clearInterval(keepaliveTimer);
+      renderDisposable.dispose();
+      recordingDisposable();
+      stopCapture();
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
       observer.disconnect();
       imagePreviews.clear();

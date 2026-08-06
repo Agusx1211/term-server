@@ -22,7 +22,28 @@ export type FrontendRecordEvent =
   | { type: "write"; data: string }
   | { type: "input"; data: string }
   | { type: "resize"; cols: number; rows: number; pixelWidth: number; pixelHeight: number }
-  | { type: "notice"; message: string };
+  | { type: "notice"; message: string }
+  // Rendered-state captures. These record what the browser actually drew, so a
+  // recording can be diffed against the server's byte stream to localize a bug
+  // to the client model vs. the paint layer.
+  | {
+      type: "render";
+      cols: number;
+      rows: number;
+      cursorX: number;
+      cursorY: number;
+      viewportY: number;
+      lines: string[];
+    }
+  | { type: "screenshot"; dataUrl: string; width: number; height: number }
+  | {
+      type: "renderer";
+      renderer: "webgl" | "canvas" | "dom";
+      webglLoaded: boolean;
+      contextLost: boolean;
+      dpr: number;
+    }
+  | { type: "visibility"; visible: boolean };
 
 export interface RecordedFrontendEvent {
   ts: number;
@@ -34,22 +55,39 @@ let active = false;
 let events: RecordedFrontendEvent[] = [];
 let truncated = false;
 
+const listeners = new Set<(active: boolean) => void>();
+
+/** Subscribe to recording start/stop. Use this to run capture work only while a
+ * recording is in progress. Returns an unsubscribe function. */
+export function onDebugRecordingChange(listener: (active: boolean) => void): () => void {
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+  };
+}
+
+function setActive(next: boolean): void {
+  if (active === next) return;
+  active = next;
+  for (const listener of listeners) listener(next);
+}
+
 export function isDebugRecordingActive(): boolean {
   return active;
 }
 
 export function startDebugRecording(): void {
-  active = true;
   events = [];
   truncated = false;
+  setActive(true);
 }
 
 export function stopDebugRecording(): void {
-  active = false;
+  setActive(false);
 }
 
 export function resetDebugRecording(): void {
-  active = false;
+  setActive(false);
   events = [];
   truncated = false;
 }

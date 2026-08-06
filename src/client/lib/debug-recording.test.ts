@@ -9,6 +9,7 @@ import {
   stopDebugRecording,
   takeFrontendRecording,
   recordDebugEvent,
+  onDebugRecordingChange,
 } from "./debug-recording";
 
 describe("debug-recording", () => {
@@ -61,5 +62,19 @@ describe("debug-recording", () => {
   it("base64 encodes bytes and text", () => {
     expect(encodeTextBase64("hi")).toBe("aGk=");
     expect(encodeBytesBase64(new Uint8Array([0x00, 0x01, 0xff]))).toBe("AAH/");
+  });
+
+  it("notifies subscribers when recording starts and stops", () => {
+    resetDebugRecording();
+    const changes: boolean[] = [];
+    const off = onDebugRecordingChange((active) => changes.push(active));
+    startDebugRecording();
+    stopDebugRecording();
+    startDebugRecording();
+    off();
+    startDebugRecording();
+    stopDebugRecording();
+    resetDebugRecording();
+    expect(changes).toEqual([true, false, true]);
   });
 });
