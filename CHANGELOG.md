@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.2 - 2026-08-06
+
+### Fixed
+
+- Terminals no longer render duplicated or stale content after a resize followed by a
+  reconnect (switching tabs, a background pane returning, or a dropped socket). A resize
+  reflows the browser terminal buffer away from the server's canonical state, so the next
+  reconnect now pulls a fresh snapshot instead of resuming delta output onto a stale grid.
+
 ## 0.8.1 - 2026-08-06
 
 ### Added

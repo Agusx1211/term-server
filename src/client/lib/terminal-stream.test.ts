@@ -79,6 +79,31 @@ describe("terminal stream protocol", () => {
     expect(state.synchronizing).toBe(false);
     expect(state.begin("snapshot", 20)).toBe(true);
   });
+
+  it("drops the resume baseline after a resize until the next snapshot", () => {
+    const state = new TerminalStreamState();
+    state.begin("snapshot", 10);
+    state.accept(decodeTerminalFrame(frame(TERMINAL_FRAME_SNAPSHOT, 10n, [1])));
+    state.finish(10);
+    state.begin("resume", 15);
+    state.accept(decodeTerminalFrame(frame(TERMINAL_FRAME_OUTPUT, 10n, [1, 2, 3])));
+    state.commit(13);
+    state.accept(decodeTerminalFrame(frame(TERMINAL_FRAME_OUTPUT, 13n, [4, 5])));
+    state.commit(15);
+    state.finish(15);
+    expect(state.resumeSequence).toBe(15);
+
+    // A resize reflows the local grid, so the committed sequence no longer
+    // matches it. The next reconnect must request a full snapshot.
+    state.invalidateResume();
+    expect(state.resumeSequence).toBeUndefined();
+
+    // Once a fresh snapshot sync completes, the resume baseline is trusted again.
+    expect(state.begin("snapshot", 30)).toBe(true);
+    state.accept(decodeTerminalFrame(frame(TERMINAL_FRAME_SNAPSHOT, 30n, [1])));
+    state.finish(30);
+    expect(state.resumeSequence).toBe(30);
+  });
 });
 
 describe("terminal renderer backlog", () => {

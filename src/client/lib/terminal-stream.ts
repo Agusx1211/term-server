@@ -75,13 +75,23 @@ export class TerminalStreamState {
   private syncMode?: TerminalSyncMode;
   private syncTarget?: number;
   private snapshotReceived = false;
+  // True once the local terminal state may have diverged from the server's
+  // canonical model (e.g. after a resize reflows the buffer). While set, the
+  // next reconnect asks for a full snapshot instead of resuming delta output
+  // from a sequence that no longer matches the local grid.
+  private resumeInvalid = false;
 
   get synchronizing(): boolean {
     return this.syncMode !== undefined;
   }
 
   get resumeSequence(): number | undefined {
-    return this.committedSequence;
+    return this.resumeInvalid ? undefined : this.committedSequence;
+  }
+
+  /** Mark the local terminal state as potentially diverged from the server. */
+  invalidateResume(): void {
+    this.resumeInvalid = true;
   }
 
   restart(): void {
@@ -90,6 +100,7 @@ export class TerminalStreamState {
     this.syncMode = undefined;
     this.syncTarget = undefined;
     this.snapshotReceived = false;
+    this.resumeInvalid = false;
   }
 
   begin(mode: TerminalSyncMode, target: number): boolean {
@@ -155,5 +166,7 @@ export class TerminalStreamState {
     }
     this.syncMode = undefined;
     this.syncTarget = undefined;
+    // A completed sync re-establishes an authoritative local state.
+    this.resumeInvalid = false;
   }
 }
