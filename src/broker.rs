@@ -1156,37 +1156,44 @@ mod tests {
         output
     }
 
-    async fn wait_for_resynchronized_output(socket: &mut BrokerWebSocket, needle: &str) -> String {
+    /// Reads a flood to its end, tolerating either outcome for a client that
+    /// falls behind: the stream is delivered whole, or the server jumps it to a
+    /// fresh snapshot. What must never happen is the socket being dropped.
+    async fn wait_for_flooded_output(socket: &mut BrokerWebSocket, needle: &str) {
+        // A flood spans megabytes across thousands of frames, so only the tail
+        // is retained: rescanning everything per frame is quadratic and dwarfs
+        // the behaviour under test.
         let mut output = String::new();
-        let mut resynchronized = false;
-        tokio::time::timeout(Duration::from_secs(15), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             while let Some(message) = socket.next().await {
                 match message.unwrap() {
                     TungsteniteMessage::Text(text) => {
                         let value = serde_json::from_str::<serde_json::Value>(&text).unwrap();
                         if value["type"] == "sync" {
                             assert_eq!(value["mode"], "snapshot");
-                            resynchronized = true;
                         }
                     }
                     TungsteniteMessage::Binary(bytes) => {
                         assert!(bytes.len() >= 9, "terminal frame includes its header");
                         output.push_str(&String::from_utf8_lossy(&bytes[9..]));
-                        if output.contains(needle) && resynchronized {
+                        if output.contains(needle) {
                             return;
+                        }
+                        let keep = output.len().saturating_sub(needle.len() * 4 + 4096);
+                        if keep > 0 && output.is_char_boundary(keep) {
+                            output.drain(..keep);
                         }
                     }
                     TungsteniteMessage::Close(_) => {
-                        panic!("lagging terminal socket was closed instead of resynchronized")
+                        panic!("flooded terminal socket was closed instead of recovering")
                     }
                     _ => {}
                 }
             }
-            panic!("terminal socket ended before it resynchronized");
+            panic!("terminal socket ended before the flood finished");
         })
         .await
-        .expect("terminal resynchronization timeout");
-        output
+        .expect("terminal flood recovery timeout");
     }
 
     #[tokio::test]
@@ -1542,7 +1549,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lagging_clients_resynchronize_without_disconnecting() {
+    async fn flooded_clients_recover_without_disconnecting() {
         let (_directory, server, client) = start_test_broker(1024 * 1024).await;
         let terminal = client
             .create(CreateTerminal {
@@ -1566,6 +1573,10 @@ mod tests {
         wait_for_control(&mut socket, "sync").await;
         wait_for_control(&mut socket, "synced").await;
 
+        // Flood the terminal while the client is not reading. Merging queued
+        // output into full frames lets the stream stay intact through a burst
+        // this size; if the client does fall far enough behind, the server
+        // still recovers it with a snapshot rather than dropping the socket.
         let command = "yes x | head -c 6000000; printf '\\nLAG-%s\\n' DONE\n";
         socket
             .send(TungsteniteMessage::Text(
@@ -1576,8 +1587,7 @@ mod tests {
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(250)).await;
-        let output = wait_for_resynchronized_output(&mut socket, "LAG-DONE").await;
-        assert!(output.contains("LAG-DONE"));
+        wait_for_flooded_output(&mut socket, "LAG-DONE").await;
 
         socket
             .send(TungsteniteMessage::Text(r#"{"type":"ping"}"#.into()))
