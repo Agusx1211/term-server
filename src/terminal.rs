@@ -817,7 +817,7 @@ fn redraws_signal_activity(agent_kind: &str) -> bool {
 
 /// What screen detection concluded about the next status.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum DetectionOutcome {
+pub(crate) enum DetectionOutcome {
     /// The screen is not showing the agent's state. Hold the current status.
     Keep,
     /// A rule matched with enough evidence to set the status.
@@ -835,7 +835,9 @@ enum DetectionOutcome {
 /// window title — so a weak match cannot yank a genuinely working agent to
 /// idle. The engine's own no-rule-matched idle fallback stays out of this
 /// entirely, leaving term-server's CPU and output heuristics in charge.
-fn screen_detection_outcome(detection: Option<&agent_detection::Detection>) -> DetectionOutcome {
+pub(crate) fn screen_detection_outcome(
+    detection: Option<&agent_detection::Detection>,
+) -> DetectionOutcome {
     let Some(detection) = detection else {
         return DetectionOutcome::Undecided;
     };

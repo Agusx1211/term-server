@@ -584,6 +584,254 @@ fn an_oversized_override_is_ignored() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Real captured screens
+// ---------------------------------------------------------------------------
+
+/// Screens captured from Claude Code v2.1.220 with `tmux capture-pane -p`,
+/// redacted only for account details and paths.
+///
+/// The tests above are written from the manifests, so they prove the engine
+/// agrees with the rules as read. These prove the rules agree with what the
+/// agent actually draws, which is the thing that silently breaks when an agent
+/// release changes its UI. Recapture with `classify_captured_screen` below.
+const CLAUDE_REAL_SCREENS: &[(&str, &str, DetectedState, &str)] = &[
+    (
+        "bash permission dialog",
+        include_str!("fixtures/claude-bash-permission.txt"),
+        DetectedState::Blocked,
+        "bash_permission_prompt",
+    ),
+    (
+        "folder trust dialog",
+        include_str!("fixtures/claude-trust-folder.txt"),
+        DetectedState::Blocked,
+        "live_blocked_form",
+    ),
+    (
+        "idle prompt box",
+        include_str!("fixtures/claude-prompt-box.txt"),
+        DetectedState::Idle,
+        "live_prompt_box",
+    ),
+    (
+        "prompt box after an interrupted turn",
+        include_str!("fixtures/claude-after-interrupt.txt"),
+        DetectedState::Idle,
+        "live_prompt_box",
+    ),
+];
+
+#[test]
+fn classifies_real_claude_code_screens() {
+    for (description, captured, expected_state, expected_rule) in CLAUDE_REAL_SCREENS {
+        let detection = classify("claude", screen(captured));
+        assert_eq!(detection.state, *expected_state, "{description}");
+        assert_eq!(
+            matched_rule_id(&detection),
+            Some(*expected_rule),
+            "{description}"
+        );
+    }
+}
+
+#[test]
+fn a_resolved_claude_permission_dialog_stops_reading_as_blocked() {
+    // The reason detection earns its place next to lifecycle hooks: a hook
+    // reports that an approval was requested but not reliably that it was
+    // dismissed. Escaping the dialog has to return the terminal to idle on the
+    // very next sample, from the screen alone.
+    let blocked = classify("claude", screen(CLAUDE_REAL_SCREENS[0].1));
+    assert_eq!(blocked.state, DetectedState::Blocked);
+
+    let cleared = classify("claude", screen(CLAUDE_REAL_SCREENS[3].1));
+    assert_eq!(cleared.state, DetectedState::Idle);
+    assert!(
+        cleared.visible_idle,
+        "idle has to be visible evidence to apply"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Replaying a real session
+// ---------------------------------------------------------------------------
+
+/// Classifies a screen captured from a real agent, printing the winning rule
+/// and every rule that matched.
+///
+/// Capture one with `tmux capture-pane -p` while the agent is showing the UI
+/// in question, then:
+///
+/// ```text
+/// TERM_SERVER_SCREEN=/tmp/claude-approval.txt TERM_SERVER_AGENT=claude \
+///   cargo test --lib classify_captured_screen -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "requires a screen capture in TERM_SERVER_SCREEN"]
+fn classify_captured_screen() {
+    let path =
+        std::env::var("TERM_SERVER_SCREEN").expect("set TERM_SERVER_SCREEN to a screen capture");
+    let agent_kind = std::env::var("TERM_SERVER_AGENT").expect("set TERM_SERVER_AGENT");
+    let screen = std::fs::read_to_string(&path).expect("read screen capture");
+    let osc_title = std::env::var("TERM_SERVER_OSC_TITLE").unwrap_or_default();
+
+    let explained = explain(
+        &agent_kind,
+        DetectionInput {
+            screen: &screen,
+            osc_title: &osc_title,
+            osc_progress: "",
+        },
+    )
+    .unwrap_or_else(|| panic!("no manifest for agent '{agent_kind}'"));
+
+    let outcome = crate::terminal::screen_detection_outcome(Some(&explained.detection));
+    println!(
+        "\n=== {path} as '{agent_kind}' ({} bytes) ===",
+        screen.len()
+    );
+    println!("engine state : {:?}", explained.detection.state);
+    println!("applied      : {outcome:?}");
+    println!("winning rule : {:?}", explained.detection.matched_rule);
+    println!("fallback     : {:?}", explained.detection.fallback_reason);
+    println!("\nrules that matched:");
+    for rule in explained.evaluated_rules.iter().filter(|rule| rule.matched) {
+        println!(
+            "  {:<28} p{:<5} {:<32} -> {:?}",
+            rule.id, rule.priority, rule.region, rule.state
+        );
+    }
+    println!("\nrules that did not match:");
+    for rule in explained
+        .evaluated_rules
+        .iter()
+        .filter(|rule| !rule.matched)
+    {
+        println!(
+            "  {:<28} p{:<5} {:<32} (region {} bytes)",
+            rule.id, rule.priority, rule.region, rule.region_bytes
+        );
+    }
+}
+
+/// Replays a recorded terminal session through the real pipeline and prints
+/// what detection concluded.
+///
+/// The tests above are written from the manifests, so they only prove the
+/// engine agrees with itself. This runs captured bytes from an actual session
+/// through the same `TerminalOutputState` the server uses, which is the only
+/// way to check the rules against the UI an agent really draws.
+///
+/// ```text
+/// TERM_SERVER_CAPTURE=captures/2/session.json TERM_SERVER_AGENT=claude \
+///   cargo test --lib replay_capture -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "requires a capture file in TERM_SERVER_CAPTURE"]
+fn replay_capture_through_detection() {
+    use base64::Engine as _;
+    use std::collections::BTreeMap;
+
+    let path = std::env::var("TERM_SERVER_CAPTURE")
+        .expect("set TERM_SERVER_CAPTURE to a debug recording path");
+    let agent_kind = std::env::var("TERM_SERVER_AGENT").unwrap_or_else(|_| "pi".to_owned());
+    let raw = std::fs::read_to_string(&path).expect("read capture");
+    let capture: serde_json::Value = serde_json::from_str(&raw).expect("parse capture");
+    let events = capture["events"].as_array().expect("events array");
+
+    // The capture records the terminal's real size; replaying at some other
+    // size rewraps everything and invalidates the region rules.
+    let (rows, cols) = events
+        .iter()
+        .find_map(|event| {
+            let message = &event["message"];
+            (message["type"].as_str() == Some("size")).then(|| {
+                (
+                    message["rows"].as_u64().unwrap_or(24) as u16,
+                    message["cols"].as_u64().unwrap_or(80) as u16,
+                )
+            })
+        })
+        .unwrap_or((24, 80));
+    println!("replaying at {rows}x{cols}");
+
+    let mut terminal = crate::terminal_state::TerminalOutputState::new(4 * 1024 * 1024, rows, cols);
+    let mut totals: BTreeMap<String, usize> = BTreeMap::new();
+    let mut transitions: Vec<(usize, String, Option<String>)> = Vec::new();
+    let mut recorded: BTreeMap<String, usize> = BTreeMap::new();
+    let mut previous = String::new();
+    let mut frames = 0usize;
+
+    for event in events {
+        match event["type"].as_str() {
+            Some("control") => {
+                let message = &event["message"];
+                if message["type"].as_str() == Some("size")
+                    && let (Some(rows), Some(cols)) =
+                        (message["rows"].as_u64(), message["cols"].as_u64())
+                {
+                    terminal.resize(rows as u16, cols as u16, 0, 0);
+                }
+                // What the recording's own server concluded, as ground truth.
+                if let Some(status) = message["terminal"]["agent"]["status"].as_str() {
+                    *recorded.entry(status.to_owned()).or_default() += 1;
+                }
+                continue;
+            }
+            Some("output") => {}
+            _ => continue,
+        }
+        let Some(encoded) = event["data"].as_str() else {
+            continue;
+        };
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+            continue;
+        };
+        terminal.publish(bytes::Bytes::from(bytes));
+        frames += 1;
+
+        let screen = terminal.detection_text();
+        let detection = detect(
+            &agent_kind,
+            DetectionInput {
+                screen: &screen,
+                osc_title: "",
+                osc_progress: "",
+            },
+        )
+        .unwrap_or_else(|| panic!("no manifest for agent '{agent_kind}'"));
+
+        // Report what the server would actually apply, not the raw engine
+        // state: the no-rule-matched idle fallback is deliberately ignored, so
+        // printing it would invent transitions that never reach a terminal.
+        let outcome = crate::terminal::screen_detection_outcome(Some(&detection));
+        let rule = detection.matched_rule.as_ref().map(|rule| rule.id.clone());
+        let applied = format!("{outcome:?}");
+        *totals.entry(applied.clone()).or_default() += 1;
+        let signature = format!("{applied}/{rule:?}");
+        if signature != previous {
+            transitions.push((frames, applied, rule));
+            previous = signature;
+        }
+    }
+
+    println!("\n=== replayed {frames} output frames as '{agent_kind}' ===");
+    println!("applied outcome totals: {totals:?}");
+    println!("status recorded by the capturing server: {recorded:?}");
+    println!("\ntransitions (frame, applied outcome, matched rule):");
+    for (frame, state, rule) in transitions.iter().take(60) {
+        println!("  {frame:>6}  {state:<24} {rule:?}");
+    }
+    if transitions.len() > 60 {
+        println!("  ... {} more transitions", transitions.len() - 60);
+    }
+    println!("\n=== final screen ===");
+    for line in terminal.detection_text().lines() {
+        println!("|{line}");
+    }
+    assert!(frames > 0, "capture contained no output frames");
+}
+
 #[test]
 fn a_missing_override_directory_is_not_an_error() {
     let cache = build_cache(Some(Path::new("/nonexistent/term-server/agent-detection")));

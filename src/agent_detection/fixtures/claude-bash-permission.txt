@@ -1,0 +1,40 @@
+╭─── Claude Code v2.1.220 ─────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting started                                        │
+│                Welcome back!                │ Run /init to create a CLAUDE.md file with instructions for Cla… │
+│                                                    │ ─────────────────────────────────────────────────────────────── │
+│                       ▐▛███▜▌                      │ What's new                                                      │
+│                      ▝▜█████▛▘                     │ Added self-hosted environments: `claude self-hosted-runner` tu… │
+│                        ▘▘ ▝▝                       │ Added `archive` plugin source: install plugins from a zip over… │
+│   Opus 5 (1M context) with xhig… · Claude Max ·    │ Added a cancel-and-confirm step when removing an unavailable p… │
+│   example@example.com's Organization                │ /release-notes for more                                         │
+│              /tmp/project               │                                                                 │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+
+❯ Use the Bash tool to run: echo second-attempt
+
+● Bash(echo second-attempt)
+  ⎿  Waiting…
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+
+   echo second-attempt
+   Echo second-attempt
+
+ Permission rule Bash requires confirmation for this command.
+ /permissions to update rules
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+
+ Esc to cancel · Tab to amend · ctrl+e to explain
+
+
+
+
+
+
+
+
