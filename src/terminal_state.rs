@@ -2,9 +2,13 @@ use std::collections::VecDeque;
 
 use bytes::Bytes;
 
-const DELTA_BUDGET_DIVISOR: usize = 4;
+// Half the budget goes to the delta ring. Resuming from it is what preserves a
+// browser's own scrollback, which is two orders of magnitude deeper than the
+// canonical model the other half pays for: a resume keeps every line the pane
+// ever rendered, while a snapshot resets it to what fits here. Spending evenly
+// buys the far more valuable outcome more often.
+const DELTA_BUDGET_DIVISOR: usize = 2;
 const MIN_RESERVED_VIEWPORT_COLS: usize = 128;
-const MAX_VIEWPORT_COLS: usize = 500;
 const CELL_BYTES: usize = std::mem::size_of::<vt100::Cell>();
 const MAX_PENDING_SEQUENCE_BYTES: usize = 64 * 1024;
 const MAX_TRACKED_SGR_BYTES: usize = 64 * 1024;
@@ -1061,10 +1065,15 @@ fn erases_scrollback(sequence: &[u8]) -> bool {
     matches!(sequence, b"\x1b[3J" | b"\x9b3J")
 }
 
+/// Rows the canonical model can hold within its share of the replay budget.
+///
+/// A row costs exactly one `Cell` per column, so charging the terminal's real
+/// width is what the memory actually is. Rounding the width up, as this once
+/// did, bought nothing and cost a wide terminal up to half its history. The
+/// floor only stops a very narrow terminal from claiming a row count whose
+/// per-row overhead would dwarf the cells it was budgeted for.
 fn scrollback_capacity(state_bytes: usize, cols: u16) -> usize {
-    let reserved_cols = usize::from(cols)
-        .next_power_of_two()
-        .clamp(MIN_RESERVED_VIEWPORT_COLS, MAX_VIEWPORT_COLS);
+    let reserved_cols = usize::from(cols).max(MIN_RESERVED_VIEWPORT_COLS);
     state_bytes / (reserved_cols * CELL_BYTES)
 }
 
@@ -1359,8 +1368,10 @@ mod tests {
 
     #[test]
     fn output_state_resumes_recent_bytes_and_snapshots_after_eviction() {
+        // Half the budget is the delta ring, so this overruns it and strands the
+        // start of the stream while leaving the recent tail resumable.
         let mut state = TerminalOutputState::new(256 * 1024, 4, 20);
-        state.publish(Bytes::from(vec![b'x'; 70 * 1024]));
+        state.publish(Bytes::from(vec![b'x'; 140 * 1024]));
         let current = state.sequence;
 
         let recent = state.sync(Some(current - 100));
@@ -1382,7 +1393,7 @@ mod tests {
 
     #[test]
     fn default_reconnect_budget_retains_typical_terminal_history() {
-        let mut state = TerminalOutputState::new(16 * 1024 * 1024, 10, 100);
+        let mut state = TerminalOutputState::new(64 * 1024 * 1024, 10, 100);
         for line in 0..2_000 {
             state.publish(Bytes::from(format!("away-{line:04}\r\n")));
         }

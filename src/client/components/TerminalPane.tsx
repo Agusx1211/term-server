@@ -604,6 +604,9 @@ export function TerminalPane({
       // talking to one; an older broker rejects any message it does not know and
       // the pane would surface an error notice for every acknowledgement.
       let flowControlled = false;
+      // Whether this server lets a cached pane keep its connection. Stays false
+      // against an older broker, which would answer `release` with an error.
+      let viewportRelease = false;
       const acknowledgeParsed = (bytes: number) => {
         const batch = outputAck.parsed(bytes);
         if (!flowControlled || batch === undefined || next.readyState !== WebSocket.OPEN) return;
@@ -628,8 +631,18 @@ export function TerminalPane({
         setConnection("recovering");
         closeTerminalSocket(next, "backlog");
       };
+      // Called when the pane leaves the screen but stays mounted. Holding the
+      // stream open is what makes coming back free: the buffer is never rebuilt
+      // and the scrollback this pane has accumulated is never traded for the far
+      // shallower snapshot a resynchronization would fall back to. The pane only
+      // gives up its say in the negotiated size, which it takes back by
+      // reporting its viewport once it is visible again.
       const suspend = () => {
         if (abandoned) return;
+        if (viewportRelease && next.readyState === WebSocket.OPEN) {
+          next.send(JSON.stringify({ type: "release" } satisfies ClientTerminalMessage));
+          return;
+        }
         abandoned = true;
         acceptingInput = false;
         term.options.disableStdin = true;
@@ -708,6 +721,7 @@ export function TerminalPane({
             if (message.type === "ready") {
               recordDebugEvent(terminal.id, { type: "control", message });
               flowControlled = message.flowControl === true;
+              viewportRelease = message.viewportRelease === true;
               onUpdate(message.terminal);
             }
             if (message.type === "size") {
@@ -825,6 +839,9 @@ export function TerminalPane({
         reconnectTimer.current = undefined;
         reportStreamIssue();
         term.blur();
+        // A released connection has no size registered against it, so the next
+        // report has to be sent even though the pane came back the same shape.
+        reportedViewport = "";
         suspendSocket?.();
         return;
       }
@@ -833,6 +850,9 @@ export function TerminalPane({
         const current = socket.current;
         if (!current || current.readyState === WebSocket.CLOSED) connect();
         reportViewport();
+        // A cached pane is display:none, so the renderer has drawn nothing while
+        // it was away however much output it parsed. Repaint from the buffer.
+        term.refresh(0, term.rows - 1);
         if (hasSynced && activeState.current) term.focus();
       });
     };

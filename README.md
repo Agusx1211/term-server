@@ -204,10 +204,10 @@ Run `term-server --help` for generated CLI help. CLI flags take precedence over 
 | `--data-dir` | `TERM_SERVER_DATA_DIR` | `$XDG_DATA_HOME/term-server` | Credentials, TLS files, and settings |
 | `--shell` | `TERM_SERVER_SHELL` | `$SHELL` | Default shell executable |
 | `--allowed-origin` | `TERM_SERVER_ALLOWED_ORIGINS` | same origin | Extra reverse-proxy origins |
-| `--replay-mb` | `TERM_SERVER_REPLAY_MB` | `16` | Canonical reconnect state and recent output per terminal |
+| `--replay-mb` | `TERM_SERVER_REPLAY_MB` | `64` | Canonical reconnect state and recent output per terminal |
 | `--scrollback-lines` | `TERM_SERVER_SCROLLBACK_LINES` | `200000` | Browser scrollback per pane |
 | `--max-panes` | `TERM_SERVER_MAX_PANES` | `4` | Visible pane limit, 1–8 |
-| `--cached-terminals` | `TERM_SERVER_CACHED_TERMINALS` | `6` | Mounted terminal renderers per browser tab; `0` keeps only visible panes |
+| `--cached-terminals` | `TERM_SERVER_CACHED_TERMINALS` | `16` | Mounted terminal renderers per browser tab; `0` keeps only visible panes |
 | `--client-dir` | `TERM_SERVER_CLIENT_DIR` | auto-detected | Compiled browser application |
 | `--disable-updates` | `TERM_SERVER_DISABLE_UPDATES` | off | Disable signed update checks and installation |
 | `--update-channel` | `TERM_SERVER_UPDATE_CHANNEL` | `main` | Signed release channel to follow |
@@ -311,6 +311,8 @@ The signing private key lives only in the `RELEASE_SIGNING_KEY` GitHub Actions s
 ## Architecture
 
 Each terminal owns a native PTY, a bounded VT state model, a short sequenced output ring, and a Tokio broadcast channel. Dedicated blocking-reader threads keep PTY I/O away from the async Axum runtime. The web process maintains a terminal-to-broker map across compatible generations and proxies each renderer to the owning socket. A newly mounted renderer receives a compact canonical snapshot of the current screen, scrollback, modes, cursor, and alternate-screen state. An existing renderer resumes from its last parser-committed byte. If a subscriber falls behind, the same WebSocket is resynchronized from the ring or a fresh snapshot instead of being disconnected.
+
+Switching panes does not cost a resynchronization. A renderer that leaves the screen but stays mounted holds its WebSocket open and keeps parsing, giving up only its say in the negotiated terminal size until it is on screen again, so returning to it finds the buffer exactly as it was left. The replay budget behind that is split evenly between the sequenced ring and the canonical model: resuming from the ring preserves a pane's own scrollback, which is far deeper than any snapshot, so the ring is worth as much as the state it falls back to.
 
 Output is flow-controlled the way VS Code's terminal is. A browser acknowledges bytes only after xterm.js has parsed them, and while a terminal has produced more unacknowledged output than the high watermark, its reader thread stops draining the PTY, so the writing process blocks rather than the browser falling behind. A full-screen TUI repaint is paced by the renderer instead of overrunning it.
 

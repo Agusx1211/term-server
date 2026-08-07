@@ -1,6 +1,34 @@
 # Changelog
 
-## 0.10.0 - 2026-08-07
+## 0.10.1 - 2026-08-07
+
+### Changed
+
+- Switching to another terminal and back no longer rebuilds the pane. A renderer that leaves the
+  screen but stays mounted now holds its connection open and keeps parsing, so returning to it finds
+  the buffer exactly as it was left. It gives up only its say in the negotiated terminal size while
+  it is off screen — a pane nobody is reading must not hold the size down for the panes that are —
+  and takes that back when it returns. Previously a cached pane closed its socket at once and had to
+  resynchronize on the way back; whenever it could not resume, the terminal was reset and up to
+  200,000 locally rendered lines were replaced with the much shallower server-side snapshot.
+
+  A terminal keeps the broker generation that created it, so terminals started before this release
+  keep closing and resynchronizing their cached panes until they are closed and reopened. The
+  browser detects this from the `ready` message and does not send a message an older broker would
+  reject.
+
+- Reconnects that do still happen keep far more history. The per-terminal replay budget is now split
+  evenly between the sequenced ring and the canonical model instead of giving the ring a quarter:
+  resuming from the ring preserves a pane's own scrollback, while the snapshot it otherwise falls
+  back to is two orders of magnitude shallower, so the ring is worth at least as much as the state
+  behind it.
+
+- The canonical model is charged the width the terminal actually has. Rows were previously billed
+  against the width rounded up to a power of two and capped at 500 columns, so a 260-column terminal
+  paid for 500 and kept roughly half the history its own memory allowed.
+
+- `--replay-mb` now defaults to 64 (was 16) and `--cached-terminals` to 16 (was 6). Both are ceilings
+  that grow with the output a terminal actually produces, so idle sessions are unaffected.
 
 ### Added
 

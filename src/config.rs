@@ -100,7 +100,11 @@ pub struct Cli {
     pub allowed_origins: Vec<String>,
 
     /// Canonical reconnect state and recent output retained per terminal, in MiB.
-    #[arg(long, env = "TERM_SERVER_REPLAY_MB", default_value_t = 16, value_parser = clap::value_parser!(u64).range(1..=1024))]
+    ///
+    /// This is a ceiling, not a reservation: both halves grow with the output a
+    /// terminal actually produces, so idle sessions cost close to nothing. Raise
+    /// it when panes that were left running still lose their history on return.
+    #[arg(long, env = "TERM_SERVER_REPLAY_MB", default_value_t = 64, value_parser = clap::value_parser!(u64).range(1..=1024))]
     pub replay_mb: u64,
 
     /// Number of scrollback rows retained by each browser terminal.
@@ -112,7 +116,10 @@ pub struct Cli {
     pub max_panes: u8,
 
     /// Target number of terminal renderers kept mounted in each browser tab.
-    #[arg(long, env = "TERM_SERVER_CACHED_TERMINALS", default_value_t = 6)]
+    ///
+    /// A mounted renderer keeps its full scrollback and its stream, so it comes
+    /// back exactly as it was left. Evicting one discards both.
+    #[arg(long, env = "TERM_SERVER_CACHED_TERMINALS", default_value_t = 16)]
     pub cached_terminals: u16,
 
     /// Directory containing the compiled browser application.
@@ -225,7 +232,8 @@ mod tests {
         assert!(cli.is_https());
         assert!(cli.tls_hostnames.is_empty());
         assert_eq!(cli.scrollback_lines, 200_000);
-        assert_eq!(cli.cached_terminals, 6);
+        assert_eq!(cli.replay_bytes(), 64 * 1024 * 1024);
+        assert_eq!(cli.cached_terminals, 16);
         assert_eq!(cli.update_channel, "main");
         assert!(!cli.disable_updates);
     }
