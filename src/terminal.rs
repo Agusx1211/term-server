@@ -19,6 +19,7 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::{
+    agent_detection,
     agent_events::{AgentActivity, AgentEvent, AgentEventKind},
     ai::{PiRequest, PiService, PiTaskKind},
     artifacts,
@@ -48,6 +49,7 @@ const REPORTED_WORKING_FRESH_MILLIS: u64 = 5_000;
 const NATIVE_EVENT_FRESH_MILLIS: u64 = 15_000;
 const LONG_RUNNING_COMMAND_MILLIS: u64 = 5_000;
 const MAX_CAPTURED_PROMPT_CHARS: usize = 16_000;
+const OSC_PAYLOAD_MAX_CHARS: usize = 256;
 const MAX_TERMINAL_INPUT_BYTES: usize = 64 * 1024;
 const TERMINAL_INPUT_QUEUE_BYTES: usize = 1024 * 1024;
 const TERMINAL_INPUT_QUEUE_MESSAGES: usize = 64;
@@ -71,6 +73,9 @@ pub enum TerminalStatus {
 #[serde(rename_all = "lowercase")]
 pub enum AgentStatus {
     Working,
+    /// The agent is waiting on a person: an approval, a question, a choice.
+    /// Distinct from `Idle`, which means it is finished and ready for input.
+    Blocked,
     Idle,
     Closed,
 }
@@ -559,6 +564,12 @@ impl Default for SessionActivity {
 
 impl SessionActivity {
     fn expire_native_state(&mut self, now: u64) -> bool {
+        // A blocked report is not refreshed while it holds: the agent sends one
+        // approval request and then nothing until a person answers. Expiring it
+        // on the freshness timer would quietly relabel a waiting agent as idle.
+        if self.native_status == Some(AgentStatus::Blocked) {
+            return false;
+        }
         if self.native_status.is_none()
             || now.saturating_sub(self.native_updated_at) <= NATIVE_EVENT_FRESH_MILLIS
         {
@@ -633,6 +644,7 @@ struct PendingAgentSubmission {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReportedAgentState {
     Working,
+    Blocked,
     Idle,
 }
 
@@ -641,6 +653,8 @@ struct TerminalSignals {
     pending: Vec<u8>,
     agent_state: Option<(ReportedAgentState, u64)>,
     active_title_seen: bool,
+    osc_title: Option<String>,
+    osc_progress: Option<String>,
 }
 
 impl TerminalSignals {
@@ -674,6 +688,7 @@ impl TerminalSignals {
 
     fn observe_osc(&mut self, payload: &[u8], now: u64) {
         let text = String::from_utf8_lossy(payload);
+        self.retain_detection_payload(text.trim());
         let normalized = text.trim().to_ascii_lowercase();
         let state = if normalized == "9;4;3" || normalized.starts_with("9;4;3;") {
             Some(ReportedAgentState::Working)
@@ -687,10 +702,11 @@ impl TerminalSignals {
             if first.is_some_and(is_braille_spinner) {
                 self.active_title_seen = true;
                 Some(ReportedAgentState::Working)
-            } else if first == Some('✳')
-                || title.contains("action required")
-                || title_contains_word(title, "ready")
-            {
+            } else if title.contains("action required") {
+                // Codex writes this when it needs an approval or an answer.
+                self.active_title_seen = false;
+                Some(ReportedAgentState::Blocked)
+            } else if first == Some('✳') || title_contains_word(title, "ready") {
                 self.active_title_seen = false;
                 Some(ReportedAgentState::Idle)
             } else if std::mem::take(&mut self.active_title_seen) {
@@ -710,6 +726,49 @@ impl TerminalSignals {
             self.agent_state = Some((state, now));
         }
     }
+
+    /// Retains the latest OSC 0/2 title and OSC 9 progress payloads with their
+    /// original case, which the detection manifests match against. An empty
+    /// title payload is a clear, so it drops the retained value.
+    fn retain_detection_payload(&mut self, payload: &str) {
+        if let Some(title) = payload
+            .strip_prefix("0;")
+            .or_else(|| payload.strip_prefix("2;"))
+        {
+            let title = sanitize_osc_payload(title);
+            self.osc_title = (!title.is_empty()).then_some(title);
+        } else if let Some(progress) = payload.strip_prefix("9;") {
+            let progress = sanitize_osc_payload(progress);
+            self.osc_progress = (!progress.is_empty()).then_some(progress);
+        }
+    }
+
+    fn osc_title(&self) -> &str {
+        self.osc_title.as_deref().unwrap_or_default()
+    }
+
+    fn osc_progress(&self) -> &str {
+        self.osc_progress.as_deref().unwrap_or_default()
+    }
+
+    /// Clears retained OSC evidence so a newly started agent does not inherit
+    /// the previous process's title or progress.
+    fn clear_detection_payloads(&mut self) {
+        self.osc_title = None;
+        self.osc_progress = None;
+    }
+}
+
+/// OSC payloads are untrusted child output. Drop control characters and bound
+/// the length before retaining them for detection.
+fn sanitize_osc_payload(payload: &str) -> String {
+    payload
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(OSC_PAYLOAD_MAX_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_owned()
 }
 
 fn is_braille_spinner(character: char) -> bool {
@@ -740,6 +799,47 @@ fn redraws_signal_activity(agent_kind: &str) -> bool {
     matches!(agent_kind, "pi" | "omp")
 }
 
+/// What screen detection concluded about the next status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DetectionOutcome {
+    /// The screen is not showing the agent's state. Hold the current status.
+    Keep,
+    /// A rule matched with enough evidence to set the status.
+    Status(AgentStatus),
+    /// Detection has nothing useful to say; defer to hooks, then heuristics.
+    Undecided,
+}
+
+/// Resolves a manifest match into a status decision.
+///
+/// `blocked` and `working` are applied from any matched rule: those states are
+/// what the manifests exist to catch, and a wrong guess self-corrects on the
+/// next sample because the rule stops matching. `idle` is applied only from a
+/// rule that declared itself visible evidence — a live prompt box, an idle
+/// window title — so a weak match cannot yank a genuinely working agent to
+/// idle. The engine's own no-rule-matched idle fallback stays out of this
+/// entirely, leaving term-server's CPU and output heuristics in charge.
+fn screen_detection_outcome(detection: Option<&agent_detection::Detection>) -> DetectionOutcome {
+    let Some(detection) = detection else {
+        return DetectionOutcome::Undecided;
+    };
+    if detection.skip_state_update {
+        return DetectionOutcome::Keep;
+    }
+    if detection.matched_rule.is_none() {
+        return DetectionOutcome::Undecided;
+    }
+    match detection.state {
+        agent_detection::DetectedState::Blocked => DetectionOutcome::Status(AgentStatus::Blocked),
+        agent_detection::DetectedState::Working => DetectionOutcome::Status(AgentStatus::Working),
+        agent_detection::DetectedState::Idle if detection.visible_idle => {
+            DetectionOutcome::Status(AgentStatus::Idle)
+        }
+        agent_detection::DetectedState::Idle => DetectionOutcome::Undecided,
+        agent_detection::DetectedState::Unknown => DetectionOutcome::Keep,
+    }
+}
+
 fn select_agent_status(
     agent_kind: &str,
     current: AgentStatus,
@@ -759,6 +859,9 @@ fn select_agent_status(
         (SUBMISSION_WORKING_MILLIS, QUIET_SAMPLES_TO_IDLE)
     };
     match reported {
+        Some((ReportedAgentState::Blocked, reported_at)) if reported_at >= input_submitted_at => {
+            return AgentStatus::Blocked;
+        }
         Some((ReportedAgentState::Idle, reported_at)) if reported_at >= input_submitted_at => {
             return AgentStatus::Idle;
         }
@@ -1399,6 +1502,21 @@ impl TerminalSession {
         info.color = color_for(&info.workspace);
     }
 
+    /// Classifies the live screen for `agent_kind`, or `None` when no manifest
+    /// covers that agent.
+    fn detect_agent_state(&self, agent_kind: &str) -> Option<agent_detection::Detection> {
+        let screen = self.output.lock().detection_text();
+        let signals = self.signals.lock();
+        agent_detection::detect(
+            agent_kind,
+            agent_detection::DetectionInput {
+                screen: &screen,
+                osc_title: signals.osc_title(),
+                osc_progress: signals.osc_progress(),
+            },
+        )
+    }
+
     fn refresh_process_metadata(
         &self,
         processes: &ProcessSnapshot,
@@ -1421,6 +1539,12 @@ impl TerminalSession {
         let alternate_screen = self.output.lock().alternate_screen();
         let output_bytes = self.output_bytes.load(Ordering::Relaxed);
         let reported_state = self.signals.lock().agent_state;
+        // Screen detection only runs for a recognized agent. Rendering the
+        // screen for every terminal on every sample would not pay for itself.
+        let detection = observation
+            .agent
+            .as_ref()
+            .and_then(|agent| self.detect_agent_state(&agent.kind));
         let mut activity = self.activity.lock();
         let mut info = self.info.write();
         if activity.expire_native_state(now)
@@ -1484,6 +1608,9 @@ impl TerminalSession {
                     activity.native_provider = None;
                     activity.native_status = None;
                     activity.native_updated_at = 0;
+                    // A new agent starts from a blank OSC slate rather than
+                    // inheriting the previous process's title or progress.
+                    self.signals.lock().clear_detection_payloads();
                     let revision = info
                         .agent
                         .as_ref()
@@ -1538,17 +1665,23 @@ impl TerminalSession {
                     .as_ref()
                     .map(|current| current.status.clone())
                     .unwrap_or(AgentStatus::Idle);
-                let next_status = activity.native_status.clone().unwrap_or_else(|| {
-                    select_agent_status(
-                        &agent.kind,
-                        current_status,
-                        reported_state,
-                        now,
-                        activity.input_submitted_at,
-                        activity.active_samples,
-                        activity.quiet_samples,
-                    )
-                });
+                let next_status = match screen_detection_outcome(detection.as_ref()) {
+                    DetectionOutcome::Keep => current_status,
+                    DetectionOutcome::Status(status) => status,
+                    DetectionOutcome::Undecided => {
+                        activity.native_status.clone().unwrap_or_else(|| {
+                            select_agent_status(
+                                &agent.kind,
+                                current_status,
+                                reported_state,
+                                now,
+                                activity.input_submitted_at,
+                                activity.active_samples,
+                                activity.quiet_samples,
+                            )
+                        })
+                    }
+                };
                 if let Some(current) = info.agent.as_mut()
                     && current.status != next_status
                 {
@@ -1666,15 +1799,20 @@ impl TerminalSession {
         let next_status = match event.kind {
             AgentEventKind::Completed => AgentStatus::Idle,
             AgentEventKind::Closed => AgentStatus::Closed,
+            // The agent asked for an approval or a decision and is now waiting
+            // on a person, which is not the same as being busy.
+            AgentEventKind::WaitingForApproval => AgentStatus::Blocked,
             _ => AgentStatus::Working,
         };
         activity.native_provider = Some(event.provider.clone());
         activity.native_status = Some(next_status.clone());
         activity.native_updated_at = now;
-        activity.input_submitted_at = if next_status == AgentStatus::Working {
-            now
-        } else {
-            0
+        activity.input_submitted_at = match next_status {
+            AgentStatus::Working => now,
+            // A block happens mid-turn, so the submission that started the turn
+            // still stands and has to survive until the agent moves on.
+            AgentStatus::Blocked => activity.input_submitted_at,
+            _ => 0,
         };
 
         let next_activity = event.kind.activity_label().map(|label| AgentActivity {
@@ -4048,6 +4186,218 @@ mod tests {
                 submitted: true,
                 prompt: Some("fix incorrect terminal title".to_owned()),
             }
+        );
+    }
+
+    fn detection(state: agent_detection::DetectedState, rule: &str) -> agent_detection::Detection {
+        agent_detection::Detection {
+            state,
+            skip_state_update: false,
+            visible_idle: false,
+            visible_blocker: false,
+            visible_working: false,
+            matched_rule: Some(agent_detection::MatchedRule {
+                id: rule.to_owned(),
+                priority: 100,
+                region: "whole_recent".to_owned(),
+                state,
+            }),
+            fallback_reason: None,
+        }
+    }
+
+    #[test]
+    fn screen_detection_applies_blocked_and_working_from_any_matched_rule() {
+        use agent_detection::DetectedState;
+
+        assert_eq!(
+            screen_detection_outcome(Some(&detection(DetectedState::Blocked, "weak_blocker"))),
+            DetectionOutcome::Status(AgentStatus::Blocked)
+        );
+        assert_eq!(
+            screen_detection_outcome(Some(&detection(DetectedState::Working, "spinner"))),
+            DetectionOutcome::Status(AgentStatus::Working)
+        );
+    }
+
+    #[test]
+    fn screen_detection_only_applies_idle_from_visible_evidence() {
+        use agent_detection::DetectedState;
+
+        // A weak idle match must not pull a working agent to idle; the CPU and
+        // output heuristics stay in charge.
+        assert_eq!(
+            screen_detection_outcome(Some(&detection(DetectedState::Idle, "weak_idle"))),
+            DetectionOutcome::Undecided
+        );
+
+        let mut visible = detection(DetectedState::Idle, "live_prompt_box");
+        visible.visible_idle = true;
+        assert_eq!(
+            screen_detection_outcome(Some(&visible)),
+            DetectionOutcome::Status(AgentStatus::Idle)
+        );
+    }
+
+    #[test]
+    fn screen_detection_holds_the_current_status_for_overlays_and_defers_without_a_match() {
+        use agent_detection::DetectedState;
+
+        let mut overlay = detection(DetectedState::Unknown, "transcript_viewer");
+        overlay.skip_state_update = true;
+        assert_eq!(
+            screen_detection_outcome(Some(&overlay)),
+            DetectionOutcome::Keep
+        );
+
+        // Unknown without the skip flag still means "not showing the agent".
+        assert_eq!(
+            screen_detection_outcome(Some(&detection(DetectedState::Unknown, "menu"))),
+            DetectionOutcome::Keep
+        );
+
+        // The engine's no-rule-matched idle fallback must not decide anything.
+        let fallback = agent_detection::Detection {
+            state: DetectedState::Idle,
+            skip_state_update: false,
+            visible_idle: false,
+            visible_blocker: false,
+            visible_working: false,
+            matched_rule: None,
+            fallback_reason: Some(agent_detection::DEFAULT_KNOWN_AGENT_IDLE_FALLBACK.to_owned()),
+        };
+        assert_eq!(
+            screen_detection_outcome(Some(&fallback)),
+            DetectionOutcome::Undecided
+        );
+        assert_eq!(screen_detection_outcome(None), DetectionOutcome::Undecided);
+    }
+
+    #[test]
+    fn codex_action_required_title_reports_blocked() {
+        let mut signals = TerminalSignals::default();
+        signals.observe(b"\x1b]0;\xe2\x9c\xb3 Action Required\x07", 1_000);
+        assert_eq!(
+            signals.agent_state,
+            Some((ReportedAgentState::Blocked, 1_000))
+        );
+        assert_eq!(signals.osc_title(), "✳ Action Required");
+
+        // The idle marker on its own stays idle.
+        signals.observe(b"\x1b]0;\xe2\x9c\xb3 Codex\x07", 2_000);
+        assert_eq!(signals.agent_state, Some((ReportedAgentState::Idle, 2_000)));
+    }
+
+    #[test]
+    fn osc_payloads_are_retained_with_original_case_and_bounded() {
+        let mut signals = TerminalSignals::default();
+        signals.observe(b"\x1b]2;Claude Code\x07", 1_000);
+        signals.observe(b"\x1b]9;4;3;40\x07", 1_000);
+        assert_eq!(signals.osc_title(), "Claude Code");
+        assert_eq!(signals.osc_progress(), "4;3;40");
+
+        // An empty title payload is a clear.
+        signals.observe(b"\x1b]0;\x07", 2_000);
+        assert_eq!(signals.osc_title(), "");
+        assert_eq!(signals.osc_progress(), "4;3;40");
+
+        let long = format!("\x1b]0;{}\x07", "t".repeat(OSC_PAYLOAD_MAX_CHARS * 2));
+        signals.observe(long.as_bytes(), 3_000);
+        assert_eq!(signals.osc_title().chars().count(), OSC_PAYLOAD_MAX_CHARS);
+
+        signals.clear_detection_payloads();
+        assert_eq!(signals.osc_title(), "");
+        assert_eq!(signals.osc_progress(), "");
+    }
+
+    #[test]
+    fn reported_blocked_state_wins_over_activity_heuristics() {
+        assert_eq!(
+            select_agent_status(
+                "codex",
+                AgentStatus::Working,
+                Some((ReportedAgentState::Blocked, 2_000)),
+                20_000,
+                1_000,
+                5,
+                0,
+            ),
+            AgentStatus::Blocked
+        );
+        // A blocked report from before the current submission is stale.
+        assert_eq!(
+            select_agent_status(
+                "codex",
+                AgentStatus::Working,
+                Some((ReportedAgentState::Blocked, 500)),
+                20_000,
+                1_000,
+                5,
+                0,
+            ),
+            AgentStatus::Working
+        );
+    }
+
+    #[test]
+    fn approval_events_block_the_agent_until_it_moves_on() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = TerminalManager {
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            default_shell: RwLock::new(Some("/bin/sh".into())),
+            replay_bytes: AtomicUsize::new(1024 * 1024),
+            home_directory: directory.path().to_path_buf(),
+            agent_event_socket: None,
+            executable: None,
+        };
+        let info = manager
+            .create(CreateTerminal {
+                path: None,
+                cwd: None,
+                shell: None,
+                clone_from: None,
+            })
+            .unwrap();
+        let pi = Arc::new(PiService::new(directory.path()));
+
+        let event = |kind| AgentEvent {
+            provider: "claude".to_owned(),
+            kind,
+            title: None,
+        };
+
+        assert!(manager.apply_agent_event(info.id, event(AgentEventKind::Thinking), pi.clone()));
+        let working = manager.get(info.id).unwrap().info().agent.unwrap();
+        assert_eq!(working.status, AgentStatus::Working);
+
+        assert!(manager.apply_agent_event(
+            info.id,
+            event(AgentEventKind::WaitingForApproval),
+            pi.clone(),
+        ));
+        let blocked = manager.get(info.id).unwrap().info().agent.unwrap();
+        assert_eq!(blocked.status, AgentStatus::Blocked);
+        assert_eq!(
+            blocked.activity.as_ref().unwrap().label,
+            "waiting for approval"
+        );
+
+        // A block has no repeat events to refresh it, so the freshness timer
+        // must not quietly relabel a waiting agent as idle.
+        let session = manager.get(info.id).unwrap();
+        let mut activity = session.activity.lock();
+        let updated_at = activity.native_updated_at;
+        assert!(!activity.expire_native_state(updated_at + NATIVE_EVENT_FRESH_MILLIS * 10));
+        assert_eq!(activity.native_status, Some(AgentStatus::Blocked));
+        // The turn's submission survives the block.
+        assert!(activity.input_submitted_at > 0);
+        drop(activity);
+        drop(session);
+
+        assert!(manager.apply_agent_event(info.id, event(AgentEventKind::Thinking), pi.clone()));
+        assert_eq!(
+            manager.get(info.id).unwrap().info().agent.unwrap().status,
+            AgentStatus::Working
         );
     }
 }
