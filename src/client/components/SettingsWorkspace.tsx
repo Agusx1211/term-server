@@ -49,6 +49,11 @@ import {
   type TerminalPreviewMode,
   type TerminalPreviewSettings,
 } from "../lib/terminal-preview";
+import {
+  CACHED_TERMINALS_LIMITS,
+  clampCachedTerminals,
+  describeCachedTerminals,
+} from "../lib/cached-terminals";
 import { ChangePassword } from "./ChangePassword";
 import type { ThemeName } from "../lib/terminal-theme";
 
@@ -74,6 +79,9 @@ interface SettingsWorkspaceProps {
   tileNewTerminals: boolean;
   confirmTerminalKills: boolean;
   terminalPreviewSettings: TerminalPreviewSettings;
+  cachedTerminals: number;
+  cachedTerminalsOverridden: boolean;
+  serverCachedTerminals: number;
   recording: DebugRecordingStatus | null;
   frontendRecordingEvents: number;
   recordingBusy: boolean;
@@ -97,6 +105,7 @@ interface SettingsWorkspaceProps {
   onTileNewTerminalsChange: (enabled: boolean) => void;
   onConfirmTerminalKillsChange: (enabled: boolean) => void;
   onTerminalPreviewSettingsChange: (settings: TerminalPreviewSettings) => void;
+  onCachedTerminalsChange: (limit: number | undefined) => void;
   onRecordingStart: () => void;
   onRecordingStop: () => void;
   onRecordingDownload: () => void;
@@ -196,6 +205,9 @@ export function SettingsWorkspace({
   tileNewTerminals,
   confirmTerminalKills,
   terminalPreviewSettings,
+  cachedTerminals,
+  cachedTerminalsOverridden,
+  serverCachedTerminals,
   recording,
   frontendRecordingEvents,
   recordingBusy,
@@ -213,6 +225,7 @@ export function SettingsWorkspace({
   onTileNewTerminalsChange,
   onConfirmTerminalKillsChange,
   onTerminalPreviewSettingsChange,
+  onCachedTerminalsChange,
   onRecordingStart,
   onRecordingStop,
   onRecordingDownload,
@@ -394,6 +407,46 @@ export function SettingsWorkspace({
               >
                 Reset preview controls
               </button>
+            </fieldset>
+            <fieldset class="terminal-preview-setting">
+              <legend>Kept-alive terminals</legend>
+              <p class="settings-hint">
+                A kept-alive terminal holds its scrollback and its connection while it is off
+                screen, so switching back to it is instant and loses nothing. Beyond this many, the
+                least recently used one is discarded and has to be rebuilt from the server when you
+                return to it.
+              </p>
+              <label class="terminal-preview-range">
+                <span>
+                  <b>Keep alive</b>
+                  <output>{describeCachedTerminals(cachedTerminals)}</output>
+                </span>
+                <input
+                  type="range"
+                  aria-label="Terminals kept alive off screen"
+                  min={CACHED_TERMINALS_LIMITS.min}
+                  max={CACHED_TERMINALS_LIMITS.max}
+                  step={CACHED_TERMINALS_LIMITS.step}
+                  value={cachedTerminals}
+                  onInput={(event) => onCachedTerminalsChange(
+                    clampCachedTerminals(Number(event.currentTarget.value)),
+                  )}
+                />
+                <small>
+                  This browser only, and it is this browser that pays: each one holds its own
+                  scrollback in memory. Raise it freely for a workspace of quiet shells; a phone, or
+                  a row of agents that have each scrolled a long way, will want it lower.
+                </small>
+              </label>
+              {cachedTerminalsOverridden && (
+                <button
+                  type="button"
+                  class="terminal-preview-reset"
+                  onClick={() => onCachedTerminalsChange(undefined)}
+                >
+                  Use the server default ({describeCachedTerminals(serverCachedTerminals)})
+                </button>
+              )}
             </fieldset>
           </section>
 
