@@ -177,6 +177,23 @@ impl WorkspaceBackend {
         }
     }
 
+    pub async fn agent_explain(
+        &self,
+        id: Uuid,
+    ) -> Result<crate::terminal::AgentDetectionExplain, WorkspaceError> {
+        match self {
+            Self::Local { terminals, .. } => terminals
+                .get(id)
+                .map(|terminal| terminal.agent_explain())
+                .ok_or_else(|| WorkspaceError::Remote {
+                    status: StatusCode::NOT_FOUND,
+                    message: "terminal not found".to_owned(),
+                }),
+            #[cfg(unix)]
+            Self::Broker(client) => client.agent_explain(id).await,
+        }
+    }
+
     pub async fn terminate_process(
         &self,
         id: Uuid,

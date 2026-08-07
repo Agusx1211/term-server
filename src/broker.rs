@@ -35,8 +35,8 @@ use crate::{
     build::{self, BuildIdentity},
     config::Cli,
     terminal::{
-        CreateTerminal, ProcessInspectorSnapshot, RenameTerminal, TerminalInfo, TerminalManager,
-        TerminalViewport, normalize_terminal_path,
+        AgentDetectionExplain, CreateTerminal, ProcessInspectorSnapshot, RenameTerminal,
+        TerminalInfo, TerminalManager, TerminalViewport, normalize_terminal_path,
     },
     workspace::{
         SessionBrokerGenerationInfo, SessionBrokerInfo, TerminalSocketQuery,
@@ -156,6 +156,11 @@ impl BrokerClient {
         id: Uuid,
     ) -> Result<ProcessInspectorSnapshot, BrokerError> {
         self.get_json(&format!("/terminals/{id}/processes")).await
+    }
+
+    pub async fn agent_explain(&self, id: Uuid) -> Result<AgentDetectionExplain, BrokerError> {
+        self.get_json(&format!("/terminals/{id}/agent-explain"))
+            .await
     }
 
     pub async fn pi_config(&self) -> Result<PiClientConfig, BrokerError> {
@@ -581,6 +586,10 @@ impl BrokerPool {
         self.owner(id).await?.client.process_inspector(id).await
     }
 
+    pub async fn agent_explain(&self, id: Uuid) -> Result<AgentDetectionExplain, BrokerError> {
+        self.owner(id).await?.client.agent_explain(id).await
+    }
+
     pub async fn pi_config(&self) -> Result<PiClientConfig, BrokerError> {
         self.current.client.pi_config().await
     }
@@ -845,6 +854,7 @@ pub async fn run_session_broker(
             patch(rename_broker_terminal).delete(remove_broker_terminal),
         )
         .route("/terminals/{id}/processes", get(broker_terminal_processes))
+        .route("/terminals/{id}/agent-explain", get(broker_agent_explain))
         .route(
             "/terminals/{id}/agent-event",
             post(broker_terminal_agent_event),
@@ -966,6 +976,17 @@ async fn broker_terminal_processes(
         .terminals
         .get(id)
         .map(|terminal| Json(terminal.process_inspector()))
+        .ok_or(BrokerApiError::NotFound)
+}
+
+async fn broker_agent_explain(
+    State(state): State<BrokerState>,
+    AxumPath(id): AxumPath<Uuid>,
+) -> Result<Json<AgentDetectionExplain>, BrokerApiError> {
+    state
+        .terminals
+        .get(id)
+        .map(|terminal| Json(terminal.agent_explain()))
         .ok_or(BrokerApiError::NotFound)
 }
 

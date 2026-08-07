@@ -80,6 +80,22 @@ pub enum AgentStatus {
     Closed,
 }
 
+/// Why a terminal's agent is in the state it is in, for debugging detection.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentDetectionExplain {
+    /// `None` when no agent is running in this terminal.
+    pub agent_kind: Option<String>,
+    pub status: Option<AgentStatus>,
+    /// `None` when no manifest covers the running agent, which leaves the
+    /// status to integration hooks and the activity heuristics.
+    pub detection: Option<agent_detection::DetectionExplain>,
+    pub osc_title: String,
+    pub osc_progress: String,
+    /// The exact screen text the rules were evaluated against.
+    pub screen: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentInfo {
@@ -1500,6 +1516,40 @@ impl TerminalSession {
         info.workspace = workspace_for(&info.cwd, &self.home_directory);
         info.path = terminal_path(&info.workspace, &info.name);
         info.color = color_for(&info.workspace);
+    }
+
+    /// Everything screen detection saw for this terminal and what it concluded.
+    ///
+    /// This is a debugging surface for a terminal showing the wrong state. It
+    /// returns the same screen the caller can already read in the browser, so
+    /// it exposes nothing new to an authenticated session, but it is terminal
+    /// content and should be treated that way.
+    pub fn agent_explain(&self) -> AgentDetectionExplain {
+        let agent = self.info.read().agent.clone();
+        let screen = self.output.lock().detection_text();
+        let signals = self.signals.lock();
+        let osc_title = signals.osc_title().to_owned();
+        let osc_progress = signals.osc_progress().to_owned();
+        drop(signals);
+
+        let detection = agent.as_ref().and_then(|agent| {
+            agent_detection::explain(
+                &agent.kind,
+                agent_detection::DetectionInput {
+                    screen: &screen,
+                    osc_title: &osc_title,
+                    osc_progress: &osc_progress,
+                },
+            )
+        });
+        AgentDetectionExplain {
+            agent_kind: agent.as_ref().map(|agent| agent.kind.clone()),
+            status: agent.map(|agent| agent.status),
+            detection,
+            osc_title,
+            osc_progress,
+            screen,
+        }
     }
 
     /// Classifies the live screen for `agent_kind`, or `None` when no manifest

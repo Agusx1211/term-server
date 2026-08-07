@@ -69,7 +69,7 @@ pub struct DetectionInput<'a> {
     pub osc_progress: &'a str,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DetectedState {
     Idle,
@@ -79,7 +79,7 @@ pub enum DetectedState {
 }
 
 /// The outcome of evaluating one snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Detection {
     pub state: DetectedState,
@@ -91,13 +91,13 @@ pub struct Detection {
     pub visible_idle: bool,
     pub visible_blocker: bool,
     pub visible_working: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matched_rule: Option<MatchedRule>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MatchedRule {
     pub id: String,
@@ -108,22 +108,22 @@ pub struct MatchedRule {
 
 /// Everything [`Detection`] carries plus per-rule evaluation evidence, for
 /// debugging a terminal that shows the wrong state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DetectionExplain {
     pub agent: String,
     #[serde(flatten)]
     pub detection: Detection,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_source: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_version: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
     pub evaluated_rules: Vec<EvaluatedRule>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EvaluatedRule {
     pub id: String,

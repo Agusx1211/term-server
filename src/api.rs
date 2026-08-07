@@ -919,6 +919,22 @@ async fn terminal_processes(
         .map_err(Into::into)
 }
 
+/// Reports what screen detection saw for a terminal and which rule decided its
+/// agent status, for diagnosing an agent stuck in the wrong state.
+async fn terminal_agent_explain(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    jar: CookieJar,
+) -> Result<Json<crate::terminal::AgentDetectionExplain>, ApiError> {
+    require_auth(&jar, &state)?;
+    state
+        .workspace
+        .agent_explain(id)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
 async fn terminate_terminal_process(
     State(state): State<AppState>,
     Path((id, process_id)): Path<(Uuid, String)>,
@@ -1398,6 +1414,7 @@ pub fn build_router(state: AppState, client_directory: Option<PathBuf>) -> Route
             patch(update_terminal_activity_view),
         )
         .route("/terminals/{id}/processes", get(terminal_processes))
+        .route("/terminals/{id}/agent/explain", get(terminal_agent_explain))
         .route(
             "/terminals/{id}/processes/{process_id}",
             delete(terminate_terminal_process),
@@ -1607,6 +1624,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn agent_explain_reports_the_detection_snapshot_and_requires_auth() {
+        let (app, cookie) = authenticated_app().await;
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/terminals")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::from(r#"{"cwd":"/tmp","shell":"/bin/sh"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let body = to_bytes(created.into_body(), 64 * 1024).await.unwrap();
+        let terminal: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let terminal_id = terminal["id"].as_str().unwrap().to_owned();
+
+        let anonymous = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/terminals/{terminal_id}/agent/explain"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+        let explained = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/terminals/{terminal_id}/agent/explain"))
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(explained.status(), StatusCode::OK);
+        let body = to_bytes(explained.into_body(), 256 * 1024).await.unwrap();
+        let explain: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // A bare shell has no agent, so there is nothing to classify, but the
+        // snapshot the rules would have run against is still reported.
+        assert!(explain["agentKind"].is_null());
+        assert!(explain["detection"].is_null());
+        assert!(explain["screen"].is_string());
+
+        let missing = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/terminals/{}/agent/explain", Uuid::new_v4()))
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
