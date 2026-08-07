@@ -1,0 +1,40 @@
+╭──────────────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.147.0)                               │
+│                                                          │
+│ model:       gpt-5.3-codex-spark xhigh   /model to chan… │
+│ directory:   /tmp/project                        │
+│ permissions: YOLO mode                                   │
+╰──────────────────────────────────────────────────────────╯
+
+  Tip: New Use /fast to enable our fastest inference with increased plan usage.
+
+
+› Improve documentation in @filename
+
+  gpt-5.3-codex-spark xhigh · Context 100% left · /tmp/project · gpt-5.3-codex-spark · project · main ·…
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

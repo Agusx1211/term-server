@@ -595,44 +595,141 @@ fn an_oversized_override_is_ignored() {
 /// agrees with the rules as read. These prove the rules agree with what the
 /// agent actually draws, which is the thing that silently breaks when an agent
 /// release changes its UI. Recapture with `classify_captured_screen` below.
-const CLAUDE_REAL_SCREENS: &[(&str, &str, DetectedState, &str)] = &[
-    (
-        "bash permission dialog",
-        include_str!("fixtures/claude-bash-permission.txt"),
-        DetectedState::Blocked,
-        "bash_permission_prompt",
-    ),
-    (
-        "folder trust dialog",
-        include_str!("fixtures/claude-trust-folder.txt"),
-        DetectedState::Blocked,
-        "live_blocked_form",
-    ),
-    (
-        "idle prompt box",
-        include_str!("fixtures/claude-prompt-box.txt"),
-        DetectedState::Idle,
-        "live_prompt_box",
-    ),
-    (
-        "prompt box after an interrupted turn",
-        include_str!("fixtures/claude-after-interrupt.txt"),
-        DetectedState::Idle,
-        "live_prompt_box",
-    ),
+struct RealScreen {
+    description: &'static str,
+    agent: &'static str,
+    screen: &'static str,
+    /// The OSC title captured alongside the screen. Codex's highest-priority
+    /// rules read this rather than the screen.
+    osc_title: &'static str,
+    expected_state: DetectedState,
+    expected_rule: &'static str,
+}
+
+const CLAUDE_REAL_SCREENS: &[RealScreen] = &[
+    RealScreen {
+        description: "claude bash permission dialog",
+        agent: "claude",
+        screen: include_str!("fixtures/claude-bash-permission.txt"),
+        osc_title: "",
+        expected_state: DetectedState::Blocked,
+        expected_rule: "bash_permission_prompt",
+    },
+    RealScreen {
+        description: "claude folder trust dialog",
+        agent: "claude",
+        screen: include_str!("fixtures/claude-trust-folder.txt"),
+        osc_title: "",
+        expected_state: DetectedState::Blocked,
+        expected_rule: "live_blocked_form",
+    },
+    RealScreen {
+        description: "claude idle prompt box",
+        agent: "claude",
+        screen: include_str!("fixtures/claude-prompt-box.txt"),
+        osc_title: "",
+        expected_state: DetectedState::Idle,
+        expected_rule: "live_prompt_box",
+    },
+    RealScreen {
+        description: "claude prompt box after an interrupted turn",
+        agent: "claude",
+        screen: include_str!("fixtures/claude-after-interrupt.txt"),
+        osc_title: "",
+        expected_state: DetectedState::Idle,
+        expected_rule: "live_prompt_box",
+    },
+    RealScreen {
+        description: "codex command approval",
+        agent: "codex",
+        screen: include_str!("fixtures/codex-command-approval.txt"),
+        osc_title: "[ ! ] Action Required | project",
+        expected_state: DetectedState::Blocked,
+        expected_rule: "osc_title_blocked",
+    },
+    RealScreen {
+        description: "codex idle prompt",
+        agent: "codex",
+        screen: include_str!("fixtures/codex-prompt-idle.txt"),
+        osc_title: "project",
+        expected_state: DetectedState::Idle,
+        expected_rule: "osc_title_idle",
+    },
+    RealScreen {
+        description: "codex prompt after escaping an approval",
+        agent: "codex",
+        screen: include_str!("fixtures/codex-after-escape.txt"),
+        osc_title: "project",
+        expected_state: DetectedState::Idle,
+        expected_rule: "osc_title_idle",
+    },
 ];
 
+fn classify_real(capture: &RealScreen) -> Detection {
+    classify(
+        capture.agent,
+        DetectionInput {
+            screen: capture.screen,
+            osc_title: capture.osc_title,
+            osc_progress: "",
+        },
+    )
+}
+
 #[test]
-fn classifies_real_claude_code_screens() {
-    for (description, captured, expected_state, expected_rule) in CLAUDE_REAL_SCREENS {
-        let detection = classify("claude", screen(captured));
-        assert_eq!(detection.state, *expected_state, "{description}");
+fn classifies_real_agent_screens() {
+    for capture in CLAUDE_REAL_SCREENS {
+        let detection = classify_real(capture);
+        assert_eq!(
+            detection.state, capture.expected_state,
+            "{}",
+            capture.description
+        );
         assert_eq!(
             matched_rule_id(&detection),
-            Some(*expected_rule),
-            "{description}"
+            Some(capture.expected_rule),
+            "{}",
+            capture.description
         );
     }
+}
+
+#[test]
+fn codex_approval_is_blocked_from_the_screen_without_the_window_title() {
+    // The title is the strongest Codex signal but it is not always available -
+    // a terminal that has not seen an OSC title since the agent started has
+    // only the screen. The approval still has to register.
+    let detection = classify(
+        "codex",
+        screen(include_str!("fixtures/codex-command-approval.txt")),
+    );
+    assert_eq!(detection.state, DetectedState::Blocked);
+    assert_eq!(matched_rule_id(&detection), Some("live_strong_blocker"));
+}
+
+#[test]
+fn codex_directory_trust_prompt_is_a_known_detection_gap() {
+    // Captured from Codex v0.147.0 at startup: "Do you trust the contents of
+    // this directory?" with numbered options. No bundled rule matches it, so
+    // the terminal keeps its heuristic state instead of reporting blocked.
+    //
+    // This characterizes current behaviour rather than endorsing it. If a
+    // manifest update starts matching this screen, this test fails and should
+    // be promoted into CLAUDE_REAL_SCREENS.
+    let detection = classify(
+        "codex",
+        screen(include_str!("fixtures/codex-trust-directory.txt")),
+    );
+    assert_eq!(detection.matched_rule, None);
+    assert_eq!(
+        detection.fallback_reason.as_deref(),
+        Some(DEFAULT_KNOWN_AGENT_IDLE_FALLBACK)
+    );
+    assert_eq!(
+        crate::terminal::screen_detection_outcome(Some(&detection)),
+        crate::terminal::DetectionOutcome::Undecided,
+        "an unmatched screen must not decide anything"
+    );
 }
 
 #[test]
@@ -641,10 +738,10 @@ fn a_resolved_claude_permission_dialog_stops_reading_as_blocked() {
     // reports that an approval was requested but not reliably that it was
     // dismissed. Escaping the dialog has to return the terminal to idle on the
     // very next sample, from the screen alone.
-    let blocked = classify("claude", screen(CLAUDE_REAL_SCREENS[0].1));
+    let blocked = classify_real(&CLAUDE_REAL_SCREENS[0]);
     assert_eq!(blocked.state, DetectedState::Blocked);
 
-    let cleared = classify("claude", screen(CLAUDE_REAL_SCREENS[3].1));
+    let cleared = classify_real(&CLAUDE_REAL_SCREENS[3]);
     assert_eq!(cleared.state, DetectedState::Idle);
     assert!(
         cleared.visible_idle,
