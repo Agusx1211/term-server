@@ -91,6 +91,9 @@ export function TerminalPreview({
     const backlog = new TerminalRenderBacklog();
     let abandoned = false;
     let messageQueue = Promise.resolve();
+    // Resolves once xterm has parsed every frame handed to it so far. Frames are
+    // written as they arrive rather than one per settled parse; see TerminalPane.
+    let pendingWrites = Promise.resolve();
     const writeTerminal = (data: Uint8Array, commit?: number) => new Promise<void>(
       (resolve, reject) => {
         try {
@@ -119,6 +122,12 @@ export function TerminalPreview({
       reportedUnavailable = true;
       setConnection("unavailable");
       setMessage(value);
+    };
+    const onStreamFailure = (error: unknown) => {
+      if (disposed || abandoned) return;
+      abandoned = true;
+      showUnavailable(error instanceof Error ? error.message : "Preview unavailable");
+      closeTerminalSocket(socket, "protocol-error");
     };
 
     socket.addEventListener("message", (event) => {
@@ -149,9 +158,17 @@ export function TerminalPreview({
           const binary = event.data instanceof Blob ? await event.data.arrayBuffer() : event.data;
           if (binary instanceof ArrayBuffer) {
             const frame = eagerFrame ?? decodeTerminalFrame(binary);
-            await writeTerminal(frame.data, stream.accept(frame));
+            const commit = stream.accept(frame);
+            const settled = queuedBytes;
+            queuedBytes = 0;
+            pendingWrites = writeTerminal(frame.data, commit)
+              .catch(onStreamFailure)
+              .finally(() => backlog.settle(settled));
             return;
           }
+          // Resets and resizes must land after the writes ahead of them.
+          await pendingWrites;
+          if (disposed || abandoned) return;
           const control = JSON.parse(String(event.data)) as ServerTerminalMessage;
           if (control.type === "size") {
             cols = control.cols;
@@ -175,12 +192,7 @@ export function TerminalPreview({
         } finally {
           backlog.settle(queuedBytes);
         }
-      }).catch((error) => {
-        if (disposed) return;
-        abandoned = true;
-        showUnavailable(error instanceof Error ? error.message : "Preview unavailable");
-        closeTerminalSocket(socket, "protocol-error");
-      });
+      }).catch(onStreamFailure);
     });
     socket.addEventListener("close", () => {
       if (!disposed && !reportedUnavailable) showUnavailable("Live preview unavailable");

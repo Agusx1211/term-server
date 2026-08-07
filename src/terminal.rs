@@ -53,6 +53,14 @@ const TERMINAL_INPUT_QUEUE_BYTES: usize = 1024 * 1024;
 const TERMINAL_INPUT_QUEUE_MESSAGES: usize = 64;
 const TERMINAL_RESPONSE_QUEUE_BYTES: usize = 64 * 1024;
 const TERMINAL_RESPONSE_QUEUE_MESSAGES: usize = 256;
+/// A pty master hands back at most one 4 KiB chunk per read, so a full-screen
+/// redraw from a TUI with a long history arrives as several hundred events in a
+/// single burst. The channel has to outlast one of those bursts while a
+/// subscriber is busy writing to its socket: lagging costs a full canonical
+/// snapshot, which is far more expensive than the buffering. Subscribers merge
+/// queued output before sending, so this only has to cover what accumulates
+/// behind one in-flight write rather than a whole slow client.
+const TERMINAL_EVENT_CAPACITY: usize = 1024;
 const DEFAULT_VIEWPORT_SIZE: TerminalViewport = TerminalViewport {
     cols: 100,
     rows: 30,
@@ -1997,7 +2005,7 @@ impl TerminalManager {
             .map_err(|error| TerminalError::Io(error.to_string()))?;
         let input = TerminalInputQueue::spawn(id, writer)?;
         let killer = child.clone_killer();
-        let (events, _) = broadcast::channel(256);
+        let (events, _) = broadcast::channel(TERMINAL_EVENT_CAPACITY);
         let session = Arc::new(TerminalSession {
             info: RwLock::new(TerminalInfo {
                 id,
