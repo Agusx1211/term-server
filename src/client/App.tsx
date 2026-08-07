@@ -65,7 +65,7 @@ import {
 } from "./lib/terminal-kill";
 import { installVisualViewportCssVars } from "./lib/visual-viewport";
 import {
-  agentCompletionEvent,
+  agentNotificationEvent,
   includesInAppNotifications,
   includesSystemNotifications,
   LEGACY_NOTIFICATIONS_STORAGE_KEY,
@@ -603,9 +603,9 @@ export function App() {
     if (!workspaceLoaded) return;
     if (!agentEventsInitialized.current) {
       for (const terminal of terminals) {
-        const event = agentCompletionEvent(terminal.agent);
-        if (event != null) {
-          deliveredAgentEvents.current.set(terminal.id, event);
+        const notification = agentNotificationEvent(terminal.agent);
+        if (notification) {
+          deliveredAgentEvents.current.set(terminal.id, notification.event);
         }
       }
       agentEventsInitialized.current = true;
@@ -615,15 +615,18 @@ export function App() {
     const deliver = (terminalId: string, event: number) => {
       const terminal = terminalsRef.current.find((candidate) => candidate.id === terminalId);
       const agent = terminal?.agent;
-      if (!terminal || !agent || agentCompletionEvent(agent) !== event) return;
+      if (!terminal || !agent || agentNotificationEvent(agent)?.event !== event) return;
       const pending = pendingAgentNotifications.current.get(terminalId);
       if (pending) clearTimeout(pending.timer);
       pendingAgentNotifications.current.delete(terminalId);
-      const body = agent.summary ?? (
-        agent.status === "idle"
-          ? `${agent.kind} is idle and ready for input in ${terminal.workspace}`
-          : `${agent.kind} closed in ${terminal.workspace}`
-      );
+      const body = agent.status === "blocked"
+        // A summary describes finished work, so it would misdescribe a block.
+        ? `${agent.kind} is waiting for input in ${terminal.workspace}`
+        : agent.summary ?? (
+          agent.status === "idle"
+            ? `${agent.kind} is idle and ready for input in ${terminal.workspace}`
+            : `${agent.kind} closed in ${terminal.workspace}`
+        );
       const toast = {
         id: `${terminal.id}:${event}`,
         terminalId: terminal.id,
@@ -651,8 +654,9 @@ export function App() {
     }
     for (const terminal of terminals) {
       const agent = terminal.agent;
-      const event = agentCompletionEvent(agent);
-      if (!agent || event == null) continue;
+      const notification = agentNotificationEvent(agent);
+      if (!agent || !notification) continue;
+      const event = notification.event;
       if (deliveredAgentEvents.current.get(terminal.id) === event) continue;
       const pending = pendingAgentNotifications.current.get(terminal.id);
       if (pending?.event === event) {
@@ -660,7 +664,9 @@ export function App() {
         continue;
       }
       if (pending) clearTimeout(pending.timer);
-      if (config.pi.summariesEnabled && !agent.summary) {
+      // A block is announced immediately; waiting on a summary would delay the
+      // one state that is already waiting on the person being told.
+      if (notification.kind === "completion" && config.pi.summariesEnabled && !agent.summary) {
         const timer = window.setTimeout(() => deliver(terminal.id, event), 12_000);
         pendingAgentNotifications.current.set(terminal.id, { event, timer });
       } else {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  agentCompletionEvent,
+  agentNotificationEvent,
   includesInAppNotifications,
   includesSystemNotifications,
   parseNotificationDuration,
@@ -47,10 +47,24 @@ describe("notification preferences", () => {
   });
 
   it("only exposes notification events for completed submitted tasks", () => {
-    expect(agentCompletionEvent(null)).toBeNull();
-    expect(agentCompletionEvent(agent({ status: "working", completedAt: null }))).toBeNull();
-    expect(agentCompletionEvent(agent({ completedAt: null }))).toBeNull();
-    expect(agentCompletionEvent(agent())).toBe(2);
+    expect(agentNotificationEvent(null)).toBeNull();
+    expect(agentNotificationEvent(agent({ status: "working", completedAt: null }))).toBeNull();
+    expect(agentNotificationEvent(agent({ completedAt: null }))).toBeNull();
+    expect(agentNotificationEvent(agent())).toEqual({ kind: "completion", event: 2 });
+  });
+
+  it("announces a block on its transition rather than a stale completion", () => {
+    const blocked = agent({ status: "blocked", statusChangedAt: 9, completedAt: 2 });
+    expect(agentNotificationEvent(blocked)).toEqual({ kind: "blocked", event: 9 });
+
+    // A working agent that was blocked a moment ago is not still announced.
+    expect(agentNotificationEvent(agent({ status: "working", completedAt: null }))).toBeNull();
+  });
+
+  it("treats each new block as its own event", () => {
+    const first = agent({ status: "blocked", statusChangedAt: 9 });
+    const second = agent({ status: "blocked", statusChangedAt: 14 });
+    expect(agentNotificationEvent(first)?.event).not.toBe(agentNotificationEvent(second)?.event);
   });
 
   it("defaults in-app notifications to the top-right corner", () => {

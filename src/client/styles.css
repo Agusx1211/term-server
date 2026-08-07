@@ -200,13 +200,26 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
 .activity-status-badge.idle, .pane-activity.idle { --activity-color: #d29922; }
 .activity-status-badge.closed, .pane-activity.closed { --activity-color: #8c959f; }
 .activity-status-badge.attention, .pane-activity.attention { --activity-color: #c586c0; }
-.activity-status-badge.attention, .pane-activity.attention {
+.activity-status-badge.blocked, .pane-activity.blocked { --activity-color: #f0883e; }
+.activity-status-badge.blocked { min-width: 72px; }
+.activity-status-badge.attention, .pane-activity.attention,
+.activity-status-badge.blocked, .pane-activity.blocked {
   animation: activity-attention-arrive .48s cubic-bezier(.2, .9, .25, 1.25) both;
 }
 .activity-status-badge.attention > svg,
 .pane-activity.attention .pane-activity-state > svg {
   transform-origin: 50% 12%;
   animation: activity-attention-ring .72s cubic-bezier(.36, .07, .19, .97) .08s both;
+}
+/* A block holds until someone answers it, so it keeps pulsing rather than
+   playing a one-shot arrival like a completion does. */
+.activity-status-badge.blocked > svg,
+.pane-activity.blocked .pane-activity-state > svg {
+  animation: activity-blocked-pulse 1.8s ease-in-out infinite;
+}
+@keyframes activity-blocked-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: .55; transform: scale(.88); }
 }
 @keyframes activity-attention-arrive {
   0% { opacity: .35; transform: scale(.82); box-shadow: 0 0 0 0 transparent; }
@@ -231,7 +244,11 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
   .activity-status-badge.attention,
   .pane-activity.attention,
   .activity-status-badge.attention > svg,
-  .pane-activity.attention .pane-activity-state > svg { animation: none; }
+  .pane-activity.attention .pane-activity-state > svg,
+  .activity-status-badge.blocked,
+  .pane-activity.blocked,
+  .activity-status-badge.blocked > svg,
+  .pane-activity.blocked .pane-activity-state > svg { animation: none; }
 }
 .terminal-row:hover .activity-status-badge { display: none; }
 .tree-status { margin-left: auto; color: var(--muted); font: 10px ui-monospace, monospace; }

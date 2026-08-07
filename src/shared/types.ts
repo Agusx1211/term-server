@@ -1,5 +1,5 @@
 export type TerminalStatus = "running" | "exited";
-export type AgentStatus = "working" | "idle" | "closed";
+export type AgentStatus = "working" | "blocked" | "idle" | "closed";
 
 export interface AgentActivity {
   label: string;

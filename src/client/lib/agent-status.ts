@@ -1,3 +1,44 @@
+import type { AgentInfo } from "../../shared/types";
+
+/** Drives the badge colour class; also the icon each surface picks. */
+export type AgentStatusTone = "blocked" | "attention" | "working" | "idle" | "closed";
+
+export interface AgentStatusPresentation {
+  tone: AgentStatusTone;
+  /** Short uppercase badge text. */
+  label: string;
+  /** Sentence used for tooltips and accessible names. */
+  description: string;
+}
+
+/**
+ * How an agent's state reads in the sidebar and on a pane header.
+ *
+ * A blocked agent outranks an unseen completion: it is waiting on a person
+ * right now, where a completion has already happened and will keep. Blocked is
+ * also never "seen away" the way a completion is, because the condition holds
+ * until someone answers it.
+ */
+export function agentStatusPresentation(
+  agent: Pick<AgentInfo, "kind" | "status">,
+  needsAttention: boolean,
+): AgentStatusPresentation {
+  const kind = agent.kind || "agent";
+  if (agent.status === "blocked") {
+    return { tone: "blocked", label: "Needs you", description: `${kind} is waiting for input` };
+  }
+  if (needsAttention) {
+    return { tone: "attention", label: "Ready", description: `${kind} is ready` };
+  }
+  if (agent.status === "working") {
+    return { tone: "working", label: "Working", description: `${kind} is working` };
+  }
+  if (agent.status === "idle") {
+    return { tone: "idle", label: "Idle", description: `${kind} is idle` };
+  }
+  return { tone: "closed", label: "Closed", description: `${kind} is closed` };
+}
+
 export function formatWorkingDuration(elapsedMilliseconds: number): string {
   const totalSeconds = Math.floor(Math.max(0, elapsedMilliseconds) / 1_000);
   const seconds = totalSeconds % 60;
