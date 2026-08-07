@@ -109,19 +109,40 @@ describe("terminal stream protocol", () => {
 describe("terminal renderer backlog", () => {
   it("bounds queued output by size and sustained parser delay", () => {
     const backlog = new TerminalRenderBacklog();
-    expect(backlog.enqueue(64 * 1024, 1_000)).toBe(false);
-    expect(backlog.enqueue(64 * 1024, 2_501)).toBe(true);
-    expect(backlog.pendingBytes).toBe(128 * 1024);
+    expect(backlog.enqueue(3 * 1024 * 1024, 1_000)).toBe(false);
+    expect(backlog.enqueue(2 * 1024 * 1024, 6_001)).toBe(true);
+    expect(backlog.pendingBytes).toBe(5 * 1024 * 1024);
 
     backlog.reset();
-    expect(backlog.enqueue(512 * 1024, 3_000)).toBe(false);
+    expect(backlog.enqueue(16 * 1024 * 1024, 3_000)).toBe(false);
     expect(backlog.enqueue(1, 3_001)).toBe(true);
 
     backlog.reset();
-    for (let index = 0; index < 128; index += 1) {
+    for (let index = 0; index < 8_192; index += 1) {
       expect(backlog.enqueue(1, 4_000)).toBe(false);
     }
     expect(backlog.enqueue(1, 4_000)).toBe(true);
+  });
+
+  it("tolerates a full-screen redraw the renderer keeps up with", () => {
+    const backlog = new TerminalRenderBacklog();
+    // A 1.3 MB TUI repaint arriving as 4 KB frames, parsed a beat behind.
+    for (let index = 0; index < 320; index += 1) {
+      expect(backlog.enqueue(4_095, 1_000 + index)).toBe(false);
+      if (index >= 16) backlog.settle(4_095);
+    }
+    expect(backlog.pendingBytes).toBeLessThan(128 * 1024);
+  });
+
+  it("ages the oldest unparsed frame, not the last idle moment", () => {
+    const backlog = new TerminalRenderBacklog();
+    // A terminal that never falls idle still settles every frame it is handed,
+    // so a steady stream must not age out however long it runs.
+    for (let index = 0; index < 5_000; index += 1) {
+      expect(backlog.enqueue(64 * 1024, 1_000 + index * 10)).toBe(false);
+      backlog.settle(64 * 1024);
+    }
+    expect(backlog.pendingBytes).toBe(0);
   });
 
   it("clears its age once xterm catches up", () => {

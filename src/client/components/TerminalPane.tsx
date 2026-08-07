@@ -433,6 +433,11 @@ export function TerminalPane({
     let parsingOutput = false;
     let responder = false;
     let messageQueue = Promise.resolve();
+    // Resolves once xterm has parsed every frame handed to it so far.
+    let pendingWrites = Promise.resolve();
+    // The stream is only quiescent once queued messages have been applied and
+    // the writes they issued have been parsed.
+    const settledStream = () => messageQueue.then(() => pendingWrites);
     let lastServerMessage = Date.now();
     let hasSynced = false;
     let recoveringOutput = false;
@@ -532,14 +537,25 @@ export function TerminalPane({
       return true;
     });
 
+    // Frames are handed to xterm as they arrive rather than one per settled
+    // parse. xterm's write buffer already slices parsing into ~12ms budgets and
+    // yields to the renderer between them; waiting for each frame's callback
+    // before writing the next one restarts that scheduler per frame and caps a
+    // burst at one frame per event-loop turn. A full-screen TUI repaint is a
+    // megabyte of 4 KB frames, so that ceiling is what made the pane fall behind
+    // and abandon its stream. More than one write can be in flight, so the
+    // parsing flag counts them instead of tracking a single write.
+    let unparsedWrites = 0;
     const writeTerminal = (data: Uint8Array, commit?: number) => new Promise<void>((resolve, reject) => {
       if (isDebugRecordingActive()) {
         recordDebugEvent(terminal.id, { type: "write", data: encodeBytesBase64(data) });
       }
+      unparsedWrites += 1;
       parsingOutput = true;
       try {
         term.write(data, () => {
-          parsingOutput = false;
+          unparsedWrites -= 1;
+          parsingOutput = unparsedWrites > 0;
           try {
             if (commit !== undefined) stream.commit(commit);
             resolve();
@@ -548,7 +564,8 @@ export function TerminalPane({
           }
         });
       } catch (error) {
-        parsingOutput = false;
+        unparsedWrites -= 1;
+        parsingOutput = unparsedWrites > 0;
         reject(error);
       }
     });
@@ -643,9 +660,20 @@ export function TerminalPane({
                 });
               }
               const commit = stream.accept(frame);
-              await writeTerminal(frame.data, commit);
+              // Hand the frame to xterm without waiting for it to be parsed. The
+              // backlog is only settled once xterm reports the bytes parsed, so
+              // it still measures what the renderer actually owes.
+              const settled = queuedBytes;
+              queuedBytes = 0;
+              pendingWrites = writeTerminal(frame.data, commit)
+                .catch(failProtocol)
+                .finally(() => backlog.settle(settled));
               return;
             }
+            // A control message may reset or resize the grid, so everything
+            // written ahead of it has to be parsed before it is applied.
+            await pendingWrites;
+            if (protocolFailed || abandoned) return;
             const message = JSON.parse(String(event.data)) as ServerTerminalMessage;
             if (message.type === "ready") {
               recordDebugEvent(terminal.id, { type: "control", message });
@@ -733,7 +761,7 @@ export function TerminalPane({
         if (!visibleState.current) {
           reportStreamIssue();
           setConnection("connecting");
-          void messageQueue.then(() => {
+          void settledStream().then(() => {
             backlog.reset();
             if (recoveringOutput) stream.restart();
           });
@@ -744,7 +772,7 @@ export function TerminalPane({
           setConnection("disconnected");
         }
         attempts += 1;
-        void messageQueue.then(() => {
+        void settledStream().then(() => {
           if (disposed || exited.current) return;
           backlog.reset();
           if (recoveringOutput) stream.restart();
@@ -769,7 +797,7 @@ export function TerminalPane({
         suspendSocket?.();
         return;
       }
-      void messageQueue.then(() => {
+      void settledStream().then(() => {
         if (disposed || exited.current || !visibleState.current) return;
         const current = socket.current;
         if (!current || current.readyState === WebSocket.CLOSED) connect();

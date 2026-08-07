@@ -1,10 +1,16 @@
 export const TERMINAL_FRAME_SNAPSHOT = 0;
 export const TERMINAL_FRAME_OUTPUT = 1;
 const TERMINAL_FRAME_HEADER_BYTES = 9;
-const MAX_RENDER_BACKLOG_BYTES = 512 * 1024;
-const MAX_RENDER_BACKLOG_AGE_MS = 1_500;
-const MAX_RENDER_BACKLOG_FRAMES = 128;
-const MIN_AGED_RENDER_BACKLOG_BYTES = 64 * 1024;
+// Abandoning the stream costs a reconnect plus a full snapshot, which is far
+// more expensive than the backlog it avoids. A full-screen TUI redraw is
+// routinely a megabyte or more arriving in a single burst, and xterm parses that
+// in a fraction of a second, so these bounds only exist to catch a renderer that
+// has genuinely stopped making progress.
+const MAX_RENDER_BACKLOG_BYTES = 16 * 1024 * 1024;
+const MAX_RENDER_BACKLOG_AGE_MS = 5_000;
+const MAX_RENDER_BACKLOG_FRAMES = 8_192;
+const MIN_AGED_RENDER_BACKLOG_BYTES = 4 * 1024 * 1024;
+const RENDER_BACKLOG_COMPACT_FRAMES = 256;
 
 export interface TerminalFrame {
   kind: number;
@@ -21,35 +27,49 @@ export interface TerminalStreamIssue {
 
 export class TerminalRenderBacklog {
   private bytes = 0;
-  private frames = 0;
-  private pendingSince?: number;
+  // Frames settle in the order they were enqueued, so a queue of arrival times
+  // dates the oldest frame the parser still owes. Tracking only the last moment
+  // the backlog stood empty would age out any terminal that never falls idle,
+  // however well the renderer is keeping up.
+  private queued: number[] = [];
+  private settled = 0;
 
   get pendingBytes(): number {
     return this.bytes;
   }
 
+  private get frames(): number {
+    return this.queued.length - this.settled;
+  }
+
   enqueue(bytes: number, now = Date.now()): boolean {
     if (bytes <= 0) return false;
-    if (this.bytes === 0) this.pendingSince = now;
     this.bytes += bytes;
-    this.frames += 1;
-    return this.frames > MAX_RENDER_BACKLOG_FRAMES
-      || this.bytes > MAX_RENDER_BACKLOG_BYTES
-      || this.bytes >= MIN_AGED_RENDER_BACKLOG_BYTES
-        && now - (this.pendingSince ?? now) > MAX_RENDER_BACKLOG_AGE_MS;
+    this.queued.push(now);
+    if (this.bytes > MAX_RENDER_BACKLOG_BYTES || this.frames > MAX_RENDER_BACKLOG_FRAMES) {
+      return true;
+    }
+    const oldest = this.queued[this.settled] ?? now;
+    return this.bytes >= MIN_AGED_RENDER_BACKLOG_BYTES
+      && now - oldest > MAX_RENDER_BACKLOG_AGE_MS;
   }
 
   settle(bytes: number): void {
     if (bytes <= 0) return;
     this.bytes = Math.max(0, this.bytes - bytes);
-    this.frames = Math.max(0, this.frames - 1);
-    if (this.bytes === 0) this.pendingSince = undefined;
+    if (this.settled < this.queued.length) this.settled += 1;
+    if (this.settled >= this.queued.length) {
+      this.reset();
+    } else if (this.settled >= RENDER_BACKLOG_COMPACT_FRAMES) {
+      this.queued = this.queued.slice(this.settled);
+      this.settled = 0;
+    }
   }
 
   reset(): void {
     this.bytes = 0;
-    this.frames = 0;
-    this.pendingSince = undefined;
+    this.queued = [];
+    this.settled = 0;
   }
 }
 

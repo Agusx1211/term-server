@@ -31,6 +31,11 @@ const TERMINAL_INPUT_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const TERMINAL_INPUT_RETRY_INTERVAL: Duration = Duration::from_millis(5);
 const TERMINAL_CLIENT_LEASE: Duration = Duration::from_secs(90);
 const TERMINAL_LEASE_CHECK_INTERVAL: Duration = Duration::from_secs(15);
+/// A pty master returns at most one 4 KiB chunk per read, so a full-screen TUI
+/// redraw reaches this loop as hundreds of tiny events. Merging whatever is
+/// already queued into one frame keeps a burst to a few dozen websocket
+/// messages, which the browser can hand to its parser in far fewer turns.
+const TERMINAL_OUTPUT_COALESCE_BYTES: usize = 60 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -464,152 +469,256 @@ pub(crate) async fn serve_terminal_socket(
     let mut last_client_message = tokio::time::Instant::now();
     let mut lease_check = tokio::time::interval(TERMINAL_LEASE_CHECK_INTERVAL);
     lease_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Holds the one event that ended a coalescing run, so merging output never
+    // reorders the size, exit, or lag notices that follow it.
+    let mut deferred: Option<Result<TerminalEvent, tokio::sync::broadcast::error::RecvError>> =
+        None;
     loop {
-        tokio::select! {
-            _ = lease_check.tick() => {
-                if last_client_message.elapsed() > TERMINAL_CLIENT_LEASE {
-                    tracing::debug!(%client_id, "terminal client lease expired");
+        let event = match deferred.take() {
+            Some(event) => event,
+            None => tokio::select! {
+                _ = lease_check.tick() => {
+                    if last_client_message.elapsed() > TERMINAL_CLIENT_LEASE {
+                        tracing::debug!(%client_id, "terminal client lease expired");
+                        break;
+                    }
+                    continue;
+                }
+                event = events.recv() => event,
+                incoming = receiver.next() => {
+                    let Some(Ok(message)) = incoming else { break; };
+                    last_client_message = tokio::time::Instant::now();
+                    if handle_client_message(
+                        message,
+                        &mut sender,
+                        &terminal,
+                        client_id,
+                        terminal_id,
+                        observer,
+                        recorder,
+                    ).await.is_err() { break; }
+                    continue;
+                }
+            },
+        };
+        match event {
+            Ok(TerminalEvent::Output(output)) => {
+                if output.end_sequence() <= sent_sequence {
+                    continue;
+                }
+                if output.sequence > sent_sequence {
+                    tracing::debug!(
+                        expected_sequence = sent_sequence,
+                        output_sequence = output.sequence,
+                        "terminal stream gap detected; sending current snapshot"
+                    );
+                    match synchronize_terminal(&mut sender, &terminal, client_id, None, recorder)
+                        .await
+                    {
+                        Ok(Some((next_events, sequence))) => {
+                            events = next_events;
+                            sent_sequence = sequence;
+                        }
+                        Ok(None) | Err(()) => break,
+                    }
+                    continue;
+                }
+                let Some(output) = output.slice_from(sent_sequence) else {
+                    continue;
+                };
+                let output = coalesce_terminal_output(output, &mut events, &mut deferred);
+                if send_terminal_output(&mut sender, &output, terminal_id, recorder)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                sent_sequence = output.end_sequence();
+            }
+            Ok(TerminalEvent::Exit(exit_code)) => {
+                if let Some(recorder) = recorder {
+                    recorder.control(
+                        &terminal_id,
+                        serde_json::json!({ "type": "exit", "exit_code": exit_code }),
+                    );
+                }
+                let message = serde_json::to_string(&TerminalServerMessage::Exit { exit_code })
+                    .expect("serializable exit");
+                let _ = send_socket_message(&mut sender, Message::Text(message.into())).await;
+                break;
+            }
+            Ok(TerminalEvent::Size(size)) => {
+                if let Some(recorder) = recorder {
+                    recorder.control(&terminal_id, serde_json::json!({ "type": "size", "cols": size.cols, "rows": size.rows, "focused": size.focused_client.is_some(), "controller": size.focused_client == Some(client_id), "responder": size.responder_client == Some(client_id) }));
+                }
+                let message = serde_json::to_string(&size_message(size, client_id))
+                    .expect("serializable terminal size");
+                if send_socket_message(&mut sender, Message::Text(message.into()))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
-            event = events.recv() => {
-                match event {
-                    Ok(TerminalEvent::Output(output)) => {
-                        if output.end_sequence() <= sent_sequence {
-                            continue;
-                        }
-                        if output.sequence > sent_sequence {
-                            tracing::debug!(
-                                expected_sequence = sent_sequence,
-                                output_sequence = output.sequence,
-                                "terminal stream gap detected; sending current snapshot"
-                            );
-                            match synchronize_terminal(
-                                &mut sender,
-                                &terminal,
-                                client_id,
-                                None,
-                                recorder,
-                            ).await {
-                                Ok(Some((next_events, sequence))) => {
-                                    events = next_events;
-                                    sent_sequence = sequence;
-                                }
-                                Ok(None) | Err(()) => break,
-                            }
-                            continue;
-                        }
-                        let Some(output) = output.slice_from(sent_sequence) else {
-                            continue;
-                        };
-                        if send_terminal_output(&mut sender, &output, terminal_id, recorder).await.is_err() { break; }
-                        sent_sequence = output.end_sequence();
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                tracing::debug!(
+                    skipped,
+                    sent_sequence,
+                    "terminal stream lagged; sending current snapshot"
+                );
+                match synchronize_terminal(&mut sender, &terminal, client_id, None, recorder).await
+                {
+                    Ok(Some((next_events, sequence))) => {
+                        events = next_events;
+                        sent_sequence = sequence;
                     }
-                    Ok(TerminalEvent::Exit(exit_code)) => {
-                        if let Some(recorder) = recorder {
-                            recorder.control(&terminal_id, serde_json::json!({ "type": "exit", "exit_code": exit_code }));
-                        }
-                        let message = serde_json::to_string(&TerminalServerMessage::Exit { exit_code })
-                            .expect("serializable exit");
-                        let _ = send_socket_message(&mut sender, Message::Text(message.into())).await;
-                        break;
-                    }
-                    Ok(TerminalEvent::Size(size)) => {
-                        if let Some(recorder) = recorder {
-                            recorder.control(&terminal_id, serde_json::json!({ "type": "size", "cols": size.cols, "rows": size.rows, "focused": size.focused_client.is_some(), "controller": size.focused_client == Some(client_id), "responder": size.responder_client == Some(client_id) }));
-                        }
-                        let message = serde_json::to_string(&size_message(size, client_id))
-                            .expect("serializable terminal size");
-                        if send_socket_message(&mut sender, Message::Text(message.into())).await.is_err() { break; }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::debug!(
-                            skipped,
-                            sent_sequence,
-                            "terminal stream lagged; sending current snapshot"
-                        );
-                        match synchronize_terminal(
-                            &mut sender,
-                            &terminal,
-                            client_id,
-                            None,
-                            recorder,
-                        ).await {
-                            Ok(Some((next_events, sequence))) => {
-                                events = next_events;
-                                sent_sequence = sequence;
-                            }
-                            Ok(None) | Err(()) => break,
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Ok(None) | Err(()) => break,
                 }
             }
-            incoming = receiver.next() => {
-                let Some(Ok(message)) = incoming else { break; };
-                last_client_message = tokio::time::Instant::now();
-                match message {
-                    Message::Text(text) => match serde_json::from_str::<TerminalClientMessage>(&text) {
-                        Ok(TerminalClientMessage::Ping) => {
-                            let pong = serde_json::to_string(&TerminalServerMessage::Pong)
-                                .expect("serializable pong");
-                            if send_socket_message(&mut sender, Message::Text(pong.into())).await.is_err() { break; }
-                        }
-                        Ok(_) if observer => {
-                            let error = serde_json::to_string(&TerminalServerMessage::Error {
-                                message: "observer connections are read-only",
-                            })
-                            .expect("serializable error");
-                            if send_socket_message(&mut sender, Message::Text(error.into())).await.is_err() { break; }
-                        }
-                        Ok(TerminalClientMessage::Input { data }) if data.len() <= 64 * 1024 => {
-                            if let Some(recorder) = recorder {
-                                recorder.input(&terminal_id, data.as_bytes());
-                            }
-                            if forward_terminal_input(&mut sender, &terminal, data.as_bytes(), terminal_id, recorder).await.is_err() { break; }
-                        }
-                        Ok(TerminalClientMessage::Resize { cols, rows, pixel_width, pixel_height }) => {
-                            if let Some(recorder) = recorder {
-                                recorder.resize(&terminal_id, cols, rows, pixel_width, pixel_height);
-                            }
-                            if terminal.resize_client(client_id, cols, rows, pixel_width, pixel_height).is_err() { break; }
-                        }
-                        Ok(TerminalClientMessage::Focus { focused }) => {
-                            if terminal.focus_client(client_id, focused).is_err() { break; }
-                        }
-                        _ => {
-                            let error = serde_json::to_string(&TerminalServerMessage::Error {
-                                message: "invalid terminal message",
-                            })
-                            .expect("serializable error");
-                            if send_socket_message(&mut sender, Message::Text(error.into())).await.is_err() { break; }
-                        }
-                    },
-                    Message::Binary(_) if observer => {
-                        let error = serde_json::to_string(&TerminalServerMessage::Error {
-                            message: "observer connections are read-only",
-                        })
-                        .expect("serializable error");
-                        if send_socket_message(&mut sender, Message::Text(error.into())).await.is_err() { break; }
-                    }
-                    Message::Binary(data) if !data.is_empty() => {
-                        if let Some(recorder) = recorder {
-                            recorder.input(&terminal_id, &data);
-                        }
-                        if forward_terminal_input(&mut sender, &terminal, &data, terminal_id, recorder).await.is_err() { break; }
-                    }
-                    Message::Close(_) => break,
-                    Message::Ping(payload) => {
-                        if send_socket_message(&mut sender, Message::Pong(payload)).await.is_err() { break; }
-                    }
-                    _ => {}
-                }
-            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
     }
     if let Some(recorder) = recorder {
         recorder.disconnect(&terminal_id, "socket closed");
     }
+}
+
+/// Merges the output events already queued behind `output` into a single frame.
+/// Stops at the coalescing budget, at a gap, or at the first non-output event,
+/// which is handed back through `deferred` so the caller processes it next.
+fn coalesce_terminal_output(
+    output: SequencedOutput,
+    events: &mut tokio::sync::broadcast::Receiver<TerminalEvent>,
+    deferred: &mut Option<Result<TerminalEvent, tokio::sync::broadcast::error::RecvError>>,
+) -> SequencedOutput {
+    use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+
+    let mut merged: Option<Vec<u8>> = None;
+    let mut end = output.end_sequence();
+    while end - output.sequence < TERMINAL_OUTPUT_COALESCE_BYTES as u64 {
+        match events.try_recv() {
+            Ok(TerminalEvent::Output(next)) => {
+                if next.end_sequence() <= end {
+                    continue;
+                }
+                if next.sequence > end {
+                    // A gap, which only the caller's snapshot recovery can close.
+                    deferred.replace(Ok(TerminalEvent::Output(next)));
+                    break;
+                }
+                let Some(next) = next.slice_from(end) else {
+                    continue;
+                };
+                end = next.end_sequence();
+                merged
+                    .get_or_insert_with(|| output.bytes.to_vec())
+                    .extend_from_slice(&next.bytes);
+            }
+            Ok(other) => {
+                deferred.replace(Ok(other));
+                break;
+            }
+            Err(TryRecvError::Lagged(skipped)) => {
+                deferred.replace(Err(RecvError::Lagged(skipped)));
+                break;
+            }
+            Err(TryRecvError::Closed) => {
+                deferred.replace(Err(RecvError::Closed));
+                break;
+            }
+            Err(TryRecvError::Empty) => break,
+        }
+    }
+    match merged {
+        Some(bytes) => SequencedOutput {
+            sequence: output.sequence,
+            bytes: bytes.into(),
+        },
+        None => output,
+    }
+}
+
+async fn handle_client_message(
+    message: Message,
+    sender: &mut SplitSink<WebSocket, Message>,
+    terminal: &Arc<TerminalSession>,
+    client_id: Uuid,
+    terminal_id: Uuid,
+    observer: bool,
+    recorder: Option<&DebugRecordingManager>,
+) -> Result<(), ()> {
+    macro_rules! send_or_stop {
+        ($message:expr) => {
+            if send_socket_message(sender, $message).await.is_err() {
+                return Err(());
+            }
+        };
+    }
+    match message {
+        Message::Text(text) => match serde_json::from_str::<TerminalClientMessage>(&text) {
+            Ok(TerminalClientMessage::Ping) => {
+                let pong =
+                    serde_json::to_string(&TerminalServerMessage::Pong).expect("serializable pong");
+                send_or_stop!(Message::Text(pong.into()));
+            }
+            Ok(_) if observer => {
+                let error = serde_json::to_string(&TerminalServerMessage::Error {
+                    message: "observer connections are read-only",
+                })
+                .expect("serializable error");
+                send_or_stop!(Message::Text(error.into()));
+            }
+            Ok(TerminalClientMessage::Input { data }) if data.len() <= 64 * 1024 => {
+                if let Some(recorder) = recorder {
+                    recorder.input(&terminal_id, data.as_bytes());
+                }
+                forward_terminal_input(sender, terminal, data.as_bytes(), terminal_id, recorder)
+                    .await?;
+            }
+            Ok(TerminalClientMessage::Resize {
+                cols,
+                rows,
+                pixel_width,
+                pixel_height,
+            }) => {
+                if let Some(recorder) = recorder {
+                    recorder.resize(&terminal_id, cols, rows, pixel_width, pixel_height);
+                }
+                terminal
+                    .resize_client(client_id, cols, rows, pixel_width, pixel_height)
+                    .map_err(|_| ())?;
+            }
+            Ok(TerminalClientMessage::Focus { focused }) => {
+                terminal.focus_client(client_id, focused).map_err(|_| ())?;
+            }
+            _ => {
+                let error = serde_json::to_string(&TerminalServerMessage::Error {
+                    message: "invalid terminal message",
+                })
+                .expect("serializable error");
+                send_or_stop!(Message::Text(error.into()));
+            }
+        },
+        Message::Binary(_) if observer => {
+            let error = serde_json::to_string(&TerminalServerMessage::Error {
+                message: "observer connections are read-only",
+            })
+            .expect("serializable error");
+            send_or_stop!(Message::Text(error.into()));
+        }
+        Message::Binary(data) if !data.is_empty() => {
+            if let Some(recorder) = recorder {
+                recorder.input(&terminal_id, &data);
+            }
+            forward_terminal_input(sender, terminal, &data, terminal_id, recorder).await?;
+        }
+        Message::Close(_) => return Err(()),
+        Message::Ping(payload) => {
+            send_or_stop!(Message::Pong(payload));
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 async fn write_terminal_input(
@@ -791,4 +900,135 @@ where
         .await
         .map_err(|_| ())?
         .map_err(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    fn output(sequence: u64, bytes: &'static [u8]) -> TerminalEvent {
+        TerminalEvent::Output(SequencedOutput {
+            sequence,
+            bytes: Bytes::from_static(bytes),
+        })
+    }
+
+    fn size_event() -> TerminalEvent {
+        TerminalEvent::Size(TerminalSizeState {
+            cols: 80,
+            rows: 24,
+            pixel_width: 800,
+            pixel_height: 480,
+            focused_client: None,
+            responder_client: None,
+        })
+    }
+
+    fn drain(first: SequencedOutput, events: Vec<TerminalEvent>) -> (SequencedOutput, usize) {
+        let (sender, mut receiver) = tokio::sync::broadcast::channel(64);
+        for event in events {
+            sender.send(event).expect("queued event");
+        }
+        let mut deferred = None;
+        let merged = coalesce_terminal_output(first, &mut receiver, &mut deferred);
+        let remaining = usize::from(deferred.is_some()) + receiver.len();
+        (merged, remaining)
+    }
+
+    #[test]
+    fn contiguous_output_is_merged_into_one_frame() {
+        let (merged, remaining) = drain(
+            SequencedOutput {
+                sequence: 10,
+                bytes: Bytes::from_static(b"abc"),
+            },
+            vec![output(13, b"de"), output(15, b"f")],
+        );
+        assert_eq!(merged.sequence, 10);
+        assert_eq!(merged.bytes.as_ref(), b"abcdef");
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn overlapping_and_stale_output_is_reconciled_while_merging() {
+        let (merged, _) = drain(
+            SequencedOutput {
+                sequence: 10,
+                bytes: Bytes::from_static(b"abc"),
+            },
+            // Already covered, then overlapping the merged tail by one byte.
+            vec![output(10, b"ab"), output(12, b"cde")],
+        );
+        assert_eq!(merged.sequence, 10);
+        assert_eq!(merged.bytes.as_ref(), b"abcde");
+    }
+
+    #[test]
+    fn merging_stops_at_a_gap_and_leaves_it_for_snapshot_recovery() {
+        let (sender, mut receiver) = tokio::sync::broadcast::channel(64);
+        sender.send(output(13, b"de")).expect("queued output");
+        sender.send(output(99, b"gap")).expect("queued gap");
+        sender.send(output(102, b"more")).expect("queued output");
+        let mut deferred = None;
+        let merged = coalesce_terminal_output(
+            SequencedOutput {
+                sequence: 10,
+                bytes: Bytes::from_static(b"abc"),
+            },
+            &mut receiver,
+            &mut deferred,
+        );
+        assert_eq!(merged.bytes.as_ref(), b"abcde");
+        let Some(Ok(TerminalEvent::Output(gap))) = deferred else {
+            panic!("the gap is handed back to the caller");
+        };
+        assert_eq!(gap.sequence, 99);
+        assert_eq!(receiver.len(), 1, "output after the gap stays queued");
+    }
+
+    #[test]
+    fn merging_stops_at_a_control_event_without_reordering_it() {
+        let (sender, mut receiver) = tokio::sync::broadcast::channel(64);
+        sender.send(output(13, b"de")).expect("queued output");
+        sender.send(size_event()).expect("queued size");
+        sender.send(output(15, b"f")).expect("queued output");
+        let mut deferred = None;
+        let merged = coalesce_terminal_output(
+            SequencedOutput {
+                sequence: 10,
+                bytes: Bytes::from_static(b"abc"),
+            },
+            &mut receiver,
+            &mut deferred,
+        );
+        assert_eq!(merged.bytes.as_ref(), b"abcde");
+        assert!(
+            matches!(deferred, Some(Ok(TerminalEvent::Size(_)))),
+            "the size event is applied before the output that follows it",
+        );
+        assert_eq!(receiver.len(), 1);
+    }
+
+    #[test]
+    fn merging_stops_at_the_frame_budget() {
+        let chunk: &'static [u8] = &[b'x'; 4095];
+        let events = (1..40)
+            .map(|index| {
+                TerminalEvent::Output(SequencedOutput {
+                    sequence: index * 4095,
+                    bytes: Bytes::from_static(chunk),
+                })
+            })
+            .collect();
+        let (merged, _) = drain(
+            SequencedOutput {
+                sequence: 0,
+                bytes: Bytes::from_static(chunk),
+            },
+            events,
+        );
+        assert!(merged.bytes.len() >= TERMINAL_OUTPUT_COALESCE_BYTES);
+        assert!(merged.bytes.len() < TERMINAL_OUTPUT_COALESCE_BYTES + 4095);
+    }
 }
