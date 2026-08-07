@@ -303,6 +303,33 @@ impl ClientViewports {
         }
     }
 
+    /// Drops a client's contribution to the negotiated size while leaving it
+    /// attached. A cached pane holds its stream open so that returning to it
+    /// never costs a resynchronization, but it is not being read and must not
+    /// hold the size down for the panes that are. The pane re-registers by
+    /// reporting its viewport again once it is back on screen.
+    fn release(&mut self, client_id: Uuid) {
+        if let Some(current) = self.sizes.get_mut(&client_id) {
+            *current = None;
+        }
+        if self.focused_client == Some(client_id) {
+            self.focused_client = None;
+        }
+        // Device queries are answered from the responder's own browser state, so
+        // hand the role to a pane that is actually on screen. Falling back to the
+        // released client matters: a terminal whose only browser has cached it
+        // still needs someone to answer, exactly as it did before it was cached.
+        if self.responder_client == Some(client_id) {
+            self.responder_client = self
+                .sizes
+                .iter()
+                .filter(|(id, size)| **id != client_id && size.is_some())
+                .map(|(id, _)| *id)
+                .min()
+                .or(Some(client_id));
+        }
+    }
+
     fn focus(&mut self, client_id: Uuid, focused: bool) {
         if focused && self.sizes.get(&client_id).is_some_and(Option::is_some) {
             self.focused_client = Some(client_id);
@@ -1442,6 +1469,11 @@ impl TerminalSession {
         focused: bool,
     ) -> Result<TerminalSizeState, TerminalError> {
         self.update_viewports(|viewports| viewports.focus(client_id, focused))
+    }
+
+    /// Stops measuring the terminal against a client that is still connected.
+    pub fn release_client(&self, client_id: Uuid) -> Result<TerminalSizeState, TerminalError> {
+        self.update_viewports(|viewports| viewports.release(client_id))
     }
 
     pub fn write(&self, data: &[u8]) -> Result<(), TerminalError> {
@@ -3823,6 +3855,40 @@ mod tests {
                 responder_client: None,
             }
         );
+    }
+
+    #[test]
+    fn a_released_client_keeps_its_connection_but_stops_constraining_the_size() {
+        let visible = Uuid::from_u128(1);
+        let cached = Uuid::from_u128(2);
+        let mut viewports = ClientViewports::default();
+
+        viewports.attach(visible, Some(TerminalViewport::new(180, 50, 1800, 1000)));
+        viewports.attach(cached, Some(TerminalViewport::new(60, 22, 600, 440)));
+        viewports.focus(cached, true);
+        assert_eq!((viewports.state().cols, viewports.state().rows), (60, 22));
+
+        // Leaving the screen must surrender both the size and the focus that
+        // was steering it, or a pane nobody is reading would still be the one
+        // the pty is measured against.
+        viewports.release(cached);
+        assert_eq!(
+            viewports.state(),
+            TerminalSizeState {
+                cols: 180,
+                rows: 50,
+                pixel_width: 1800,
+                pixel_height: 1000,
+                focused_client: None,
+                responder_client: Some(visible),
+            }
+        );
+        // Still attached: the connection was never closed, so the pane is there
+        // to take its size back without resynchronizing.
+        assert_eq!(viewports.sizes.len(), 2);
+
+        viewports.resize(cached, TerminalViewport::new(60, 22, 600, 440));
+        assert_eq!((viewports.state().cols, viewports.state().rows), (60, 22));
     }
 
     #[test]

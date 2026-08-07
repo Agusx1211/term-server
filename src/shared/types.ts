@@ -318,6 +318,10 @@ export type ClientTerminalMessage =
       pixelHeight: number;
     }
   | { type: "focus"; focused: boolean }
+  // The pane is cached: still mounted and still streaming, but off screen. It
+  // gives up its say in the negotiated size until it reports a viewport again,
+  // so a cached pane cannot hold the size down for the panes being read.
+  | { type: "release" }
   // Bytes this browser's parser has consumed since the last acknowledgement.
   // The server stops draining the pty while a browser owes too many.
   | { type: "ack"; bytes: number }
@@ -328,7 +332,14 @@ export type ServerTerminalMessage =
   // broker generation that created it, so a current browser regularly talks to
   // one of those; it must stay silent about acknowledgements until told
   // otherwise, because an older broker answers unknown messages with an error.
-  | { type: "ready"; terminal: TerminalInfo; flowControl?: boolean }
+  // `viewportRelease` carries the same caveat and marks a server that lets a
+  // cached pane hold its connection open instead of closing and resynchronizing.
+  | {
+      type: "ready";
+      terminal: TerminalInfo;
+      flowControl?: boolean;
+      viewportRelease?: boolean;
+    }
   | { type: "exit"; exitCode: number }
   | {
       type: "size";

@@ -1625,6 +1625,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_cached_pane_releases_its_size_without_giving_up_its_stream() {
+        let (_directory, server, client) = start_test_broker(1024 * 1024).await;
+        let terminal = client
+            .create(CreateTerminal {
+                path: Some("cached-pane".to_owned()),
+                cwd: Some(PathBuf::from("/tmp")),
+                shell: Some("/bin/sh".to_owned()),
+                clone_from: None,
+            })
+            .await
+            .unwrap();
+        let mut wide = client
+            .terminal_socket(
+                terminal.id,
+                Some(TerminalViewport::new(160, 48, 1600, 960)),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let ready = wait_for_control(&mut wide, "ready").await;
+        assert_eq!(ready["viewportRelease"], true);
+        wait_for_control(&mut wide, "synced").await;
+
+        // A second pane, narrower, pins the terminal to its size the way a tiled
+        // layout does.
+        let mut narrow = client
+            .terminal_socket(
+                terminal.id,
+                Some(TerminalViewport::new(80, 24, 800, 480)),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        wait_for_control(&mut narrow, "synced").await;
+        let shared = wait_for_control(&mut wide, "size").await;
+        assert_eq!(shared["cols"], 80);
+
+        // Caching the narrow pane hands the terminal back to the pane still on
+        // screen, and the cached socket stays open behind it.
+        narrow
+            .send(TungsteniteMessage::Text(r#"{"type":"release"}"#.into()))
+            .await
+            .unwrap();
+        let restored = wait_for_control(&mut wide, "size").await;
+        assert_eq!(restored["cols"], 160);
+        assert_eq!(restored["rows"], 48);
+
+        // The whole point of releasing rather than closing: the cached pane is
+        // still streaming, so returning to it costs no resynchronization.
+        wide.send(TungsteniteMessage::Text(
+            serde_json::json!({ "type": "input", "data": "printf 'CACHED-%s\\n' OK\n" })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let mirrored = wait_for_output(&mut narrow, "CACHED-OK").await;
+        assert!(mirrored.contains("CACHED-OK"));
+
+        // Coming back on screen re-registers the size it reports.
+        narrow
+            .send(TungsteniteMessage::Text(
+                serde_json::json!({
+                    "type": "resize",
+                    "cols": 80,
+                    "rows": 24,
+                    "pixelWidth": 800,
+                    "pixelHeight": 480,
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let renegotiated = wait_for_control(&mut wide, "size").await;
+        assert_eq!(renegotiated["cols"], 80);
+
+        client.remove(terminal.id).await.unwrap();
+        client.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("broker shutdown timeout")
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn flooded_observers_recover_with_a_snapshot() {
         let (_directory, server, client) = start_test_broker(1024 * 1024).await;
         let terminal = client
