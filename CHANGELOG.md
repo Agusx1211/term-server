@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.9.0 - 2026-08-07
+
+### Fixed
+
+- Terminals running full-screen TUIs no longer settle into a loop of "Catching up"
+  reconnects with duplicated and stale content on screen. Programs like pi and btop repaint
+  their whole history in a single burst, 1.3 MB in about 70 ms in the recording this was
+  diagnosed from, and three separate limits turned that burst into a loop that fed itself. A
+  capture of the stuck state shows 18 reconnects and 14 full snapshot resynchronizations in
+  16 seconds.
+- The browser handed xterm one websocket frame at a time and waited for the parser before
+  writing the next one, which caps a pane at roughly one 4 KB frame per event loop turn.
+  Measured against the recorded stream, that is 1.9 MB/s where the same frames pipelined
+  reach 11 MB/s and coalesced reach 20 MB/s. Frames are now written as they arrive. Control
+  messages still wait for the writes ahead of them, so a reset or a resize never lands on a
+  buffer that still has unparsed output queued behind it.
+- The render backlog watchdog abandoned the socket at 512 KB of pending output, and the
+  reconnect pulled a full snapshot that cost more than the burst it was avoiding. It also
+  measured backlog age from the last moment the backlog stood empty, so a terminal that never
+  goes idle could be disconnected while keeping up perfectly well. It now dates the oldest
+  unparsed frame, and its bounds leave room for a full screen repaint.
+- The per terminal event channel held 256 events while a repaint produces around 320, so the
+  server independently resynchronized every connected client mid burst. The channel is larger,
+  and a subscriber now merges whatever output is already queued into full frames before
+  sending, so a burst reaches the browser as a few dozen websocket messages instead of a few
+  hundred. Frames grow only while a client is behind, and shrink back to one pty read once it
+  catches up.
+
+### Known issues
+
+- A snapshot resynchronization still replaces the browser scrollback with the server's
+  canonical terminal state, which holds 1536 rows at 211 columns against the 200000 rows the
+  browser is configured to keep. Resynchronizations are rare now instead of roughly one per
+  second, but scrollback is still truncated when one happens.
+
 ## 0.8.3 - 2026-08-06
 
 ### Added
