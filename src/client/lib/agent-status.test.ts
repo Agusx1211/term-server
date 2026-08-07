@@ -1,5 +1,45 @@
 import { describe, expect, it } from "vitest";
-import { formatWorkingDuration } from "./agent-status";
+import { agentStatusPresentation, formatWorkingDuration } from "./agent-status";
+
+describe("agent status presentation", () => {
+  const agent = (status: "working" | "blocked" | "idle" | "closed") => ({
+    kind: "codex",
+    status,
+  });
+
+  it("marks a blocked agent as needing a person", () => {
+    expect(agentStatusPresentation(agent("blocked"), false)).toEqual({
+      tone: "blocked",
+      label: "Needs you",
+      description: "codex is waiting for input",
+    });
+  });
+
+  it("keeps a block visible even once the terminal has been seen", () => {
+    // A completion is dismissed by looking at it; a block is not, because the
+    // agent is still waiting no matter who looked.
+    expect(agentStatusPresentation(agent("blocked"), true).tone).toBe("blocked");
+  });
+
+  it("shows an unseen completion as ready", () => {
+    expect(agentStatusPresentation(agent("idle"), true)).toEqual({
+      tone: "attention",
+      label: "Ready",
+      description: "codex is ready",
+    });
+  });
+
+  it("describes the remaining states", () => {
+    expect(agentStatusPresentation(agent("working"), false).tone).toBe("working");
+    expect(agentStatusPresentation(agent("idle"), false).tone).toBe("idle");
+    expect(agentStatusPresentation(agent("closed"), false).tone).toBe("closed");
+  });
+
+  it("falls back to a generic name when the agent kind is empty", () => {
+    expect(agentStatusPresentation({ kind: "", status: "blocked" }, false).description)
+      .toBe("agent is waiting for input");
+  });
+});
 
 describe("working duration", () => {
   it("shows seconds for the first minute", () => {

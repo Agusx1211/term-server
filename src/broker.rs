@@ -35,8 +35,8 @@ use crate::{
     build::{self, BuildIdentity},
     config::Cli,
     terminal::{
-        CreateTerminal, ProcessInspectorSnapshot, RenameTerminal, TerminalInfo, TerminalManager,
-        TerminalViewport, normalize_terminal_path,
+        AgentDetectionExplain, CreateTerminal, ProcessInspectorSnapshot, RenameTerminal,
+        TerminalInfo, TerminalManager, TerminalViewport, normalize_terminal_path,
     },
     workspace::{
         SessionBrokerGenerationInfo, SessionBrokerInfo, TerminalSocketQuery,
@@ -156,6 +156,11 @@ impl BrokerClient {
         id: Uuid,
     ) -> Result<ProcessInspectorSnapshot, BrokerError> {
         self.get_json(&format!("/terminals/{id}/processes")).await
+    }
+
+    pub async fn agent_explain(&self, id: Uuid) -> Result<AgentDetectionExplain, BrokerError> {
+        self.get_json(&format!("/terminals/{id}/agent-explain"))
+            .await
     }
 
     pub async fn pi_config(&self) -> Result<PiClientConfig, BrokerError> {
@@ -581,6 +586,10 @@ impl BrokerPool {
         self.owner(id).await?.client.process_inspector(id).await
     }
 
+    pub async fn agent_explain(&self, id: Uuid) -> Result<AgentDetectionExplain, BrokerError> {
+        self.owner(id).await?.client.agent_explain(id).await
+    }
+
     pub async fn pi_config(&self) -> Result<PiClientConfig, BrokerError> {
         self.current.client.pi_config().await
     }
@@ -845,6 +854,7 @@ pub async fn run_session_broker(
             patch(rename_broker_terminal).delete(remove_broker_terminal),
         )
         .route("/terminals/{id}/processes", get(broker_terminal_processes))
+        .route("/terminals/{id}/agent-explain", get(broker_agent_explain))
         .route(
             "/terminals/{id}/agent-event",
             post(broker_terminal_agent_event),
@@ -966,6 +976,17 @@ async fn broker_terminal_processes(
         .terminals
         .get(id)
         .map(|terminal| Json(terminal.process_inspector()))
+        .ok_or(BrokerApiError::NotFound)
+}
+
+async fn broker_agent_explain(
+    State(state): State<BrokerState>,
+    AxumPath(id): AxumPath<Uuid>,
+) -> Result<Json<AgentDetectionExplain>, BrokerApiError> {
+    state
+        .terminals
+        .get(id)
+        .map(|terminal| Json(terminal.agent_explain()))
         .ok_or(BrokerApiError::NotFound)
 }
 
@@ -1549,7 +1570,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flooded_clients_recover_without_disconnecting() {
+    async fn flooded_clients_are_paced_rather_than_resynchronized() {
         let (_directory, server, client) = start_test_broker(1024 * 1024).await;
         let terminal = client
             .create(CreateTerminal {
@@ -1573,10 +1594,11 @@ mod tests {
         wait_for_control(&mut socket, "sync").await;
         wait_for_control(&mut socket, "synced").await;
 
-        // Flood the terminal while the client is not reading. Merging queued
-        // output into full frames lets the stream stay intact through a burst
-        // this size; if the client does fall far enough behind, the server
-        // still recovers it with a snapshot rather than dropping the socket.
+        // A flood far larger than any buffer between the pty and the browser.
+        // Acknowledging as a real browser does, flow control paces the producer,
+        // so the client never falls behind and the stream is never rebuilt. This
+        // used to be a test that falling behind recovered gracefully; the point
+        // now is that a client keeping up does not fall behind at all.
         let command = "yes x | head -c 6000000; printf '\\nLAG-%s\\n' DONE\n";
         socket
             .send(TungsteniteMessage::Text(
@@ -1586,14 +1608,266 @@ mod tests {
             ))
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        wait_for_flooded_output(&mut socket, "LAG-DONE").await;
+        let resyncs = drain_with_acknowledgements(&mut socket, "LAG-DONE").await;
+        assert_eq!(resyncs, 0, "a client that keeps up is never resynchronized");
 
         socket
             .send(TungsteniteMessage::Text(r#"{"type":"ping"}"#.into()))
             .await
             .unwrap();
         wait_for_control(&mut socket, "pong").await;
+        client.remove(terminal.id).await.unwrap();
+        client.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("broker shutdown timeout")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn flooded_observers_recover_with_a_snapshot() {
+        let (_directory, server, client) = start_test_broker(1024 * 1024).await;
+        let terminal = client
+            .create(CreateTerminal {
+                path: Some("observer-lag".to_owned()),
+                cwd: Some(PathBuf::from("/tmp")),
+                shell: Some("/bin/sh".to_owned()),
+                clone_from: None,
+            })
+            .await
+            .unwrap();
+        let mut controller = client
+            .terminal_socket(
+                terminal.id,
+                Some(TerminalViewport::new(80, 24, 800, 480)),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        wait_for_control(&mut controller, "size").await;
+        wait_for_control(&mut controller, "sync").await;
+        wait_for_control(&mut controller, "synced").await;
+        let mut observer = client
+            .terminal_socket(terminal.id, None, None, true)
+            .await
+            .unwrap();
+        wait_for_control(&mut observer, "synced").await;
+
+        // Observers are outside flow control, so they can still fall behind a
+        // flood. That path has to keep working: the server rebuilds the stream
+        // from a snapshot on the same socket instead of dropping it.
+        let command = "yes x | head -c 6000000; printf '\\nOBSLAG-%s\\n' DONE\n";
+        controller
+            .send(TungsteniteMessage::Text(
+                serde_json::json!({ "type": "input", "data": command })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let controller_drain = tokio::spawn(async move {
+            drain_with_acknowledgements(&mut controller, "OBSLAG-DONE").await;
+            controller
+        });
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        wait_for_flooded_output(&mut observer, "OBSLAG-DONE").await;
+        let _controller = controller_drain.await.unwrap();
+
+        client.remove(terminal.id).await.unwrap();
+        client.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("broker shutdown timeout")
+            .unwrap();
+    }
+
+    /// Reads terminal payload bytes until the stream stays silent for `quiet`,
+    /// acknowledging nothing. Returns the total payload delivered.
+    async fn read_payload_until_quiet(socket: &mut BrokerWebSocket, quiet: Duration) -> u64 {
+        let mut delivered = 0_u64;
+        loop {
+            match tokio::time::timeout(quiet, socket.next()).await {
+                Err(_) => return delivered,
+                Ok(Some(Ok(TungsteniteMessage::Binary(bytes)))) => {
+                    delivered += (bytes.len() - 9) as u64;
+                }
+                Ok(Some(Ok(TungsteniteMessage::Close(_))) | None) => {
+                    panic!("terminal socket closed instead of pausing")
+                }
+                Ok(Some(Ok(_))) => {}
+                Ok(Some(Err(error))) => panic!("terminal socket failed: {error}"),
+            }
+        }
+    }
+
+    /// Drains the stream to `needle`, acknowledging every frame as a browser
+    /// would. Without the acknowledgements the pty stays paused and this hangs,
+    /// which is what makes it a test of flow control rather than of throughput.
+    /// Returns how many times the server had to resynchronize the stream.
+    async fn drain_with_acknowledgements(socket: &mut BrokerWebSocket, needle: &str) -> usize {
+        let mut output = String::new();
+        let mut resyncs = 0;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while let Some(message) = socket.next().await {
+                match message.unwrap() {
+                    TungsteniteMessage::Text(text) => {
+                        let value = serde_json::from_str::<serde_json::Value>(&text).unwrap();
+                        if value["type"] == "sync" {
+                            resyncs += 1;
+                        }
+                    }
+                    TungsteniteMessage::Binary(bytes) => {
+                        let payload = &bytes[9..];
+                        output.push_str(&String::from_utf8_lossy(payload));
+                        if output.contains(needle) {
+                            return;
+                        }
+                        let keep = output.len().saturating_sub(needle.len() * 4 + 4096);
+                        if keep > 0 && output.is_char_boundary(keep) {
+                            output.drain(..keep);
+                        }
+                        socket
+                            .send(TungsteniteMessage::Text(
+                                serde_json::json!({ "type": "ack", "bytes": payload.len() })
+                                    .to_string()
+                                    .into(),
+                            ))
+                            .await
+                            .unwrap();
+                    }
+                    TungsteniteMessage::Close(_) => panic!("terminal socket closed while draining"),
+                    _ => {}
+                }
+            }
+            panic!("terminal socket ended before {needle}");
+        })
+        .await
+        .expect("acknowledged drain timeout");
+        resyncs
+    }
+
+    #[tokio::test]
+    async fn unacknowledged_output_pauses_the_pty_until_the_browser_catches_up() {
+        let (_directory, server, client) = start_test_broker(1024 * 1024).await;
+        let terminal = client
+            .create(CreateTerminal {
+                path: Some("flow-test".to_owned()),
+                cwd: Some(PathBuf::from("/tmp")),
+                shell: Some("/bin/sh".to_owned()),
+                clone_from: None,
+            })
+            .await
+            .unwrap();
+        let mut socket = client
+            .terminal_socket(
+                terminal.id,
+                Some(TerminalViewport::new(80, 24, 800, 480)),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        // A browser stays silent until the server advertises flow control, so a
+        // server that supports it has to say so. Terminals keep the broker
+        // generation that created them, and an older broker rejects any message
+        // it does not recognize with an error the pane shows the user.
+        let ready = wait_for_control(&mut socket, "ready").await;
+        assert_eq!(ready["flowControl"], true);
+        wait_for_control(&mut socket, "size").await;
+        wait_for_control(&mut socket, "sync").await;
+        wait_for_control(&mut socket, "synced").await;
+
+        // Ask for far more output than the flow-control window and acknowledge
+        // none of it. The pty read loop should stop draining the master, which
+        // blocks the writing process instead of burying the browser.
+        let total = 4_000_000;
+        let command = format!("yes flow-control | head -c {total}; printf '\\nFLOW-%s\\n' DONE\n");
+        socket
+            .send(TungsteniteMessage::Text(
+                serde_json::json!({ "type": "input", "data": command })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+        // Must finish inside the stall timeout, or the server would rightly
+        // decide this client is gone rather than slow and resume without it.
+        let delivered = read_payload_until_quiet(&mut socket, Duration::from_millis(400)).await;
+        assert!(
+            delivered > 0,
+            "the first window is delivered before pausing"
+        );
+        assert!(
+            delivered < total / 2,
+            "an unacknowledging client received {delivered} of {total} bytes; \
+             the pty was never paused"
+        );
+
+        // Acknowledging what arrived releases the pty and the rest follows.
+        socket
+            .send(TungsteniteMessage::Text(
+                serde_json::json!({ "type": "ack", "bytes": delivered })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        drain_with_acknowledgements(&mut socket, "FLOW-DONE").await;
+
+        client.remove(terminal.id).await.unwrap();
+        client.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("broker shutdown timeout")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn observer_sockets_never_pause_the_pty() {
+        let (_directory, server, client) = start_test_broker(1024 * 1024).await;
+        let terminal = client
+            .create(CreateTerminal {
+                path: Some("observer-flow".to_owned()),
+                cwd: Some(PathBuf::from("/tmp")),
+                shell: Some("/bin/sh".to_owned()),
+                clone_from: None,
+            })
+            .await
+            .unwrap();
+        let mut controller = client
+            .terminal_socket(
+                terminal.id,
+                Some(TerminalViewport::new(80, 24, 800, 480)),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        wait_for_control(&mut controller, "size").await;
+        wait_for_control(&mut controller, "sync").await;
+        wait_for_control(&mut controller, "synced").await;
+        // An observer that never reads a byte. A preview pane must not be able
+        // to hold back the terminal it is previewing.
+        let _observer = client
+            .terminal_socket(terminal.id, None, None, true)
+            .await
+            .unwrap();
+
+        let total = 400_000;
+        let command = format!("yes observer-flow | head -c {total}; printf '\\nOBS-%s\\n' DONE\n");
+        controller
+            .send(TungsteniteMessage::Text(
+                serde_json::json!({ "type": "input", "data": command })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+        drain_with_acknowledgements(&mut controller, "OBS-DONE").await;
+
         client.remove(terminal.id).await.unwrap();
         client.shutdown().await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), server)

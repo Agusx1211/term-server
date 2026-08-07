@@ -12,6 +12,32 @@ const MAX_RENDER_BACKLOG_FRAMES = 8_192;
 const MIN_AGED_RENDER_BACKLOG_BYTES = 4 * 1024 * 1024;
 const RENDER_BACKLOG_COMPACT_FRAMES = 256;
 
+// Acknowledgements are batched rather than sent per frame, so a burst costs a
+// handful of small messages instead of one per chunk. The batch size matches the
+// server's low watermark: the unsent remainder is therefore always smaller than
+// the amount that would keep the terminal paused, so a stream that goes quiet
+// mid-batch still leaves the pty running.
+export const TERMINAL_ACK_BYTES = 5_000;
+
+/// Batches parsed-byte counts into acknowledgements for the server.
+export class TerminalOutputAck {
+  private pending = 0;
+
+  /**
+   * Records bytes the parser has consumed and returns the batch to acknowledge
+   * once one is due. The remainder is carried, never dropped, so the server's
+   * view of what this browser owes cannot drift upwards over a long session.
+   */
+  parsed(bytes: number): number | undefined {
+    if (!Number.isFinite(bytes) || bytes <= 0) return undefined;
+    this.pending += bytes;
+    if (this.pending < TERMINAL_ACK_BYTES) return undefined;
+    const batch = this.pending;
+    this.pending = 0;
+    return batch;
+  }
+}
+
 export interface TerminalFrame {
   kind: number;
   sequence: number;

@@ -125,6 +125,16 @@ impl TerminalOutputState {
         self.terminal.alternate_screen()
     }
 
+    /// The rendered live screen, rows joined by `\n`, for agent detection.
+    ///
+    /// This is the canonical server-side screen, so it always reflects the
+    /// bottom of the buffer no matter where a browser has scrolled. Full-screen
+    /// agents draw their prompt and approval UI on the alternate screen, which
+    /// is what `screen()` reports while one is active.
+    pub fn detection_text(&self) -> String {
+        self.terminal.screen_text()
+    }
+
     pub fn mark_exited(&mut self, exit_code: u32) {
         self.exit_code = Some(exit_code);
     }
@@ -423,6 +433,19 @@ impl CanonicalTerminal {
 
     fn alternate_screen(&self) -> bool {
         self.parser.screen().alternate_screen()
+    }
+
+    fn screen_text(&self) -> String {
+        let screen = self.parser.screen();
+        let (_, cols) = screen.size();
+        let mut text = String::new();
+        for (index, row) in screen.rows(0, cols).enumerate() {
+            if index > 0 {
+                text.push('\n');
+            }
+            text.push_str(&row);
+        }
+        text
     }
 
     fn snapshot(&self) -> Vec<u8> {
@@ -1790,6 +1813,40 @@ mod tests {
                 Bytes::from_static(b"\x1b[6;20;10t"),
                 Bytes::from_static(b"\x1b[8;24;80t"),
             ]
+        );
+    }
+
+    #[test]
+    fn detection_text_renders_the_live_screen_with_leading_indentation() {
+        let mut state = TerminalOutputState::new(1024 * 1024, 4, 40);
+        state.publish(Bytes::from_static(
+            b"Do you want to proceed?\r\n  \xe2\x9d\xaf 1. Yes\r\n    2. No",
+        ));
+
+        let text = state.detection_text();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "Do you want to proceed?");
+        // Regions such as `bottom_non_empty_lines` depend on the indentation
+        // surviving, and trailing blanks being trimmed.
+        assert_eq!(lines[1], "  ❯ 1. Yes");
+        assert_eq!(lines[2], "    2. No");
+        // The unused fourth row contributes an empty trailing line.
+        assert_eq!(lines.len(), 3);
+        assert!(text.ends_with('\n'), "{text:?}");
+    }
+
+    #[test]
+    fn detection_text_follows_a_full_screen_agent_onto_the_alternate_screen() {
+        let mut state = TerminalOutputState::new(1024 * 1024, 3, 40);
+        state.publish(Bytes::from_static(b"shell scrollback\r\n"));
+        state.publish(Bytes::from_static(b"\x1b[?1049h\x1b[H\x1b[Jallow command?"));
+
+        assert!(state.alternate_screen());
+        let text = state.detection_text();
+        assert!(text.contains("allow command?"), "{text:?}");
+        assert!(
+            !text.contains("shell scrollback"),
+            "the alternate screen replaces the shell view: {text:?}"
         );
     }
 

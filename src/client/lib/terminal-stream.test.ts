@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  TERMINAL_ACK_BYTES,
   TERMINAL_FRAME_OUTPUT,
   TERMINAL_FRAME_SNAPSHOT,
+  TerminalOutputAck,
   TerminalRenderBacklog,
   TerminalStreamState,
   decodeTerminalFrame,
@@ -151,5 +153,48 @@ describe("terminal renderer backlog", () => {
     backlog.settle(64 * 1024);
     expect(backlog.pendingBytes).toBe(0);
     expect(backlog.enqueue(64 * 1024, 10_000)).toBe(false);
+  });
+});
+
+describe("terminal output acknowledgements", () => {
+  it("batches parsed bytes instead of acknowledging every frame", () => {
+    const ack = new TerminalOutputAck();
+
+    expect(ack.parsed(TERMINAL_ACK_BYTES - 1)).toBeUndefined();
+    expect(ack.parsed(1)).toBe(TERMINAL_ACK_BYTES);
+  });
+
+  it("carries the remainder so the server's window cannot drift", () => {
+    const ack = new TerminalOutputAck();
+    const chunk = 3_000;
+    let acknowledged = 0;
+    let parsed = 0;
+
+    for (let index = 0; index < 100; index += 1) {
+      parsed += chunk;
+      acknowledged += ack.parsed(chunk) ?? 0;
+    }
+
+    // Anything dropped rather than carried would accumulate as bytes the server
+    // believes this browser still owes, and would eventually pause it forever.
+    expect(parsed - acknowledged).toBeLessThan(TERMINAL_ACK_BYTES);
+  });
+
+  it("leaves a remainder smaller than the amount that keeps a terminal paused", () => {
+    const ack = new TerminalOutputAck();
+
+    // The server resumes below TERMINAL_ACK_BYTES owed, so a stream that stops
+    // mid-batch must never strand more than that unacknowledged.
+    expect(ack.parsed(TERMINAL_ACK_BYTES * 4 - 1)).toBe(TERMINAL_ACK_BYTES * 4 - 1);
+    expect(ack.parsed(TERMINAL_ACK_BYTES - 1)).toBeUndefined();
+  });
+
+  it("ignores empty and invalid counts", () => {
+    const ack = new TerminalOutputAck();
+
+    expect(ack.parsed(0)).toBeUndefined();
+    expect(ack.parsed(-5)).toBeUndefined();
+    expect(ack.parsed(Number.NaN)).toBeUndefined();
+    expect(ack.parsed(TERMINAL_ACK_BYTES)).toBe(TERMINAL_ACK_BYTES);
   });
 });

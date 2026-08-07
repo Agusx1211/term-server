@@ -1,6 +1,8 @@
 export type TerminalSocketCloseCause = "backlog" | "protocol-error" | "timeout";
 
-export const TERMINAL_STREAM_PROTOCOL = 2;
+// 3 added output acknowledgements. The server refuses older protocols outright
+// rather than attach a browser that will never acknowledge what it is sent.
+export const TERMINAL_STREAM_PROTOCOL = 3;
 
 export function addTerminalStreamProtocol(url: URL): URL {
   url.searchParams.set("stream", String(TERMINAL_STREAM_PROTOCOL));

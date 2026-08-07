@@ -54,7 +54,7 @@ On first boot, open `https://127.0.0.1:8090`. term-server prints a random passwo
 - **Files when needed:** searchable explorer, local image and PDF previews, direct downloads, and a lazy-loaded CodeMirror editor with syntax highlighting, atomic saves, and stale-file conflict detection.
 - **Agent-connected artifacts:** multiline handoffs stay attached to the terminal and agent that created them, with inline text, image, and PDF previews plus an optional full editor.
 - **Process visibility and control:** a lightweight Linux `/proc` sampler shows the complete live descendant process tree, foreground job, CPU and memory usage, and lets you send SIGTERM to a selected process. Command lines are secret-aware and redacted; input, output, and exited processes are not retained.
-- **Agent awareness:** Codex, Claude, and Pi sessions show working, idle, and closed states. An unseen return to idle gets a distinct bell until you focus that terminal. Completion alerts can appear in-app, as desktop notifications, in both places, or remain off. In-app cards inherit their terminal color and can be placed in any corner with a configurable dismissal time.
+- **Agent awareness:** Codex, Claude, Pi, and OMP sessions show working, blocked, idle, and closed states. An agent waiting on an approval or a question is marked **Needs you** for as long as it waits, so a stalled agent is visible without opening it. An unseen return to idle gets a distinct bell until you focus that terminal. Alerts can appear in-app, as desktop notifications, in both places, or remain off. In-app cards inherit their terminal color and can be placed in any corner with a configurable dismissal time.
 - **Secure defaults:** loopback binding, HTTPS, Argon2 password hashing, signed HTTP-only SameSite cookies, origin enforcement, CSP, HSTS, login throttling, and bounded memory use.
 - **Deployment choices:** one native executable plus static browser assets, with Docker Compose and a systemd user service included.
 
@@ -137,12 +137,41 @@ ln -s "$PWD/skills/term-server-artifacts" \
 
 ### Live agent activity
 
-Term-server continues to infer Codex, Claude Code, and Pi state from their process trees, terminal
-signals, output, and CPU activity. **Settings → Live agent activity** can additionally install a
-small provider-native plugin or extension for more immediate lifecycle updates such as thinking,
-running a command, waiting for approval, and compacting context. These updates appear in the
-existing terminal subtitle; working, idle, ready, closed, and completion notifications keep using
-the existing state machine.
+Term-server continues to infer Codex, Claude Code, Pi, and OMP state from their process trees,
+terminal signals, output, and CPU activity. **Settings → Live agent activity** can additionally
+install a small provider-native plugin or extension for more immediate lifecycle updates such as
+thinking, running a command, waiting for approval, and compacting context. These updates appear in
+the existing terminal subtitle; working, blocked, idle, ready, closed, and completion notifications
+keep using the existing state machine.
+
+### Blocked agents and screen detection
+
+An agent waiting on a person is its own state. A permission prompt, a question, or a menu leaves the
+agent **Needs you** until it is answered, separately from **Working** and **Idle**, and it stays
+marked that way rather than being dismissed when you look at the terminal.
+
+Three signals produce it. An installed integration reports an approval request directly. Codex's
+`Action Required` window title reports it. And for agents whose hooks do not cover the whole
+lifecycle, term-server matches the visible approval UI on the live screen against a per-agent
+manifest of rules.
+
+Those manifests are TOML rule sets scoped to structural regions of the screen — the prompt box, the
+text below the last horizontal rule, the window title — rather than the whole screen, so transcript
+text left over from an answered prompt cannot keep a terminal marked as waiting. Rules are
+priority-ordered, a rule that recognizes an overlay such as a transcript viewer holds the last known
+state instead of guessing, and an agent that matches nothing keeps its heuristic state rather than
+being reported as blocked.
+
+Manifests ship inside the binary. To change detection for one agent without waiting for a release,
+drop a replacement at `~/.config/term-server/agent-detection/<agent>.toml`
+(or under `$XDG_CONFIG_HOME`); an unreadable or invalid file is ignored with a warning and the
+bundled rules stay in use. `GET /api/terminals/{id}/agent/explain` reports the screen the rules ran
+against, which rule won, and how every rule evaluated, which is the fastest way to diagnose a
+terminal showing the wrong state or to write an override.
+
+The manifest format and the bundled Claude Code, Codex, and Pi rule sets come from
+[herdr](https://github.com/herdrdev/herdr) and are used under the Apache License 2.0; see
+[`NOTICE`](NOTICE).
 
 Ordinary foreground commands that keep running for at least five seconds also appear in terminal
 rows and headers with an elapsed time. When they finish, they use the same unread badge and
@@ -283,11 +312,15 @@ The signing private key lives only in the `RELEASE_SIGNING_KEY` GitHub Actions s
 
 Each terminal owns a native PTY, a bounded VT state model, a short sequenced output ring, and a Tokio broadcast channel. Dedicated blocking-reader threads keep PTY I/O away from the async Axum runtime. The web process maintains a terminal-to-broker map across compatible generations and proxies each renderer to the owning socket. A newly mounted renderer receives a compact canonical snapshot of the current screen, scrollback, modes, cursor, and alternate-screen state. An existing renderer resumes from its last parser-committed byte. If a subscriber falls behind, the same WebSocket is resynchronized from the ring or a fresh snapshot instead of being disconnected.
 
+Output is flow-controlled the way VS Code's terminal is. A browser acknowledges bytes only after xterm.js has parsed them, and while a terminal has produced more unacknowledged output than the high watermark, its reader thread stops draining the PTY, so the writing process blocks rather than the browser falling behind. A full-screen TUI repaint is paced by the renderer instead of overrunning it.
+
+The window is counted per terminal rather than per browser, which is VS Code's design and its tradeoff. When several browsers watch one terminal they acknowledge the same bytes, so the counter drains faster than it fills and the quickest browser decides when output resumes; a slower one still falls behind and recovers through the snapshot path, but no browser can throttle a terminal for the others. Preview panes attach as observers and are outside flow control entirely. A terminal with no browser attached is never paused, because output nobody will ever acknowledge must not block an agent working unattended.
+
 On Linux, one sampler reads `/proc` for all terminals every 1.5 seconds. It follows parent PID relationships across the complete process table, tracks the PTY foreground process group and per-process CPU and resident memory, and recognizes supported agent process trees without parsing or delaying terminal bytes. Process termination revalidates the terminal ancestry and process start time before sending SIGTERM. Other operating systems retain normal terminal behavior but do not expose process and agent metadata.
 
 Foreground command status combines that process-group identity with the canonical VT alternate-screen state. Short commands are ignored, pipelines remain one activity even when their leader exits, and any process group that enters the alternate screen remains classified as an interactive TUI until the whole group leaves the foreground.
 
-The browser delegates terminal parsing and rendering to xterm.js. It commits resume positions only after xterm.js has parsed the corresponding bytes and suppresses terminal-generated replies while applying snapshots, so historical device queries cannot leak back into a live PTY. One designated browser responds to live device queries when several clients are attached. Recently viewed renderers remain mounted in a bounded cache so switching panes preserves the screen and scroll position without keeping every historical renderer alive.
+The browser delegates terminal parsing and rendering to xterm.js. It commits resume positions and acknowledges output only after xterm.js has parsed the corresponding bytes, and suppresses terminal-generated replies while applying snapshots, so historical device queries cannot leak back into a live PTY. One designated browser responds to live device queries when several clients are attached. Recently viewed renderers remain mounted in a bounded cache so switching panes preserves the screen and scroll position without keeping every historical renderer alive.
 
 ## Security and privacy
 

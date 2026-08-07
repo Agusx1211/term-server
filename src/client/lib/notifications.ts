@@ -29,9 +29,27 @@ export function includesSystemNotifications(mode: NotificationMode): boolean {
   return mode === "system" || mode === "both";
 }
 
-export function agentCompletionEvent(agent: AgentInfo | null): number | null {
-  if (!agent || agent.status === "working") return null;
-  return agent.completedAt;
+export type AgentNotificationKind = "blocked" | "completion";
+
+export interface AgentNotificationEvent {
+  kind: AgentNotificationKind;
+  /** Identifies this occurrence, so the same one is announced once. */
+  event: number;
+}
+
+/**
+ * The next thing worth telling someone about for this agent, if anything.
+ *
+ * A block is announced as soon as it appears and is keyed on the transition
+ * itself, because nothing else will happen until a person answers. A
+ * completion is keyed on `completedAt` as before.
+ */
+export function agentNotificationEvent(agent: AgentInfo | null): AgentNotificationEvent | null {
+  if (!agent) return null;
+  if (agent.status === "blocked") return { kind: "blocked", event: agent.statusChangedAt };
+  if (agent.status === "working") return null;
+  if (agent.completedAt == null) return null;
+  return { kind: "completion", event: agent.completedAt };
 }
 
 export function parseNotificationPosition(stored: string | null): NotificationPosition {

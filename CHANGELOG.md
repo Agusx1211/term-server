@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.10.0 - 2026-08-07
+
+### Added
+
+- Terminal output is now flow-controlled, following VS Code's terminal design. A browser
+  acknowledges bytes once xterm.js has parsed them, and while a terminal has produced more
+  unacknowledged output than the high watermark the server stops draining its PTY, so the program
+  writing to it blocks instead. Previously nothing slowed the producer: a browser that fell behind
+  could only give up, drop its socket, and redraw the whole screen from a fresh snapshot, which a
+  busy agent TUI could trigger many times a second.
+
+  As in VS Code the window is counted per terminal, not per browser. With several browsers on one
+  terminal the quickest one decides when output resumes, so no browser can throttle a terminal for
+  the others; a slower browser still recovers through the existing snapshot path. Preview panes
+  attach as observers and are outside flow control, and a terminal nobody is watching is never
+  paused, so unattended agents keep running.
+
+  The terminal stream protocol is now version 3. Browsers left open from an older release are asked
+  to reload rather than attached, because they would never acknowledge what they were sent. A
+  terminal keeps the broker generation that created it, so terminals started before this release
+  keep running without flow control until they are closed and reopened; the browser detects that
+  and stays silent rather than sending acknowledgements an older broker would reject.
+
+- Agents now have a **blocked** state. An agent waiting on an approval, a question, or a menu is
+  marked **Needs you** in the sidebar and pane header for as long as it waits, distinct from working
+  and idle. Previously a permission prompt left the agent looking busy, with no bell, no sidebar
+  signal, and no notification for the one state that actually needs a person. Unlike a completion, a
+  block is not dismissed by looking at the terminal, because the agent is still waiting no matter who
+  looked.
+- Blocked agents raise the same alerts as completions — in-app cards, desktop notifications, and
+  Pushover — announced immediately rather than waiting for a Pi summary.
+- Screen-based agent detection. For agents whose integration hooks do not cover the whole lifecycle,
+  term-server now matches the visible agent UI on the live screen against a per-agent manifest of
+  priority-ordered rules scoped to structural screen regions (the prompt box, the text below the last
+  horizontal rule, the window title). Detection self-clears when the prompt does, which hooks alone
+  cannot do reliably.
+- Detection manifests can be replaced per agent at
+  `~/.config/term-server/agent-detection/<agent>.toml`, so detection can be corrected for a new agent
+  release without waiting for a term-server update. An invalid or oversized override is ignored with
+  a warning and the bundled rules stay in use.
+- `GET /api/terminals/{id}/agent/explain` reports the screen the detection rules ran against, the
+  retained OSC title and progress, which rule decided the status, and how every rule evaluated.
+
+### Changed
+
+- Codex's `Action Required` window title is now read as blocked. It was previously treated as idle.
+- The sidebar and pane header agent badges share one presentation helper instead of duplicating the
+  label and icon logic.
+
+### Credits
+
+- The detection manifest format and the bundled Claude Code, Codex, and Pi rule sets are ported from
+  [herdr](https://github.com/herdrdev/herdr) under the Apache License 2.0. See `NOTICE`. The
+  detection engine is an independent implementation.
+
 ## 0.9.0 - 2026-08-07
 
 ### Fixed

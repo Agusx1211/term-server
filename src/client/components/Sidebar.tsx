@@ -15,6 +15,7 @@ import {
   Folder,
   FolderSearch,
   FolderOpen,
+  Hand,
   LoaderCircle,
   PackageOpen,
   Pencil,
@@ -37,6 +38,7 @@ import type {
 } from "../../shared/types";
 import { pushoverBellEnabled, setPushoverBell } from "../lib/pushover";
 import { agentSubtitle } from "../lib/agent-activity";
+import { agentStatusPresentation, type AgentStatusTone } from "../lib/agent-status";
 import { commandSubtitle } from "../lib/command-status";
 import { configureTerminalDrag } from "../lib/layout";
 import {
@@ -600,29 +602,25 @@ export function Sidebar({
   );
 }
 
+const AGENT_STATUS_ICONS: Record<AgentStatusTone, typeof Activity> = {
+  blocked: Hand,
+  attention: Bell,
+  working: Activity,
+  idle: CirclePause,
+  closed: CircleX,
+};
+
 function AgentState({ agent, needsAttention }: { agent: AgentInfo; needsAttention: boolean }) {
-  const label = needsAttention
-    ? "Ready"
-    : agent.status === "working"
-      ? "Working"
-      : agent.status === "idle"
-        ? "Idle"
-        : "Closed";
-  const Icon = needsAttention
-    ? Bell
-    : agent.status === "working"
-      ? Activity
-      : agent.status === "idle"
-        ? CirclePause
-        : CircleX;
+  const { tone, label, description } = agentStatusPresentation(agent, needsAttention);
+  const Icon = AGENT_STATUS_ICONS[tone];
   return (
     <span
-      class={`activity-status-badge ${needsAttention ? "attention" : agent.status}`}
-      title={agent.summary ?? `${agent.kind} is ${label.toLocaleLowerCase()}`}
-      aria-label={agent.status === "working" ? undefined : `${agent.kind} is ${label.toLocaleLowerCase()}`}
+      class={`activity-status-badge ${tone}`}
+      title={agent.summary ?? description}
+      aria-label={tone === "working" ? undefined : description}
     >
       <Icon size={12} strokeWidth={2.2} aria-hidden="true" />
-      {agent.status === "working" ? <WorkingDuration since={agent.statusChangedAt} /> : <span class="activity-status-label">{label}</span>}
+      {tone === "working" ? <WorkingDuration since={agent.statusChangedAt} /> : <span class="activity-status-label">{label}</span>}
     </span>
   );
 }
