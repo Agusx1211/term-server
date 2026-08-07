@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.10.0 - 2026-08-07
 
 ### Added
 
@@ -18,7 +18,10 @@
   paused, so unattended agents keep running.
 
   The terminal stream protocol is now version 3. Browsers left open from an older release are asked
-  to reload rather than attached, because they would never acknowledge what they were sent.
+  to reload rather than attached, because they would never acknowledge what they were sent. A
+  terminal keeps the broker generation that created it, so terminals started before this release
+  keep running without flow control until they are closed and reopened; the browser detects that
+  and stays silent rather than sending acknowledgements an older broker would reject.
 
 - Agents now have a **blocked** state. An agent waiting on an approval, a question, or a menu is
   marked **Needs you** in the sidebar and pane header for as long as it waits, distinct from working
