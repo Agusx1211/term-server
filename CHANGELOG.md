@@ -4,6 +4,22 @@
 
 ### Added
 
+- Terminal output is now flow-controlled, following VS Code's terminal design. A browser
+  acknowledges bytes once xterm.js has parsed them, and while a terminal has produced more
+  unacknowledged output than the high watermark the server stops draining its PTY, so the program
+  writing to it blocks instead. Previously nothing slowed the producer: a browser that fell behind
+  could only give up, drop its socket, and redraw the whole screen from a fresh snapshot, which a
+  busy agent TUI could trigger many times a second.
+
+  As in VS Code the window is counted per terminal, not per browser. With several browsers on one
+  terminal the quickest one decides when output resumes, so no browser can throttle a terminal for
+  the others; a slower browser still recovers through the existing snapshot path. Preview panes
+  attach as observers and are outside flow control, and a terminal nobody is watching is never
+  paused, so unattended agents keep running.
+
+  The terminal stream protocol is now version 3. Browsers left open from an older release are asked
+  to reload rather than attached, because they would never acknowledge what they were sent.
+
 - Agents now have a **blocked** state. An agent waiting on an approval, a question, or a menu is
   marked **Needs you** in the sidebar and pane header for as long as it waits, distinct from working
   and idle. Previously a permission prompt left the agent looking busy, with no bell, no sidebar

@@ -1579,7 +1579,7 @@ mod tests {
 
     #[test]
     fn terminal_socket_rejects_outdated_stream_clients() {
-        for protocol in [None, Some(0), Some(1), Some(3)] {
+        for protocol in [None, Some(0), Some(1), Some(2), Some(4)] {
             let error = require_terminal_stream_protocol(protocol).unwrap_err();
             assert_eq!(
                 error.to_string(),

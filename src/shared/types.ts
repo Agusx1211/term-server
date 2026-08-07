@@ -318,10 +318,17 @@ export type ClientTerminalMessage =
       pixelHeight: number;
     }
   | { type: "focus"; focused: boolean }
+  // Bytes this browser's parser has consumed since the last acknowledgement.
+  // The server stops draining the pty while a browser owes too many.
+  | { type: "ack"; bytes: number }
   | { type: "ping" };
 
 export type ServerTerminalMessage =
-  | { type: "ready"; terminal: TerminalInfo }
+  // `flowControl` is absent on brokers older than 0.10.0. A terminal keeps the
+  // broker generation that created it, so a current browser regularly talks to
+  // one of those; it must stay silent about acknowledgements until told
+  // otherwise, because an older broker answers unknown messages with an error.
+  | { type: "ready"; terminal: TerminalInfo; flowControl?: boolean }
   | { type: "exit"; exitCode: number }
   | {
       type: "size";

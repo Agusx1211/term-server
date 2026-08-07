@@ -7,7 +7,7 @@ use std::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     thread,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::Bytes;
@@ -63,6 +63,21 @@ const TERMINAL_RESPONSE_QUEUE_MESSAGES: usize = 256;
 /// queued output before sending, so this only has to cover what accumulates
 /// behind one in-flight write rather than a whole slow client.
 const TERMINAL_EVENT_CAPACITY: usize = 1024;
+/// Unacknowledged output bytes before the pty read loop stops draining the
+/// master. The master's buffer then fills and the process writing to it blocks,
+/// which is the only backpressure that reaches a TUI. Matches VS Code's
+/// `FlowControlConstants.HighWatermarkChars`.
+const FLOW_CONTROL_HIGH_WATERMARK_BYTES: u64 = 100_000;
+/// Unacknowledged bytes output has to fall back under before the pty resumes.
+/// The gap from the high watermark is hysteresis: resuming at the same point
+/// would re-pause on the next chunk and shred a burst into single reads.
+/// Matches VS Code's `FlowControlConstants.LowWatermarkChars`.
+const FLOW_CONTROL_LOW_WATERMARK_BYTES: u64 = 5_000;
+/// Liveness backstop for a parked read loop. Every transition that can resume
+/// the pty notifies the condvar, so this only ever re-checks a predicate that is
+/// already false. It exists because a missed notification would wedge an agent
+/// silently, which is far worse than one predicate check every few seconds.
+const FLOW_CONTROL_WAIT_BACKSTOP: Duration = Duration::from_secs(5);
 const DEFAULT_VIEWPORT_SIZE: TerminalViewport = TerminalViewport {
     cols: 100,
     rows: 30,
@@ -1244,6 +1259,82 @@ fn run_terminal_input_writer<W: Write>(
     Ok(())
 }
 
+#[derive(Debug, Default)]
+struct FlowControlState {
+    /// Output bytes published but not yet acknowledged by a browser. One counter
+    /// for the whole pty, exactly as VS Code keeps one `_unacknowledgedCharCount`
+    /// per `TerminalProcess` rather than one per attached client.
+    unacknowledged: u64,
+    /// Latches at the high watermark and only clears under the low one. Without
+    /// the latch a terminal sitting at the watermark would pause and resume on
+    /// every chunk.
+    paused: bool,
+    /// Browsers whose acknowledgements the counter is waiting on. Observer
+    /// connections are excluded, and at zero the pty is never paused: agents
+    /// here routinely run with nobody watching, and output that no one will ever
+    /// acknowledge must not block them.
+    clients: usize,
+    /// Set once the pty has exited so a blocked read loop can never be stranded.
+    released: bool,
+}
+
+impl FlowControlState {
+    fn blocked(&self) -> bool {
+        self.paused && self.clients > 0 && !self.released
+    }
+
+    fn published(&mut self, bytes: u64) {
+        if self.clients == 0 {
+            return;
+        }
+        self.unacknowledged = self.unacknowledged.saturating_add(bytes);
+        if !self.paused && self.unacknowledged > FLOW_CONTROL_HIGH_WATERMARK_BYTES {
+            self.paused = true;
+        }
+    }
+
+    /// Returns true when this acknowledgement resumed the pty.
+    fn acknowledged(&mut self, bytes: u64) -> bool {
+        // Saturating, like VS Code's `Math.max(count - charCount, 0)`: with
+        // several browsers attached the same bytes are acknowledged more than
+        // once, and the counter is expected to heal rather than go negative.
+        self.unacknowledged = self.unacknowledged.saturating_sub(bytes);
+        if self.paused && self.unacknowledged < FLOW_CONTROL_LOW_WATERMARK_BYTES {
+            self.paused = false;
+            return true;
+        }
+        false
+    }
+
+    /// Drops the outstanding debt and resumes, mirroring VS Code's
+    /// `clearUnacknowledgedChars`. Used whenever the set of browsers changes:
+    /// what an arriving or departing client owes cannot be reconciled with a
+    /// counter that does not track clients individually.
+    fn clear(&mut self) {
+        self.unacknowledged = 0;
+        self.paused = false;
+    }
+}
+
+/// VS Code's terminal flow control.
+///
+/// A browser acknowledges output once its parser has consumed it. While the pty
+/// has produced more than the high watermark of unacknowledged output the read
+/// loop stops draining the master, so the writing process blocks instead of the
+/// browser falling behind.
+///
+/// The counter is per pty, not per browser, which is VS Code's design and its
+/// tradeoff: when several browsers watch one terminal they acknowledge the same
+/// bytes, the counter drains faster than it fills, and the quickest browser
+/// effectively decides when output resumes. A browser slower than that still
+/// falls behind and recovers through the existing snapshot path — no browser can
+/// throttle the terminal for the others.
+#[derive(Debug, Default)]
+struct FlowControl {
+    state: Mutex<FlowControlState>,
+    resumed: Condvar,
+}
+
 pub struct TerminalSession {
     info: RwLock<TerminalInfo>,
     master: Mutex<Box<dyn MasterPty + Send>>,
@@ -1256,6 +1347,7 @@ pub struct TerminalSession {
     activity: Mutex<SessionActivity>,
     signals: Mutex<TerminalSignals>,
     process_tracker: Mutex<ProcessTracker>,
+    flow: FlowControl,
     home_directory: PathBuf,
 }
 
@@ -1358,6 +1450,60 @@ impl TerminalSession {
         }
         self.input
             .enqueue(data, || self.observe_accepted_input(data))
+    }
+
+    /// Enrols a browser in flow control. Observer connections stay out, so a
+    /// preview pane can never pause the pty for the panes that are being read.
+    ///
+    /// Attaching clears the outstanding debt, mirroring the
+    /// `clearUnacknowledgedChars` VS Code performs when a client attaches and
+    /// replays: the arriving browser cannot acknowledge output sent before it
+    /// existed, so carrying that debt would pause the pty against nobody.
+    pub fn flow_attach(&self) {
+        let mut state = self.flow.state.lock();
+        state.clients += 1;
+        state.clear();
+        drop(state);
+        self.flow.resumed.notify_all();
+    }
+
+    pub fn flow_detach(&self) {
+        let mut state = self.flow.state.lock();
+        state.clients = state.clients.saturating_sub(1);
+        // What the departing browser owed can no longer be acknowledged, and at
+        // zero clients nothing ever will be. Either way the debt is stale.
+        state.clear();
+        drop(state);
+        self.flow.resumed.notify_all();
+    }
+
+    pub fn flow_acknowledged(&self, bytes: u64) {
+        let mut state = self.flow.state.lock();
+        if state.acknowledged(bytes) {
+            drop(state);
+            self.flow.resumed.notify_all();
+        }
+    }
+
+    /// Blocks the pty read loop while output stands unacknowledged above the
+    /// high watermark, so the master's buffer fills and the writing process
+    /// blocks. This is the only backpressure that reaches a TUI.
+    fn flow_wait_until_resumed(&self) {
+        let mut state = self.flow.state.lock();
+        while state.blocked() {
+            self.flow
+                .resumed
+                .wait_for(&mut state, FLOW_CONTROL_WAIT_BACKSTOP);
+        }
+    }
+
+    /// Permanently opens the gate. A parked read loop must not outlive the
+    /// process it is reading from.
+    fn flow_release(&self) {
+        let mut state = self.flow.state.lock();
+        state.released = true;
+        drop(state);
+        self.flow.resumed.notify_all();
     }
 
     fn observe_accepted_input(&self, data: &[u8]) {
@@ -1467,6 +1613,9 @@ impl TerminalSession {
     }
 
     pub fn kill(&self) {
+        // Open the gate first: a parked read loop would otherwise wait on
+        // acknowledgements for a pty that is about to close.
+        self.flow_release();
         if self.info.read().status == TerminalStatus::Running {
             let _ = self.killer.lock().kill();
         }
@@ -1477,6 +1626,11 @@ impl TerminalSession {
         self.signals.lock().observe(&bytes, now);
         self.output_bytes
             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        // Counted once here, where the bytes leave the pty, rather than once per
+        // browser they are fanned out to. This is VS Code's accounting: the debt
+        // belongs to the terminal, and any browser's acknowledgement pays it
+        // down. The read loop checks the result before its next read.
+        self.flow.state.lock().published(bytes.len() as u64);
         // Keep the canonical mutation and its event ordered against resize,
         // which publishes Size while holding this same lock.
         let mut state = self.output.lock();
@@ -1492,6 +1646,7 @@ impl TerminalSession {
     }
 
     fn exited(&self, exit_code: u32) {
+        self.flow_release();
         {
             let mut info = self.info.write();
             info.status = TerminalStatus::Exited;
@@ -2235,6 +2390,7 @@ impl TerminalManager {
             }),
             signals: Mutex::new(TerminalSignals::default()),
             process_tracker: Mutex::new(ProcessTracker::default()),
+            flow: FlowControl::default(),
             home_directory: self.home_directory.clone(),
         });
         sessions.insert(id, session.clone());
@@ -2321,12 +2477,25 @@ pub(crate) fn terminate_descendant_process(
 }
 
 fn read_output(mut reader: Box<dyn Read + Send>, session: Arc<TerminalSession>) {
-    read_output_chunks(reader.as_mut(), |bytes| session.publish(bytes));
+    read_output_chunks(
+        reader.as_mut(),
+        || session.flow_wait_until_resumed(),
+        |bytes| session.publish(bytes),
+    );
 }
 
-fn read_output_chunks<R: Read + ?Sized>(reader: &mut R, mut publish: impl FnMut(Bytes)) {
+/// Drains the pty master. `before_read` gates each read on flow control: while
+/// it blocks, the master's buffer fills and the process writing to it blocks
+/// too, which is what stops a browser from ever being handed more output than
+/// it can parse.
+fn read_output_chunks<R: Read + ?Sized>(
+    reader: &mut R,
+    mut before_read: impl FnMut(),
+    mut publish: impl FnMut(Bytes),
+) {
     let mut buffer = vec![0_u8; 64 * 1024];
     loop {
+        before_read();
         match reader.read(&mut buffer) {
             Ok(0) => break,
             Ok(count) => publish(Bytes::copy_from_slice(&buffer[..count])),
@@ -3272,10 +3441,137 @@ mod tests {
         };
         let mut output = Vec::new();
 
-        read_output_chunks(&mut reader, |bytes| output.extend_from_slice(&bytes));
+        read_output_chunks(&mut reader, || {}, |bytes| output.extend_from_slice(&bytes));
 
         assert_eq!(output, b"first second");
         assert!(reader.steps.is_empty());
+    }
+
+    #[test]
+    fn terminal_output_reader_gates_every_read_on_flow_control() {
+        let mut reader = ScriptedReader {
+            steps: VecDeque::from([
+                ReadStep::Bytes(b"first "),
+                ReadStep::Bytes(b"second"),
+                ReadStep::Eof,
+            ]),
+        };
+        let mut gates = 0_usize;
+        let mut output = Vec::new();
+
+        read_output_chunks(
+            &mut reader,
+            || gates += 1,
+            |bytes| output.extend_from_slice(&bytes),
+        );
+
+        // Every read, including the one that reports end of file. Gating after
+        // the read instead would hand over a chunk the browser has no room for.
+        assert_eq!(gates, 3);
+        assert_eq!(output, b"first second");
+    }
+
+    fn attached_flow() -> FlowControlState {
+        FlowControlState {
+            clients: 1,
+            ..FlowControlState::default()
+        }
+    }
+
+    #[test]
+    fn flow_control_pauses_over_the_high_watermark() {
+        let mut state = attached_flow();
+
+        state.published(FLOW_CONTROL_HIGH_WATERMARK_BYTES);
+        assert!(!state.blocked(), "the watermark itself does not pause");
+
+        state.published(1);
+        assert!(state.blocked());
+    }
+
+    #[test]
+    fn flow_control_holds_until_the_low_watermark_and_not_merely_below_the_high_one() {
+        let mut state = attached_flow();
+        state.published(FLOW_CONTROL_HIGH_WATERMARK_BYTES + 1);
+
+        // Back under the high watermark but nowhere near drained: resuming here
+        // would re-pause on the very next chunk and shred the burst.
+        assert!(!state.acknowledged(1));
+        assert!(state.blocked());
+
+        let remaining = state.unacknowledged - FLOW_CONTROL_LOW_WATERMARK_BYTES;
+        assert!(!state.acknowledged(remaining));
+        assert!(state.blocked(), "the low watermark itself keeps the pause");
+
+        assert!(state.acknowledged(1), "resumed under the low watermark");
+        assert!(!state.blocked());
+    }
+
+    #[test]
+    fn flow_control_acknowledgements_cannot_drive_the_window_negative() {
+        let mut state = attached_flow();
+        state.published(1_000);
+
+        // Several browsers acknowledge the same bytes, so over-acknowledgement
+        // is routine rather than an error. VS Code clamps here for the same
+        // reason; the counter has to heal instead of wrapping.
+        state.acknowledged(50_000);
+
+        assert_eq!(state.unacknowledged, 0);
+    }
+
+    #[test]
+    fn flow_control_lets_the_quickest_browser_resume_the_terminal() {
+        let mut state = attached_flow();
+        state.clients = 2;
+        state.published(FLOW_CONTROL_HIGH_WATERMARK_BYTES + 1);
+        assert!(state.blocked());
+
+        // One counter for the pty means either browser's acknowledgements pay
+        // the debt down. A browser slower than that falls behind and recovers
+        // through the snapshot path rather than throttling the terminal.
+        assert!(state.acknowledged(FLOW_CONTROL_HIGH_WATERMARK_BYTES));
+        assert!(!state.blocked());
+    }
+
+    #[test]
+    fn flow_control_never_pauses_a_terminal_nobody_is_watching() {
+        let mut state = FlowControlState::default();
+
+        state.published(FLOW_CONTROL_HIGH_WATERMARK_BYTES * 10);
+
+        // Agents here run unattended for hours. Output that no browser will ever
+        // acknowledge must not be allowed to block the process producing it.
+        assert!(!state.blocked());
+        assert_eq!(state.unacknowledged, 0);
+    }
+
+    #[test]
+    fn flow_control_clears_the_window_when_the_set_of_browsers_changes() {
+        let mut state = attached_flow();
+        state.published(FLOW_CONTROL_HIGH_WATERMARK_BYTES + 1);
+        assert!(state.blocked());
+
+        // An arriving browser cannot acknowledge output sent before it existed,
+        // and a departing one takes its outstanding debt with it. Either way the
+        // counter is stale, which is what VS Code's clearUnacknowledgedChars is
+        // for. Leaving it would pause the pty against nobody.
+        state.clear();
+
+        assert!(!state.blocked());
+        assert_eq!(state.unacknowledged, 0);
+    }
+
+    #[test]
+    fn flow_control_release_opens_the_gate_for_a_parked_reader() {
+        let mut state = attached_flow();
+        state.published(FLOW_CONTROL_HIGH_WATERMARK_BYTES + 1);
+        assert!(state.blocked());
+
+        state.released = true;
+
+        // An exited or killed pty must never leave its read loop parked.
+        assert!(!state.blocked());
     }
 
     fn foreground(group: i32, name: &str) -> ForegroundObservation {
