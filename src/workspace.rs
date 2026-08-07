@@ -377,6 +377,10 @@ enum TerminalClientMessage {
     Focus {
         focused: bool,
     },
+    /// The pane is cached: still mounted and still streaming, but off screen.
+    /// It keeps the connection so that coming back costs nothing, and gives up
+    /// its say in the negotiated size until it reports a viewport again.
+    Release,
     /// Bytes this browser's parser has consumed since the last acknowledgement.
     Ack {
         bytes: u64,
@@ -396,6 +400,13 @@ enum TerminalServerMessage<'a> {
         /// not recognize with an error the pane surfaces to the user.
         #[serde(rename = "flowControl")]
         flow_control: bool,
+        /// Advertises that this server understands `release`, and therefore
+        /// that a pane may hold its connection open once it is cached. Carries
+        /// the same caveat as `flowControl`: an older broker would answer the
+        /// message with an error the pane surfaces to the user, so a browser
+        /// must keep closing cached sockets until it has seen this.
+        #[serde(rename = "viewportRelease")]
+        viewport_release: bool,
     },
     Exit {
         #[serde(rename = "exitCode")]
@@ -483,6 +494,7 @@ pub(crate) async fn serve_terminal_socket(
     let ready = serde_json::to_string(&TerminalServerMessage::Ready {
         terminal: Box::new(terminal.info()),
         flow_control: true,
+        viewport_release: true,
     })
     .expect("serializable terminal");
     if send_socket_message(&mut socket, Message::Text(ready.into()))
@@ -733,6 +745,12 @@ async fn handle_client_message(
             }
             Ok(TerminalClientMessage::Focus { focused }) => {
                 terminal.focus_client(client_id, focused).map_err(|_| ())?;
+            }
+            Ok(TerminalClientMessage::Release) => {
+                if let Some(recorder) = recorder {
+                    recorder.note(&terminal_id, "client viewport released");
+                }
+                terminal.release_client(client_id).map_err(|_| ())?;
             }
             _ => {
                 let error = serde_json::to_string(&TerminalServerMessage::Error {
