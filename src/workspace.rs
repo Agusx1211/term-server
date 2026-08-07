@@ -20,7 +20,11 @@ use crate::{
     terminal_state::{SequencedOutput, SyncMode, TerminalSync},
 };
 
-pub(crate) const TERMINAL_STREAM_PROTOCOL: u8 = 2;
+/// Bumped to 3 for flow control. A browser on the old protocol never
+/// acknowledges output, so it has to be turned away and reloaded rather than
+/// attached: it would otherwise leave the pty paused against acknowledgements
+/// that are never coming.
+pub(crate) const TERMINAL_STREAM_PROTOCOL: u8 = 3;
 
 const TERMINAL_FRAME_HEADER_BYTES: usize = 9;
 const TERMINAL_FRAME_PAYLOAD_BYTES: usize = 60 * 1024;
@@ -373,6 +377,10 @@ enum TerminalClientMessage {
     Focus {
         focused: bool,
     },
+    /// Bytes this browser's parser has consumed since the last acknowledgement.
+    Ack {
+        bytes: u64,
+    },
     Ping,
 }
 
@@ -381,6 +389,13 @@ enum TerminalClientMessage {
 enum TerminalServerMessage<'a> {
     Ready {
         terminal: Box<TerminalInfo>,
+        /// Advertises that this server understands `ack`. A browser must not
+        /// acknowledge output until it has seen this: terminals stay on the
+        /// broker generation that created them, so a current browser routinely
+        /// talks to an older broker, and that broker answers any message it does
+        /// not recognize with an error the pane surfaces to the user.
+        #[serde(rename = "flowControl")]
+        flow_control: bool,
     },
     Exit {
         #[serde(rename = "exitCode")]
@@ -413,6 +428,7 @@ struct Attachment {
 
 impl Drop for Attachment {
     fn drop(&mut self) {
+        self.terminal.flow_detach();
         self.terminal.detach(self.client_id);
     }
 }
@@ -456,6 +472,9 @@ pub(crate) async fn serve_terminal_socket(
             tracing::debug!(%error, "initial terminal resize failed");
             return;
         }
+        // Only real clients gate the pty. A preview pane observes whatever the
+        // terminal produces and is never allowed to slow it down.
+        terminal.flow_attach();
         Some(Attachment {
             terminal: terminal.clone(),
             client_id,
@@ -463,6 +482,7 @@ pub(crate) async fn serve_terminal_socket(
     };
     let ready = serde_json::to_string(&TerminalServerMessage::Ready {
         terminal: Box::new(terminal.info()),
+        flow_control: true,
     })
     .expect("serializable terminal");
     if send_socket_message(&mut socket, Message::Text(ready.into()))
@@ -677,6 +697,12 @@ async fn handle_client_message(
                 let pong =
                     serde_json::to_string(&TerminalServerMessage::Pong).expect("serializable pong");
                 send_or_stop!(Message::Text(pong.into()));
+            }
+            // Acknowledgements are read-only, so observers are not rejected for
+            // sending them. An observer never registered, and acknowledging an
+            // unregistered client is a no-op.
+            Ok(TerminalClientMessage::Ack { bytes }) => {
+                terminal.flow_acknowledged(bytes);
             }
             Ok(_) if observer => {
                 let error = serde_json::to_string(&TerminalServerMessage::Error {

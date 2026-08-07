@@ -73,6 +73,7 @@ import {
 } from "../lib/terminal-input";
 import {
   TERMINAL_FRAME_OUTPUT,
+  TerminalOutputAck,
   TerminalRenderBacklog,
   TerminalStreamState,
   decodeTerminalFrame,
@@ -595,6 +596,19 @@ export function TerminalPane({
       const resumeSequence = stream.resumeSequence;
       if (resumeSequence !== undefined) url.searchParams.set("sequence", String(resumeSequence));
       const next = new WebSocket(url);
+      // The server tracks what it is owed per connection, so acknowledgements
+      // belong to the socket the bytes arrived on and start over on reconnect.
+      const outputAck = new TerminalOutputAck();
+      // Stays false against a broker too old to have flow control. Terminals
+      // keep the broker generation that created them, so this pane may well be
+      // talking to one; an older broker rejects any message it does not know and
+      // the pane would surface an error notice for every acknowledgement.
+      let flowControlled = false;
+      const acknowledgeParsed = (bytes: number) => {
+        const batch = outputAck.parsed(bytes);
+        if (!flowControlled || batch === undefined || next.readyState !== WebSocket.OPEN) return;
+        next.send(JSON.stringify({ type: "ack", bytes: batch } satisfies ClientTerminalMessage));
+      };
       let protocolFailed = false;
       let abandoned = false;
       const failProtocol = (error: unknown) => {
@@ -668,6 +682,20 @@ export function TerminalPane({
               const settled = queuedBytes;
               queuedBytes = 0;
               pendingWrites = writeTerminal(frame.data, commit)
+                // Acknowledged only once xterm reports the bytes parsed. Acking
+                // on arrival would defeat the point: the server would keep
+                // sending while this pane was still working through the last
+                // burst, which is exactly the backlog flow control prevents.
+                //
+                // Only live output counts. The server's window tracks bytes as
+                // they leave the pty, and a snapshot is state it rebuilt rather
+                // than pty output, so acknowledging one would pay down a debt
+                // that was never owed.
+                .then(() => {
+                  if (frame.kind === TERMINAL_FRAME_OUTPUT) {
+                    acknowledgeParsed(frame.data.byteLength);
+                  }
+                })
                 .catch(failProtocol)
                 .finally(() => backlog.settle(settled));
               return;
@@ -679,6 +707,7 @@ export function TerminalPane({
             const message = JSON.parse(String(event.data)) as ServerTerminalMessage;
             if (message.type === "ready") {
               recordDebugEvent(terminal.id, { type: "control", message });
+              flowControlled = message.flowControl === true;
               onUpdate(message.terminal);
             }
             if (message.type === "size") {
