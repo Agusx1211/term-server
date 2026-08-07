@@ -13,6 +13,7 @@ import {
   CopyPlus,
   EllipsisVertical,
   GripVertical,
+  Hand,
   ListTree,
   Maximize2,
   PackageOpen,
@@ -91,6 +92,7 @@ import {
 import { ProcessInspector } from "./ProcessInspector";
 import { ArtifactDrawer } from "./ArtifactDrawer";
 import { WorkingDuration } from "./WorkingDuration";
+import { agentStatusPresentation, type AgentStatusTone } from "../lib/agent-status";
 
 interface TerminalPaneProps {
   terminal: TerminalInfo;
@@ -1359,6 +1361,14 @@ export function TerminalPane({
   );
 }
 
+const AGENT_STATUS_ICONS: Record<AgentStatusTone, typeof Activity> = {
+  blocked: Hand,
+  attention: Bell,
+  working: Activity,
+  idle: CirclePause,
+  closed: CircleX,
+};
+
 function PaneAgentState({
   agent,
   needsAttention,
@@ -1366,30 +1376,15 @@ function PaneAgentState({
   agent: NonNullable<TerminalInfo["agent"]>;
   needsAttention: boolean;
 }) {
-  const label = needsAttention
-    ? "Ready"
-    : agent.status === "working"
-      ? "Working"
-      : agent.status === "idle"
-        ? "Idle"
-        : "Closed";
-  const Icon = needsAttention
-    ? Bell
-    : agent.status === "working"
-      ? Activity
-      : agent.status === "idle"
-        ? CirclePause
-        : CircleX;
+  const { tone, label, description } = agentStatusPresentation(agent, needsAttention);
+  const Icon = AGENT_STATUS_ICONS[tone];
   return (
-    <span
-      class={`pane-activity ${needsAttention ? "attention" : agent.status}`}
-      title={agent.summary ?? `${agent.kind} is ${label.toLocaleLowerCase()}`}
-    >
+    <span class={`pane-activity ${tone}`} title={agent.summary ?? description}>
       <Bot size={12} aria-hidden="true" />
       <span class="pane-activity-kind">{agent.kind}</span>
       <span class="pane-activity-state">
         <Icon size={11} strokeWidth={2.2} aria-hidden="true" />
-        {agent.status === "working" ? <WorkingDuration since={agent.statusChangedAt} /> : label}
+        {tone === "working" ? <WorkingDuration since={agent.statusChangedAt} /> : label}
       </span>
     </span>
   );

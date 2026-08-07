@@ -51,7 +51,11 @@ export function buildPushoverMessage(
   hostname: string,
 ): PushoverMessage {
   const kind = agent.kind || "agent";
-  const state = agent.status === "idle" ? "ready" : "closed";
+  const state = agent.status === "blocked"
+    ? "waiting for input"
+    : agent.status === "idle"
+      ? "ready"
+      : "closed";
   const title = terminal.name.trim() || kind;
   const lines = [
     `${kind} is ${state}`,

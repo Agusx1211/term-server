@@ -1,0 +1,40 @@
+╭─── Claude Code v2.1.220 ─────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting started                                        │
+│                Welcome back!                │ Run /init to create a CLAUDE.md file with instructions for Cla… │
+│                                                    │ ─────────────────────────────────────────────────────────────── │
+│                       ▐▛███▜▌                      │ What's new                                                      │
+│                      ▝▜█████▛▘                     │ Added self-hosted environments: `claude self-hosted-runner` tu… │
+│                        ▘▘ ▝▝                       │ Added `archive` plugin source: install plugins from a zip over… │
+│   Opus 5 (1M context) with xhig… · Claude Max ·    │ Added a cancel-and-confirm step when removing an unavailable p… │
+│   example@example.com's Organization                │ /release-notes for more                                         │
+│              /tmp/project               │                                                                 │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+
+❯ Use the Bash tool to run: echo second-attempt
+
+● Bash(echo second-attempt)
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Sautéed for 28s
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts · ← for agents                                                  ◉ xhigh · /effort
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

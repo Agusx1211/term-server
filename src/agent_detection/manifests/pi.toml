@@ -1,0 +1,25 @@
+# Agent detection manifest ported from herdr (https://github.com/herdrdev/herdr),
+# src/detect/manifests/pi.toml, at commit 79a953e9.
+#
+# Copyright the herdr contributors.
+# Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+# this file except in compliance with the License. A copy of the License ships in
+# licenses/APACHE-2.0.txt and is available at
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Modified by the term-server contributors: this header was added. The manifest
+# body below is unchanged from the upstream file.
+
+id = "pi"
+version = "2026.06.10.1"
+min_engine_version = 1
+updated_at = "2026-06-10T00:00:00Z"
+aliases = ["herdr:pi"]
+
+[[rules]]
+id = "working_literal"
+state = "working"
+priority = 100
+region = "whole_recent"
+visible_working = true
+contains = ["Working..."]

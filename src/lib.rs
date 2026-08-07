@@ -1,4 +1,5 @@
 pub mod activity_view;
+pub mod agent_detection;
 pub mod agent_events;
 pub mod agent_integrations;
 pub mod ai;
