@@ -24,7 +24,7 @@ use crate::{
     ai::{PiRequest, PiService, PiTaskKind},
     artifacts,
     build::BuildIdentity,
-    terminal_state::{SequencedOutput, TerminalOutputState, TerminalSync},
+    terminal_state::{SequencedOutput, TerminalOutputState, TerminalResume, TerminalSync},
 };
 
 // Neighboring buckets jump across the hue wheel and keep similar luminance across themes.
@@ -234,6 +234,10 @@ pub struct TerminalSizeState {
     pub pixel_height: u16,
     pub focused_client: Option<Uuid>,
     pub responder_client: Option<Uuid>,
+    /// Changes whenever the PTY grid changes. Byte sequences alone cannot
+    /// prove a reconnect did not miss a resize, because resizes consume no
+    /// output bytes.
+    pub epoch: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,6 +280,7 @@ impl Default for ClientViewports {
                 pixel_height: DEFAULT_VIEWPORT_SIZE.pixel_height,
                 focused_client: None,
                 responder_client: None,
+                epoch: 0,
             },
         }
     }
@@ -367,6 +372,7 @@ impl ClientViewports {
             pixel_height: size.pixel_height,
             focused_client: self.focused_client,
             responder_client: self.responder_client,
+            epoch: self.published.epoch,
         }
     }
 }
@@ -1388,7 +1394,7 @@ impl TerminalSession {
 
     pub fn subscribe(
         &self,
-        requested_sequence: Option<u64>,
+        requested: Option<TerminalResume>,
     ) -> (
         broadcast::Receiver<TerminalEvent>,
         TerminalSync,
@@ -1402,7 +1408,7 @@ impl TerminalSession {
         let viewports = self.viewports.lock();
         let output = self.output.lock();
         let receiver = self.events.subscribe();
-        let sync = output.sync(requested_sequence);
+        let sync = output.sync(requested);
         let exit_code = output.exit_code();
         (receiver, sync, viewports.published, exit_code)
     }
@@ -1517,6 +1523,16 @@ impl TerminalSession {
         }
     }
 
+    pub fn checkpoint_maximum_bytes(&self) -> usize {
+        self.output.lock().checkpoint_maximum_bytes()
+    }
+
+    pub fn store_browser_checkpoint(&self, sequence: u64, epoch: u64, bytes: Bytes) -> bool {
+        self.output
+            .lock()
+            .store_browser_checkpoint(sequence, epoch, bytes)
+    }
+
     /// Blocks the pty read loop while output stands unacknowledged above the
     /// high watermark, so the master's buffer fills and the writing process
     /// blocks. This is the only backpressure that reaches a TUI.
@@ -1598,7 +1614,7 @@ impl TerminalSession {
     ) -> Result<TerminalSizeState, TerminalError> {
         let mut viewports = self.viewports.lock();
         update(&mut viewports);
-        let state = viewports.state();
+        let mut state = viewports.state();
         let size_changed = (
             state.cols,
             state.rows,
@@ -1616,16 +1632,18 @@ impl TerminalSession {
         // output so every browser applies the role and grid before the output
         // whose replies it may be responsible for.
         let mut output = publish.then(|| self.output.lock());
-        if size_changed && running {
-            self.master
-                .lock()
-                .resize(PtySize {
-                    cols: state.cols,
-                    rows: state.rows,
-                    pixel_width: state.pixel_width,
-                    pixel_height: state.pixel_height,
-                })
-                .map_err(|error| TerminalError::Io(error.to_string()))?;
+        if size_changed {
+            if running {
+                self.master
+                    .lock()
+                    .resize(PtySize {
+                        cols: state.cols,
+                        rows: state.rows,
+                        pixel_width: state.pixel_width,
+                        pixel_height: state.pixel_height,
+                    })
+                    .map_err(|error| TerminalError::Io(error.to_string()))?;
+            }
             output
                 .as_mut()
                 .expect("output state locked for resize")
@@ -1635,6 +1653,10 @@ impl TerminalSession {
                     state.pixel_width,
                     state.pixel_height,
                 );
+            state.epoch = output
+                .as_ref()
+                .expect("output state locked for resize")
+                .grid_epoch();
         }
         viewports.published = state;
         if publish {
@@ -3797,6 +3819,7 @@ mod tests {
                 pixel_height: 440,
                 focused_client: None,
                 responder_client: Some(desktop),
+                epoch: 0,
             }
         );
 
@@ -3810,6 +3833,7 @@ mod tests {
                 pixel_height: 440,
                 focused_client: Some(mobile),
                 responder_client: Some(mobile),
+                epoch: 0,
             }
         );
 
@@ -3823,6 +3847,7 @@ mod tests {
                 pixel_height: 1000,
                 focused_client: Some(desktop),
                 responder_client: Some(desktop),
+                epoch: 0,
             }
         );
 
@@ -3839,6 +3864,7 @@ mod tests {
                 pixel_height: 320,
                 focused_client: None,
                 responder_client: Some(mobile),
+                epoch: 0,
             }
         );
 
@@ -3853,6 +3879,7 @@ mod tests {
                 pixel_height: 320,
                 focused_client: None,
                 responder_client: None,
+                epoch: 0,
             }
         );
     }
@@ -3881,6 +3908,7 @@ mod tests {
                 pixel_height: 1000,
                 focused_client: None,
                 responder_client: Some(visible),
+                epoch: 0,
             }
         );
         // Still attached: the connection was never closed, so the pane is there

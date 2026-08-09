@@ -20,6 +20,22 @@ describe("mobile terminal input", () => {
   it("leaves unmodified terminal input untouched", () => {
     expect(transformTerminalInput("hello", NO_TERMINAL_MODIFIERS)).toBe("hello");
   });
+
+  it("adds one-shot mobile modifiers to Kitty keyboard input", () => {
+    expect(transformTerminalInput("c", { ctrl: true, alt: false }, 1))
+      .toBe("\u001b[99;5u");
+    expect(transformTerminalInput("x", { ctrl: false, alt: true }, 17))
+      .toBe("\u001b[120;3;120u");
+    expect(transformTerminalInput("\u001b[120u", { ctrl: true, alt: false }, 9))
+      .toBe("\u001b[120;5u");
+  });
+
+  it("encodes keybar Escape and Tab when the TUI requests Kitty reporting", () => {
+    expect(transformTerminalInput("\u001b", NO_TERMINAL_MODIFIERS, 1))
+      .toBe("\u001b[27u");
+    expect(transformTerminalInput("\t", NO_TERMINAL_MODIFIERS, 8))
+      .toBe("\u001b[9u");
+  });
 });
 
 describe("mobile terminal scrolling", () => {

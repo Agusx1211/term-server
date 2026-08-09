@@ -4,6 +4,8 @@ use axum::{
     extract::ws::{Message, WebSocket},
     http::StatusCode,
 };
+use base64::Engine as _;
+use bytes::Bytes;
 use futures_util::{Sink, SinkExt, StreamExt, stream::SplitSink};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -17,7 +19,7 @@ use crate::{
         TerminalError, TerminalEvent, TerminalInfo, TerminalManager, TerminalSession,
         TerminalSizeState, TerminalViewport, terminate_descendant_process,
     },
-    terminal_state::{SequencedOutput, SyncMode, TerminalSync},
+    terminal_state::{SequencedOutput, SyncMode, TerminalResume, TerminalSync},
 };
 
 /// Bumped to 3 for flow control. A browser on the old protocol never
@@ -33,6 +35,9 @@ const TERMINAL_FRAME_OUTPUT: u8 = 1;
 const TERMINAL_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 const TERMINAL_INPUT_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const TERMINAL_INPUT_RETRY_INTERVAL: Duration = Duration::from_millis(5);
+const TERMINAL_CHECKPOINT_CHUNK_BYTES: usize = 32 * 1024;
+const TERMINAL_CHECKPOINT_CHUNK_BASE64_BYTES: usize =
+    TERMINAL_CHECKPOINT_CHUNK_BYTES.div_ceil(3) * 4;
 const TERMINAL_CLIENT_LEASE: Duration = Duration::from_secs(90);
 const TERMINAL_LEASE_CHECK_INTERVAL: Duration = Duration::from_secs(15);
 /// A pty master returns at most one 4 KiB chunk per read, so a full-screen TUI
@@ -276,7 +281,7 @@ impl WorkspaceBackend {
         &self,
         id: Uuid,
         initial_size: Option<TerminalViewport>,
-        sequence: Option<u64>,
+        resume: Option<TerminalResume>,
         observer: bool,
     ) -> Result<SessionConnection, WorkspaceError> {
         match self {
@@ -289,7 +294,7 @@ impl WorkspaceBackend {
                 }),
             #[cfg(unix)]
             Self::Broker(client) => client
-                .terminal_socket(id, initial_size, sequence, observer)
+                .terminal_socket(id, initial_size, resume, observer)
                 .await
                 .map(Box::new)
                 .map(SessionConnection::Broker),
@@ -330,6 +335,7 @@ pub(crate) struct TerminalSocketQuery {
     #[serde(rename = "pixelHeight")]
     pixel_height: Option<u16>,
     sequence: Option<u64>,
+    epoch: Option<u64>,
     stream: Option<u8>,
     #[serde(default)]
     observer: bool,
@@ -347,8 +353,10 @@ impl TerminalSocketQuery {
         })
     }
 
-    pub(crate) fn sequence(&self) -> Option<u64> {
+    pub(crate) fn resume(&self) -> Option<TerminalResume> {
         self.sequence
+            .zip(self.epoch)
+            .map(|(sequence, epoch)| TerminalResume { sequence, epoch })
     }
 
     pub(crate) fn stream_protocol(&self) -> Option<u8> {
@@ -385,6 +393,17 @@ enum TerminalClientMessage {
     Ack {
         bytes: u64,
     },
+    /// One bounded chunk of an official xterm.js serialization. Chunks are
+    /// ordered and assembled per socket because browser WebSocket messages are
+    /// deliberately capped at 64 KiB.
+    Checkpoint {
+        sequence: u64,
+        epoch: u64,
+        offset: usize,
+        data: String,
+        #[serde(rename = "final")]
+        final_chunk: bool,
+    },
     Ping,
 }
 
@@ -407,6 +426,11 @@ enum TerminalServerMessage<'a> {
         /// must keep closing cached sockets until it has seen this.
         #[serde(rename = "viewportRelease")]
         viewport_release: bool,
+        /// Maximum decoded size of an xterm checkpoint. Its presence is also
+        /// the feature negotiation that lets new browsers stay silent when a
+        /// terminal belongs to an older broker generation.
+        #[serde(rename = "checkpointBytes")]
+        checkpoint_bytes: usize,
     },
     Exit {
         #[serde(rename = "exitCode")]
@@ -418,6 +442,7 @@ enum TerminalServerMessage<'a> {
         focused: bool,
         controller: bool,
         responder: bool,
+        epoch: u64,
     },
     Sync {
         mode: &'a str,
@@ -437,6 +462,13 @@ struct Attachment {
     client_id: Uuid,
 }
 
+#[derive(Debug)]
+struct PendingCheckpoint {
+    sequence: u64,
+    epoch: u64,
+    bytes: Vec<u8>,
+}
+
 impl Drop for Attachment {
     fn drop(&mut self) {
         self.terminal.flow_detach();
@@ -451,6 +483,7 @@ fn size_message(state: TerminalSizeState, client_id: Uuid) -> TerminalServerMess
         focused: state.focused_client.is_some(),
         controller: state.focused_client == Some(client_id),
         responder: state.responder_client == Some(client_id),
+        epoch: state.epoch,
     }
 }
 
@@ -458,7 +491,7 @@ pub(crate) async fn serve_terminal_socket(
     mut socket: WebSocket,
     terminal: Arc<TerminalSession>,
     initial_size: Option<TerminalViewport>,
-    requested_sequence: Option<u64>,
+    requested: Option<TerminalResume>,
     observer: bool,
     recorder: Option<&DebugRecordingManager>,
 ) {
@@ -495,6 +528,7 @@ pub(crate) async fn serve_terminal_socket(
         terminal: Box::new(terminal.info()),
         flow_control: true,
         viewport_release: true,
+        checkpoint_bytes: terminal.checkpoint_maximum_bytes(),
     })
     .expect("serializable terminal");
     if send_socket_message(&mut socket, Message::Text(ready.into()))
@@ -504,14 +538,8 @@ pub(crate) async fn serve_terminal_socket(
         return;
     }
     let (mut sender, mut receiver) = socket.split();
-    let Ok(Some((mut events, mut sent_sequence))) = synchronize_terminal(
-        &mut sender,
-        &terminal,
-        client_id,
-        requested_sequence,
-        recorder,
-    )
-    .await
+    let Ok(Some((mut events, mut sent_sequence))) =
+        synchronize_terminal(&mut sender, &terminal, client_id, requested, recorder).await
     else {
         return;
     };
@@ -522,6 +550,14 @@ pub(crate) async fn serve_terminal_socket(
     // reorders the size, exit, or lag notices that follow it.
     let mut deferred: Option<Result<TerminalEvent, tokio::sync::broadcast::error::RecvError>> =
         None;
+    let mut checkpoint: Option<PendingCheckpoint> = None;
+    let client = TerminalClientContext {
+        terminal: &terminal,
+        client_id,
+        terminal_id,
+        observer,
+        recorder,
+    };
     loop {
         let event = match deferred.take() {
             Some(event) => event,
@@ -540,11 +576,8 @@ pub(crate) async fn serve_terminal_socket(
                     if handle_client_message(
                         message,
                         &mut sender,
-                        &terminal,
-                        client_id,
-                        terminal_id,
-                        observer,
-                        recorder,
+                        client,
+                        &mut checkpoint,
                     ).await.is_err() { break; }
                     continue;
                 }
@@ -598,7 +631,7 @@ pub(crate) async fn serve_terminal_socket(
             }
             Ok(TerminalEvent::Size(size)) => {
                 if let Some(recorder) = recorder {
-                    recorder.control(&terminal_id, serde_json::json!({ "type": "size", "cols": size.cols, "rows": size.rows, "focused": size.focused_client.is_some(), "controller": size.focused_client == Some(client_id), "responder": size.responder_client == Some(client_id) }));
+                    recorder.control(&terminal_id, serde_json::json!({ "type": "size", "cols": size.cols, "rows": size.rows, "focused": size.focused_client.is_some(), "controller": size.focused_client == Some(client_id), "responder": size.responder_client == Some(client_id), "epoch": size.epoch }));
                 }
                 let message = serde_json::to_string(&size_message(size, client_id))
                     .expect("serializable terminal size");
@@ -687,15 +720,28 @@ fn coalesce_terminal_output(
     }
 }
 
-async fn handle_client_message(
-    message: Message,
-    sender: &mut SplitSink<WebSocket, Message>,
-    terminal: &Arc<TerminalSession>,
+#[derive(Clone, Copy)]
+struct TerminalClientContext<'a> {
+    terminal: &'a TerminalSession,
     client_id: Uuid,
     terminal_id: Uuid,
     observer: bool,
-    recorder: Option<&DebugRecordingManager>,
+    recorder: Option<&'a DebugRecordingManager>,
+}
+
+async fn handle_client_message(
+    message: Message,
+    sender: &mut SplitSink<WebSocket, Message>,
+    client: TerminalClientContext<'_>,
+    checkpoint: &mut Option<PendingCheckpoint>,
 ) -> Result<(), ()> {
+    let TerminalClientContext {
+        terminal,
+        client_id,
+        terminal_id,
+        observer,
+        recorder,
+    } = client;
     macro_rules! send_or_stop {
         ($message:expr) => {
             if send_socket_message(sender, $message).await.is_err() {
@@ -752,6 +798,33 @@ async fn handle_client_message(
                 }
                 terminal.release_client(client_id).map_err(|_| ())?;
             }
+            Ok(TerminalClientMessage::Checkpoint {
+                sequence,
+                epoch,
+                offset,
+                data,
+                final_chunk,
+            }) => match append_checkpoint(
+                checkpoint,
+                terminal,
+                sequence,
+                epoch,
+                offset,
+                &data,
+                final_chunk,
+            ) {
+                Ok(true) => {
+                    if let Some(recorder) = recorder {
+                        recorder.note(&terminal_id, "xterm checkpoint stored");
+                    }
+                }
+                Ok(false) => {}
+                Err(message) => {
+                    let error = serde_json::to_string(&TerminalServerMessage::Error { message })
+                        .expect("serializable error");
+                    send_or_stop!(Message::Text(error.into()));
+                }
+            },
             _ => {
                 let error = serde_json::to_string(&TerminalServerMessage::Error {
                     message: "invalid terminal message",
@@ -780,6 +853,61 @@ async fn handle_client_message(
         _ => {}
     }
     Ok(())
+}
+
+/// Appends one base64 checkpoint chunk. WebSocket ordering makes an offset
+/// sufficient to reject missing, duplicated, or interleaved chunks, and the
+/// terminal's replay budget bounds the assembly before it is retained.
+fn append_checkpoint(
+    pending: &mut Option<PendingCheckpoint>,
+    terminal: &TerminalSession,
+    sequence: u64,
+    epoch: u64,
+    offset: usize,
+    data: &str,
+    final_chunk: bool,
+) -> Result<bool, &'static str> {
+    if offset == 0 {
+        *pending = Some(PendingCheckpoint {
+            sequence,
+            epoch,
+            bytes: Vec::new(),
+        });
+    }
+    let maximum = terminal.checkpoint_maximum_bytes();
+    let Some(current) = pending.as_mut() else {
+        return Err("terminal checkpoint is missing its first chunk");
+    };
+    if current.sequence != sequence || current.epoch != epoch || current.bytes.len() != offset {
+        *pending = None;
+        return Err("terminal checkpoint chunks are out of order");
+    }
+    if data.len() > TERMINAL_CHECKPOINT_CHUNK_BASE64_BYTES {
+        *pending = None;
+        return Err("terminal checkpoint chunk exceeds the message limit");
+    }
+    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(data) else {
+        *pending = None;
+        return Err("terminal checkpoint contains invalid data");
+    };
+    if decoded.len() > TERMINAL_CHECKPOINT_CHUNK_BYTES {
+        *pending = None;
+        return Err("terminal checkpoint chunk exceeds the message limit");
+    }
+    if current.bytes.len().saturating_add(decoded.len()) > maximum {
+        *pending = None;
+        return Err("terminal checkpoint exceeds the replay limit");
+    }
+    current.bytes.extend_from_slice(&decoded);
+    if !final_chunk {
+        return Ok(false);
+    }
+    let completed = pending.take().expect("checkpoint assembly exists");
+    Ok(terminal.store_browser_checkpoint(
+        completed.sequence,
+        completed.epoch,
+        Bytes::from(completed.bytes),
+    ))
 }
 
 async fn write_terminal_input(
@@ -827,11 +955,11 @@ async fn synchronize_terminal(
     sender: &mut SplitSink<WebSocket, Message>,
     terminal: &TerminalSession,
     client_id: Uuid,
-    requested_sequence: Option<u64>,
+    requested: Option<TerminalResume>,
     recorder: Option<&DebugRecordingManager>,
 ) -> Result<Option<(tokio::sync::broadcast::Receiver<TerminalEvent>, u64)>, ()> {
     let terminal_id = terminal.info().id;
-    let (events, sync, size, exit_code) = terminal.subscribe(requested_sequence);
+    let (events, sync, size, exit_code) = terminal.subscribe(requested);
     send_terminal_control(sender, size_message(size, client_id), terminal_id, recorder).await?;
     let sequence = send_terminal_sync(sender, sync, terminal_id, recorder).await?;
     if let Some(exit_code) = exit_code {
@@ -983,6 +1111,7 @@ mod tests {
             pixel_height: 480,
             focused_client: None,
             responder_client: None,
+            epoch: 1,
         })
     }
 

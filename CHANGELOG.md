@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.11.0 - 2026-08-09
+
+### Changed
+
+- The number of off-screen terminal renderers kept alive can now be set per browser under
+  **Settings → Terminal behavior**. Clearing the override follows the server default again, while
+  setting it to zero keeps only visible panes mounted.
+
+### Fixed
+
+- Snapshot recovery now prefers a bounded checkpoint produced by xterm.js's official serialize
+  addon, followed by the exact retained PTY bytes that arrived after it. This removes the parser
+  mismatch between the browser and the Rust fallback model from normal reconnects, including
+  alternate-screen TUIs, while keeping the canonical snapshot as a cold-start fallback.
+- Resume tokens now include a terminal-grid epoch. A reconnect that missed a resize can no longer
+  append bytes to a buffer laid out at the old dimensions; the broker detects the stale epoch and
+  sends a fresh snapshot instead.
+- The browser terminal stack now matches code-server's pinned xterm.js builds and settings. Kitty
+  keyboard reporting (including mobile modifier input), erase-to-scrollback behavior, overlapping
+  glyph rescaling, a bundled Nerd Font symbols fallback, and OSC 52 clipboard reads and writes now
+  work consistently in full-screen TUIs.
+- Kitty keyboard flags and stacks, mutually exclusive SGR mouse encodings, and common terminal-mode
+  queries now survive or accurately reflect broker recovery. The broker also answers Kitty keyboard
+  and terminal-version queries while no renderer is attached, without replaying a half-finished
+  synchronized-output frame that could leave a reconnected TUI frozen.
+
 ## 0.10.1 - 2026-08-07
 
 ### Changed

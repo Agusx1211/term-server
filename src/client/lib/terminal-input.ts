@@ -29,6 +29,11 @@ const SERVER_OWNED_TERMINAL_REPLIES = [
   /^\x1b\[\??[0-9]+;[0-4]\$y$/,
   // Pixel, character-cell, and text-area size reports (14t/16t/18t).
   /^\x1b\[(?:4|6|8);[0-9]+;[0-9]+t$/,
+  // Kitty keyboard flags. The broker owns the query so it also works while no
+  // browser is attached; xterm still tracks the set/push/pop state locally.
+  /^\x1b\[\?[0-9]+u$/,
+  // XTVERSION. Identity is broker-owned for detached capability probes.
+  /^\x1bP>\|[^\x1b]*(?:\x1b\\|\x9c)$/,
 ] as const;
 
 export function isServerOwnedTerminalReply(data: string): boolean {

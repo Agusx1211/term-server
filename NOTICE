@@ -36,3 +36,17 @@ format above, and the design of that format — priority-ordered rules, structur
 screen regions, nested any/all/not matchers, and the deliberate idle fallback —
 originates with herdr. The engine code itself is not derived from herdr's source
 and is covered by term-server's MIT License.
+
+--------------------------------------------------------------------------------
+Symbols Nerd Font Mono
+--------------------------------------------------------------------------------
+
+The browser client includes the Symbols Nerd Font Mono fallback from Nerd Fonts
+v3.5.0, compressed from the official TTF release to WOFF2 without subsetting or
+changing its glyphs.
+
+Copyright (c) 2014 Ryan L McIntyre and the respective icon-set contributors.
+
+Nerd Fonts is licensed under the MIT License. A copy ships in
+licenses/NERD-FONTS.txt. The bundled glyph sources and their individual licenses
+and upstream projects are recorded in licenses/NERD-FONTS-SYMBOLS.md.

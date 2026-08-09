@@ -99,10 +99,12 @@ describe("terminal input encoding", () => {
       "\x1b[4;1080;1920t",
       "\x1b[6;20;10t",
       "\x1b[8;24;80t",
+      "\x1b[?7u",
+      "\x1bP>|term-server(0.10.1)\x1b\\",
+      "\x1bP>|xterm.js(6.0.0)\x1b\\",
     ];
     const browserOwned = [
       "\x1b]10;rgb:ffff/ffff/ffff\x1b\\",
-      "\x1bP>|XTerm(276)\x1b\\",
       "\x1b[3;10;20t",
       "\x1b[?1;2c trailing",
       "\x1b[?7;1$p",
@@ -129,7 +131,11 @@ describe("terminal input encoding", () => {
   });
 
   it("recognizes replies emitted by xterm while it parses server output", async () => {
-    const terminal = new Terminal({ cols: 80, rows: 24 });
+    const terminal = new Terminal({
+      cols: 80,
+      rows: 24,
+      vtExtensions: { kittyKeyboard: true },
+    });
     const dispositions: Array<[string, string]> = [];
     const data = terminal.onData((reply) => {
       dispositions.push([reply, terminalDataDisposition({
@@ -143,7 +149,7 @@ describe("terminal input encoding", () => {
 
     try {
       await new Promise<void>((resolve) => {
-        terminal.write("\x1b[c\x1b[>c\x1b[5n\x1b[6n\x1b[?6n\x1b[?7$p", resolve);
+        terminal.write("\x1b[c\x1b[>c\x1b[5n\x1b[6n\x1b[?6n\x1b[?7$p\x1b[=7u\x1b[?u\x1b[>q", resolve);
       });
       expect(dispositions).toEqual([
         ["\x1b[?1;2c", "ignore"],
@@ -152,6 +158,8 @@ describe("terminal input encoding", () => {
         ["\x1b[1;1R", "ignore"],
         ["\x1b[?1;1R", "ignore"],
         ["\x1b[?7;1$y", "ignore"],
+        ["\x1b[?7u", "ignore"],
+        ["\x1bP>|xterm.js(6.0.0)\x1b\\", "ignore"],
       ]);
     } finally {
       data.dispose();

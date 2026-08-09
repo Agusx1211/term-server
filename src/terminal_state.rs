@@ -8,10 +8,19 @@ use bytes::Bytes;
 // ever rendered, while a snapshot resets it to what fits here. Spending evenly
 // buys the far more valuable outcome more often.
 const DELTA_BUDGET_DIVISOR: usize = 2;
+// Browser checkpoints are an exact xterm.js serialization, but keeping one is
+// additional to the canonical VT model and delta ring. Cap that extra state at
+// a small fraction of the configured replay budget (and at 4 MiB outright).
+// This is enough for a dense live screen plus useful scrollback without turning
+// an authenticated browser into an unbounded allocator in the broker.
+const CHECKPOINT_BUDGET_DIVISOR: usize = 16;
+const MIN_CHECKPOINT_BYTES: usize = 64 * 1024;
+const MAX_CHECKPOINT_BYTES: usize = 4 * 1024 * 1024;
 const MIN_RESERVED_VIEWPORT_COLS: usize = 128;
 const CELL_BYTES: usize = std::mem::size_of::<vt100::Cell>();
 const MAX_PENDING_SEQUENCE_BYTES: usize = 64 * 1024;
 const MAX_TRACKED_SGR_BYTES: usize = 64 * 1024;
+const KITTY_KEYBOARD_STACK_LIMIT: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SequencedOutput {
@@ -42,6 +51,12 @@ pub enum SyncMode {
     Resume,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalResume {
+    pub sequence: u64,
+    pub epoch: u64,
+}
+
 #[derive(Debug)]
 pub struct TerminalSync {
     pub mode: SyncMode,
@@ -52,10 +67,20 @@ pub struct TerminalSync {
 
 pub struct TerminalOutputState {
     sequence: u64,
+    grid_epoch: u64,
     delta: DeltaBuffer,
     state_bytes: usize,
+    checkpoint_bytes: usize,
+    browser_checkpoint: Option<BrowserCheckpoint>,
     terminal: CanonicalTerminal,
     exit_code: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct BrowserCheckpoint {
+    sequence: u64,
+    epoch: u64,
+    bytes: Bytes,
 }
 
 impl TerminalOutputState {
@@ -64,8 +89,12 @@ impl TerminalOutputState {
         let state_bytes = maximum_bytes.saturating_sub(delta_bytes);
         Self {
             sequence: 0,
+            grid_epoch: 0,
             delta: DeltaBuffer::new(delta_bytes),
             state_bytes,
+            checkpoint_bytes: (maximum_bytes / CHECKPOINT_BUDGET_DIVISOR)
+                .clamp(MIN_CHECKPOINT_BYTES, MAX_CHECKPOINT_BYTES),
+            browser_checkpoint: None,
             terminal: CanonicalTerminal::new(rows, cols, scrollback_capacity(state_bytes, cols)),
             exit_code: None,
         }
@@ -83,6 +112,10 @@ impl TerminalOutputState {
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16, pixel_width: u16, pixel_height: u16) {
+        self.grid_epoch = self.grid_epoch.saturating_add(1);
+        // Output sequences do not advance for a resize. A checkpoint from the
+        // previous grid therefore cannot be paired safely with later bytes.
+        self.browser_checkpoint = None;
         self.terminal.resize(
             rows,
             cols,
@@ -90,6 +123,36 @@ impl TerminalOutputState {
             pixel_width,
             pixel_height,
         );
+    }
+
+    pub fn grid_epoch(&self) -> u64 {
+        self.grid_epoch
+    }
+
+    pub fn checkpoint_maximum_bytes(&self) -> usize {
+        self.checkpoint_bytes
+    }
+
+    /// Retains a browser-produced xterm serialization when it describes this
+    /// exact grid and its sequence is still bridgeable by the delta ring.
+    pub fn store_browser_checkpoint(&mut self, sequence: u64, epoch: u64, bytes: Bytes) -> bool {
+        if bytes.is_empty()
+            || bytes.len() > self.checkpoint_bytes
+            || epoch != self.grid_epoch
+            || self.delta.outputs_since(sequence, self.sequence).is_none()
+            || self
+                .browser_checkpoint
+                .as_ref()
+                .is_some_and(|checkpoint| checkpoint.sequence > sequence)
+        {
+            return false;
+        }
+        self.browser_checkpoint = Some(BrowserCheckpoint {
+            sequence,
+            epoch,
+            bytes,
+        });
+        true
     }
 
     /// Drains replies to terminal status/device queries observed in published
@@ -102,9 +165,10 @@ impl TerminalOutputState {
             .collect()
     }
 
-    pub fn sync(&self, requested_sequence: Option<u64>) -> TerminalSync {
-        if let Some(sequence) = requested_sequence
-            && let Some(output) = self.delta.outputs_since(sequence, self.sequence)
+    pub fn sync(&self, requested: Option<TerminalResume>) -> TerminalSync {
+        if let Some(requested) = requested
+            && requested.epoch == self.grid_epoch
+            && let Some(output) = self.delta.outputs_since(requested.sequence, self.sequence)
         {
             return TerminalSync {
                 mode: SyncMode::Resume,
@@ -113,12 +177,44 @@ impl TerminalOutputState {
                 output,
             };
         }
+        if let Some(snapshot) = self.browser_snapshot() {
+            return TerminalSync {
+                mode: SyncMode::Snapshot,
+                sequence: self.sequence,
+                snapshot: Some(snapshot),
+                output: Vec::new(),
+            };
+        }
         TerminalSync {
             mode: SyncMode::Snapshot,
             sequence: self.sequence,
             snapshot: Some(Bytes::from(self.terminal.snapshot())),
             output: Vec::new(),
         }
+    }
+
+    /// Replays the official xterm serialization followed by every raw byte the
+    /// broker has observed since it was produced. Resize invalidation and the
+    /// epoch check in `store_browser_checkpoint` guarantee there is no missing
+    /// grid transition in between.
+    fn browser_snapshot(&self) -> Option<Bytes> {
+        let checkpoint = self.browser_checkpoint.as_ref()?;
+        if checkpoint.epoch != self.grid_epoch {
+            return None;
+        }
+        let output = self
+            .delta
+            .outputs_since(checkpoint.sequence, self.sequence)?;
+        if output.is_empty() {
+            return Some(checkpoint.bytes.clone());
+        }
+        let output_bytes = output.iter().map(|chunk| chunk.bytes.len()).sum::<usize>();
+        let mut snapshot = Vec::with_capacity(checkpoint.bytes.len() + output_bytes);
+        snapshot.extend_from_slice(&checkpoint.bytes);
+        for chunk in output {
+            snapshot.extend_from_slice(&chunk.bytes);
+        }
+        Some(Bytes::from(snapshot))
     }
 
     pub fn text_tail(&self, maximum_bytes: usize) -> String {
@@ -234,6 +330,7 @@ struct CanonicalTerminal {
     normal_execution_before_alt: Option<ExecutionState>,
     alternate_entry: Option<AlternateEntry>,
     execution: ExecutionState,
+    kitty_keyboard: KittyKeyboardState,
     sequence: EscapeSequence,
     pending: Vec<u8>,
     utf8_pending: Vec<u8>,
@@ -252,6 +349,7 @@ impl CanonicalTerminal {
             normal_execution_before_alt: None,
             alternate_entry: None,
             execution: ExecutionState::new(rows),
+            kitty_keyboard: KittyKeyboardState::default(),
             sequence: EscapeSequence::Ground,
             pending: Vec::new(),
             utf8_pending: Vec::new(),
@@ -288,10 +386,13 @@ impl CanonicalTerminal {
             }
             self.execution
                 .observe(&sequence.bytes, self.parser.screen());
+            self.kitty_keyboard
+                .observe(&sequence.bytes, self.parser.screen().alternate_screen());
             if let Some(response) = terminal_query_response(
                 &sequence.bytes,
                 self.parser.screen(),
                 &self.execution,
+                self.kitty_keyboard.flags,
                 self.pixel_width,
                 self.pixel_height,
             ) {
@@ -410,6 +511,8 @@ impl CanonicalTerminal {
                 execution.remap_positions(&plan);
                 execution.write_restore_at(&mut output, plan.cursor, plan.pending_wrap.as_ref());
             }
+            self.kitty_keyboard
+                .write_buffer_restore(&mut output, false, true);
             output.extend_from_slice(
                 self.alternate_entry
                     .unwrap_or(AlternateEntry::Mode1049)
@@ -420,6 +523,8 @@ impl CanonicalTerminal {
             let mut execution = self.execution.clone();
             execution.remap_positions(&plan);
             execution.write_restore_at(&mut output, plan.cursor, plan.pending_wrap.as_ref());
+            self.kitty_keyboard
+                .write_buffer_restore(&mut output, true, true);
             output.extend_from_slice(&self.pending);
             output.extend_from_slice(&self.utf8_pending);
             output
@@ -429,6 +534,9 @@ impl CanonicalTerminal {
             let mut execution = self.execution.clone();
             execution.remap_positions(&plan);
             execution.write_restore_at(&mut output, plan.cursor, plan.pending_wrap.as_ref());
+            self.kitty_keyboard
+                .write_buffer_restore(&mut output, false, false);
+            self.kitty_keyboard.write_hidden_alt_restore(&mut output);
             output.extend_from_slice(&self.pending);
             output.extend_from_slice(&self.utf8_pending);
             output
@@ -464,6 +572,8 @@ impl CanonicalTerminal {
                 (Some(screen), None) => snapshot_screen(screen),
                 _ => Vec::new(),
             };
+            self.kitty_keyboard
+                .write_buffer_restore(&mut bytes, false, true);
             bytes.extend_from_slice(
                 self.alternate_entry
                     .unwrap_or(AlternateEntry::Mode1049)
@@ -472,9 +582,15 @@ impl CanonicalTerminal {
             bytes.extend_from_slice(&self.parser.screen().state_formatted());
             self.execution
                 .write_restore(&mut bytes, self.parser.screen());
+            self.kitty_keyboard
+                .write_buffer_restore(&mut bytes, true, true);
             bytes
         } else {
-            snapshot_screen_with_execution(self.parser.screen(), &self.execution)
+            let mut bytes = snapshot_screen_with_execution(self.parser.screen(), &self.execution);
+            self.kitty_keyboard
+                .write_buffer_restore(&mut bytes, false, false);
+            self.kitty_keyboard.write_hidden_alt_restore(&mut bytes);
+            bytes
         };
         snapshot.extend_from_slice(&self.pending);
         snapshot.extend_from_slice(&self.utf8_pending);
@@ -484,6 +600,138 @@ impl CanonicalTerminal {
     fn drain_responses(&mut self) -> Vec<Vec<u8>> {
         self.responses.drain(..).collect()
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct KittyKeyboardState {
+    flags: u16,
+    main_flags: u16,
+    alt_flags: u16,
+    main_stack: Vec<u16>,
+    alt_stack: Vec<u16>,
+}
+
+impl KittyKeyboardState {
+    fn observe(&mut self, sequence: &[u8], alternate_screen: bool) {
+        if sequence == b"\x1bc" {
+            *self = Self::default();
+            return;
+        }
+
+        match alternate_mode(sequence) {
+            AlternateMode::Enter47 | AlternateMode::Enter1047 | AlternateMode::Enter1049 => {
+                self.main_flags = self.flags;
+                self.flags = self.alt_flags;
+            }
+            AlternateMode::Exit47 | AlternateMode::Exit1047 | AlternateMode::Exit1049 => {
+                self.alt_flags = self.flags;
+                self.flags = self.main_flags;
+            }
+            AlternateMode::None => {}
+        }
+
+        let Some((parameters, intermediates, b'u')) = csi_parts(sequence) else {
+            return;
+        };
+        if !intermediates.is_empty() {
+            return;
+        }
+        let Some((&prefix, parameters)) = parameters.split_first() else {
+            return;
+        };
+        let parameters = numeric_params(parameters);
+        match prefix {
+            b'=' => {
+                let flags = parameters.first().copied().flatten().unwrap_or(0);
+                let mode = parameters
+                    .get(1)
+                    .copied()
+                    .flatten()
+                    .filter(|mode| *mode > 0)
+                    .unwrap_or(1);
+                match mode {
+                    1 => self.flags = flags,
+                    2 => self.flags |= flags,
+                    3 => self.flags &= !flags,
+                    _ => {}
+                }
+            }
+            b'>' => {
+                let flags = parameters.first().copied().flatten().unwrap_or(0);
+                let current = self.flags;
+                let stack = self.stack_mut(alternate_screen);
+                if stack.len() >= KITTY_KEYBOARD_STACK_LIMIT {
+                    stack.remove(0);
+                }
+                stack.push(current);
+                self.flags = flags;
+            }
+            b'<' => {
+                let count = usize::from(parameters.first().copied().flatten().unwrap_or(1).max(1));
+                let mut flags = self.flags;
+                let stack = self.stack_mut(alternate_screen);
+                for _ in 0..count {
+                    let Some(previous) = stack.pop() else {
+                        break;
+                    };
+                    flags = previous;
+                }
+                self.flags = if stack.is_empty() { 0 } else { flags };
+            }
+            _ => {}
+        }
+    }
+
+    fn stack_mut(&mut self, alternate_screen: bool) -> &mut Vec<u16> {
+        if alternate_screen {
+            &mut self.alt_stack
+        } else {
+            &mut self.main_stack
+        }
+    }
+
+    fn write_buffer_restore(
+        &self,
+        output: &mut Vec<u8>,
+        alternate_buffer: bool,
+        active_alternate: bool,
+    ) {
+        let flags = match (alternate_buffer, active_alternate) {
+            (false, false) | (true, true) => self.flags,
+            (false, true) => self.main_flags,
+            (true, false) => self.alt_flags,
+        };
+        let stack = if alternate_buffer {
+            &self.alt_stack
+        } else {
+            &self.main_stack
+        };
+        write_kitty_keyboard_restore(output, flags, stack);
+    }
+
+    fn write_hidden_alt_restore(&self, output: &mut Vec<u8>) {
+        if self.alt_flags == 0 && self.alt_stack.is_empty() {
+            return;
+        }
+        output.extend_from_slice(b"\x1b[?47h");
+        write_kitty_keyboard_restore(output, self.alt_flags, &self.alt_stack);
+        output.extend_from_slice(b"\x1b[?47l");
+    }
+}
+
+fn write_kitty_keyboard_restore(output: &mut Vec<u8>, flags: u16, stack: &[u16]) {
+    if flags == 0 && stack.is_empty() {
+        return;
+    }
+    let Some((&first, remaining)) = stack.split_first() else {
+        output.extend_from_slice(format!("\x1b[={flags}u").as_bytes());
+        return;
+    };
+    output.extend_from_slice(format!("\x1b[={first}u").as_bytes());
+    for saved in remaining {
+        output.extend_from_slice(format!("\x1b[>{saved}u").as_bytes());
+    }
+    output.extend_from_slice(format!("\x1b[>{flags}u").as_bytes());
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -496,11 +744,20 @@ struct ExecutionState {
     reverse_wrap_mode: bool,
     focus_mode: bool,
     alternate_scroll_mode: bool,
-    pixel_mouse_mode: bool,
+    mouse_encoding: MouseEncoding,
+    synchronized_output_mode: bool,
     cursor_style: u16,
     attrs: Vec<Vec<u8>>,
     attrs_bytes: usize,
     saved_cursor: Option<SavedCursor>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum MouseEncoding {
+    #[default]
+    Default,
+    Sgr,
+    SgrPixels,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -522,7 +779,8 @@ impl ExecutionState {
             reverse_wrap_mode: false,
             focus_mode: false,
             alternate_scroll_mode: false,
-            pixel_mouse_mode: false,
+            mouse_encoding: MouseEncoding::Default,
+            synchronized_output_mode: false,
             cursor_style: 0,
             attrs: Vec::new(),
             attrs_bytes: 0,
@@ -577,10 +835,21 @@ impl ExecutionState {
                             45 => self.reverse_wrap_mode = enabled,
                             1004 => self.focus_mode = enabled,
                             1007 => self.alternate_scroll_mode = enabled,
-                            1016 => self.pixel_mouse_mode = enabled,
-                            // Deliberately do not persist synchronized output
-                            // (?2026). A snapshot with a missing reset could
-                            // otherwise leave a reconnect permanently frozen.
+                            1006 => {
+                                self.mouse_encoding = if enabled {
+                                    MouseEncoding::Sgr
+                                } else {
+                                    MouseEncoding::Default
+                                };
+                            }
+                            1016 => {
+                                self.mouse_encoding = if enabled {
+                                    MouseEncoding::SgrPixels
+                                } else {
+                                    MouseEncoding::Default
+                                };
+                            }
+                            2026 => self.synchronized_output_mode = enabled,
                             _ => {}
                         }
                     }
@@ -666,7 +935,22 @@ impl ExecutionState {
         write_dec_mode(output, 45, self.reverse_wrap_mode);
         write_dec_mode(output, 1004, self.focus_mode);
         write_dec_mode(output, 1007, self.alternate_scroll_mode);
-        write_dec_mode(output, 1016, self.pixel_mouse_mode);
+        match self.mouse_encoding {
+            MouseEncoding::Default => {
+                write_dec_mode(output, 1006, false);
+                write_dec_mode(output, 1016, false);
+            }
+            MouseEncoding::Sgr => {
+                write_dec_mode(output, 1016, false);
+                write_dec_mode(output, 1006, true);
+            }
+            MouseEncoding::SgrPixels => {
+                write_dec_mode(output, 1006, false);
+                write_dec_mode(output, 1016, true);
+            }
+        }
+        // Deliberately do not restore synchronized output (?2026). A snapshot
+        // taken between set/reset must not leave a reconnect permanently frozen.
         self.write_scroll_region(output);
         write_dec_mode(output, 6, self.origin_mode);
         output.extend_from_slice(format!("\x1b[{} q", self.cursor_style).as_bytes());
@@ -798,6 +1082,7 @@ fn terminal_query_response(
     sequence: &[u8],
     screen: &vt100::Screen,
     execution: &ExecutionState,
+    kitty_keyboard_flags: u16,
     pixel_width: u16,
     pixel_height: u16,
 ) -> Option<Vec<u8>> {
@@ -830,6 +1115,10 @@ fn terminal_query_response(
         return None;
     }
     match (parameters, final_byte) {
+        (b"?", b'u') => Some(format!("\x1b[?{kitty_keyboard_flags}u").into_bytes()),
+        (b">", b'q') => {
+            Some(format!("\x1bP>|term-server({})\x1b\\", env!("CARGO_PKG_VERSION")).into_bytes())
+        }
         (b"" | b"0", b'c') => Some(b"\x1b[?1;2c".to_vec()),
         (b">" | b">0", b'c') => Some(b"\x1b[>0;276;0c".to_vec()),
         (b"5", b'n') => Some(b"\x1b[0n".to_vec()),
@@ -875,43 +1164,57 @@ fn terminal_mode_status(
     screen: &vt100::Screen,
     execution: &ExecutionState,
 ) -> u8 {
-    let enabled = if private {
+    if private {
         match mode {
-            1 => formatted_mode_enabled(screen, b"\x1b[?1h"),
-            6 => execution.origin_mode,
-            7 => execution.auto_wrap_mode,
-            9 => matches!(
+            1 => mode_status(formatted_mode_enabled(screen, b"\x1b[?1h")),
+            3 => 0,
+            6 => mode_status(execution.origin_mode),
+            7 => mode_status(execution.auto_wrap_mode),
+            8 => 3,
+            9 => mode_status(matches!(
                 screen.mouse_protocol_mode(),
                 vt100::MouseProtocolMode::Press
-            ),
-            25 => !screen.hide_cursor(),
-            45 => execution.reverse_wrap_mode,
-            47 | 1047 | 1049 => screen.alternate_screen(),
-            66 => formatted_mode_enabled(screen, b"\x1b="),
-            1000 => matches!(
+            )),
+            12 => 1,
+            25 => mode_status(!screen.hide_cursor()),
+            45 => mode_status(execution.reverse_wrap_mode),
+            47 | 1047 | 1049 => mode_status(screen.alternate_screen()),
+            66 => mode_status(formatted_mode_enabled(screen, b"\x1b=")),
+            67 => 4,
+            1000 => mode_status(matches!(
                 screen.mouse_protocol_mode(),
                 vt100::MouseProtocolMode::PressRelease
-            ),
-            1002 => matches!(
+            )),
+            1002 => mode_status(matches!(
                 screen.mouse_protocol_mode(),
                 vt100::MouseProtocolMode::ButtonMotion
-            ),
-            1003 => matches!(
+            )),
+            1003 => mode_status(matches!(
                 screen.mouse_protocol_mode(),
                 vt100::MouseProtocolMode::AnyMotion
-            ),
-            1004 => execution.focus_mode,
-            1007 => execution.alternate_scroll_mode,
-            1016 => execution.pixel_mouse_mode,
-            2004 => formatted_mode_enabled(screen, b"\x1b[?2004h"),
-            _ => return 0,
+            )),
+            1004 => mode_status(execution.focus_mode),
+            1005 | 1015 => 4,
+            1006 => mode_status(execution.mouse_encoding == MouseEncoding::Sgr),
+            1016 => mode_status(execution.mouse_encoding == MouseEncoding::SgrPixels),
+            1048 => 1,
+            2004 => mode_status(formatted_mode_enabled(screen, b"\x1b[?2004h")),
+            2026 => mode_status(execution.synchronized_output_mode),
+            9001 => 0,
+            _ => 0,
         }
     } else {
         match mode {
-            4 => execution.insert_mode,
-            _ => return 0,
+            2 => 4,
+            4 => mode_status(execution.insert_mode),
+            12 => 3,
+            20 => 2,
+            _ => 0,
         }
-    };
+    }
+}
+
+fn mode_status(enabled: bool) -> u8 {
     if enabled { 1 } else { 2 }
 }
 
@@ -1374,7 +1677,10 @@ mod tests {
         state.publish(Bytes::from(vec![b'x'; 140 * 1024]));
         let current = state.sequence;
 
-        let recent = state.sync(Some(current - 100));
+        let recent = state.sync(Some(TerminalResume {
+            sequence: current - 100,
+            epoch: state.grid_epoch(),
+        }));
         assert_eq!(recent.mode, SyncMode::Resume);
         assert_eq!(
             recent
@@ -1385,10 +1691,67 @@ mod tests {
             vec![b'x'; 100]
         );
 
-        let old = state.sync(Some(0));
+        let old = state.sync(Some(TerminalResume {
+            sequence: 0,
+            epoch: state.grid_epoch(),
+        }));
         assert_eq!(old.mode, SyncMode::Snapshot);
         assert!(old.output.is_empty());
         assert!(old.snapshot.unwrap().len() < 4 * 1024);
+    }
+
+    #[test]
+    fn resume_requires_the_grid_epoch_that_produced_the_local_buffer() {
+        let mut state = TerminalOutputState::new(1024 * 1024, 4, 20);
+        state.publish(Bytes::from_static(b"before"));
+        let sequence = state.sequence;
+        let epoch = state.grid_epoch();
+        state.resize(4, 10, 0, 0);
+        state.publish(Bytes::from_static(b"after"));
+
+        let stale = state.sync(Some(TerminalResume { sequence, epoch }));
+        assert_eq!(stale.mode, SyncMode::Snapshot);
+
+        let current = state.sync(Some(TerminalResume {
+            sequence,
+            epoch: state.grid_epoch(),
+        }));
+        assert_eq!(current.mode, SyncMode::Resume);
+        assert_eq!(current.output, vec![output(sequence, b"after")]);
+    }
+
+    #[test]
+    fn browser_xterm_checkpoint_is_extended_with_retained_raw_output() {
+        let mut state = TerminalOutputState::new(1024 * 1024, 4, 20);
+        state.publish(Bytes::from_static(b"state represented by xterm"));
+        let sequence = state.sequence;
+        assert!(state.store_browser_checkpoint(
+            sequence,
+            state.grid_epoch(),
+            Bytes::from_static(b"official-xterm-snapshot"),
+        ));
+        state.publish(Bytes::from_static(b"-new-output"));
+
+        let sync = state.sync(None);
+        assert_eq!(sync.mode, SyncMode::Snapshot);
+        assert_eq!(
+            sync.snapshot.unwrap().as_ref(),
+            b"official-xterm-snapshot-new-output"
+        );
+    }
+
+    #[test]
+    fn resize_invalidates_a_browser_checkpoint_without_a_byte_sequence_change() {
+        let mut state = TerminalOutputState::new(1024 * 1024, 4, 20);
+        assert!(state.store_browser_checkpoint(
+            0,
+            state.grid_epoch(),
+            Bytes::from_static(b"official-xterm-snapshot"),
+        ));
+        state.resize(4, 10, 0, 0);
+
+        let snapshot = state.sync(None).snapshot.unwrap();
+        assert!(!snapshot.starts_with(b"official-xterm-snapshot"));
     }
 
     #[test]
@@ -1693,7 +2056,31 @@ mod tests {
 
         let mut reconstructed = CanonicalTerminal::new(6, 12, 20);
         reconstructed.process(&snapshot);
-        assert_eq!(reconstructed.execution, terminal.execution);
+        let mut expected = terminal.execution.clone();
+        expected.synchronized_output_mode = false;
+        assert_eq!(reconstructed.execution, expected);
+    }
+
+    #[test]
+    fn snapshot_preserves_mutually_exclusive_mouse_encoding() {
+        let cases = [
+            (b"\x1b[?1006h".as_slice(), MouseEncoding::Sgr),
+            (b"\x1b[?1016h".as_slice(), MouseEncoding::SgrPixels),
+            (
+                b"\x1b[?1006h\x1b[?1016h\x1b[?1016l".as_slice(),
+                MouseEncoding::Default,
+            ),
+        ];
+
+        for (setup, expected) in cases {
+            let mut terminal = CanonicalTerminal::new(6, 12, 20);
+            terminal.process(setup);
+            assert_eq!(terminal.execution.mouse_encoding, expected);
+
+            let mut reconstructed = CanonicalTerminal::new(6, 12, 20);
+            reconstructed.process(&terminal.snapshot());
+            assert_eq!(reconstructed.execution.mouse_encoding, expected);
+        }
     }
 
     #[test]
@@ -1723,12 +2110,28 @@ mod tests {
             (b"\x1b[>c", b"\x1b[>0;276;0c"),
             (b"\x1b[>0c", b"\x1b[>0;276;0c"),
             (b"\x1b[5n", b"\x1b[0n"),
+            (b"\x1b[2$p", b"\x1b[2;4$y"),
             (b"\x1b[4$p", b"\x1b[4;2$y"),
+            (b"\x1b[12$p", b"\x1b[12;3$y"),
+            (b"\x1b[20$p", b"\x1b[20;2$y"),
+            (b"\x1b[?3$p", b"\x1b[?3;0$y"),
             (b"\x1b[?7$p", b"\x1b[?7;1$y"),
-            (b"\x1b[?2026$p", b"\x1b[?2026;0$y"),
+            (b"\x1b[?8$p", b"\x1b[?8;3$y"),
+            (b"\x1b[?12$p", b"\x1b[?12;1$y"),
+            (b"\x1b[?67$p", b"\x1b[?67;4$y"),
+            (b"\x1b[?1005$p", b"\x1b[?1005;4$y"),
+            (b"\x1b[?1015$p", b"\x1b[?1015;4$y"),
+            (b"\x1b[?1048$p", b"\x1b[?1048;1$y"),
+            (b"\x1b[?2026$p", b"\x1b[?2026;2$y"),
+            (b"\x1b[?9001$p", b"\x1b[?9001;0$y"),
             (b"\x1b[18t", b"\x1b[8;5;20t"),
             (b"\x1b[14t", b"\x1b[4;0;0t"),
             (b"\x1b[16t", b"\x1b[6;0;0t"),
+            (b"\x1b[?u", b"\x1b[?0u"),
+            (
+                b"\x1b[>q",
+                concat!("\x1bP>|term-server(", env!("CARGO_PKG_VERSION"), ")\x1b\\").as_bytes(),
+            ),
         ];
         for &(query, expected) in cases {
             for split in 1..query.len() {
@@ -1754,6 +2157,53 @@ mod tests {
     }
 
     #[test]
+    fn kitty_keyboard_state_survives_snapshot_resize_and_screen_switches() {
+        let mut terminal = CanonicalTerminal::new(5, 20, 20);
+        terminal.process(b"shell\x1b[=1u\x1b[>3u\x1b[>7u\x1b[?1049h");
+        terminal.process(b"tui\x1b[=2u\x1b[>5u\x1b[>9u");
+        assert_eq!(terminal.kitty_keyboard.flags, 9);
+
+        let mut reconstructed = CanonicalTerminal::new(5, 20, 20);
+        reconstructed.process(&terminal.snapshot());
+        assert_eq!(reconstructed.kitty_keyboard, terminal.kitty_keyboard);
+        assert!(reconstructed.drain_responses().is_empty());
+
+        reconstructed.resize(6, 24, 20, 0, 0);
+        assert_eq!(reconstructed.kitty_keyboard, terminal.kitty_keyboard);
+        reconstructed.process(b"\x1b[?u\x1b[<u\x1b[?u\x1b[?1049l\x1b[?u\x1b[<u\x1b[?u");
+        assert_eq!(
+            reconstructed.drain_responses(),
+            vec![
+                b"\x1b[?9u".to_vec(),
+                b"\x1b[?5u".to_vec(),
+                b"\x1b[?7u".to_vec(),
+                b"\x1b[?3u".to_vec(),
+            ]
+        );
+
+        let mut normal_screen = CanonicalTerminal::new(6, 24, 20);
+        normal_screen.process(&reconstructed.snapshot());
+        assert_eq!(
+            normal_screen.kitty_keyboard.flags,
+            reconstructed.kitty_keyboard.flags
+        );
+        assert_eq!(
+            normal_screen.kitty_keyboard.main_stack,
+            reconstructed.kitty_keyboard.main_stack
+        );
+        assert_eq!(
+            normal_screen.kitty_keyboard.alt_flags,
+            reconstructed.kitty_keyboard.alt_flags
+        );
+        assert_eq!(
+            normal_screen.kitty_keyboard.alt_stack,
+            reconstructed.kitty_keyboard.alt_stack
+        );
+        normal_screen.process(b"\x1b[?1049h\x1b[?u");
+        assert_eq!(normal_screen.drain_responses(), vec![b"\x1b[?5u".to_vec()]);
+    }
+
+    #[test]
     fn mode_queries_report_tracked_state_across_split_boundaries() {
         let cases: &[(&[u8], &[u8], &[u8])] = &[
             (b"\x1b[4h", b"\x1b[4$p", b"\x1b[4;1$y"),
@@ -1761,8 +2211,20 @@ mod tests {
             (b"\x1b[?7l", b"\x1b[?7$p", b"\x1b[?7;2$y"),
             (b"\x1b[?45h", b"\x1b[?45$p", b"\x1b[?45;1$y"),
             (b"\x1b[?1004h", b"\x1b[?1004$p", b"\x1b[?1004;1$y"),
-            (b"\x1b[?1007h", b"\x1b[?1007$p", b"\x1b[?1007;1$y"),
+            (b"\x1b[?1007h", b"\x1b[?1007$p", b"\x1b[?1007;0$y"),
+            (b"\x1b[?1006h", b"\x1b[?1006$p", b"\x1b[?1006;1$y"),
+            (
+                b"\x1b[?1006h\x1b[?1016h",
+                b"\x1b[?1006$p",
+                b"\x1b[?1006;2$y",
+            ),
             (b"\x1b[?1016h", b"\x1b[?1016$p", b"\x1b[?1016;1$y"),
+            (
+                b"\x1b[?1006h\x1b[?1016l",
+                b"\x1b[?1006$p",
+                b"\x1b[?1006;2$y",
+            ),
+            (b"\x1b[?2026h", b"\x1b[?2026$p", b"\x1b[?2026;1$y"),
         ];
         for &(setup, query, expected) in cases {
             for split in 1..query.len() {

@@ -38,6 +38,7 @@ use crate::{
         AgentDetectionExplain, CreateTerminal, ProcessInspectorSnapshot, RenameTerminal,
         TerminalInfo, TerminalManager, TerminalViewport, normalize_terminal_path,
     },
+    terminal_state::TerminalResume,
     workspace::{
         SessionBrokerGenerationInfo, SessionBrokerInfo, TerminalSocketQuery,
         WorkspaceError as BrokerError, serve_terminal_socket,
@@ -187,7 +188,7 @@ impl BrokerClient {
         &self,
         id: Uuid,
         initial_size: Option<TerminalViewport>,
-        sequence: Option<u64>,
+        resume: Option<TerminalResume>,
         observer: bool,
     ) -> Result<BrokerWebSocket, BrokerError> {
         let stream = UnixStream::connect(self.socket_path.as_ref()).await?;
@@ -198,8 +199,9 @@ impl BrokerClient {
             query.push(format!("pixelWidth={}", viewport.pixel_width));
             query.push(format!("pixelHeight={}", viewport.pixel_height));
         }
-        if let Some(sequence) = sequence {
-            query.push(format!("sequence={sequence}"));
+        if let Some(resume) = resume {
+            query.push(format!("sequence={}", resume.sequence));
+            query.push(format!("epoch={}", resume.epoch));
         }
         let query = if query.is_empty() {
             String::new()
@@ -615,13 +617,13 @@ impl BrokerPool {
         &self,
         id: Uuid,
         initial_size: Option<TerminalViewport>,
-        sequence: Option<u64>,
+        resume: Option<TerminalResume>,
         observer: bool,
     ) -> Result<BrokerWebSocket, BrokerError> {
         self.owner(id)
             .await?
             .client
-            .terminal_socket(id, initial_size, sequence, observer)
+            .terminal_socket(id, initial_size, resume, observer)
             .await
     }
 
@@ -1007,7 +1009,7 @@ async fn broker_terminal_socket(
                 socket,
                 terminal,
                 query.viewport(),
-                query.sequence(),
+                query.resume(),
                 false,
                 None,
             )
@@ -1027,7 +1029,7 @@ async fn broker_terminal_observer(
         .write_buffer_size(128 * 1024)
         .max_write_buffer_size(4 * 1024 * 1024)
         .on_upgrade(move |socket| {
-            serve_terminal_socket(socket, terminal, None, query.sequence(), true, None)
+            serve_terminal_socket(socket, terminal, None, query.resume(), true, None)
         }))
 }
 
@@ -1045,6 +1047,7 @@ async fn shutdown_broker(State(state): State<BrokerState>) -> StatusCode {
 mod tests {
     use std::path::PathBuf;
 
+    use base64::Engine as _;
     use clap::Parser;
     use futures_util::{SinkExt, StreamExt};
     use tempfile::TempDir;
@@ -1177,6 +1180,62 @@ mod tests {
         output
     }
 
+    async fn collect_sync(socket: &mut BrokerWebSocket) -> (serde_json::Value, Vec<u8>) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut sync = None;
+            let mut payload = Vec::new();
+            while let Some(message) = socket.next().await {
+                match message.unwrap() {
+                    TungsteniteMessage::Text(text) => {
+                        let value = serde_json::from_str::<serde_json::Value>(&text).unwrap();
+                        match value["type"].as_str() {
+                            Some("sync") => {
+                                assert!(sync.replace(value).is_none(), "duplicate terminal sync");
+                            }
+                            Some("synced") => {
+                                let sync = sync.expect("terminal synced before sync began");
+                                assert_eq!(value["sequence"], sync["sequence"]);
+                                return (sync, payload);
+                            }
+                            _ => {}
+                        }
+                    }
+                    TungsteniteMessage::Binary(bytes) => {
+                        assert!(sync.is_some(), "terminal bytes arrived before sync");
+                        assert!(bytes.len() >= 9, "terminal frame includes its header");
+                        payload.extend_from_slice(&bytes[9..]);
+                    }
+                    TungsteniteMessage::Close(_) => panic!("terminal socket closed"),
+                    _ => {}
+                }
+            }
+            panic!("terminal socket ended before sync completed");
+        })
+        .await
+        .expect("terminal sync timeout")
+    }
+
+    async fn wait_for_client_count(client: &BrokerClient, terminal_id: Uuid, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let clients = client
+                    .list()
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|terminal| terminal.id == terminal_id)
+                    .expect("test terminal exists")
+                    .clients;
+                if clients == expected {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("terminal client count timeout");
+    }
+
     /// Reads a flood to its end, tolerating either outcome for a client that
     /// falls behind: the stream is delivered whole, or the server jumps it to a
     /// fresh snapshot. What must never happen is the socket being dropped.
@@ -1273,6 +1332,7 @@ mod tests {
         let initial_sync = wait_for_control(&mut first, "sync").await;
         assert_eq!(initial_sync["mode"], "snapshot");
         let initial_sequence = initial_sync["sequence"].as_u64().unwrap();
+        let initial_epoch = size["epoch"].as_u64().unwrap();
         let synced = wait_for_control(&mut first, "synced").await;
         assert_eq!(synced["sequence"], initial_sequence);
         first
@@ -1305,7 +1365,10 @@ mod tests {
             .terminal_socket(
                 terminal.id,
                 Some(TerminalViewport::new(80, 24, 800, 480)),
-                Some(initial_sequence),
+                Some(TerminalResume {
+                    sequence: initial_sequence,
+                    epoch: initial_epoch,
+                }),
                 false,
             )
             .await
@@ -1329,6 +1392,167 @@ mod tests {
 
         replacement_client.remove(terminal.id).await.unwrap();
         replacement_client.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("broker shutdown timeout")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn browser_xterm_checkpoints_are_used_for_snapshot_recovery() {
+        let (_directory, server, client) = start_test_broker(1024 * 1024).await;
+        let terminal = client
+            .create(CreateTerminal {
+                path: Some("xterm-checkpoint".to_owned()),
+                cwd: Some(PathBuf::from("/tmp")),
+                shell: Some("/bin/sh".to_owned()),
+                clone_from: None,
+            })
+            .await
+            .unwrap();
+        let viewport = TerminalViewport::new(80, 24, 800, 480);
+        let mut first = client
+            .terminal_socket(terminal.id, Some(viewport), None, false)
+            .await
+            .unwrap();
+        let ready = wait_for_control(&mut first, "ready").await;
+        assert!(ready["checkpointBytes"].as_u64().unwrap() >= 64 * 1024);
+        let size = wait_for_control(&mut first, "size").await;
+        let epoch = size["epoch"].as_u64().unwrap();
+        let (initial_sync, _) = collect_sync(&mut first).await;
+        let sequence = initial_sync["sequence"].as_u64().unwrap();
+
+        let first_part = b"official-xterm-";
+        let second_part = b"snapshot";
+        for (offset, data, final_chunk) in [
+            (0, first_part.as_slice(), false),
+            (first_part.len(), second_part.as_slice(), true),
+        ] {
+            first
+                .send(TungsteniteMessage::Text(
+                    serde_json::json!({
+                        "type": "checkpoint",
+                        "sequence": sequence,
+                        "epoch": epoch,
+                        "offset": offset,
+                        "data": base64::engine::general_purpose::STANDARD.encode(data),
+                        "final": final_chunk,
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        }
+        // WebSocket ordering makes the pong proof that both chunks were stored.
+        first
+            .send(TungsteniteMessage::Text(r#"{"type":"ping"}"#.into()))
+            .await
+            .unwrap();
+        wait_for_control(&mut first, "pong").await;
+
+        first
+            .send(TungsteniteMessage::Text(
+                serde_json::json!({
+                    "type": "input",
+                    "data": "printf '%s' retained-after-checkpoint\n",
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        wait_for_output(&mut first, "retained-after-checkpoint").await;
+        first.close(None).await.unwrap();
+        wait_for_client_count(&client, terminal.id, 0).await;
+
+        let mut recovered = client
+            .terminal_socket(terminal.id, Some(viewport), None, false)
+            .await
+            .unwrap();
+        wait_for_control(&mut recovered, "ready").await;
+        let recovered_size = wait_for_control(&mut recovered, "size").await;
+        assert_eq!(recovered_size["epoch"], epoch);
+        let (sync, snapshot) = collect_sync(&mut recovered).await;
+        assert_eq!(sync["mode"], "snapshot");
+        assert!(snapshot.starts_with(b"official-xterm-snapshot"));
+        assert!(
+            String::from_utf8_lossy(&snapshot).contains("retained-after-checkpoint"),
+            "raw output after the checkpoint must extend the snapshot"
+        );
+
+        client.remove(terminal.id).await.unwrap();
+        client.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("broker shutdown timeout")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconnect_cannot_resume_across_a_resize_it_missed() {
+        let (_directory, server, client) = start_test_broker(1024 * 1024).await;
+        let terminal = client
+            .create(CreateTerminal {
+                path: Some("resize-epoch".to_owned()),
+                cwd: Some(PathBuf::from("/tmp")),
+                shell: Some("/bin/sh".to_owned()),
+                clone_from: None,
+            })
+            .await
+            .unwrap();
+        let mut original = client
+            .terminal_socket(
+                terminal.id,
+                Some(TerminalViewport::new(80, 24, 800, 480)),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        wait_for_control(&mut original, "ready").await;
+        let original_size = wait_for_control(&mut original, "size").await;
+        let original_epoch = original_size["epoch"].as_u64().unwrap();
+        let (original_sync, _) = collect_sync(&mut original).await;
+        let original_sequence = original_sync["sequence"].as_u64().unwrap();
+        original.close(None).await.unwrap();
+        wait_for_client_count(&client, terminal.id, 0).await;
+
+        // Another browser changes the PTY grid while the original browser is
+        // away. No terminal output byte records this transition.
+        let resized_viewport = TerminalViewport::new(120, 36, 1200, 720);
+        let mut resizer = client
+            .terminal_socket(terminal.id, Some(resized_viewport), None, false)
+            .await
+            .unwrap();
+        wait_for_control(&mut resizer, "ready").await;
+        let resized = wait_for_control(&mut resizer, "size").await;
+        let resized_epoch = resized["epoch"].as_u64().unwrap();
+        assert!(resized_epoch > original_epoch);
+        collect_sync(&mut resizer).await;
+        resizer.close(None).await.unwrap();
+        wait_for_client_count(&client, terminal.id, 0).await;
+
+        let mut stale = client
+            .terminal_socket(
+                terminal.id,
+                Some(resized_viewport),
+                Some(TerminalResume {
+                    sequence: original_sequence,
+                    epoch: original_epoch,
+                }),
+                false,
+            )
+            .await
+            .unwrap();
+        wait_for_control(&mut stale, "ready").await;
+        let current_size = wait_for_control(&mut stale, "size").await;
+        assert_eq!(current_size["epoch"], resized_epoch);
+        let (sync, _) = collect_sync(&mut stale).await;
+        assert_eq!(sync["mode"], "snapshot");
+
+        client.remove(terminal.id).await.unwrap();
+        client.shutdown().await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), server)
             .await
             .expect("broker shutdown timeout")

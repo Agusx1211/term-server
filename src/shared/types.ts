@@ -325,6 +325,16 @@ export type ClientTerminalMessage =
   // Bytes this browser's parser has consumed since the last acknowledgement.
   // The server stops draining the pty while a browser owes too many.
   | { type: "ack"; bytes: number }
+  // A bounded chunk of an official xterm serialization. `checkpointBytes` in
+  // the ready message is the feature negotiation and decoded-size ceiling.
+  | {
+      type: "checkpoint";
+      sequence: number;
+      epoch: number;
+      offset: number;
+      data: string;
+      final: boolean;
+    }
   | { type: "ping" };
 
 export type ServerTerminalMessage =
@@ -339,6 +349,7 @@ export type ServerTerminalMessage =
       terminal: TerminalInfo;
       flowControl?: boolean;
       viewportRelease?: boolean;
+      checkpointBytes?: number;
     }
   | { type: "exit"; exitCode: number }
   | {
@@ -348,6 +359,7 @@ export type ServerTerminalMessage =
       focused: boolean;
       controller: boolean;
       responder: boolean;
+      epoch?: number;
     }
   | { type: "sync"; mode: "snapshot" | "resume"; sequence: number }
   | { type: "synced"; sequence: number }
