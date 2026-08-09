@@ -29,8 +29,10 @@ import {
   ZoomOut,
 } from "lucide-preact";
 import { Terminal as XTerm, type ILink } from "@xterm/xterm";
+import { ClipboardAddon } from "@xterm/addon-clipboard";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon, type ISearchOptions } from "@xterm/addon-search";
+import { SerializeAddon } from "@xterm/addon-serialize";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import type {
   ArtifactEntry,
@@ -80,6 +82,17 @@ import {
   type TerminalFrame,
   type TerminalStreamIssue,
 } from "../lib/terminal-stream";
+import {
+  TERMINAL_CHECKPOINT_IDLE_MS,
+  TERMINAL_CHECKPOINT_MAX_INTERVAL_MS,
+  sendTerminalCheckpoint,
+  serializeTerminalCheckpoint,
+} from "../lib/terminal-checkpoint";
+import {
+  terminalKittyKeyboardState,
+  tuiCompatibilityOptions,
+} from "../lib/terminal-compatibility";
+import { loadTerminalNerdFont, TERMINAL_FONT_FAMILY } from "../lib/terminal-font";
 import {
   createSettledTask,
   terminalViewportSize,
@@ -239,15 +252,17 @@ export function TerminalPane({
     if (!container.current) return;
     let disposed = false;
     let attempts = 0;
+    let responder = false;
     const fit = new FitAddon();
     const search = new SearchAddon({ highlightLimit: 1000 });
+    const serialize = new SerializeAddon();
     const term = new XTerm({
       // The official search addon's multi-match decorations use xterm's decoration API.
       allowProposedApi: true,
       cursorBlink: true,
       cursorStyle: "block",
       disableStdin: true,
-      fontFamily: "'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace",
+      fontFamily: TERMINAL_FONT_FAMILY,
       fontSize,
       letterSpacing: 0,
       lineHeight: 1.15,
@@ -256,11 +271,34 @@ export function TerminalPane({
       scrollSensitivity: 1.5,
       smoothScrollDuration: 0,
       theme: terminalTheme(theme, terminal.color),
+      // Match VS Code's modern input contract. Window-size reports stay
+      // disabled here because the broker answers them once from the elected
+      // viewport; enabling xterm's copies would send duplicate PTY replies.
+      ...tuiCompatibilityOptions(),
     });
     xterm.current = term;
     searchAddon.current = search;
     term.loadAddon(fit);
     term.loadAddon(search);
+    term.loadAddon(serialize);
+    term.loadAddon(new ClipboardAddon(undefined, {
+      async readText() {
+        if (!responder || !navigator.clipboard?.readText) return "";
+        try {
+          return await navigator.clipboard.readText();
+        } catch {
+          return "";
+        }
+      },
+      async writeText(_selection, text) {
+        if (!responder || !navigator.clipboard?.writeText) return;
+        try {
+          await navigator.clipboard.writeText(text);
+        } catch {
+          // Clipboard permission failures must not reject xterm's parser write.
+        }
+      },
+    }));
     term.loadAddon(new PanoptesUnicode17Addon());
     const searchResultsDisposable = search.onDidChangeResults(({ resultIndex, resultCount }) => {
       setSearchResults({ index: resultIndex, count: resultCount });
@@ -271,6 +309,11 @@ export function TerminalPane({
       }),
     );
     term.open(container.current);
+    void loadTerminalNerdFont().then(() => {
+      if (disposed) return;
+      term.clearTextureAtlas();
+      term.refresh(0, term.rows - 1);
+    });
     const imagePreviews = createHoverPreviewController<
       { key: string; path: string; cwd: string; left: number; top: number },
       FileEntry
@@ -434,7 +477,6 @@ export function TerminalPane({
     const backlog = new TerminalRenderBacklog();
     let acceptingInput = false;
     let parsingOutput = false;
-    let responder = false;
     let messageQueue = Promise.resolve();
     // Resolves once xterm has parsed every frame handed to it so far.
     let pendingWrites = Promise.resolve();
@@ -446,6 +488,12 @@ export function TerminalPane({
     let recoveringOutput = false;
     let reportedIssue = "";
     let suspendSocket: (() => void) | undefined;
+    let terminalEpoch: number | undefined;
+    let checkpointMaximumBytes = 0;
+    let checkpointTimer: number | undefined;
+    let checkpointWindowStartedAt = 0;
+    let lastCheckpointSequence: number | undefined;
+    let lastCheckpointEpoch: number | undefined;
     const reportStreamIssue = (issue?: TerminalStreamIssue) => {
       const key = issue ? `${issue.kind}:${issue.pendingBytes ?? 0}` : "";
       if (key === reportedIssue) return;
@@ -508,7 +556,11 @@ export function TerminalPane({
         return;
       }
       const currentModifiers = modifiers.current;
-      sendTextInput(transformTerminalInput(data, currentModifiers));
+      sendTextInput(transformTerminalInput(
+        data,
+        currentModifiers,
+        terminalKittyKeyboardState(term)?.flags ?? 0,
+      ));
       if (currentModifiers.alt || currentModifiers.ctrl) {
         updateMobileModifiers(NO_TERMINAL_MODIFIERS);
       }
@@ -549,6 +601,58 @@ export function TerminalPane({
     // and abandon its stream. More than one write can be in flight, so the
     // parsing flag counts them instead of tracking a single write.
     let unparsedWrites = 0;
+    const clearCheckpointTimer = () => {
+      if (checkpointTimer !== undefined) window.clearTimeout(checkpointTimer);
+      checkpointTimer = undefined;
+    };
+    const writeCheckpoint = () => {
+      clearCheckpointTimer();
+      const current = socket.current;
+      const sequence = stream.resumeSequence;
+      if (
+        disposed
+        || !acceptingInput
+        || stream.synchronizing
+        || unparsedWrites > 0
+        || sequence === undefined
+        || terminalEpoch === undefined
+        || checkpointMaximumBytes <= 0
+        || current?.readyState !== WebSocket.OPEN
+      ) return;
+      if (current.bufferedAmount > 1024 * 1024) {
+        checkpointWindowStartedAt = Date.now();
+        checkpointTimer = window.setTimeout(writeCheckpoint, TERMINAL_CHECKPOINT_IDLE_MS);
+        return;
+      }
+      if (sequence === lastCheckpointSequence && terminalEpoch === lastCheckpointEpoch) {
+        checkpointWindowStartedAt = 0;
+        return;
+      }
+      const bytes = serializeTerminalCheckpoint(
+        serialize,
+        term,
+        checkpointMaximumBytes,
+      );
+      if (!bytes) {
+        checkpointWindowStartedAt = 0;
+        return;
+      }
+      sendTerminalCheckpoint(current, sequence, terminalEpoch, bytes);
+      checkpointWindowStartedAt = 0;
+      lastCheckpointSequence = sequence;
+      lastCheckpointEpoch = terminalEpoch;
+    };
+    const scheduleCheckpoint = () => {
+      if (checkpointMaximumBytes <= 0 || terminalEpoch === undefined || !acceptingInput) return;
+      const now = Date.now();
+      if (!checkpointWindowStartedAt) checkpointWindowStartedAt = now;
+      const dueAt = Math.min(
+        now + TERMINAL_CHECKPOINT_IDLE_MS,
+        checkpointWindowStartedAt + TERMINAL_CHECKPOINT_MAX_INTERVAL_MS,
+      );
+      clearCheckpointTimer();
+      checkpointTimer = window.setTimeout(writeCheckpoint, Math.max(0, dueAt - now));
+    };
     const writeTerminal = (data: Uint8Array, commit?: number) => new Promise<void>((resolve, reject) => {
       if (isDebugRecordingActive()) {
         recordDebugEvent(terminal.id, { type: "write", data: encodeBytesBase64(data) });
@@ -562,6 +666,7 @@ export function TerminalPane({
           try {
             if (commit !== undefined) stream.commit(commit);
             resolve();
+            scheduleCheckpoint();
           } catch (error) {
             reject(error);
           }
@@ -594,7 +699,10 @@ export function TerminalPane({
         reportedViewport = `${size.cols}x${size.rows}@${size.pixelWidth}x${size.pixelHeight}`;
       }
       const resumeSequence = stream.resumeSequence;
-      if (resumeSequence !== undefined) url.searchParams.set("sequence", String(resumeSequence));
+      if (resumeSequence !== undefined && (checkpointMaximumBytes <= 0 || terminalEpoch !== undefined)) {
+        url.searchParams.set("sequence", String(resumeSequence));
+        if (terminalEpoch !== undefined) url.searchParams.set("epoch", String(terminalEpoch));
+      }
       const next = new WebSocket(url);
       // The server tracks what it is owed per connection, so acknowledgements
       // belong to the socket the bytes arrived on and start over on reconnect.
@@ -722,6 +830,12 @@ export function TerminalPane({
               recordDebugEvent(terminal.id, { type: "control", message });
               flowControlled = message.flowControl === true;
               viewportRelease = message.viewportRelease === true;
+              const checkpointBytes = message.checkpointBytes;
+              checkpointMaximumBytes = typeof checkpointBytes === "number"
+                && Number.isSafeInteger(checkpointBytes)
+                && checkpointBytes > 0
+                ? checkpointBytes
+                : 0;
               onUpdate(message.terminal);
             }
             if (message.type === "size") {
@@ -731,18 +845,15 @@ export function TerminalPane({
                 rows: message.rows,
                 controller: message.controller,
                 responder: message.responder,
+                epoch: message.epoch,
               });
-              // A resize reflows the local buffer, which may no longer match the
-              // server's canonical model at the committed sequence. Drop the
-              // resume baseline so the next reconnect pulls a fresh snapshot.
-              if (message.cols !== term.cols || message.rows !== term.rows) {
-                stream.invalidateResume();
-              }
+              terminalEpoch = message.epoch;
               term.resize(message.cols, message.rows);
               responder = message.responder;
               if (!acceptingInput) term.options.disableStdin = !responder;
               setTerminalSize({ focused: message.focused, controller: message.controller });
               captureRenderState(true);
+              scheduleCheckpoint();
             }
             if (message.type === "sync") {
               recordDebugEvent(terminal.id, {
@@ -774,6 +885,7 @@ export function TerminalPane({
               reportViewport();
               if (activeState.current && visibleState.current) term.focus();
               captureRenderState(true);
+              scheduleCheckpoint();
             }
             if (message.type === "exit") {
               recordDebugEvent(terminal.id, { type: "control", message });
@@ -896,7 +1008,9 @@ export function TerminalPane({
     if (isDebugRecordingActive()) startCapture();
 
     return () => {
+      writeCheckpoint();
       disposed = true;
+      clearCheckpointTimer();
       viewportReporter.cancel();
       clearInterval(keepaliveTimer);
       renderDisposable.dispose();

@@ -1,3 +1,11 @@
+@font-face {
+  font-family: "Symbols Nerd Font Mono";
+  src: url("/fonts/symbols-nerd-font-mono-v3.5.0.woff2") format("woff2");
+  font-display: swap;
+  font-style: normal;
+  font-weight: 400;
+}
+
 :root {
   color-scheme: dark;
   --sidebar: #181818;

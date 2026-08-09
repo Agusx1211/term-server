@@ -11,6 +11,8 @@ import {
   type TerminalPreviewMode,
 } from "../lib/terminal-preview";
 import { PanoptesUnicode17Addon } from "../lib/terminal-unicode";
+import { tuiCompatibilityOptions } from "../lib/terminal-compatibility";
+import { loadTerminalNerdFont, TERMINAL_FONT_FAMILY } from "../lib/terminal-font";
 import { addTerminalStreamProtocol, closeTerminalSocket } from "../lib/terminal-socket";
 import {
   TerminalRenderBacklog,
@@ -60,17 +62,23 @@ export function TerminalPreview({
       rows,
       cursorBlink: false,
       disableStdin: true,
-      fontFamily: "'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace",
+      fontFamily: TERMINAL_FONT_FAMILY,
       fontSize: mode === "large" ? 15 : 11,
       letterSpacing: 0,
       lineHeight: 1.15,
       minimumContrastRatio: 1,
       scrollback: 0,
       theme: terminalTheme(theme, terminal.color),
+      ...tuiCompatibilityOptions(),
     });
     xterm.current = term;
     term.loadAddon(new PanoptesUnicode17Addon());
     term.open(host);
+    void loadTerminalNerdFont().then(() => {
+      if (disposed) return;
+      term.clearTextureAtlas();
+      term.refresh(0, term.rows - 1);
+    });
 
     const fitExistingGrid = () => {
       if (!host.clientWidth || !host.clientHeight) return;

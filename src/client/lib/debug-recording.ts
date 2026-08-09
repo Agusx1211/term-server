@@ -16,7 +16,14 @@ export type FrontendRecordEvent =
   | { type: "state"; state: string }
   | { type: "sync"; mode: "snapshot" | "resume"; sequence: number }
   | { type: "synced"; sequence: number }
-  | { type: "size"; cols: number; rows: number; controller: boolean; responder: boolean }
+  | {
+      type: "size";
+      cols: number;
+      rows: number;
+      controller: boolean;
+      responder: boolean;
+      epoch?: number;
+    }
   | { type: "control"; message: unknown }
   | { type: "output"; sequence: number; data: string }
   | { type: "write"; data: string }

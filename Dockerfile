@@ -27,6 +27,8 @@ RUN apt-get update \
     && install -d -o term-server -g term-server /data /usr/share/term-server/client
 COPY --from=backend /build/target/release/term-server /usr/local/bin/term-server
 COPY --from=web /build/dist/client /usr/share/term-server/client
+COPY LICENSE NOTICE /usr/share/doc/term-server/
+COPY licenses /usr/share/doc/term-server/licenses
 
 ENV LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \

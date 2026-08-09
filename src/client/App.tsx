@@ -91,6 +91,11 @@ import {
   type TerminalPreviewSettings,
 } from "./lib/terminal-preview";
 import {
+  CACHED_TERMINALS_STORAGE_KEY,
+  parseCachedTerminals,
+  resolveCachedTerminals,
+} from "./lib/cached-terminals";
+import {
   artifactCountsBySession,
   artifactOwnerLabel,
   discoverArtifacts,
@@ -274,6 +279,9 @@ const initialTerminalPreviewSettings = () =>
     localStorage.getItem(TERMINAL_PREVIEW_MODE_STORAGE_KEY),
   );
 
+const initialCachedTerminals = () =>
+  parseCachedTerminals(localStorage.getItem(CACHED_TERMINALS_STORAGE_KEY));
+
 const initialViewedAgentRevisions = () =>
   parseViewedAgentRevisions(localStorage.getItem(VIEWED_AGENT_REVISIONS_STORAGE_KEY));
 
@@ -314,6 +322,7 @@ export function App() {
   const [terminalFontSize, setTerminalFontSize] = useState(initialTerminalFontSize);
   const [terminalPreviewSettings, setTerminalPreviewSettings] =
     useState(initialTerminalPreviewSettings);
+  const [cachedTerminalsOverride, setCachedTerminalsOverride] = useState(initialCachedTerminals);
   const [terminalStreamIssues, setTerminalStreamIssues] =
     useState(new Map<string, TerminalStreamIssue>());
   const [recordingStatus, setRecordingStatus] = useState<DebugRecordingStatus | null>(null);
@@ -789,13 +798,15 @@ export function App() {
     [displayedRectangles],
   );
 
+  const cachedTerminals = resolveCachedTerminals(cachedTerminalsOverride, config.cachedTerminals);
+
   useEffect(() => {
     const available = new Set(terminals.map((terminal) => terminal.id));
     setMountedIds((current) => {
-      const next = reconcileMounted(current, paneIds, available, config.cachedTerminals);
+      const next = reconcileMounted(current, paneIds, available, cachedTerminals);
       return next.length === current.length && next.every((id, index) => id === current[index]) ? current : next;
     });
-  }, [paneIds, terminals, config.cachedTerminals]);
+  }, [paneIds, terminals, cachedTerminals]);
 
   const markTerminalActivityViewed = (id: string) => {
     const terminal = terminalsRef.current.find((candidate) => candidate.id === id);
@@ -1193,6 +1204,15 @@ export function App() {
   const updateTerminalPreviewSettings = (settings: TerminalPreviewSettings) => {
     setTerminalPreviewSettings(settings);
     localStorage.setItem(TERMINAL_PREVIEW_SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+  };
+
+  // `undefined` clears the override and hands the choice back to the server,
+  // which is not the same as storing whatever the server currently says: the
+  // deployment can change its default and this browser should follow it.
+  const updateCachedTerminals = (limit: number | undefined) => {
+    setCachedTerminalsOverride(limit);
+    if (limit === undefined) localStorage.removeItem(CACHED_TERMINALS_STORAGE_KEY);
+    else localStorage.setItem(CACHED_TERMINALS_STORAGE_KEY, String(limit));
   };
 
   const waitForServer = async (ready: (nextConfig: ClientConfig) => boolean) => {
@@ -1694,6 +1714,9 @@ export function App() {
                 tileNewTerminals={tileNewTerminals}
                 confirmTerminalKills={confirmTerminalKills}
                 terminalPreviewSettings={terminalPreviewSettings}
+                cachedTerminals={cachedTerminals}
+                cachedTerminalsOverridden={cachedTerminalsOverride !== undefined}
+                serverCachedTerminals={config.cachedTerminals}
                 recording={recordingStatus}
                 frontendRecordingEvents={frontendRecordingEvents}
                 recordingBusy={recordingBusy}
@@ -1717,6 +1740,7 @@ export function App() {
                 onTileNewTerminalsChange={updateTileNewTerminals}
                 onConfirmTerminalKillsChange={updateConfirmTerminalKills}
                 onTerminalPreviewSettingsChange={updateTerminalPreviewSettings}
+                onCachedTerminalsChange={updateCachedTerminals}
                 onRecordingStart={() => void startRecording()}
                 onRecordingStop={() => void stopRecording()}
                 onRecordingDownload={() => void downloadRecording()}

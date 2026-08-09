@@ -1188,10 +1188,10 @@ async fn terminal_socket(
     require_terminal_stream_protocol(query.stream_protocol())?;
     let observer = query.observer();
     let initial_size = if observer { None } else { query.viewport() };
-    let sequence = query.sequence();
+    let resume = query.resume();
     let terminal = state
         .workspace
-        .connect_terminal(id, initial_size, sequence, observer)
+        .connect_terminal(id, initial_size, resume, observer)
         .await?;
     Ok(websocket
         .max_message_size(64 * 1024)
@@ -1205,7 +1205,7 @@ async fn terminal_socket(
                         socket,
                         terminal,
                         initial_size,
-                        sequence,
+                        resume,
                         observer,
                         Some(&state.debug_recording),
                     )
