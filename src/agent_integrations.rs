@@ -26,6 +26,7 @@ const PI_EXTENSION: &str =
 const OMP_PACKAGE: &str = include_str!("../integrations/omp/package.json");
 const OMP_EXTENSION: &str =
     include_str!("../integrations/omp/extensions/term-server-agent-events.ts");
+const OMP_ACTIVITY: &str = include_str!("../integrations/omp/extensions/subagent-activity.ts");
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -542,6 +543,13 @@ impl AgentIntegrationService {
                     OMP_EXTENSION,
                 )
                 .await?;
+                write_asset(
+                    &root.join(format!(
+                        "plugins/{PLUGIN_NAME}/extensions/subagent-activity.ts"
+                    )),
+                    OMP_ACTIVITY,
+                )
+                .await?;
                 write_json(
                     &root.join(".omp-plugin/marketplace.json"),
                     &omp_marketplace(),
@@ -593,6 +601,10 @@ impl AgentIntegrationService {
                 (
                     "plugins/term-server-agent-events/extensions/term-server-agent-events.ts",
                     OMP_EXTENSION,
+                ),
+                (
+                    "plugins/term-server-agent-events/extensions/subagent-activity.ts",
+                    OMP_ACTIVITY,
                 ),
             ],
         };
