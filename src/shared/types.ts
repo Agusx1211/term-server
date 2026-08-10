@@ -102,6 +102,46 @@ export interface ClientConfig {
   broker: SessionBrokerInfo | null;
   updates: UpdateConfig;
 }
+export type StatusModuleState = "ok" | "warn" | "error" | "unconfigured";
+
+export interface StatusModuleDetail {
+  label: string;
+  value: string;
+}
+
+export interface StatusModuleRefresh {
+  updatedAt: number | null;
+  nextAt: number | null;
+  intervalSeconds: number;
+  stale: boolean;
+}
+
+export interface StatusModuleError {
+  code: string;
+  message: string;
+  retryable: boolean;
+}
+
+export interface StatusModule {
+  id: string;
+  label: string;
+  provider: string;
+  state: StatusModuleState;
+  primary: string | null;
+  details: StatusModuleDetail[];
+  refresh: StatusModuleRefresh;
+  error: StatusModuleError | null;
+}
+
+export interface StatusModulesResponse {
+  enabled: boolean;
+  display: {
+    showOnMobile: boolean;
+  };
+  modules: StatusModule[];
+  generatedAt: number;
+}
+
 
 export interface BuildInfo {
   version: string;

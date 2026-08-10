@@ -8,6 +8,18 @@
   **Settings → Terminal behavior**. Clearing the override follows the server default again, while
   setting it to zero keeps only visible panes mounted.
 
+### Added
+
+- An optional provider-neutral status line can now be enabled with
+  `--status-config` or `TERM_SERVER_STATUS_CONFIG`. Version-1 TOML modules retain
+  their configured order and expose only normalized, authenticated
+  `GET /api/status-modules` data. Standard provider credentials report configured
+  state when no public quota source exists; explicitly opted-in OpenAI and
+  Anthropic admin modules show configured rate limits rather than pretending
+  they are remaining quota or billing balances.
+- Status credentials stay in the term-server parent environment and are never
+  accepted from the browser, placed in the TOML file, serialized, or logged.
+
 ### Fixed
 
 - Snapshot recovery now prefers a bounded checkpoint produced by xterm.js's official serialize
@@ -57,6 +69,7 @@
   that grow with the output a terminal actually produces, so idle sessions are unaffected.
 
 ### Added
+
 
 - Terminal output is now flow-controlled, following VS Code's terminal design. A browser
   acknowledges bytes once xterm.js has parsed them, and while a terminal has produced more

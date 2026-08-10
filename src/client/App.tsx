@@ -124,6 +124,7 @@ import {
 import { Login } from "./components/Login";
 import { Sidebar } from "./components/Sidebar";
 import { SettingsWorkspace } from "./components/SettingsWorkspace";
+import { StatusModules } from "./components/StatusModules";
 import { TermServerLogo } from "./components/TermServerLogo";
 import { WelcomeSection } from "./components/WelcomeSection";
 import { ResourceTabBar } from "./components/ResourceTabs";
@@ -327,6 +328,7 @@ export function App() {
     useState(new Map<string, TerminalStreamIssue>());
   const [recordingStatus, setRecordingStatus] = useState<DebugRecordingStatus | null>(null);
   const [frontendRecordingEvents, setFrontendRecordingEvents] = useState(0);
+  const [statusModulesMobileVisible, setStatusModulesMobileVisible] = useState(false);
   const [recordingBusy, setRecordingBusy] = useState(false);
   const legacyViewedAgentRevisions = useRef(initialViewedAgentRevisions());
   const legacyViewedCommandCompletions = useRef(initialViewedCommandCompletions());
@@ -1452,7 +1454,7 @@ export function App() {
     .join("\n");
 
   return (
-    <div class="workbench">
+    <div class={`workbench ${statusModulesMobileVisible ? "status-modules-mobile" : ""}`}>
       <div class="workbench-main">
         <header class="mobile-toolbar">
           <button
@@ -1772,6 +1774,7 @@ export function App() {
             </span>
           )}
         </span>
+        <StatusModules onMobileVisibilityChange={setStatusModulesMobileVisible} />
         <span class="statusbar-group statusbar-right">
           <span
             class="statusbar-item statusbar-build"

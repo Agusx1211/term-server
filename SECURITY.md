@@ -17,6 +17,48 @@ Official update metadata and checksum lists are signed with Ed25519. Installed r
 
 Pi-generated titles and notification summaries are independently disabled by default. Enabling titles sends a bounded copy of the submitted task message to the selected Pi model provider. Enabling notification summaries sends a bounded, ANSI-sanitized tail of terminal output, which may contain source code, command output, paths, or secrets. Use only a provider appropriate for that data. term-server starts Pi without project context, sessions, skills, or built-in tools and exposes only a single metadata-result tool, but model-provider data handling remains governed by the selected provider.
 
+## Optional provider status modules
+
+The optional status configuration is version-1 non-secret TOML selected with
+`--status-config` or `TERM_SERVER_STATUS_CONFIG`. Keep the file owner-readable
+because module labels and admin project/workspace identifiers can still be
+operationally sensitive, but never put a key, token, bearer value, or password
+in it. Unknown keys and unsupported provider fields are rejected at startup.
+
+Provider credentials are discovered once from the term-server startup
+environment. On Unix, the same-user session broker and terminal children
+intentionally inherit these variables, so commands run by that user may observe
+them. They are never accepted from the browser, copied into the status
+configuration, serialized in `/api/status-modules`, or written to logs. The
+endpoint is authenticated and no-store. The browser receives only bounded
+provider-neutral display values, fixed error codes/messages, and timestamps; it
+never receives an authorization header, upstream response body, raw URL,
+account identifier, or credential name/value.
+
+Normal `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`, `OPENAI_API_KEY`,
+`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`, and
+`ZAI_API_KEY` values are used only to report configured state. The status
+service does not make model calls or paid inference requests just to discover
+rate-limit headers.
+
+`OPENAI_ADMIN_KEY` and `ANTHROPIC_ADMIN_KEY` are separate admin credentials:
+they are used only by a module with explicit `admin = true` and the matching
+provider, never as a fallback for a normal module. Admin modules query only the
+documented provider rate-limit endpoints; configured limits are not billing
+balances or remaining quota. Anthropic workspace responses are overrides only:
+omitted or null limit types inherit organization settings and are never
+presented as complete effective limits.
+
+Missing credentials produce an unconfigured module without network access.
+Provider failures are isolated and normalized to safe fixed messages. A refresh
+uses at most eight upstream requests concurrently and has a 60-second aggregate
+deadline; retryable failures use bounded exponential backoff. After a
+successful snapshot, a failed refresh retains the prior display value but marks
+the module warning/stale and exposes only a retryable sanitized error; an
+initial failure has no prior value to retain. Custom outbound URLs, dashboard
+scraping, undocumented provider endpoints, and browser-supplied credential
+paths are not supported.
+
 ## Reporting a vulnerability
 
 Please report vulnerabilities privately to the project maintainers. Include the affected version, reproduction steps, impact, and any suggested mitigation. Do not open a public issue until a fix or disclosure plan is available.

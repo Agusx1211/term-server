@@ -14,6 +14,7 @@ pub mod config;
 pub mod debug_recording;
 pub mod files;
 pub mod pushover;
+pub mod status;
 pub mod terminal;
 mod terminal_state;
 pub mod tls;
