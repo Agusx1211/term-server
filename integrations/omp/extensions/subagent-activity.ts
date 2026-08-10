@@ -5,49 +5,75 @@ interface SubagentLifecycleEvent {
 
 export interface SubagentActivityTracker {
   onParentStart(): void;
-  onParentEnd(): void;
+  onParentEnd(event?: unknown): void;
   onSubagentLifecycle(event: unknown): void;
+  hasActiveWork(): boolean;
   shutdown(): void;
 }
 
 function isSubagentLifecycleEvent(event: unknown): event is SubagentLifecycleEvent {
-  if (typeof event !== "object" || event === null) return false;
-  const candidate = event as { id?: unknown; status?: unknown };
-  return typeof candidate.id === "string"
+  if (
+    typeof event !== "object"
+    || event === null
+    || !("id" in event)
+    || !("status" in event)
+  ) return false;
+  const id = event.id;
+  const status = event.status;
+  return typeof id === "string"
     && (
-      candidate.status === "started"
-      || candidate.status === "completed"
-      || candidate.status === "failed"
-      || candidate.status === "aborted"
+      status === "started"
+      || status === "completed"
+      || status === "failed"
+      || status === "aborted"
     );
+}
+
+function isNonterminalAgentEnd(event: unknown): event is { isTerminal: false } {
+  if (
+    typeof event !== "object"
+    || event === null
+    || !("isTerminal" in event)
+  ) return false;
+  return event.isTerminal === false;
 }
 
 export function createSubagentActivityTracker(
   send: (event: string) => void,
 ): SubagentActivityTracker {
-  const states = new Map<string, "active" | "settled">();
+  const activeSubagents = new Set<string>();
+  let parentActive = false;
   let parentSettled = false;
+  let settlementReported = true;
   let shutdown = false;
 
-  function hasActiveSubagent(): boolean {
-    for (const state of states.values()) {
-      if (state === "active") return true;
-    }
-    return false;
-  }
-
   function settleIfReady(): void {
-    if (parentSettled && !hasActiveSubagent()) send("agent_settled");
+    if (
+      parentSettled
+      && activeSubagents.size === 0
+      && !settlementReported
+    ) {
+      settlementReported = true;
+      send("agent_settled");
+    }
   }
 
   return {
     onParentStart() {
       if (shutdown) return;
+      parentActive = true;
       parentSettled = false;
+      settlementReported = false;
       send("agent_start");
     },
-    onParentEnd() {
-      if (shutdown || parentSettled) return;
+    onParentEnd(event?: unknown) {
+      if (
+        shutdown
+        || !parentActive
+        || parentSettled
+        || isNonterminalAgentEnd(event)
+      ) return;
+      parentActive = false;
       parentSettled = true;
       settleIfReady();
     },
@@ -58,26 +84,25 @@ export function createSubagentActivityTracker(
       if (!id) return;
 
       if (event.status === "started") {
-        if (states.has(id)) return;
-        states.set(id, "active");
+        if (activeSubagents.has(id)) return;
+        activeSubagents.add(id);
+        settlementReported = false;
         send("agent_start");
         return;
       }
 
-      if (states.get(id) !== "active") {
-        // Remember a terminal event that arrived before its start or was
-        // already observed so duplicate/out-of-order events stay inert.
-        if (!states.has(id)) states.set(id, "settled");
-        return;
-      }
-
-      states.set(id, "settled");
+      if (!activeSubagents.delete(id)) return;
       settleIfReady();
+    },
+    hasActiveWork() {
+      return parentActive || activeSubagents.size > 0;
     },
     shutdown() {
       shutdown = true;
-      parentSettled = false;
-      states.clear();
+      parentActive = false;
+      parentSettled = true;
+      settlementReported = true;
+      activeSubagents.clear();
     },
   };
 }

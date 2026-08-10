@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- The agent activity pill now treats a connector's own status report as the source of truth. When
+  omp, pi, codex, or claude reports its state through its hook connector, that signal outranks the
+  screen-content heuristics, so an agent driving subagents (which reports itself as working even when
+  its own TUI looks idle) no longer flips to "ready" prematurely. Screen detection and CPU/output
+  heuristics still drive terminals without a live connector.
+
 ## 0.12.2 - 2026-08-10
 
 ### Fixed
@@ -10,9 +20,15 @@
 - OSC 52 clipboard requests now follow the browser that most recently sent terminal input, and
   clipboard permission or secure-context failures are shown instead of being silently ignored.
 
+- OMP activity now accepts lifecycle events only from the interactive root session, distinguishes
+  intermediate continuations from final settlement, keeps silent subagents active with heartbeats,
+  and rejects reordered hook reports. Stale browser refreshes and terminal-stream callbacks can no
+  longer replay an older completion state.
+
 ### Upgrade notes
 
-- There are no breaking changes or data migrations.
+- There are no breaking changes or data migrations. Use **Repair** under **Settings → Live agent
+  activity** and start a new OMP session to load the corrected managed extension.
 
 ## 0.12.1 - 2026-08-10
 

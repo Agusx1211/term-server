@@ -593,12 +593,25 @@ export function TerminalPane({
     const backlog = new TerminalRenderBacklog();
     let acceptingInput = false;
     let parsingOutput = false;
+    let streamGeneration = 0;
+    let messageQueueGeneration = 0;
     let messageQueue = Promise.resolve();
     // Resolves once xterm has parsed every frame handed to it so far.
     let pendingWrites = Promise.resolve();
+    const isCurrentGeneration = (generation: number) =>
+      !disposed && generation === streamGeneration;
+    const isCurrentSocket = (generation: number, candidate: WebSocket) =>
+      isCurrentGeneration(generation) && socket.current === candidate;
     // The stream is only quiescent once queued messages have been applied and
-    // the writes they issued have been parsed.
-    const settledStream = () => messageQueue.then(() => pendingWrites);
+    // the writes they issued have been parsed. A settled callback from an old
+    // generation must never wait on or mutate the current generation's queue.
+    const settledStream = (generation = messageQueueGeneration) => {
+      const queue = messageQueue;
+      return queue.then(() => {
+        if (messageQueueGeneration !== generation) return;
+        return pendingWrites;
+      });
+    };
     let lastServerMessage = Date.now();
     let hasSynced = false;
     let recoveringOutput = false;
@@ -843,7 +856,16 @@ export function TerminalPane({
       clearCheckpointTimer();
       checkpointTimer = window.setTimeout(writeCheckpoint, Math.max(0, dueAt - now));
     };
-    const writeTerminal = (data: Uint8Array, commit?: number) => new Promise<void>((resolve, reject) => {
+    const writeTerminal = (
+      data: Uint8Array,
+      commit: number | undefined,
+      generation: number,
+      owner: WebSocket,
+    ) => new Promise<void>((resolve, reject) => {
+      if (!isCurrentSocket(generation, owner)) {
+        resolve();
+        return;
+      }
       if (isDebugRecordingActive()) {
         recordDebugEvent(terminal.id, { type: "write", data: encodeBytesBase64(data) });
       }
@@ -852,6 +874,10 @@ export function TerminalPane({
       updateStreamDiagnostics();
       try {
         term.write(data, () => {
+          if (!isCurrentSocket(generation, owner)) {
+            resolve();
+            return;
+          }
           unparsedWrites -= 1;
           parsingOutput = unparsedWrites > 0;
           try {
@@ -869,15 +895,33 @@ export function TerminalPane({
           }
         });
       } catch (error) {
-        unparsedWrites -= 1;
-        parsingOutput = unparsedWrites > 0;
-        updateStreamDiagnostics();
+        if (isCurrentSocket(generation, owner)) {
+          unparsedWrites -= 1;
+          parsingOutput = unparsedWrites > 0;
+          updateStreamDiagnostics();
+        }
         reject(error);
       }
     });
+    const clearReconnectTimer = () => {
+      if (reconnectTimer.current !== undefined) clearTimeout(reconnectTimer.current);
+      reconnectTimer.current = undefined;
+    };
 
     const connect = () => {
+      const current = socket.current;
       if (disposed || exited.current || !visibleState.current || reloadRequiredState.current) return;
+      if (current && current.readyState !== WebSocket.CLOSED) return;
+      if (current) socket.current = undefined;
+      clearReconnectTimer();
+      const generation = ++streamGeneration;
+      messageQueueGeneration = generation;
+      messageQueue = Promise.resolve();
+      pendingWrites = Promise.resolve();
+      unparsedWrites = 0;
+      parsingOutput = false;
+      backlog.reset();
+      suspendSocket = undefined;
       acceptingInput = false;
       responder = false;
       term.options.disableStdin = true;
@@ -926,6 +970,7 @@ export function TerminalPane({
       // against an older broker, which would answer `release` with an error.
       let viewportRelease = false;
       const acknowledgeParsed = (bytes: number) => {
+        if (!isCurrentSocket(generation, next)) return;
         const batch = outputAck.parsed(bytes);
         if (flowControlled && batch !== undefined && next.readyState === WebSocket.OPEN) {
           next.send(JSON.stringify({ type: "ack", bytes: batch } satisfies ClientTerminalMessage));
@@ -942,7 +987,7 @@ export function TerminalPane({
       let abandoned = false;
       let closeHandled = false;
       const failProtocol = (error: unknown) => {
-        if (protocolFailed || abandoned) return;
+        if (!isCurrentSocket(generation, next) || protocolFailed || abandoned) return;
         protocolFailed = true;
         acceptingInput = false;
         term.options.disableStdin = true;
@@ -950,6 +995,7 @@ export function TerminalPane({
         closeTerminalSocket(next, "protocol-error");
       };
       const recoverBacklog = () => {
+        if (!isCurrentSocket(generation, next) || abandoned) return;
         abandoned = true;
         recoveringOutput = true;
         acceptingInput = false;
@@ -965,7 +1011,7 @@ export function TerminalPane({
       // gives up its say in the negotiated size, which it takes back by
       // reporting its viewport once it is visible again.
       const suspend = () => {
-        if (abandoned) return;
+        if (!isCurrentSocket(generation, next) || abandoned) return;
         if (viewportRelease && next.readyState === WebSocket.OPEN) {
           next.send(JSON.stringify({ type: "release" } satisfies ClientTerminalMessage));
           return;
@@ -979,13 +1025,14 @@ export function TerminalPane({
       next.binaryType = "arraybuffer";
       socket.current = next;
       next.addEventListener("open", () => {
-        if (disposed || socket.current !== next) return;
+        if (!isCurrentSocket(generation, next)) return;
         diagnosticsHandle?.socketOpened(next);
         lastServerMessage = Date.now();
         reportViewport();
       });
+
       next.addEventListener("message", (event) => {
-        if (disposed || socket.current !== next || protocolFailed || abandoned) return;
+        if (!isCurrentSocket(generation, next) || protocolFailed || abandoned) return;
         diagnosticsHandle?.socketMessage(next, event.data);
         lastServerMessage = Date.now();
         let eagerFrame: TerminalFrame | undefined;
@@ -1007,10 +1054,12 @@ export function TerminalPane({
             updateStreamDiagnostics();
           }
         }
+        if (messageQueueGeneration !== generation) return;
         messageQueue = messageQueue.then(async () => {
           try {
-            if (socket.current !== next || protocolFailed || abandoned) return;
+            if (!isCurrentSocket(generation, next) || messageQueueGeneration !== generation) return;
             const binary = event.data instanceof Blob ? await event.data.arrayBuffer() : event.data;
+            if (!isCurrentSocket(generation, next) || messageQueueGeneration !== generation) return;
             if (binary instanceof ArrayBuffer) {
               const frame = eagerFrame ?? decodeTerminalFrame(binary);
               if (isDebugRecordingActive()) {
@@ -1031,7 +1080,7 @@ export function TerminalPane({
               // it still measures what the renderer actually owes.
               const settled = queuedBytes;
               queuedBytes = 0;
-              pendingWrites = writeTerminal(frame.data, commit)
+              pendingWrites = writeTerminal(frame.data, commit, generation, next)
                 // Acknowledged only once xterm reports the bytes parsed. Acking
                 // on arrival would defeat the point: the server would keep
                 // sending while this pane was still working through the last
@@ -1047,15 +1096,18 @@ export function TerminalPane({
                 })
                 .catch(failProtocol)
                 .finally(() => {
-                  backlog.settle(settled);
-                  updateStreamDiagnostics();
+                  if (isCurrentSocket(generation, next)) {
+                    backlog.settle(settled);
+                    updateStreamDiagnostics();
+                  }
                 });
               return;
             }
             // A control message may reset or resize the grid, so everything
             // written ahead of it has to be parsed before it is applied.
             await pendingWrites;
-            if (socket.current !== next || protocolFailed || abandoned) return;
+            if (!isCurrentSocket(generation, next) || messageQueueGeneration !== generation
+              || protocolFailed || abandoned) return;
             const message = JSON.parse(String(event.data)) as ServerTerminalMessage;
             if (message.type === "ready") {
               recordDebugEvent(terminal.id, { type: "control", message });
@@ -1204,8 +1256,10 @@ export function TerminalPane({
               onNotice(message.message);
             }
           } finally {
-            backlog.settle(queuedBytes);
-            updateStreamDiagnostics();
+            if (isCurrentSocket(generation, next)) {
+              backlog.settle(queuedBytes);
+              updateStreamDiagnostics();
+            }
           }
         }).catch((error) => {
           failProtocol(error);
@@ -1214,16 +1268,14 @@ export function TerminalPane({
       next.addEventListener("close", () => {
         if (closeHandled) return;
         closeHandled = true;
-        const stale = socket.current !== next;
         diagnosticsHandle?.socketClosed(next);
-        if (stale) return;
+        if (!isCurrentSocket(generation, next)) return;
         recordDebugEvent(terminal.id, { type: "disconnect", cause: "close" });
         // A server exit is sent immediately before the socket closes. Let all
         // messages already delivered by this socket run before invalidating it;
         // otherwise the close callback races the queue and drops the exit.
-        void settledStream().then(() => {
-          if (socket.current !== next) return;
-          if (disposed || exited.current) return;
+        void settledStream(generation).then(() => {
+          if (!isCurrentSocket(generation, next) || exited.current) return;
           acceptingInput = false;
           term.options.disableStdin = true;
           socket.current = undefined;
@@ -1259,14 +1311,18 @@ export function TerminalPane({
           diagnosticsHandle?.socketState("disconnected");
           backlog.reset();
           if (recoveringOutput) stream.restart();
-          reconnectTimer.current = window.setTimeout(
-            connect,
-            recoveringOutput ? 0 : Math.min(5000, 250 * 2 ** attempts),
-          );
+          clearReconnectTimer();
+          const delay = recoveringOutput ? 0 : Math.min(5000, 250 * 2 ** attempts);
+          reconnectTimer.current = window.setTimeout(() => {
+            reconnectTimer.current = undefined;
+            if (!isCurrentGeneration(generation) || exited.current || !visibleState.current) return;
+            connect();
+          }, delay);
         });
       });
       next.addEventListener("error", () => {
-        if (socket.current === next) next.close();
+        if (!isCurrentSocket(generation, next)) return;
+        next.close();
       });
     };
 
@@ -1282,8 +1338,7 @@ export function TerminalPane({
       recordDebugEvent(terminal.id, { type: "visibility", visible: nextVisible });
       if (!nextVisible) {
         viewportReporter.cancel();
-        if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
-        reconnectTimer.current = undefined;
+        clearReconnectTimer();
         reportStreamIssue();
         term.blur();
         // A released connection has no size registered against it, so the next
@@ -1292,8 +1347,10 @@ export function TerminalPane({
         suspendSocket?.();
         return;
       }
-      void settledStream().then(() => {
-        if (disposed || exited.current || !visibleState.current) return;
+      clearReconnectTimer();
+      const generation = streamGeneration;
+      void settledStream(generation).then(() => {
+        if (!isCurrentGeneration(generation) || exited.current || !visibleState.current) return;
         const current = socket.current;
         if (!current || current.readyState === WebSocket.CLOSED) connect();
         reportViewport();
@@ -1357,6 +1414,8 @@ export function TerminalPane({
       unregisterContextLossControl = undefined;
       writeCheckpoint();
       disposed = true;
+      streamGeneration += 1;
+      clearReconnectTimer();
       clearCheckpointTimer();
       viewportReporter.cancel();
       clearInterval(keepaliveTimer);
@@ -1364,7 +1423,6 @@ export function TerminalPane({
       selectionDisposable.dispose();
       recordingDisposable();
       stopCapture();
-      if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
       observer.disconnect();
       imagePreviews.clear();
       disposeTouchScroll();

@@ -47,6 +47,8 @@ impl AgentEventKind {
 pub struct AgentEvent {
     pub provider: String,
     pub kind: AgentEventKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<u64>,
     /// A provider-supplied conversation title. omp generates one from the
     /// first message and forwards it so term-server reuses it instead of
     /// generating its own; other providers leave this `None`.
@@ -87,6 +89,7 @@ impl AgentEvent {
         Some(Self {
             provider: provider.to_owned(),
             kind,
+            sequence: input.get("sequence").and_then(Value::as_u64),
             title: input
                 .get("title")
                 .and_then(Value::as_str)
@@ -165,6 +168,7 @@ mod tests {
             AgentEvent {
                 provider: "codex".to_owned(),
                 kind: AgentEventKind::RunningCommand,
+                sequence: None,
                 title: None,
             }
         );
@@ -208,20 +212,30 @@ mod tests {
         .unwrap();
         assert_eq!(activity.provider, "omp");
         assert_eq!(activity.kind, AgentEventKind::EditingFiles);
+        assert_eq!(activity.sequence, None);
         assert_eq!(activity.title, None);
 
         let titled = AgentEvent::from_hook_input(
             "OMP",
             &serde_json::json!({
                 "hook_event_name": "agent_start",
-                "title": "  fix checkout latency  "
+                "title": "  fix checkout latency  ",
+                "sequence": 42
             }),
         )
         .unwrap();
         assert_eq!(titled.kind, AgentEventKind::Thinking);
+        assert_eq!(titled.sequence, Some(42));
         assert_eq!(titled.title.as_deref(), Some("fix checkout latency"));
-        // The title is absent from the wire shape when unset.
-        assert!(!serde_json::to_string(&activity).unwrap().contains("title"));
+        // The title and sequence are absent from the wire shape when unset.
+        let activity_json = serde_json::to_string(&activity).unwrap();
+        assert!(!activity_json.contains("title"));
+        assert!(!activity_json.contains("sequence"));
+        assert!(
+            serde_json::to_string(&titled)
+                .unwrap()
+                .contains("\"sequence\":42")
+        );
     }
 
     #[test]
