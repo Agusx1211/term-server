@@ -39,6 +39,7 @@ import {
   stopDebugRecording,
   takeFrontendRecording,
 } from "./lib/debug-recording";
+import { installE2EDiagnostics } from "./lib/e2e-diagnostics";
 import {
   agentNeedsAttention,
   parseViewedAgentRevisions,
@@ -96,6 +97,11 @@ import {
   resolveCachedTerminals,
 } from "./lib/cached-terminals";
 import {
+  parseTerminalScrollback,
+  resolveTerminalScrollback,
+  TERMINAL_SCROLLBACK_STORAGE_KEY,
+} from "./lib/terminal-scrollback";
+import {
   artifactCountsBySession,
   artifactOwnerLabel,
   discoverArtifacts,
@@ -108,7 +114,9 @@ import {
 } from "./lib/artifacts";
 import {
   arrangeLayout,
+  clampSplitRatio,
   isPaneLayout,
+  dividerRatioAtPoint,
   layoutFromIds,
   paneIds as idsFromLayout,
   paneLeaf,
@@ -117,9 +125,14 @@ import {
   pruneLayout,
   reconcileMounted,
   removePane,
+  removePaneAndSelect,
+  splitDividerAt,
+  splitDividers,
   TERMINAL_DRAG_TYPE,
+  updateSplitRatio,
   type DropPosition,
   type PaneLayout,
+  type PanePath,
 } from "./lib/layout";
 import { Login } from "./components/Login";
 import { Sidebar } from "./components/Sidebar";
@@ -283,6 +296,9 @@ const initialTerminalPreviewSettings = () =>
 const initialCachedTerminals = () =>
   parseCachedTerminals(localStorage.getItem(CACHED_TERMINALS_STORAGE_KEY));
 
+const initialTerminalScrollback = () =>
+  parseTerminalScrollback(localStorage.getItem(TERMINAL_SCROLLBACK_STORAGE_KEY));
+
 const initialViewedAgentRevisions = () =>
   parseViewedAgentRevisions(localStorage.getItem(VIEWED_AGENT_REVISIONS_STORAGE_KEY));
 
@@ -292,6 +308,9 @@ const initialViewedCommandCompletions = () =>
   );
 
 export function App() {
+  useEffect(() => {
+    installE2EDiagnostics();
+  }, []);
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
   const [workspaceLoaded, setWorkspaceLoaded] = useState(false);
   const [terminals, setTerminals] = useState<TerminalInfo[]>([]);
@@ -323,6 +342,7 @@ export function App() {
   const [terminalFontSize, setTerminalFontSize] = useState(initialTerminalFontSize);
   const [terminalPreviewSettings, setTerminalPreviewSettings] =
     useState(initialTerminalPreviewSettings);
+  const [scrollbackLinesOverride, setScrollbackLinesOverride] = useState(initialTerminalScrollback);
   const [cachedTerminalsOverride, setCachedTerminalsOverride] = useState(initialCachedTerminals);
   const [terminalStreamIssues, setTerminalStreamIssues] =
     useState(new Map<string, TerminalStreamIssue>());
@@ -339,6 +359,7 @@ export function App() {
   const artifactsInitialized = useRef(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsActive, setSettingsActive] = useState(false);
+  const agentIntegrationsRequested = useRef(false);
   const agentEventsInitialized = useRef(false);
   const deliveredAgentEvents = useRef(new Map<string, number>());
   const commandEventsInitialized = useRef(false);
@@ -357,9 +378,53 @@ export function App() {
   configRef.current = config;
   const activeIdRef = useRef(activeId);
   activeIdRef.current = activeId;
+  const editorGridRef = useRef<HTMLElement>(null);
+  const layoutRef = useRef(layout);
+  layoutRef.current = layout;
+  const dividerDragRef = useRef<{
+    pointerId: number;
+    path: PanePath;
+    handle: HTMLElement;
+  }>();
   const paneIds = useMemo(() => idsFromLayout(layout), [layout]);
 
   useEffect(() => installVisualViewportCssVars(), []);
+  useEffect(() => {
+    const finish = (event?: PointerEvent) => {
+      const active = dividerDragRef.current;
+      if (!active || (event && event.pointerId !== active.pointerId)) return;
+      if (active.handle.hasPointerCapture(active.pointerId)) {
+        active.handle.releasePointerCapture(active.pointerId);
+      }
+      dividerDragRef.current = undefined;
+      document.body.classList.remove("pane-resizing");
+    };
+
+    const move = (event: PointerEvent) => {
+      const active = dividerDragRef.current;
+      if (!active || active.pointerId !== event.pointerId) return;
+      const currentLayout = layoutRef.current;
+      const divider = splitDividerAt(currentLayout, active.path);
+      const viewport = editorGridRef.current?.getBoundingClientRect();
+      if (!divider || !viewport || viewport.width <= 0 || viewport.height <= 0) return;
+      const ratio = dividerRatioAtPoint(divider, viewport, event.clientX, event.clientY);
+      setLayout((current) => updateSplitRatio(current, active.path, ratio));
+      event.preventDefault();
+    };
+
+    const cancel = () => finish();
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", finish);
+    window.addEventListener("pointercancel", finish);
+    window.addEventListener("blur", cancel);
+    return () => {
+      finish();
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", finish);
+      window.removeEventListener("pointercancel", finish);
+      window.removeEventListener("blur", cancel);
+    };
+  }, []);
 
   const showNotice = (message: string) => {
     setNotice(message);
@@ -488,32 +553,30 @@ export function App() {
         api.terminals(),
         api.artifacts(),
       ]);
-      const runningTerminals = await migrateLegacyActivityViews(
-        nextTerminals.filter((terminal) => terminal.status === "running"),
-      );
+      const workspaceTerminals = await migrateLegacyActivityViews(nextTerminals);
       const focusedSession = activeIdRef.current
-        && runningTerminals.some((terminal) => terminal.id === activeIdRef.current)
+        && workspaceTerminals.some((terminal) => terminal.id === activeIdRef.current)
         ? activeIdRef.current
-        : runningTerminals[0]?.id;
+        : workspaceTerminals[0]?.id;
       setConfig({
         ...nextConfig,
         broker: nextConfig.broker
-          ? withBrokerSessions(nextConfig.broker, runningTerminals)
+          ? withBrokerSessions(nextConfig.broker, workspaceTerminals)
           : null,
       });
-      setTerminals(runningTerminals);
+      setTerminals(workspaceTerminals);
       setWorkspaceLoaded(true);
       setLayout((current) => {
-        const available = new Set(runningTerminals.map((terminal) => terminal.id));
+        const available = new Set(workspaceTerminals.map((terminal) => terminal.id));
         const kept = pruneLayout(current, available);
-        return kept ?? (runningTerminals[0] ? paneLeaf(runningTerminals[0].id) : null);
+        return kept ?? (workspaceTerminals[0] ? paneLeaf(workspaceTerminals[0].id) : null);
       });
       setActiveId((current) =>
-        current && runningTerminals.some((terminal) => terminal.id === current)
+        current && workspaceTerminals.some((terminal) => terminal.id === current)
           ? current
-          : runningTerminals[0]?.id,
+          : workspaceTerminals[0]?.id,
       );
-      syncArtifacts(artifacts, focusedSession, runningTerminals);
+      syncArtifacts(artifacts, focusedSession, workspaceTerminals);
       setAuthenticated(true);
     } catch (error) {
       if (error instanceof ApiError && error.status === 401) setAuthenticated(false);
@@ -530,6 +593,20 @@ export function App() {
       })
       .catch(() => setAuthenticated(false));
   }, []);
+
+  useEffect(() => {
+    if (!authenticated || !settingsActive || agentIntegrationsRequested.current) return;
+    agentIntegrationsRequested.current = true;
+    void api
+      .agentIntegrations()
+      .then((agentIntegrations) => {
+        setConfig((current) => ({ ...current, agentIntegrations }));
+      })
+      .catch((error) => {
+        agentIntegrationsRequested.current = false;
+        showNotice(error instanceof Error ? error.message : "Unable to inspect agent integrations");
+      });
+  }, [authenticated, settingsActive]);
 
   useEffect(() => {
     if (!authenticated || !config.updates?.enabled) return;
@@ -587,15 +664,15 @@ export function App() {
     const refresh = () => {
       void Promise.all([api.terminals(), api.artifacts()])
         .then(([next, artifacts]) => {
-          const running = next.filter((terminal) => terminal.status === "running");
-          setTerminals((current) => mergeTerminalActivityViews(running, current));
+          const workspaceTerminals = next;
+          setTerminals((current) => mergeTerminalActivityViews(workspaceTerminals, current));
           setConfig((current) => ({
             ...current,
-            broker: current.broker ? withBrokerSessions(current.broker, running) : null,
+            broker: current.broker ? withBrokerSessions(current.broker, workspaceTerminals) : null,
           }));
-          const available = new Set(running.map((terminal) => terminal.id));
+          const available = new Set(workspaceTerminals.map((terminal) => terminal.id));
           setLayout((current) => pruneLayout(current, available));
-          syncArtifacts(artifacts, activeIdRef.current, running);
+          syncArtifacts(artifacts, activeIdRef.current, workspaceTerminals);
         })
         .catch((error) => {
           if (error instanceof ApiError && error.status === 401) setAuthenticated(false);
@@ -786,6 +863,7 @@ export function App() {
   const renderedIds = [...mountedIds, ...paneIds.filter((id) => !mountedIds.includes(id))];
   const mountedTerminals = renderedIds.map((id) => terminalById.get(id)).filter(Boolean) as TerminalInfo[];
   const rectangles = useMemo(() => paneRects(layout), [layout]);
+  const dividers = useMemo(() => splitDividers(layout), [layout]);
   const previewLayout = useMemo(
     () =>
       draggedId && dropTarget
@@ -801,6 +879,13 @@ export function App() {
   );
 
   const cachedTerminals = resolveCachedTerminals(cachedTerminalsOverride, config.cachedTerminals);
+  const scrollbackLines = resolveTerminalScrollback(scrollbackLinesOverride, config.scrollbackLines);
+  const terminalConfig = useMemo(
+    () => (scrollbackLines === config.scrollbackLines
+      ? config
+      : { ...config, scrollbackLines }),
+    [config, scrollbackLines],
+  );
 
   useEffect(() => {
     const available = new Set(terminals.map((terminal) => terminal.id));
@@ -997,13 +1082,60 @@ export function App() {
   };
 
   const closePane = (id: string) => {
-    setLayout((current) => removePane(current, id));
+    const next = removePaneAndSelect(layout, id, activeIdRef.current);
+    setLayout(next.layout);
+    setActiveId(next.activeId);
   };
 
   const forgetTerminal = (id: string) => {
     setTerminals((current) => current.filter((terminal) => terminal.id !== id));
     setLayout((current) => removePane(current, id));
     setMountedIds((current) => current.filter((mounted) => mounted !== id));
+  };
+  const startDividerDrag = (event: PointerEvent, path: PanePath) => {
+    if (event.button !== 0 || dividerDragRef.current) return;
+    const handle = event.currentTarget as HTMLElement;
+    dividerDragRef.current = {
+      pointerId: event.pointerId,
+      path: [...path],
+      handle,
+    };
+    handle.setPointerCapture(event.pointerId);
+    document.body.classList.add("pane-resizing");
+    event.preventDefault();
+    event.stopPropagation();
+  };
+
+  const resizeDividerWithKeyboard = (event: KeyboardEvent, path: PanePath) => {
+    const divider = splitDividerAt(layoutRef.current, path);
+    if (!divider) return;
+    const step = event.shiftKey ? 0.1 : 0.05;
+    let ratio: number | undefined;
+    if (event.key === "Home") ratio = 0.15;
+    if (event.key === "End") ratio = 0.85;
+    if (
+      divider.direction === "horizontal"
+      && (event.key === "ArrowLeft" || event.key === "ArrowRight")
+    ) {
+      ratio = divider.ratio + (event.key === "ArrowRight" ? step : -step);
+    }
+    if (
+      divider.direction === "vertical"
+      && (event.key === "ArrowUp" || event.key === "ArrowDown")
+    ) {
+      ratio = divider.ratio + (event.key === "ArrowDown" ? step : -step);
+    }
+    if (ratio === undefined) return;
+    event.preventDefault();
+    setLayout((current) => updateSplitRatio(current, path, clampSplitRatio(ratio!)));
+  };
+
+  const markTerminalExited = (id: string, exitCode: number) => {
+    setTerminals((current) => current.map((terminal) => (
+      terminal.id === id
+        ? { ...terminal, pid: null, status: "exited", exitCode }
+        : terminal
+    )));
   };
 
   const finishDrag = () => {
@@ -1215,6 +1347,12 @@ export function App() {
     setCachedTerminalsOverride(limit);
     if (limit === undefined) localStorage.removeItem(CACHED_TERMINALS_STORAGE_KEY);
     else localStorage.setItem(CACHED_TERMINALS_STORAGE_KEY, String(limit));
+  };
+  const updateScrollbackLines = (lines: number | undefined) => {
+    const next = lines === undefined ? undefined : resolveTerminalScrollback(lines, config.scrollbackLines);
+    setScrollbackLinesOverride(next);
+    if (next === undefined) localStorage.removeItem(TERMINAL_SCROLLBACK_STORAGE_KEY);
+    else localStorage.setItem(TERMINAL_SCROLLBACK_STORAGE_KEY, String(next));
   };
 
   const waitForServer = async (ready: (nextConfig: ClientConfig) => boolean) => {
@@ -1538,6 +1676,7 @@ export function App() {
           )}
           <div class="workspace-stage">
             <main
+              ref={editorGridRef}
           class={`editor-grid ${draggedId ? "dragging-terminal" : ""} ${activeResource || settingsActive ? "resource-hidden" : ""}`}
           aria-hidden={Boolean(activeResource || settingsActive)}
           onDragOver={(event) => {
@@ -1558,6 +1697,8 @@ export function App() {
               return (
                 <div
                   key={terminal.id}
+                  data-terminal-id={terminal.id}
+                  data-pane-id={`pane-${terminal.id}`}
                   class={`pane-slot ${visible ? "" : "cached"} ${visible && terminal.id === activeId ? "active" : ""}`}
                   style={
                     rectangle
@@ -1572,9 +1713,9 @@ export function App() {
                 >
                   <TerminalPane
                     terminal={terminal}
-                    needsAttention={attentionTerminalIds.has(terminal.id)}
                     artifacts={artifactsBySession.get(terminal.id) ?? []}
-                    config={config}
+                    needsAttention={attentionTerminalIds.has(terminal.id)}
+                    config={terminalConfig}
                     theme={theme}
                     fontSize={terminalFontSize}
                     active={visible && terminal.id === activeId && !activeResource && !settingsActive}
@@ -1588,7 +1729,7 @@ export function App() {
                       setDropTarget(undefined);
                     }}
                     onDragEnd={finishDrag}
-                    onExit={() => forgetTerminal(terminal.id)}
+                    onExit={markTerminalExited}
                     onUpdate={updateTerminal}
                     onStreamIssue={(issue) => updateTerminalStreamIssue(terminal.id, issue)}
                     onNotice={showNotice}
@@ -1601,6 +1742,38 @@ export function App() {
               );
             })}
           </Suspense>
+          {!draggedId && dividers.length > 0 && (
+            <div class="layout-dividers" aria-label="Resize terminal panes">
+              {dividers.map((divider) => {
+                const vertical = divider.direction === "horizontal";
+                const bounds = divider.bounds;
+                return (
+                  <div
+                    key={divider.path.join(".") || "root"}
+                    class={`layout-divider ${vertical ? "vertical" : "horizontal"}`}
+                    role="separator"
+                    aria-label="Resize terminal panes"
+                    aria-orientation={vertical ? "vertical" : "horizontal"}
+                    aria-valuemin={0.15}
+                    aria-valuemax={0.85}
+                    aria-valuenow={divider.ratio}
+                    data-divider-path={divider.path.join("/") || "root"}
+                    data-divider-direction={divider.direction}
+                    tabIndex={0}
+                    title="Drag to resize panes"
+                    style={{
+                      left: `${bounds.x * 100}%`,
+                      top: `${bounds.y * 100}%`,
+                      width: `${bounds.width * 100}%`,
+                      height: `${bounds.height * 100}%`,
+                    }}
+                    onPointerDown={(event) => startDividerDrag(event, divider.path)}
+                    onKeyDown={(event) => resizeDividerWithKeyboard(event, divider.path)}
+                  />
+                );
+              })}
+            </div>
+          )}
           {draggedId && displayedLayout && !mountedTerminals.some((terminal) => terminal.id === draggedId) && (() => {
             const rectangle = displayedRectangleById.get(draggedId);
             const terminal = terminalById.get(draggedId);
@@ -1719,6 +1892,9 @@ export function App() {
                 cachedTerminals={cachedTerminals}
                 cachedTerminalsOverridden={cachedTerminalsOverride !== undefined}
                 serverCachedTerminals={config.cachedTerminals}
+                scrollbackLines={scrollbackLines}
+                scrollbackLinesOverridden={scrollbackLinesOverride !== undefined}
+                serverScrollbackLines={config.scrollbackLines}
                 recording={recordingStatus}
                 frontendRecordingEvents={frontendRecordingEvents}
                 recordingBusy={recordingBusy}
@@ -1743,6 +1919,7 @@ export function App() {
                 onConfirmTerminalKillsChange={updateConfirmTerminalKills}
                 onTerminalPreviewSettingsChange={updateTerminalPreviewSettings}
                 onCachedTerminalsChange={updateCachedTerminals}
+                onScrollbackLinesChange={updateScrollbackLines}
                 onRecordingStart={() => void startRecording()}
                 onRecordingStop={() => void stopRecording()}
                 onRecordingDownload={() => void downloadRecording()}
@@ -1783,7 +1960,7 @@ export function App() {
             v{config.build.version} · {config.build.commit.slice(0, 7)}
           </span>
           <span class="statusbar-item">{visibleTerminals.length}/{config.maxPanes} panes</span>
-          <span class="statusbar-item statusbar-scrollback">{config.scrollbackLines.toLocaleString()} line scrollback</span>
+          <span class="statusbar-item statusbar-scrollback">{scrollbackLines.toLocaleString()} line scrollback</span>
           <span class="statusbar-item" title={config.secure ? "HTTPS enabled" : "HTTPS disabled"}>
             <ShieldCheck size={13} /> {config.secure ? "HTTPS" : "HTTP"}
           </span>

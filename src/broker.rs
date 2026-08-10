@@ -2187,4 +2187,89 @@ mod tests {
             .expect("broker shutdown timeout")
             .unwrap();
     }
+    #[tokio::test]
+    async fn observer_acknowledgement_does_not_mutate_flow_control() {
+        let (_directory, server, client) = start_test_broker(1024 * 1024).await;
+        let terminal = client
+            .create(CreateTerminal {
+                path: Some("observer-ack-flow".to_owned()),
+                cwd: Some(PathBuf::from("/tmp")),
+                shell: Some("/bin/sh".to_owned()),
+                clone_from: None,
+            })
+            .await
+            .unwrap();
+        let mut controller = client
+            .terminal_socket(
+                terminal.id,
+                Some(TerminalViewport::new(80, 24, 800, 480)),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        wait_for_control(&mut controller, "size").await;
+        wait_for_control(&mut controller, "sync").await;
+        wait_for_control(&mut controller, "synced").await;
+        let mut observer = client
+            .terminal_socket(terminal.id, None, None, true)
+            .await
+            .unwrap();
+        wait_for_control(&mut observer, "synced").await;
+
+        let total = 4_000_000;
+        let command =
+            format!("yes observer-ack | head -c {total}; printf '\\nOBSACK-%s\\n' DONE\n");
+        controller
+            .send(TungsteniteMessage::Text(
+                serde_json::json!({ "type": "input", "data": command })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let delivered = read_payload_until_quiet(&mut controller, Duration::from_millis(400)).await;
+        assert!(
+            delivered > 0,
+            "the controlling client must receive the first flow window"
+        );
+        assert!(
+            delivered < total / 2,
+            "the controlling client must pause before the flood completes"
+        );
+
+        observer
+            .send(TungsteniteMessage::Text(
+                serde_json::json!({ "type": "ack", "bytes": delivered * 2 })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let error = wait_for_control_without_size(&mut observer, "error").await;
+        assert_eq!(error["message"], "observer connections are read-only");
+        let after_observer_ack =
+            read_payload_until_quiet(&mut controller, Duration::from_millis(400)).await;
+        assert_eq!(
+            after_observer_ack, 0,
+            "an observer acknowledgement must not advance global flow control"
+        );
+
+        controller
+            .send(TungsteniteMessage::Text(
+                serde_json::json!({ "type": "ack", "bytes": delivered })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        drain_with_acknowledgements(&mut controller, "OBSACK-DONE").await;
+
+        client.remove(terminal.id).await.unwrap();
+        client.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("broker shutdown timeout")
+            .unwrap();
+    }
 }

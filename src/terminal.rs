@@ -298,7 +298,13 @@ impl ClientViewports {
             self.focused_client = None;
         }
         if self.responder_client == Some(client_id) {
-            self.responder_client = self.sizes.keys().copied().min();
+            self.responder_client = self
+                .sizes
+                .iter()
+                .filter(|(_, size)| size.is_some())
+                .map(|(id, _)| *id)
+                .min()
+                .or_else(|| self.sizes.keys().copied().min());
         }
     }
 
@@ -2461,14 +2467,12 @@ impl TerminalManager {
         drop(sessions);
 
         let output_session = session.clone();
-        let sessions_on_exit = self.sessions.clone();
         thread::Builder::new()
             .name(format!("terminal-output-{id}"))
             .spawn(move || {
                 read_output(reader, output_session.clone());
                 let exit_code = child.wait().map(|status| status.exit_code()).unwrap_or(1);
                 output_session.exited(exit_code);
-                sessions_on_exit.write().remove(&id);
             })
             .map_err(|error| TerminalError::Io(error.to_string()))?;
 
@@ -4131,7 +4135,7 @@ mod tests {
     }
 
     #[test]
-    fn starts_writes_resizes_and_removes_a_terminal() {
+    fn starts_writes_resizes_and_retains_an_exited_terminal() {
         let directory = tempfile::tempdir().unwrap();
         let manager = TerminalManager {
             sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -4184,15 +4188,22 @@ mod tests {
         assert_eq!(clone.color, moved.color);
 
         session.write(b"exit\n").unwrap();
-        let removed_on_exit = (0..100).any(|_| {
-            if manager.get(info.id).is_none() {
-                true
+        let exited = (0..100).find_map(|_| {
+            let next = manager.get(info.id)?.info();
+            if next.status == TerminalStatus::Exited {
+                Some(next)
             } else {
                 thread::sleep(std::time::Duration::from_millis(10));
-                false
+                None
             }
         });
-        assert!(removed_on_exit);
+        let exited = exited.unwrap();
+        assert_eq!(exited.exit_code, Some(0));
+        assert_eq!(
+            manager.get(info.id).unwrap().info().status,
+            TerminalStatus::Exited
+        );
+        assert!(manager.remove(info.id));
         assert!(!manager.remove(info.id));
         assert!(manager.remove(clone.id));
         assert!(manager.list().is_empty());

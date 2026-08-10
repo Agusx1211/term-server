@@ -58,7 +58,7 @@ import {
   MIN_TERMINAL_FONT_SIZE,
   terminalZoomPercent,
 } from "../lib/terminal-zoom";
-import { addTerminalStreamProtocol, closeTerminalSocket } from "../lib/terminal-socket";
+import { addTerminalStreamProtocol, closeTerminalSocket, TerminalSocketFailureTracker } from "../lib/terminal-socket";
 import {
   encodeBytesBase64,
   encodeTextBase64,
@@ -82,10 +82,12 @@ import {
 } from "../lib/terminal-clipboard";
 import {
   TERMINAL_FRAME_OUTPUT,
+  TERMINAL_FRAME_SNAPSHOT,
   TerminalOutputAck,
   TerminalRenderBacklog,
   TerminalStreamState,
   decodeTerminalFrame,
+  type TerminalBacklogKind,
   type TerminalFrame,
   type TerminalStreamIssue,
 } from "../lib/terminal-stream";
@@ -100,11 +102,19 @@ import {
   tuiCompatibilityOptions,
 } from "../lib/terminal-compatibility";
 import { loadTerminalNerdFont, TERMINAL_FONT_FAMILY } from "../lib/terminal-font";
+import { PanoptesUnicode17Addon } from "../lib/terminal-unicode";
 import {
   createSettledTask,
+  nextTerminalViewportReport,
+  terminalViewportForServerSize,
   terminalViewportSize,
+  type TerminalViewportSize,
 } from "../lib/terminal-viewport";
-import { PanoptesUnicode17Addon } from "../lib/terminal-unicode";
+import {
+  registerE2ETerminal,
+  type E2ETerminalDiagnosticsHandle,
+  type E2EViewport,
+} from "../lib/e2e-diagnostics";
 import {
   mixedTerminalBackground,
   terminalTheme,
@@ -130,7 +140,7 @@ interface TerminalPaneProps {
   onClone: () => void;
   onDragStart: () => void;
   onDragEnd: () => void;
-  onExit: () => void;
+  onExit: (terminalId: string, exitCode: number) => void;
   onUpdate: (terminal: TerminalInfo) => void;
   onStreamIssue: (issue?: TerminalStreamIssue) => void;
   onNotice: (message: string) => void;
@@ -139,6 +149,7 @@ interface TerminalPaneProps {
   onOpenArtifact: (artifact: ArtifactEntry) => void;
   onDeleteArtifact: (artifact: ArtifactEntry) => Promise<void>;
 }
+const TERMINAL_PROTOCOL_MISMATCH_MESSAGE = "terminal client is out of date; reload the page";
 
 const searchOptions = (theme: ThemeName, incremental = false): ISearchOptions => ({
   incremental,
@@ -217,7 +228,10 @@ export function TerminalPane({
   const streamIssue = useRef(onStreamIssue);
   const activeState = useRef(active);
   const visibleState = useRef(visible);
+  const reloadRequiredState = useRef(false);
   const modifiers = useRef<TerminalModifiers>(NO_TERMINAL_MODIFIERS);
+  const paneId = `pane-${terminal.id}`;
+  const diagnostics = useRef<E2ETerminalDiagnosticsHandle>();
   terminalState.current = terminal;
   openFile.current = onOpenFile;
   streamIssue.current = onStreamIssue;
@@ -229,11 +243,13 @@ export function TerminalPane({
   const [actionsOpen, setActionsOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
+  const [searchRevision, setSearchRevision] = useState(0);
   const [searchResults, setSearchResults] = useState({ index: -1, count: 0 });
   const [mobileModifiers, setMobileModifiers] = useState(NO_TERMINAL_MODIFIERS);
   const [scrolledBack, setScrolledBack] = useState(false);
   const [imagePreview, setImagePreview] = useState<{ file: FileEntry; left: number; top: number }>();
   const [terminalSize, setTerminalSize] = useState({ focused: false, controller: false });
+  const [reloadRequired, setReloadRequired] = useState(false);
   const [connection, setConnection] = useState<
     "connecting" | "connected" | "recovering" | "disconnected" | "exited"
   >(
@@ -241,6 +257,20 @@ export function TerminalPane({
   );
   const artifactSignature = artifacts.map((artifact) => artifact.id).join("\u0000");
   const artifactsVisible = artifactsOpen && artifacts.length > 0;
+
+  useEffect(() => {
+    const handle = diagnostics.current;
+    if (!handle) return;
+    handle.update({
+      mounted: true,
+      visible,
+      cached: !visible,
+      active,
+      acceptingInput: visible && active && connection === "connected",
+    });
+    handle.record("visibility", { visible });
+    handle.record("active", { active });
+  }, [active, visible, connection]);
 
   useEffect(() => {
     const discovered = artifacts.some((artifact) => !knownArtifactIds.current.has(artifact.id));
@@ -256,9 +286,33 @@ export function TerminalPane({
   };
 
   useEffect(() => {
-    if (!container.current) return;
+    const diagnosticsHandle = registerE2ETerminal({
+      terminalId: terminal.id,
+      paneId,
+      kind: "pane",
+    });
+    diagnostics.current = diagnosticsHandle;
+    const initiallyExited = terminal.status === "exited";
+    const initialExitCode = initiallyExited && terminal.exitCode !== null ? terminal.exitCode : undefined;
+    diagnosticsHandle.update({
+      mounted: true,
+      visible,
+      cached: !visible,
+      active,
+      acceptingInput: visible && active && connection === "connected",
+      socketState: initiallyExited ? "exited" : undefined,
+      exitCode: initialExitCode,
+    });
+    diagnosticsHandle.record("visibility", { visible });
+    diagnosticsHandle.record("active", { active });
+    if (initialExitCode !== undefined) {
+      diagnosticsHandle.record("exit", { exitCode: initialExitCode });
+    }
+    const host = container.current;
+    if (!host) return;
     let disposed = false;
     let attempts = 0;
+    const preSyncFailures = new TerminalSocketFailureTracker();
     let responder = false;
     const fit = new FitAddon();
     const search = new SearchAddon({ highlightLimit: 1000 });
@@ -307,11 +361,13 @@ export function TerminalPane({
         window.open(uri, "_blank", "noopener,noreferrer");
       }),
     );
-    term.open(container.current);
+    term.open(host);
     void loadTerminalNerdFont().then(() => {
       if (disposed) return;
       term.clearTextureAtlas();
       term.refresh(0, term.rows - 1);
+      diagnosticsHandle?.record("font-load", { result: "settled" });
+      reportTerminalViewport.current?.();
     });
     const imagePreviews = createHoverPreviewController<
       { key: string; path: string; cwd: string; left: number; top: number },
@@ -365,14 +421,19 @@ export function TerminalPane({
     // Renderer state for debug recording. xterm does not expose the active
     // renderer, so we track whether WebGL loaded and capture the rendered
     // output (buffer model + canvas) ourselves while a recording is active.
-    let rendererKind: "webgl" | "canvas" | "dom" = "dom";
+    let rendererKind: "webgl" | "canvas" | "dom" = "canvas";
+    let reportedViewport = "";
     let webglLoaded = false;
     let webglContextLost = false;
+    let webglAddon: { dispose(): void } | undefined;
+    let removeWebglContextLossListener: (() => void) | undefined;
+    let unregisterContextLossControl: (() => void) | undefined;
     const RENDER_SAMPLE_MS = 250;
     const SCREENSHOT_SAMPLE_MS = 1000;
     let lastRenderSample = 0;
     let lastScreenshotSample = 0;
     const recordRenderer = (): void => {
+      diagnosticsHandle?.update({ renderer: rendererKind });
       if (!isDebugRecordingActive()) return;
       recordDebugEvent(terminal.id, {
         type: "renderer",
@@ -432,24 +493,80 @@ export function TerminalPane({
         captureScreenshot();
       }
     };
-    void import("@xterm/addon-webgl").then(({ WebglAddon }) => {
-      if (disposed) return;
-      try {
-        const webgl = new WebglAddon();
-        webgl.onContextLoss(() => {
-          webgl.dispose();
-          webglContextLost = true;
+    const fallbackFromWebgl = (): void => {
+      if (disposed || webglContextLost) return;
+      // Mark the transition before disposing. xterm's addon cleanup removes
+      // its restoration listener, so a restored context can never revive the
+      // renderer or dispose resources that now belong to the fallback.
+      webglContextLost = true;
+      removeWebglContextLossListener?.();
+      removeWebglContextLossListener = undefined;
+      unregisterContextLossControl?.();
+      unregisterContextLossControl = undefined;
+      webglAddon?.dispose();
+      webglAddon = undefined;
+      rendererKind = "canvas";
+      webglLoaded = false;
+      diagnosticsHandle?.rendererContextLost();
+      recordRenderer();
+      term.refresh(0, term.rows - 1);
+      reportedViewport = "";
+      reportTerminalViewport.current?.();
+    };
+    void (diagnosticsHandle?.beforeRendererLoad() ?? Promise.resolve())
+      .then(() => import("@xterm/addon-webgl"))
+      .then(({ WebglAddon }) => {
+        if (disposed || webglContextLost) return;
+        try {
+          const webgl = new WebglAddon();
+          webglAddon = webgl;
+          webgl.onContextLoss(fallbackFromWebgl);
+          unregisterContextLossControl = diagnosticsHandle?.registerContextLossControl(() => {
+            const canvases = term.element?.querySelectorAll<HTMLCanvasElement>("canvas") ?? [];
+            for (const canvas of canvases) {
+              const context = canvas.getContext("webgl2") ?? canvas.getContext("webgl");
+              const extension = context?.getExtension("WEBGL_lose_context");
+              if (extension) {
+                extension.loseContext();
+                return;
+              }
+            }
+            throw new Error("WEBGL_lose_context is unavailable for the active WebGL canvas");
+          });
+          term.loadAddon(webgl);
+          const webglCanvas = term.element?.querySelector<HTMLCanvasElement>(
+            ".xterm-screen canvas:not(.xterm-link-layer)",
+          );
+          if (webglCanvas) {
+            const onContextLoss = (): void => fallbackFromWebgl();
+            webglCanvas.addEventListener("webglcontextlost", onContextLoss);
+            removeWebglContextLossListener = () => {
+              webglCanvas.removeEventListener("webglcontextlost", onContextLoss);
+            };
+          }
+          rendererKind = "webgl";
+          webglLoaded = true;
+          diagnosticsHandle?.rendererLoaded("webgl");
+          reportTerminalViewport.current?.();
           recordRenderer();
-        });
-        term.loadAddon(webgl);
-        rendererKind = "webgl";
-        webglLoaded = true;
-        recordRenderer();
-      } catch {
-        // xterm's built-in renderer is the compatibility fallback.
-        recordRenderer();
-      }
-    });
+        } catch {
+          removeWebglContextLossListener?.();
+          removeWebglContextLossListener = undefined;
+          webglAddon?.dispose();
+          webglAddon = undefined;
+          unregisterContextLossControl?.();
+          unregisterContextLossControl = undefined;
+          // xterm's built-in renderer is the compatibility fallback.
+          diagnosticsHandle?.rendererFallback("load-failed");
+          recordRenderer();
+        }
+      })
+      .catch(() => {
+        if (!disposed) {
+          diagnosticsHandle?.rendererFallback("load-failed");
+          recordRenderer();
+        }
+      });
 
     const send = (message: ClientTerminalMessage) => {
       if (socket.current?.readyState === WebSocket.OPEN) socket.current.send(JSON.stringify(message));
@@ -486,6 +603,12 @@ export function TerminalPane({
     let hasSynced = false;
     let recoveringOutput = false;
     let reportedIssue = "";
+    const viewportHistory = new Map<string, TerminalViewportSize>();
+    const serverViewportKey = (cols: number, rows: number): string => `${cols}x${rows}`;
+    const rememberViewport = (viewport: TerminalViewportSize): void => {
+      viewportHistory.set(serverViewportKey(viewport.cols, viewport.rows), viewport);
+    };
+    let serverViewport: TerminalViewportSize | undefined;
     let suspendSocket: (() => void) | undefined;
     let terminalEpoch: number | undefined;
     let checkpointMaximumBytes = 0;
@@ -500,30 +623,43 @@ export function TerminalPane({
       streamIssue.current(issue);
     };
     const proposedViewport = () => {
-      if (!container.current?.clientWidth || !container.current.clientHeight) return;
+      if (!host.clientWidth || !host.clientHeight) return;
       try {
         const proposed = fit.proposeDimensions();
         const screen = term.element?.querySelector<HTMLElement>(".xterm-screen");
         if (!proposed || !screen) return;
         const bounds = screen.getBoundingClientRect();
-        return terminalViewportSize(proposed, {
+        const size = terminalViewportSize(proposed, {
           cols: term.cols,
           rows: term.rows,
           pixelWidth: bounds.width,
           pixelHeight: bounds.height,
         });
+        if (size) {
+          diagnosticsHandle?.record("viewport", { source: "proposed", ...size });
+          diagnosticsHandle?.update({ proposedViewport: { ...size, source: "proposed" } satisfies E2EViewport });
+        }
+        return size;
       } catch {
         // The pane may be between layout states.
       }
     };
-    let reportedViewport = "";
     const viewportReporter = createSettledTask(() => {
       if (!visibleState.current) return;
       const size = proposedViewport();
       if (!size) return;
       const key = `${size.cols}x${size.rows}@${size.pixelWidth}x${size.pixelHeight}`;
-      if (key === reportedViewport) return;
-      reportedViewport = key;
+      diagnosticsHandle?.update({
+        desiredViewport: { ...size, source: "desired" } satisfies E2EViewport,
+      });
+      const current = socket.current;
+      const nextReported = nextTerminalViewportReport(
+        reportedViewport,
+        key,
+        current?.readyState === WebSocket.OPEN,
+      );
+      if (nextReported === undefined) return;
+      reportedViewport = nextReported;
       recordDebugEvent(terminal.id, {
         type: "resize",
         cols: size.cols,
@@ -532,6 +668,21 @@ export function TerminalPane({
         pixelHeight: size.pixelHeight,
       });
       send({ type: "resize", ...size });
+      rememberViewport(size);
+      if (serverViewport && serverViewport.cols === size.cols && serverViewport.rows === size.rows) {
+        serverViewport = {
+          ...serverViewport,
+          pixelWidth: size.pixelWidth,
+          pixelHeight: size.pixelHeight,
+        };
+        diagnosticsHandle?.update({
+          serverViewport: { ...serverViewport, source: "server" } satisfies E2EViewport,
+        });
+      }
+      diagnosticsHandle?.update({
+        sentViewport: { ...size, source: "sent" } satisfies E2EViewport,
+      });
+      diagnosticsHandle?.record("viewport", { source: "sent", ...size });
     });
     const reportViewport = viewportReporter.schedule;
     reportTerminalViewport.current = reportViewport;
@@ -577,8 +728,8 @@ export function TerminalPane({
         if (term.hasSelection()) term.element?.ownerDocument.execCommand("copy");
       },
     ));
-    const disposeTouchScroll = installTerminalTouchScroll(container.current, term, () => {
-      const screen = container.current?.querySelector<HTMLElement>(".xterm-screen");
+    const disposeTouchScroll = installTerminalTouchScroll(host, term, () => {
+      const screen = host.querySelector<HTMLElement>(".xterm-screen");
       return screen && term.rows ? screen.getBoundingClientRect().height / term.rows : 15;
     });
 
@@ -591,6 +742,21 @@ export function TerminalPane({
     // and abandon its stream. More than one write can be in flight, so the
     // parsing flag counts them instead of tracking a single write.
     let unparsedWrites = 0;
+    const updateStreamDiagnostics = (): void => {
+      diagnosticsHandle?.parserState(unparsedWrites, backlog.pendingBytes);
+      diagnosticsHandle?.renderBacklog({
+        bytes: backlog.pendingBytes,
+        frames: backlog.pendingFrames,
+        oldestAgeMs: backlog.oldestAgeMs,
+      });
+      diagnosticsHandle?.streamState({
+        gridEpoch: terminalEpoch,
+        receivedSequence: stream.received,
+        committedSequence: stream.committed,
+        syncMode: stream.mode,
+        syncTarget: stream.target,
+      });
+    };
     const clearCheckpointTimer = () => {
       if (checkpointTimer !== undefined) window.clearTimeout(checkpointTimer);
       checkpointTimer = undefined;
@@ -618,16 +784,50 @@ export function TerminalPane({
         checkpointWindowStartedAt = 0;
         return;
       }
+      const serializationStartedAt = performance.now();
       const bytes = serializeTerminalCheckpoint(
         serialize,
         term,
         checkpointMaximumBytes,
       );
+      const serializationDurationMs = performance.now() - serializationStartedAt;
       if (!bytes) {
         checkpointWindowStartedAt = 0;
+        diagnosticsHandle?.checkpointState({
+          sequence,
+          epoch: terminalEpoch,
+          size: 0,
+          chunks: 0,
+          serializationDurationMs,
+          uploadDurationMs: 0,
+          result: "skipped",
+        });
         return;
       }
-      sendTerminalCheckpoint(current, sequence, terminalEpoch, bytes);
+      try {
+        const uploadStartedAt = performance.now();
+        const chunks = sendTerminalCheckpoint(current, sequence, terminalEpoch, bytes);
+        diagnosticsHandle?.checkpointState({
+          sequence,
+          epoch: terminalEpoch,
+          size: bytes.byteLength,
+          chunks,
+          serializationDurationMs,
+          uploadDurationMs: performance.now() - uploadStartedAt,
+          result: "sent",
+        });
+      } catch (error) {
+        diagnosticsHandle?.checkpointState({
+          sequence,
+          epoch: terminalEpoch,
+          size: bytes.byteLength,
+          chunks: 0,
+          serializationDurationMs,
+          uploadDurationMs: 0,
+          result: "failed",
+        });
+        throw error;
+      }
       checkpointWindowStartedAt = 0;
       lastCheckpointSequence = sequence;
       lastCheckpointEpoch = terminalEpoch;
@@ -649,44 +849,62 @@ export function TerminalPane({
       }
       unparsedWrites += 1;
       parsingOutput = true;
+      updateStreamDiagnostics();
       try {
         term.write(data, () => {
           unparsedWrites -= 1;
           parsingOutput = unparsedWrites > 0;
           try {
-            if (commit !== undefined) stream.commit(commit);
+            if (commit !== undefined) {
+              stream.commit(commit);
+              diagnosticsHandle?.record("parser-commit", { sequence: commit });
+            }
+            diagnosticsHandle?.updateXterm(term);
+            updateStreamDiagnostics();
             resolve();
             scheduleCheckpoint();
           } catch (error) {
+            updateStreamDiagnostics();
             reject(error);
           }
         });
       } catch (error) {
         unparsedWrites -= 1;
         parsingOutput = unparsedWrites > 0;
+        updateStreamDiagnostics();
         reject(error);
       }
     });
 
     const connect = () => {
-      if (disposed || exited.current || !visibleState.current) return;
+      if (disposed || exited.current || !visibleState.current || reloadRequiredState.current) return;
       acceptingInput = false;
       responder = false;
       term.options.disableStdin = true;
       setConnection(recoveringOutput ? "recovering" : "connecting");
+      diagnosticsHandle?.socketState(recoveringOutput ? "recovering" : "connecting");
+      diagnosticsHandle?.update({ acceptingInput: false });
       recordDebugEvent(terminal.id, { type: "connect" });
       recordDebugEvent(terminal.id, { type: "state", state: recoveringOutput ? "recovering" : "connecting" });
       const protocol = location.protocol === "https:" ? "wss:" : "ws:";
       const url = addTerminalStreamProtocol(
         new URL(`${protocol}//${location.host}/api/terminals/${terminal.id}/socket`),
       );
+      const protocolVersion = diagnosticsHandle?.socketProtocolVersion();
+      if (protocolVersion !== undefined) url.searchParams.set("stream", String(protocolVersion));
       const size = proposedViewport();
       if (size) {
+        rememberViewport(size);
         url.searchParams.set("cols", String(size.cols));
         url.searchParams.set("rows", String(size.rows));
         url.searchParams.set("pixelWidth", String(size.pixelWidth));
         url.searchParams.set("pixelHeight", String(size.pixelHeight));
         reportedViewport = `${size.cols}x${size.rows}@${size.pixelWidth}x${size.pixelHeight}`;
+        diagnosticsHandle?.update({
+          desiredViewport: { ...size, source: "desired" } satisfies E2EViewport,
+          urlViewport: { ...size, source: "url" } satisfies E2EViewport,
+          sentViewport: { ...size, source: "sent" } satisfies E2EViewport,
+        });
       }
       const resumeSequence = stream.resumeSequence;
       if (resumeSequence !== undefined && (checkpointMaximumBytes <= 0 || terminalEpoch !== undefined)) {
@@ -694,6 +912,7 @@ export function TerminalPane({
         if (terminalEpoch !== undefined) url.searchParams.set("epoch", String(terminalEpoch));
       }
       const next = new WebSocket(url);
+      const socketGeneration = diagnosticsHandle?.socketCreated(next, url.toString()) ?? 0;
       // The server tracks what it is owed per connection, so acknowledgements
       // belong to the socket the bytes arrived on and start over on reconnect.
       const outputAck = new TerminalOutputAck();
@@ -702,16 +921,26 @@ export function TerminalPane({
       // talking to one; an older broker rejects any message it does not know and
       // the pane would surface an error notice for every acknowledgement.
       let flowControlled = false;
+      let acknowledgedBytes = 0;
       // Whether this server lets a cached pane keep its connection. Stays false
       // against an older broker, which would answer `release` with an error.
       let viewportRelease = false;
       const acknowledgeParsed = (bytes: number) => {
         const batch = outputAck.parsed(bytes);
-        if (!flowControlled || batch === undefined || next.readyState !== WebSocket.OPEN) return;
-        next.send(JSON.stringify({ type: "ack", bytes: batch } satisfies ClientTerminalMessage));
+        if (flowControlled && batch !== undefined && next.readyState === WebSocket.OPEN) {
+          next.send(JSON.stringify({ type: "ack", bytes: batch } satisfies ClientTerminalMessage));
+          acknowledgedBytes += batch;
+        }
+        diagnosticsHandle?.flowState({
+          controlled: flowControlled,
+          acknowledgedBytes,
+          pendingAcknowledgementBytes: outputAck.pendingBytes,
+        });
       };
       let protocolFailed = false;
+      let socketSynced = false;
       let abandoned = false;
+      let closeHandled = false;
       const failProtocol = (error: unknown) => {
         if (protocolFailed || abandoned) return;
         protocolFailed = true;
@@ -750,11 +979,14 @@ export function TerminalPane({
       next.binaryType = "arraybuffer";
       socket.current = next;
       next.addEventListener("open", () => {
+        if (disposed || socket.current !== next) return;
+        diagnosticsHandle?.socketOpened(next);
         lastServerMessage = Date.now();
         reportViewport();
       });
       next.addEventListener("message", (event) => {
-        if (protocolFailed || abandoned) return;
+        if (disposed || socket.current !== next || protocolFailed || abandoned) return;
+        diagnosticsHandle?.socketMessage(next, event.data);
         lastServerMessage = Date.now();
         let eagerFrame: TerminalFrame | undefined;
         let queuedBytes = 0;
@@ -765,17 +997,19 @@ export function TerminalPane({
             failProtocol(error);
             return;
           }
-          if (eagerFrame.kind === TERMINAL_FRAME_OUTPUT) {
+          if (eagerFrame.kind === TERMINAL_FRAME_OUTPUT || eagerFrame.kind === TERMINAL_FRAME_SNAPSHOT) {
+            const backlogKind: TerminalBacklogKind = eagerFrame.kind === TERMINAL_FRAME_SNAPSHOT ? "snapshot" : "output";
             queuedBytes = eagerFrame.data.byteLength;
-            if (backlog.enqueue(queuedBytes)) {
+            if (backlog.enqueue(queuedBytes, Date.now(), backlogKind)) {
               recoverBacklog();
               return;
             }
+            updateStreamDiagnostics();
           }
         }
         messageQueue = messageQueue.then(async () => {
           try {
-            if (protocolFailed || abandoned) return;
+            if (socket.current !== next || protocolFailed || abandoned) return;
             const binary = event.data instanceof Blob ? await event.data.arrayBuffer() : event.data;
             if (binary instanceof ArrayBuffer) {
               const frame = eagerFrame ?? decodeTerminalFrame(binary);
@@ -787,6 +1021,11 @@ export function TerminalPane({
                 });
               }
               const commit = stream.accept(frame);
+              diagnosticsHandle?.outputReceived(
+                stream.received ?? frame.sequence,
+                frame.data.byteLength,
+              );
+              updateStreamDiagnostics();
               // Hand the frame to xterm without waiting for it to be parsed. The
               // backlog is only settled once xterm reports the bytes parsed, so
               // it still measures what the renderer actually owes.
@@ -798,23 +1037,25 @@ export function TerminalPane({
                 // sending while this pane was still working through the last
                 // burst, which is exactly the backlog flow control prevents.
                 //
-                // Only live output counts. The server's window tracks bytes as
-                // they leave the pty, and a snapshot is state it rebuilt rather
-                // than pty output, so acknowledging one would pay down a debt
-                // that was never owed.
+                // Only live output is acknowledged. Snapshot bytes are rebuilt
+                // state rather than pty output, but they still count toward the
+                // parser backlog so a stalled snapshot cannot wait forever.
                 .then(() => {
                   if (frame.kind === TERMINAL_FRAME_OUTPUT) {
                     acknowledgeParsed(frame.data.byteLength);
                   }
                 })
                 .catch(failProtocol)
-                .finally(() => backlog.settle(settled));
+                .finally(() => {
+                  backlog.settle(settled);
+                  updateStreamDiagnostics();
+                });
               return;
             }
             // A control message may reset or resize the grid, so everything
             // written ahead of it has to be parsed before it is applied.
             await pendingWrites;
-            if (protocolFailed || abandoned) return;
+            if (socket.current !== next || protocolFailed || abandoned) return;
             const message = JSON.parse(String(event.data)) as ServerTerminalMessage;
             if (message.type === "ready") {
               recordDebugEvent(terminal.id, { type: "control", message });
@@ -827,6 +1068,11 @@ export function TerminalPane({
                 ? checkpointBytes
                 : 0;
               onUpdate(message.terminal);
+              diagnosticsHandle?.flowState({
+                controlled: flowControlled,
+                acknowledgedBytes,
+                pendingAcknowledgementBytes: outputAck.pendingBytes,
+              });
             }
             if (message.type === "size") {
               recordDebugEvent(terminal.id, {
@@ -842,6 +1088,34 @@ export function TerminalPane({
               responder = message.responder;
               if (!acceptingInput) term.options.disableStdin = !responder;
               setTerminalSize({ focused: message.focused, controller: message.controller });
+              const nextServerViewport = terminalViewportForServerSize(
+                { cols: message.cols, rows: message.rows },
+                viewportHistory.get(serverViewportKey(message.cols, message.rows)),
+              );
+              serverViewport = nextServerViewport;
+              diagnosticsHandle?.update({
+                focused: message.focused,
+                gridEpoch: message.epoch,
+                serverViewport: {
+                  ...nextServerViewport,
+                  source: "server",
+                } satisfies E2EViewport,
+              });
+              diagnosticsHandle?.record("size", {
+                cols: message.cols,
+                rows: message.rows,
+                focused: message.focused,
+                controller: message.controller,
+                responder: message.responder,
+                epoch: message.epoch,
+              });
+              diagnosticsHandle?.record("focus", {
+                focused: message.focused,
+                controller: message.controller,
+                responder: message.responder,
+              });
+              diagnosticsHandle?.updateXterm(term);
+              updateStreamDiagnostics();
               captureRenderState(true);
               scheduleCheckpoint();
             }
@@ -861,17 +1135,50 @@ export function TerminalPane({
                 setConnection("recovering");
               }
               if (stream.begin(message.mode, message.sequence)) term.reset();
+              diagnosticsHandle?.streamState({
+                gridEpoch: terminalEpoch,
+                receivedSequence: stream.received,
+                committedSequence: stream.committed,
+                syncMode: stream.mode,
+                syncTarget: stream.target,
+              });
+              diagnosticsHandle?.record("sync", {
+                mode: message.mode,
+                sequence: message.sequence,
+                epoch: terminalEpoch,
+                generation: socketGeneration,
+              });
+              diagnosticsHandle?.update({ acceptingInput: false });
             }
             if (message.type === "synced") {
               recordDebugEvent(terminal.id, { type: "synced", sequence: message.sequence });
               stream.finish(message.sequence);
               hasSynced = true;
+              socketSynced = true;
+              preSyncFailures.reset();
+              reloadRequiredState.current = false;
+              setReloadRequired(false);
               recoveringOutput = false;
               acceptingInput = true;
               term.options.disableStdin = false;
+              diagnosticsHandle?.update({ acceptingInput: true });
+              diagnosticsHandle?.streamState({
+                gridEpoch: terminalEpoch,
+                receivedSequence: stream.received,
+                committedSequence: stream.committed,
+                syncMode: stream.mode,
+                syncTarget: stream.target,
+              });
+              diagnosticsHandle?.updateXterm(term);
               attempts = 0;
               reportStreamIssue();
               setConnection("connected");
+              diagnosticsHandle?.socketState("connected");
+              setSearchRevision((revision) => revision + 1);
+              diagnosticsHandle?.record("synced", {
+                sequence: stream.committed ?? message.sequence,
+                epoch: terminalEpoch,
+              });
               reportViewport();
               if (activeState.current && visibleState.current) term.focus();
               captureRenderState(true);
@@ -884,7 +1191,13 @@ export function TerminalPane({
               term.options.disableStdin = true;
               reportStreamIssue();
               setConnection("exited");
-              onExit();
+              diagnosticsHandle?.socketState("exited");
+              diagnosticsHandle?.update({
+                exitCode: message.exitCode,
+                acceptingInput: false,
+              });
+              diagnosticsHandle?.record("exit", { exitCode: message.exitCode });
+              onExit(terminal.id, message.exitCode);
             }
             if (message.type === "error") {
               recordDebugEvent(terminal.id, { type: "notice", message: message.message });
@@ -892,35 +1205,58 @@ export function TerminalPane({
             }
           } finally {
             backlog.settle(queuedBytes);
+            updateStreamDiagnostics();
           }
         }).catch((error) => {
           failProtocol(error);
         });
       });
       next.addEventListener("close", () => {
+        if (closeHandled) return;
+        closeHandled = true;
+        const stale = socket.current !== next;
+        diagnosticsHandle?.socketClosed(next);
+        if (stale) return;
         recordDebugEvent(terminal.id, { type: "disconnect", cause: "close" });
-        if (disposed || exited.current) return;
-        acceptingInput = false;
-        term.options.disableStdin = true;
-        if (socket.current === next) socket.current = undefined;
-        if (suspendSocket === suspend) suspendSocket = undefined;
-        setTerminalSize({ focused: false, controller: false });
-        if (!visibleState.current) {
-          reportStreamIssue();
-          setConnection("connecting");
-          void settledStream().then(() => {
+        // A server exit is sent immediately before the socket closes. Let all
+        // messages already delivered by this socket run before invalidating it;
+        // otherwise the close callback races the queue and drops the exit.
+        void settledStream().then(() => {
+          if (socket.current !== next) return;
+          if (disposed || exited.current) return;
+          acceptingInput = false;
+          term.options.disableStdin = true;
+          socket.current = undefined;
+          if (suspendSocket === suspend) suspendSocket = undefined;
+          diagnosticsHandle?.update({ acceptingInput: false, focused: false });
+          setTerminalSize({ focused: false, controller: false });
+          if (!visibleState.current) {
+            reportStreamIssue();
+            diagnosticsHandle?.socketState("connecting");
+            setConnection("connecting");
             backlog.reset();
             if (recoveringOutput) stream.restart();
-          });
-          return;
-        }
-        if (!recoveringOutput) {
-          reportStreamIssue({ kind: "reconnecting" });
-          setConnection("disconnected");
-        }
-        attempts += 1;
-        void settledStream().then(() => {
-          if (disposed || exited.current) return;
+            return;
+          }
+          if (!socketSynced && preSyncFailures.recordBeforeReady()) {
+            reloadRequiredState.current = true;
+            setReloadRequired(true);
+            reportStreamIssue();
+            setConnection("disconnected");
+            diagnosticsHandle?.socketState("disconnected");
+            diagnosticsHandle?.record("error", {
+              kind: "protocol-version",
+              message: TERMINAL_PROTOCOL_MISMATCH_MESSAGE,
+            });
+            onNotice(TERMINAL_PROTOCOL_MISMATCH_MESSAGE);
+            return;
+          }
+          if (!recoveringOutput) {
+            reportStreamIssue({ kind: "reconnecting" });
+            setConnection("disconnected");
+          }
+          attempts += 1;
+          diagnosticsHandle?.socketState("disconnected");
           backlog.reset();
           if (recoveringOutput) stream.restart();
           reconnectTimer.current = window.setTimeout(
@@ -929,10 +1265,19 @@ export function TerminalPane({
           );
         });
       });
-      next.addEventListener("error", () => next.close());
+      next.addEventListener("error", () => {
+        if (socket.current === next) next.close();
+      });
     };
 
     setTerminalVisibility.current = (nextVisible) => {
+      diagnosticsHandle?.update({
+        visible: nextVisible,
+        cached: !nextVisible,
+        acceptingInput: nextVisible ? undefined : false,
+        focused: nextVisible ? undefined : false,
+      });
+      diagnosticsHandle?.record("visibility", { visible: nextVisible });
       visibleState.current = nextVisible;
       recordDebugEvent(terminal.id, { type: "visibility", visible: nextVisible });
       if (!nextVisible) {
@@ -970,14 +1315,21 @@ export function TerminalPane({
     }, 15_000);
 
     const observer = new ResizeObserver(reportViewport);
-    observer.observe(container.current);
+    observer.observe(host);
     if (visibleState.current) connect();
     reportViewport();
 
     // Debug recording: capture the rendered state (xterm model + canvas) only
     // while a recording is active. onRender fires with a fresh WebGL buffer; the
-    // interval covers idle periods when no output is being drawn.
-    const renderDisposable = term.onRender(() => captureRenderState(false));
+    // interval covers idle periods when no output is being drawn. Diagnostics
+    // refresh their full buffer text after parser commits instead of per frame.
+    const renderDisposable = term.onRender(() => {
+      diagnosticsHandle?.rendererRendered();
+      captureRenderState(false);
+    });
+    const selectionDisposable = term.onSelectionChange(() => {
+      diagnosticsHandle?.updateXterm(term);
+    });
     let captureTimer: number | undefined;
     const startCapture = (): void => {
       if (captureTimer !== undefined) return;
@@ -998,12 +1350,18 @@ export function TerminalPane({
     if (isDebugRecordingActive()) startCapture();
 
     return () => {
+      removeWebglContextLossListener?.();
+      removeWebglContextLossListener = undefined;
+      webglAddon = undefined;
+      unregisterContextLossControl?.();
+      unregisterContextLossControl = undefined;
       writeCheckpoint();
       disposed = true;
       clearCheckpointTimer();
       viewportReporter.cancel();
       clearInterval(keepaliveTimer);
       renderDisposable.dispose();
+      selectionDisposable.dispose();
       recordingDisposable();
       stopCapture();
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
@@ -1019,6 +1377,8 @@ export function TerminalPane({
       reportStreamIssue();
       socket.current?.close(1000, "Pane closed");
       socket.current = undefined;
+      diagnosticsHandle.dispose();
+      if (diagnostics.current === diagnosticsHandle) diagnostics.current = undefined;
       reportTerminalViewport.current = undefined;
       setTerminalVisibility.current = undefined;
       term.dispose();
@@ -1093,7 +1453,7 @@ export function TerminalPane({
       return;
     }
     search.findNext(searchQuery, searchOptions(theme, true));
-  }, [searchOpen, searchQuery, theme]);
+  }, [searchOpen, searchQuery, theme, searchRevision]);
 
   useEffect(() => {
     if (!active) return;
@@ -1182,8 +1542,10 @@ export function TerminalPane({
     xterm.current?.focus();
   };
   const inputKey = (data: string) => {
-    xterm.current?.input(data, true);
-    xterm.current?.focus();
+    const terminal = xterm.current;
+    if (!terminal || terminal.options.disableStdin) return;
+    terminal.input(data, true);
+    terminal.focus();
   };
   const changeFontSize = (next: number) => {
     onFontSizeChange(next);
@@ -1194,6 +1556,10 @@ export function TerminalPane({
 
   return (
     <section
+      role="region"
+      aria-label={`Terminal ${terminal.name}`}
+      data-terminal-id={terminal.id}
+      data-pane-id={paneId}
       ref={pane}
       class={`terminal-pane ${active ? "active" : ""} ${artifactsVisible ? "artifacts-visible" : ""}`}
       style={{
@@ -1489,7 +1855,11 @@ export function TerminalPane({
         </div>
       )}
       {processesOpen && <ProcessInspector terminalId={terminal.id} onClose={() => setProcessesOpen(false)} />}
-      {connection === "disconnected" && <div class="pane-banner"><WifiOff size={13} /> Reconnecting…</div>}
+      {connection === "disconnected" && (
+        <div class="pane-banner">
+          {reloadRequired ? TERMINAL_PROTOCOL_MISMATCH_MESSAGE : <><WifiOff size={13} /> Reconnecting…</>}
+        </div>
+      )}
       {connection === "exited" && <div class="pane-banner exited">Process exited with code {terminal.exitCode ?? 0}</div>}
     </section>
   );

@@ -15,11 +15,19 @@ import { tuiCompatibilityOptions } from "../lib/terminal-compatibility";
 import { loadTerminalNerdFont, TERMINAL_FONT_FAMILY } from "../lib/terminal-font";
 import { addTerminalStreamProtocol, closeTerminalSocket } from "../lib/terminal-socket";
 import {
+  TERMINAL_FRAME_OUTPUT,
+  TERMINAL_FRAME_SNAPSHOT,
   TerminalRenderBacklog,
   TerminalStreamState,
   decodeTerminalFrame,
+  type TerminalBacklogKind,
   type TerminalFrame,
 } from "../lib/terminal-stream";
+import {
+  registerE2ETerminal,
+  type E2ETerminalDiagnosticsHandle,
+  type E2EViewport,
+} from "../lib/e2e-diagnostics";
 import {
   mixedTerminalBackground,
   terminalTheme,
@@ -44,11 +52,22 @@ export function TerminalPreview({
   animationDuration,
 }: TerminalPreviewProps) {
   const container = useRef<HTMLDivElement>(null);
+  const paneId = `preview-${terminal.id}`;
+  const diagnostics = useRef<E2ETerminalDiagnosticsHandle>();
+  if (!diagnostics.current) {
+    diagnostics.current = registerE2ETerminal({
+      terminalId: terminal.id,
+      paneId,
+      kind: "preview",
+    });
+  }
   const xterm = useRef<XTerm>();
   const [connection, setConnection] = useState<PreviewConnection>("connecting");
   const [message, setMessage] = useState("Connecting live preview…");
 
   useEffect(() => {
+    const diagnosticsHandle = diagnostics.current;
+    diagnosticsHandle?.update({ mounted: true, visible: true, cached: false, active: true });
     const host = container.current;
     if (!host) return;
     let disposed = false;
@@ -74,6 +93,10 @@ export function TerminalPreview({
     xterm.current = term;
     term.loadAddon(new PanoptesUnicode17Addon());
     term.open(host);
+    diagnosticsHandle?.updateXterm(term);
+    const renderDisposable = term.onRender(() => {
+      diagnosticsHandle?.rendererRendered();
+    });
     void loadTerminalNerdFont().then(() => {
       if (disposed) return;
       term.clearTextureAtlas();
@@ -89,6 +112,16 @@ export function TerminalPreview({
         host.clientHeight,
         mode,
       );
+      const viewport = {
+        cols,
+        rows,
+        pixelWidth: host.clientWidth,
+        pixelHeight: host.clientHeight,
+      };
+      diagnosticsHandle?.update({
+        proposedViewport: { ...viewport, source: "proposed" } satisfies E2EViewport,
+        desiredViewport: { ...viewport, source: "desired" } satisfies E2EViewport,
+      });
       if (term.options.fontSize !== fontSize) term.options.fontSize = fontSize;
     };
     const resizeObserver = new ResizeObserver(fitExistingGrid);
@@ -102,18 +135,45 @@ export function TerminalPreview({
     // Resolves once xterm has parsed every frame handed to it so far. Frames are
     // written as they arrive rather than one per settled parse; see TerminalPane.
     let pendingWrites = Promise.resolve();
+    let pendingWriteCount = 0;
+    let pendingWriteBytes = 0;
+    const updateStreamDiagnostics = () => {
+      diagnosticsHandle?.parserState(pendingWriteCount, pendingWriteBytes);
+      diagnosticsHandle?.renderBacklog({
+        bytes: backlog.pendingBytes,
+        frames: backlog.pendingFrames,
+        oldestAgeMs: backlog.oldestAgeMs,
+      });
+      diagnosticsHandle?.streamState({
+        receivedSequence: stream.received,
+        committedSequence: stream.committed,
+        syncMode: stream.mode,
+        syncTarget: stream.target,
+      });
+    };
     const writeTerminal = (data: Uint8Array, commit?: number) => new Promise<void>(
       (resolve, reject) => {
+        pendingWriteCount += 1;
+        pendingWriteBytes += data.byteLength;
+        updateStreamDiagnostics();
         try {
           term.write(data, () => {
+            pendingWriteCount -= 1;
+            pendingWriteBytes = Math.max(0, pendingWriteBytes - data.byteLength);
             try {
               if (commit !== undefined) stream.commit(commit);
+              diagnosticsHandle?.updateXterm(term);
+              updateStreamDiagnostics();
               resolve();
             } catch (error) {
+              updateStreamDiagnostics();
               reject(error);
             }
           });
         } catch (error) {
+          pendingWriteCount -= 1;
+          pendingWriteBytes = Math.max(0, pendingWriteBytes - data.byteLength);
+          updateStreamDiagnostics();
           reject(error);
         }
       },
@@ -126,6 +186,7 @@ export function TerminalPreview({
     url.searchParams.set("observer", "true");
     const socket = new WebSocket(url);
     socket.binaryType = "arraybuffer";
+    diagnosticsHandle?.socketCreated(socket, url.toString());
     const showUnavailable = (value: string) => {
       reportedUnavailable = true;
       setConnection("unavailable");
@@ -137,9 +198,14 @@ export function TerminalPreview({
       showUnavailable(error instanceof Error ? error.message : "Preview unavailable");
       closeTerminalSocket(socket, "protocol-error");
     };
+    socket.addEventListener("open", () => {
+      if (disposed) return;
+      diagnosticsHandle?.socketOpened(socket);
+    });
 
     socket.addEventListener("message", (event) => {
-      if (abandoned) return;
+      if (disposed || abandoned) return;
+      diagnosticsHandle?.socketMessage(socket, event.data);
       lastServerMessage = Date.now();
       let eagerFrame: TerminalFrame | undefined;
       let queuedBytes = 0;
@@ -152,12 +218,16 @@ export function TerminalPreview({
           closeTerminalSocket(socket, "protocol-error");
           return;
         }
-        queuedBytes = eagerFrame.data.byteLength;
-        if (backlog.enqueue(queuedBytes)) {
-          abandoned = true;
-          showUnavailable("Preview renderer fell behind");
-          closeTerminalSocket(socket, "backlog");
-          return;
+        if (eagerFrame.kind === TERMINAL_FRAME_OUTPUT || eagerFrame.kind === TERMINAL_FRAME_SNAPSHOT) {
+          const backlogKind: TerminalBacklogKind = eagerFrame.kind === TERMINAL_FRAME_SNAPSHOT ? "snapshot" : "output";
+          queuedBytes = eagerFrame.data.byteLength;
+          if (backlog.enqueue(queuedBytes, Date.now(), backlogKind)) {
+            abandoned = true;
+            showUnavailable("Preview renderer fell behind");
+            closeTerminalSocket(socket, "backlog");
+            return;
+          }
+          updateStreamDiagnostics();
         }
       }
       messageQueue = messageQueue.then(async () => {
@@ -167,6 +237,11 @@ export function TerminalPreview({
           if (binary instanceof ArrayBuffer) {
             const frame = eagerFrame ?? decodeTerminalFrame(binary);
             const commit = stream.accept(frame);
+            diagnosticsHandle?.outputReceived(
+              stream.received ?? frame.sequence,
+              frame.data.byteLength,
+            );
+            updateStreamDiagnostics();
             const settled = queuedBytes;
             queuedBytes = 0;
             pendingWrites = writeTerminal(frame.data, commit)
@@ -183,15 +258,42 @@ export function TerminalPreview({
             rows = control.rows;
             term.resize(cols, rows);
             fitExistingGrid();
+            diagnosticsHandle?.update({
+              serverViewport: {
+                cols,
+                rows,
+                pixelWidth: host.clientWidth,
+                pixelHeight: host.clientHeight,
+                source: "server",
+              } satisfies E2EViewport,
+            });
+            diagnosticsHandle?.updateXterm(term);
+            updateStreamDiagnostics();
           }
-          if (control.type === "sync" && stream.begin(control.mode, control.sequence)) {
-            term.reset();
+          if (control.type === "sync") {
+            if (stream.begin(control.mode, control.sequence)) term.reset();
+            diagnosticsHandle?.streamState({
+              receivedSequence: stream.received,
+              committedSequence: stream.committed,
+              syncMode: stream.mode,
+              syncTarget: stream.target,
+            });
+            diagnosticsHandle?.record("sync", { mode: control.mode, sequence: control.sequence });
           }
           if (control.type === "synced") {
             stream.finish(control.sequence);
             term.scrollToBottom();
             setConnection("connected");
             setMessage("Live");
+            diagnosticsHandle?.streamState({
+              receivedSequence: stream.received,
+              committedSequence: stream.committed,
+              syncMode: stream.mode,
+              syncTarget: stream.target,
+            });
+            diagnosticsHandle?.update({ acceptingInput: false });
+            diagnosticsHandle?.updateXterm(term);
+            diagnosticsHandle?.record("synced", { sequence: control.sequence });
           }
           if (control.type === "exit") {
             showUnavailable(`Process exited with code ${control.exitCode}`);
@@ -199,10 +301,12 @@ export function TerminalPreview({
           if (control.type === "error") throw new Error(control.message);
         } finally {
           backlog.settle(queuedBytes);
+          updateStreamDiagnostics();
         }
       }).catch(onStreamFailure);
     });
     socket.addEventListener("close", () => {
+      diagnosticsHandle?.socketClosed(socket);
       if (!disposed && !reportedUnavailable) showUnavailable("Live preview unavailable");
     });
     socket.addEventListener("error", () => socket.close());
@@ -219,8 +323,10 @@ export function TerminalPreview({
     return () => {
       disposed = true;
       clearInterval(keepaliveTimer);
+      renderDisposable.dispose();
       resizeObserver.disconnect();
       backlog.reset();
+      diagnosticsHandle?.dispose();
       socket.close(1000, "Preview closed");
       term.dispose();
       xterm.current = undefined;
@@ -244,6 +350,8 @@ export function TerminalPreview({
         "--terminal-background": mixedTerminalBackground(theme, terminal.color),
       }}
       role="tooltip"
+      data-terminal-id={terminal.id}
+      data-pane-id={paneId}
       aria-label={`Live preview of ${terminal.name}`}
     >
       <header>

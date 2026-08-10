@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [dev, main]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
@@ -30,6 +30,38 @@ jobs:
       - run: npm run typecheck
       - run: npm run test:web
       - run: npm run build:client
+
+  e2e-browser-gate:
+    name: E2E Chromium gate
+    if: github.event_name == 'pull_request' || github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    needs: check
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build:e2e
+      - run: npm exec -- playwright install --with-deps chromium
+      - run: npx playwright test --config=e2e/playwright.config.ts --project=chromium-pr --workers=2
+        env:
+          CI: true
+      - run: npx playwright test --config=e2e/playwright.config.ts --project=chromium-fallback --workers=2
+        if: always()
+        env:
+          CI: true
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: e2e-pr-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/e2e
+          if-no-files-found: ignore
+          retention-days: 14
 
   artifacts:
     name: Linux ${{ matrix.architecture }} artifact
@@ -67,10 +99,54 @@ jobs:
           path: artifacts/term-server-linux-${{ matrix.architecture }}.tar.gz
           if-no-files-found: error
 
+  e2e-packaged-smoke:
+    name: E2E packaged x86_64 smoke
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    needs: artifacts
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - uses: actions/download-artifact@v8
+        with:
+          name: term-server-linux-x86_64
+          path: ${{ runner.temp }}/term-server-e2e-archive
+      - name: Extract packaged release
+        run: |
+          package_dir="$RUNNER_TEMP/term-server-e2e-package"
+          mkdir -p "$package_dir"
+          tar --extract --gzip \
+            --file "$RUNNER_TEMP/term-server-e2e-archive/term-server-linux-x86_64.tar.gz" \
+            --strip-components=1 \
+            --directory "$package_dir"
+      - run: npm run build:e2e:fixture
+      - run: npm exec -- playwright install --with-deps chromium
+      - run: npx playwright test --config=e2e/playwright.config.ts --project=chromium-packaged --workers=2
+        env:
+          CI: true
+          TERM_SERVER_E2E_BINARY: ${{ runner.temp }}/term-server-e2e-package/term-server
+          TERM_SERVER_E2E_CLIENT_DIR: ${{ runner.temp }}/term-server-e2e-package/client
+          TERM_SERVER_E2E_BROWSER: chromium
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: e2e-packaged-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/e2e
+          if-no-files-found: ignore
+          retention-days: 14
+
+
   publish-release:
     name: Publish signed release
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
-    needs: artifacts
+    needs: [artifacts, e2e-browser-gate, e2e-packaged-smoke]
     runs-on: ubuntu-22.04
     concurrency:
       group: publish-${{ github.ref }}

@@ -20,6 +20,27 @@ describe("terminal Nerd Font fallback", () => {
     expect(load).toHaveBeenCalledOnce();
     expect(load).toHaveBeenCalledWith('16px "Symbols Nerd Font Mono"', "\ue0b0");
   });
+  it("holds the font request until the completion gate releases", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const load = vi.fn(async () => []);
+    const fonts = { load };
+    let settled = false;
+
+    const ready = loadTerminalNerdFont(fonts, () => gate).then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+
+    expect(load).not.toHaveBeenCalled();
+    expect(settled).toBe(false);
+
+    release();
+    await ready;
+    expect(load).toHaveBeenCalledOnce();
+  });
 
   it("does not block the terminal when a browser rejects font loading", async () => {
     const fonts = { load: vi.fn(() => Promise.reject(new Error("font unavailable"))) };

@@ -1,11 +1,11 @@
 import type { SerializeAddon } from "@xterm/addon-serialize";
-import type { ClientTerminalMessage } from "../../shared/types";
-import { encodeBytesBase64 } from "./debug-recording";
+import type { ClientTerminalMessage } from "../../shared/types.js";
+import { encodeBytesBase64 } from "./debug-recording.js";
 import {
   terminalCheckpointCompatibilityState,
   type TerminalCheckpointCompatibilityState,
   type TerminalKittyKeyboardState,
-} from "./terminal-compatibility";
+} from "./terminal-compatibility.js";
 
 export const TERMINAL_CHECKPOINT_CHUNK_BYTES = 32 * 1024;
 export const TERMINAL_CHECKPOINT_IDLE_MS = 750;
@@ -133,13 +133,19 @@ function kittyFlag(value: number): number {
   return Number.isSafeInteger(value) && value > 0 ? Math.min(value, 0x7fff_ffff) : 0;
 }
 
+export interface TerminalCheckpointSendHooks {
+  onChunk?: (offset: number, bytes: number, final: boolean) => void;
+}
+
 /** Sends an exact checkpoint as ordered sub-64-KiB JSON messages. */
 export function sendTerminalCheckpoint(
   socket: Pick<WebSocket, "send">,
   sequence: number,
   epoch: number,
   bytes: Uint8Array,
-): void {
+  hooks?: TerminalCheckpointSendHooks,
+): number {
+  let chunks = 0;
   for (let offset = 0; offset < bytes.byteLength; offset += TERMINAL_CHECKPOINT_CHUNK_BYTES) {
     const end = Math.min(bytes.byteLength, offset + TERMINAL_CHECKPOINT_CHUNK_BYTES);
     socket.send(JSON.stringify({
@@ -150,5 +156,8 @@ export function sendTerminalCheckpoint(
       data: encodeBytesBase64(bytes.subarray(offset, end)),
       final: end === bytes.byteLength,
     } satisfies ClientTerminalMessage));
+    chunks += 1;
+    hooks?.onChunk?.(offset, end - offset, end === bytes.byteLength);
   }
+  return chunks;
 }

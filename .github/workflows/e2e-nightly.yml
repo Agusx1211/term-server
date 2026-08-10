@@ -1,0 +1,49 @@
+name: E2E Nightly
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-nightly
+  cancel-in-progress: false
+
+jobs:
+  nightly:
+    name: E2E ${{ matrix.browser }} DPR ${{ matrix.dpr }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, firefox, webkit]
+        dpr: [1, 1.25, 1.8, 2]
+    env:
+      CI: true
+      TERM_SERVER_E2E_BROWSER: ${{ matrix.browser }}
+      TERM_SERVER_E2E_DPR: ${{ matrix.dpr }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build:e2e
+      - run: npm exec -- playwright install --with-deps "${{ matrix.browser }}"
+      - run: npx playwright test --config=e2e/playwright.config.ts --project=${{ matrix.browser }}-nightly --workers=2
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: e2e-nightly-${{ matrix.browser }}-dpr-${{ matrix.dpr }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/e2e
+          if-no-files-found: ignore
+          retention-days: 14
