@@ -2,8 +2,11 @@ import { Terminal } from "@xterm/headless";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   copyTerminalSelection,
-  isTerminalCopyShortcut,
+  handleTerminalClipboardShortcut,
   pasteTerminalClipboard,
+  readTerminalOsc52Clipboard,
+  terminalClipboardShortcut,
+  writeTerminalOsc52Clipboard,
 } from "./terminal-clipboard";
 
 let clipboardModule: typeof import("@xterm/addon-clipboard");
@@ -56,6 +59,24 @@ describe("terminal OSC 52 clipboard compatibility", () => {
     expect(response).toBe(`\x1b]52;c;${new Base64().encodeText("pasted text")}\x07`);
     disposable.dispose();
     terminal.dispose();
+  });
+
+  it("surfaces browser clipboard failures without rejecting the parser", async () => {
+    const onNotice = vi.fn();
+    const clipboard = {
+      readText: vi.fn(async () => {
+        throw new DOMException("denied", "NotAllowedError");
+      }),
+      writeText: vi.fn(async () => {
+        throw new DOMException("denied", "NotAllowedError");
+      }),
+    };
+
+    await expect(readTerminalOsc52Clipboard(clipboard, onNotice)).resolves.toBe("");
+    await expect(writeTerminalOsc52Clipboard("copied", clipboard, onNotice)).resolves.toBeUndefined();
+
+    expect(onNotice).toHaveBeenNthCalledWith(1, "Clipboard permission was denied");
+    expect(onNotice).toHaveBeenNthCalledWith(2, "Clipboard permission was denied");
   });
 });
 
@@ -118,33 +139,70 @@ describe("terminal native clipboard fallbacks", () => {
   });
 
   it.each([
-    ["Linux Ctrl+Shift+C", "Linux", "KeyC", true, true, false, false, "keydown", true],
-    ["macOS Ctrl+Shift+C", "MacIntel", "KeyC", true, true, false, false, "keydown", false],
-    ["macOS Cmd+C", "MacIntel", "KeyC", false, false, false, true, "keydown", false],
-    ["Linux Ctrl+C", "Linux", "KeyC", true, false, false, false, "keydown", false],
-    ["Linux Ctrl+Shift+V", "Linux", "KeyV", true, true, false, false, "keydown", false],
-    ["Linux Ctrl+Shift+C keyup", "Linux", "KeyC", true, true, false, false, "keyup", false],
-  ] satisfies [string, string, string, boolean, boolean, boolean, boolean, string, boolean][])(
-    "%s uses the native browser copy path only when appropriate",
+    ["Linux Ctrl+Shift+C", "Linux", "KeyC", true, true, false, false, "keydown", "copy"],
+    ["Linux Ctrl+Shift+V", "Linux", "KeyV", true, true, false, false, "keydown", "paste"],
+    ["Linux Ctrl+Insert", "Linux", "Insert", true, false, false, false, "keydown", "copy"],
+    ["Linux Shift+Insert", "Linux", "Insert", false, true, false, false, "keydown", "paste"],
+    ["macOS Cmd+C", "MacIntel", "KeyC", false, false, false, true, "keydown", "copy"],
+    ["macOS Cmd+V", "MacIntel", "KeyV", false, false, false, true, "keydown", "paste"],
+    ["macOS Cmd+Shift+V", "MacIntel", "KeyV", false, true, false, true, "keydown", "paste"],
+    ["macOS Ctrl+Shift+C", "MacIntel", "KeyC", true, true, false, false, "keydown", undefined],
+    ["Linux Ctrl+C", "Linux", "KeyC", true, false, false, false, "keydown", undefined],
+    ["Linux Ctrl+V", "Linux", "KeyV", true, false, false, false, "keydown", undefined],
+    ["Linux Ctrl+Shift+C keyup", "Linux", "KeyC", true, true, false, false, "keyup", "copy"],
+  ] satisfies [string, string, string, boolean, boolean, boolean, boolean, string, "copy" | "paste" | undefined][])(
+    "%s identifies the browser clipboard shortcut",
     (
       _name,
-    platform,
-    code,
-    ctrlKey,
-    shiftKey,
-    altKey,
-    metaKey,
-    type,
-    expected,
-  ) => {
-    expect(isTerminalCopyShortcut({
-      altKey,
+      platform,
       code,
       ctrlKey,
-      metaKey,
       shiftKey,
+      altKey,
+      metaKey,
       type,
-    }, platform)).toBe(expected);
+      expected,
+    ) => {
+      expect(terminalClipboardShortcut({
+        altKey,
+        code,
+        ctrlKey,
+        metaKey,
+        preventDefault: () => {},
+        shiftKey,
+        type,
+      }, platform)).toBe(expected);
+    },
+  );
+
+  it("blocks xterm input while preserving native copy and paste events", () => {
+    const copy = vi.fn();
+    const copyEvent = shortcutEvent("KeyC");
+    const pasteEvent = shortcutEvent("KeyV");
+    const releaseEvent = shortcutEvent("KeyV", "keyup");
+
+    expect(handleTerminalClipboardShortcut(copyEvent, "Linux", copy)).toBe(false);
+    expect(copyEvent.preventDefault).toHaveBeenCalledOnce();
+    expect(copy).toHaveBeenCalledOnce();
+
+    expect(handleTerminalClipboardShortcut(pasteEvent, "Linux", copy)).toBe(false);
+    expect(pasteEvent.preventDefault).not.toHaveBeenCalled();
+    expect(copy).toHaveBeenCalledOnce();
+
+    expect(handleTerminalClipboardShortcut(releaseEvent, "Linux", copy)).toBe(false);
+    expect(copy).toHaveBeenCalledOnce();
   });
 
 });
+
+function shortcutEvent(code: string, type = "keydown") {
+  return {
+    altKey: false,
+    code,
+    ctrlKey: true,
+    metaKey: false,
+    preventDefault: vi.fn(),
+    shiftKey: true,
+    type,
+  };
+}

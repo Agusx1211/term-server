@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.12.2 - 2026-08-10
+
+### Fixed
+
+- Terminal copy and paste shortcuts now stay with the browser after a full-screen TUI enables
+  Kitty keyboard reporting. This restores `Ctrl+Shift+C/V`, `Ctrl/Shift+Insert`, and macOS
+  `Cmd+C/V` while preserving native selection copy and bracketed paste behavior.
+- OSC 52 clipboard requests now follow the browser that most recently sent terminal input, and
+  clipboard permission or secure-context failures are shown instead of being silently ignored.
+
+### Upgrade notes
+
+- There are no breaking changes or data migrations.
+
 ## 0.12.1 - 2026-08-10
 
 ### Fixed

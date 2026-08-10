@@ -1,6 +1,7 @@
 import { Terminal as HeadlessTerminal } from "@xterm/headless";
 import { Terminal as BrowserTerminal } from "@xterm/xterm";
 import { describe, expect, it } from "vitest";
+import { handleTerminalClipboardShortcut } from "./terminal-clipboard";
 import { tuiCompatibilityOptions } from "./terminal-compatibility";
 
 interface WritableTerminal {
@@ -34,6 +35,31 @@ describe("full-screen TUI emulator compatibility", () => {
       .toBe("\x1b[13;2u");
     expect(keyboard!.evaluateKeyDown(keyEvent("c", "KeyC", { ctrlKey: true })).key)
       .toBe("\x1b[99;5u");
+    terminal.dispose();
+  });
+
+  it("claims browser clipboard shortcuts before Kitty can encode them", async () => {
+    const terminal = new BrowserTerminal({
+      allowProposedApi: true,
+      ...tuiCompatibilityOptions(),
+    });
+    await write(terminal, "\x1b[=1u");
+    const keyboard = (terminal as BrowserTerminal & InternalKeyboardTerminal)
+      ._core?._keyboardService;
+    const shortcuts: [KeyboardEvent, string][] = [
+      [keyEvent("c", "KeyC", { ctrlKey: true, shiftKey: true }), "Linux"],
+      [keyEvent("v", "KeyV", { ctrlKey: true, shiftKey: true }), "Linux"],
+      [keyEvent("c", "KeyC", { metaKey: true }), "MacIntel"],
+      [keyEvent("v", "KeyV", { metaKey: true }), "MacIntel"],
+    ];
+    let copies = 0;
+
+    for (const [event, platform] of shortcuts) {
+      expect(keyboard!.evaluateKeyDown(event).key).toBeDefined();
+      expect(handleTerminalClipboardShortcut(event, platform, () => copies += 1)).toBe(false);
+    }
+
+    expect(copies).toBe(2);
     terminal.dispose();
   });
 
