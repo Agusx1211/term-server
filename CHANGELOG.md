@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.12.0 - 2026-08-10
+
+### Changed
+
+- The bundled OMP integration now tracks subagent lifecycle events, keeping the parent session
+  active until its subagents complete, fail, or abort. Duplicate and out-of-order lifecycle events
+  stay inert, and the existing process and output inference remains available as a fallback.
+
+### Added
+
+- An optional provider-neutral status line can be enabled with `--status-config` or
+  `TERM_SERVER_STATUS_CONFIG`. Version-1 TOML modules retain their configured order and expose
+  authenticated `GET /api/status-modules` data for Codex/OpenAI, Anthropic/Claude, and Z.ai
+  providers. Normal credentials report configured state, while explicitly opted-in OpenAI and
+  Anthropic admin modules can show documented rate limits.
+
+### Security
+
+- Status credentials are read only from allowlisted term-server startup environment variables.
+  They are never accepted from the browser, stored in the TOML file, serialized in the status API,
+  or written to logs. The authenticated, no-store endpoint returns only bounded provider-neutral
+  values and fixed sanitized errors; normal credentials are not used for model calls or quota
+  discovery.
+
+### Upgrade notes
+
+- There are no breaking changes or data migrations. Status modules remain disabled unless configured.
+  Existing OMP installations that report the managed package as out of date should use **Repair**
+  in **Settings → Live agent activity** to install subagent tracking; process and output inference
+  continues while the package is unavailable.
+
 ## 0.11.0 - 2026-08-09
 
 ### Changed
@@ -7,18 +38,6 @@
 - The number of off-screen terminal renderers kept alive can now be set per browser under
   **Settings → Terminal behavior**. Clearing the override follows the server default again, while
   setting it to zero keeps only visible panes mounted.
-
-### Added
-
-- An optional provider-neutral status line can now be enabled with
-  `--status-config` or `TERM_SERVER_STATUS_CONFIG`. Version-1 TOML modules retain
-  their configured order and expose only normalized, authenticated
-  `GET /api/status-modules` data. Standard provider credentials report configured
-  state when no public quota source exists; explicitly opted-in OpenAI and
-  Anthropic admin modules show configured rate limits rather than pretending
-  they are remaining quota or billing balances.
-- Status credentials stay in the term-server parent environment and are never
-  accepted from the browser, placed in the TOML file, serialized, or logged.
 
 ### Fixed
 
