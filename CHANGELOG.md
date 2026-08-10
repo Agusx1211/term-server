@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- The agent activity pill now treats a connector's own status report as the source of truth. When
+  omp, pi, codex, or claude reports its state through its hook connector, that signal outranks the
+  screen-content heuristics, so an agent driving subagents (which reports itself as working even when
+  its own TUI looks idle) no longer flips to "ready" prematurely. Screen detection and CPU/output
+  heuristics still drive terminals without a live connector.
+
 ## 0.12.2 - 2026-08-10
 
 ### Fixed

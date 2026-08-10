@@ -965,6 +965,72 @@ pub(crate) fn screen_detection_outcome(
     }
 }
 
+/// Resolve the next agent status from the available signals, in priority order.
+///
+/// 1. A connector-reported status (`native_status`) is authoritative. omp, pi,
+///    codex and claude each ship a hook connector that delivers the agent's own
+///    state here, and every one of them covers the waiting-for-input case
+///    (PermissionRequest / Notification → Blocked). The agent knows whether it
+///    is working or settled, and that report outranks a screen-content guess:
+///    an agent driving subagents reports itself as working even when its own
+///    TUI is idle, and a settled agent reports itself as idle even when a
+///    spinner frame lingers on screen. `Keep` (an overlay hiding the agent)
+///    does not override a live connector signal — the agent is still reporting
+///    behind the overlay.
+/// 2. Screen-content detection: `blocked` and `working` from a matched rule,
+///    or a visible idle prompt.
+/// 3. The OSC-reported state and the CPU/output heuristics
+///    ([`select_agent_status`]).
+///
+/// Freshness is enforced upstream: [`SessionActivity::expire_native_state`]
+/// clears a non-`Blocked` status once it is older than
+/// `NATIVE_EVENT_FRESH_MILLIS`, so a `native_status` present here is either
+/// fresh or a held `Blocked`. When the connector stops reporting, the field is
+/// `None` and the screen + heuristic tiers take over.
+/// Inputs for the fallback tiers (screen detection, then heuristics) of
+/// [`resolve_agent_status`], gathered so the resolver stays readable.
+struct StatusFallback<'a> {
+    agent_kind: &'a str,
+    current_status: AgentStatus,
+    reported_state: Option<(ReportedAgentState, u64)>,
+    now: u64,
+    input_submitted_at: u64,
+    active_samples: u8,
+    quiet_samples: u8,
+}
+
+fn resolve_agent_status(
+    native_status: Option<AgentStatus>,
+    detection: Option<&agent_detection::Detection>,
+    fallback: StatusFallback,
+) -> AgentStatus {
+    if let Some(native) = native_status {
+        return native;
+    }
+    let StatusFallback {
+        agent_kind,
+        current_status,
+        reported_state,
+        now,
+        input_submitted_at,
+        active_samples,
+        quiet_samples,
+    } = fallback;
+    match screen_detection_outcome(detection) {
+        DetectionOutcome::Keep => current_status,
+        DetectionOutcome::Status(status) => status,
+        DetectionOutcome::Undecided => select_agent_status(
+            agent_kind,
+            current_status,
+            reported_state,
+            now,
+            input_submitted_at,
+            active_samples,
+            quiet_samples,
+        ),
+    }
+}
+
 fn select_agent_status(
     agent_kind: &str,
     current: AgentStatus,
@@ -2005,23 +2071,19 @@ impl TerminalSession {
                     .as_ref()
                     .map(|current| current.status.clone())
                     .unwrap_or(AgentStatus::Idle);
-                let next_status = match screen_detection_outcome(detection.as_ref()) {
-                    DetectionOutcome::Keep => current_status,
-                    DetectionOutcome::Status(status) => status,
-                    DetectionOutcome::Undecided => {
-                        activity.native_status.clone().unwrap_or_else(|| {
-                            select_agent_status(
-                                &agent.kind,
-                                current_status,
-                                reported_state,
-                                now,
-                                activity.input_submitted_at,
-                                activity.active_samples,
-                                activity.quiet_samples,
-                            )
-                        })
-                    }
-                };
+                let next_status = resolve_agent_status(
+                    activity.native_status.clone(),
+                    detection.as_ref(),
+                    StatusFallback {
+                        agent_kind: &agent.kind,
+                        current_status,
+                        reported_state,
+                        now,
+                        input_submitted_at: activity.input_submitted_at,
+                        active_samples: activity.active_samples,
+                        quiet_samples: activity.quiet_samples,
+                    },
+                );
                 if let Some(current) = info.agent.as_mut()
                     && current.status != next_status
                 {
@@ -4902,6 +4964,116 @@ mod tests {
         // The idle marker on its own stays idle.
         signals.observe(b"\x1b]0;\xe2\x9c\xb3 Codex\x07", 2_000);
         assert_eq!(signals.agent_state, Some((ReportedAgentState::Idle, 2_000)));
+    }
+
+    #[test]
+    fn native_connector_signal_is_authoritative_over_screen_detection() {
+        use agent_detection::DetectedState;
+
+        // A connector reporting Working wins over a visible-idle screen rule:
+        // an agent driving subagents reports itself as working even when its
+        // own TUI looks idle.
+        let mut idle_screen = detection(DetectedState::Idle, "live_prompt_box");
+        idle_screen.visible_idle = true;
+        assert_eq!(
+            resolve_agent_status(
+                Some(AgentStatus::Working),
+                Some(&idle_screen),
+                StatusFallback {
+                    agent_kind: "omp",
+                    current_status: AgentStatus::Idle,
+                    reported_state: None,
+                    now: 5_000,
+                    input_submitted_at: 1_000,
+                    active_samples: 0,
+                    quiet_samples: 5,
+                },
+            ),
+            AgentStatus::Working
+        );
+
+        // Symmetric: a connector reporting Idle wins over a working screen rule.
+        let working_screen = detection(DetectedState::Working, "spinner");
+        assert_eq!(
+            resolve_agent_status(
+                Some(AgentStatus::Idle),
+                Some(&working_screen),
+                StatusFallback {
+                    agent_kind: "codex",
+                    current_status: AgentStatus::Working,
+                    reported_state: None,
+                    now: 5_000,
+                    input_submitted_at: 1_000,
+                    active_samples: 3,
+                    quiet_samples: 0,
+                },
+            ),
+            AgentStatus::Idle
+        );
+
+        // A connector Blocked wins even when the screen holds an overlay that
+        // would otherwise Keep the previous status.
+        let mut overlay = detection(DetectedState::Unknown, "transcript_viewer");
+        overlay.skip_state_update = true;
+        assert_eq!(
+            resolve_agent_status(
+                Some(AgentStatus::Blocked),
+                Some(&overlay),
+                StatusFallback {
+                    agent_kind: "claude",
+                    current_status: AgentStatus::Working,
+                    reported_state: None,
+                    now: 5_000,
+                    input_submitted_at: 1_000,
+                    active_samples: 0,
+                    quiet_samples: 0,
+                },
+            ),
+            AgentStatus::Blocked
+        );
+    }
+
+    #[test]
+    fn resolve_agent_status_falls_back_to_screen_then_heuristics_without_a_connector() {
+        use agent_detection::DetectedState;
+
+        // No connector signal: a screen Blocked rule decides.
+        let blocked_screen = detection(DetectedState::Blocked, "permission_prompt");
+        assert_eq!(
+            resolve_agent_status(
+                None,
+                Some(&blocked_screen),
+                StatusFallback {
+                    agent_kind: "codex",
+                    current_status: AgentStatus::Working,
+                    reported_state: None,
+                    now: 5_000,
+                    input_submitted_at: 1_000,
+                    active_samples: 0,
+                    quiet_samples: 0,
+                },
+            ),
+            AgentStatus::Blocked
+        );
+
+        // No connector signal, screen Undecided: the OSC reported state and
+        // CPU/output heuristics decide, exactly as before.
+        assert_eq!(
+            resolve_agent_status(
+                None,
+                None,
+                StatusFallback {
+                    agent_kind: "pi",
+                    current_status: AgentStatus::Working,
+                    reported_state: None,
+                    now: 5_000,
+                    input_submitted_at: 1_000,
+                    active_samples: 0,
+                    quiet_samples: 2,
+                },
+            ),
+            AgentStatus::Idle
+        );
     }
 
     #[test]
