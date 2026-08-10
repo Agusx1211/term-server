@@ -86,6 +86,9 @@ pub struct Cli {
     /// Directory for credentials and generated TLS material.
     #[arg(long, env = "TERM_SERVER_DATA_DIR", default_value_os_t = default_data_dir())]
     pub data_dir: PathBuf,
+    /// Optional versioned TOML configuration for authenticated provider status modules.
+    #[arg(long = "status-config", env = "TERM_SERVER_STATUS_CONFIG")]
+    pub status_config: Option<PathBuf>,
 
     /// Default shell executable used for new terminals.
     #[arg(long, env = "TERM_SERVER_SHELL")]

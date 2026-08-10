@@ -53,6 +53,7 @@ use crate::{
     },
     files::{self, FileError},
     pushover::{PushoverConfig, PushoverNotification, PushoverService, UpdatePushoverConfig},
+    status::{StatusPayload, StatusService},
     terminal::{CreateTerminal, RenameTerminal, TerminalError, TerminalInfo},
     update::{UpdateConfig, UpdateError, UpdateService, UpdateStatus},
     workspace::{
@@ -86,6 +87,7 @@ pub struct AppState {
     pub server_control: ServerControl,
     pub debug_recording: Arc<DebugRecordingManager>,
     pub pushover: Arc<PushoverService>,
+    pub status_modules: Arc<StatusService>,
 }
 
 #[derive(Clone)]
@@ -623,6 +625,14 @@ async fn config(
         broker,
         updates: state.updates.config(),
     }))
+}
+
+async fn status_modules(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> Result<Json<StatusPayload>, ApiError> {
+    require_auth(&jar, &state)?;
+    Ok(Json(state.status_modules.snapshot().await))
 }
 
 async fn agent_integrations(
@@ -1381,6 +1391,7 @@ pub fn build_router(state: AppState, client_directory: Option<PathBuf>) -> Route
         .route("/site-data", delete(clear_site_data))
         .route("/password", patch(change_password))
         .route("/config", get(config))
+        .route("/status-modules", get(status_modules))
         .route("/config/pi", patch(update_pi_config))
         .route(
             "/config/pushover",
@@ -1532,6 +1543,7 @@ mod tests {
             server_control: ServerControl::new(Handle::new()),
             debug_recording: Arc::new(DebugRecordingManager::new()),
             pushover: Arc::new(PushoverService::new(directory.path())),
+            status_modules: Arc::new(StatusService::disabled()),
         }
     }
 
@@ -1575,6 +1587,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn status_modules_requires_authentication() {
+        let response = build_router(test_state().await, None)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/status-modules")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn status_modules_returns_disabled_no_store_payload() {
+        let (app, cookie) = authenticated_app().await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/status-modules")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["enabled"], false);
+        assert_eq!(json["display"]["showOnMobile"], false);
+        assert_eq!(json["modules"], serde_json::json!([]));
+        assert!(json["generatedAt"].is_number());
     }
 
     #[test]
