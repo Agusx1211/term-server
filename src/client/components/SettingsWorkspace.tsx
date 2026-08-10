@@ -54,6 +54,10 @@ import {
   clampCachedTerminals,
   describeCachedTerminals,
 } from "../lib/cached-terminals";
+import {
+  agentIntegrationActionFor,
+  agentIntegrationProfileSummary,
+} from "../lib/agent-integrations";
 import { ChangePassword } from "./ChangePassword";
 import type { ThemeName } from "../lib/terminal-theme";
 
@@ -592,11 +596,16 @@ export function SettingsWorkspace({
             <p>
               Add privacy-bounded native lifecycle events without replacing provider hooks or
               term-server&apos;s process, output, CPU, and terminal-signal inference.
+              {" "}For OMP, Install, Repair, and Remove apply to every discovered profile.
             </p>
             <div class="agent-integration-list">
               {agentIntegrations.providers.map((integration) => {
                 const busy = updatingAgentIntegration === integration.provider;
                 const unavailable = integration.state === "unavailable";
+                const primaryAction = agentIntegrationActionFor(integration);
+                const noProfiles =
+                  integration.provider === "omp" && integration.profiles?.length === 0;
+                const profileSummary = agentIntegrationProfileSummary(integration.profiles);
                 return (
                   <div class="agent-integration" key={integration.provider}>
                     <span
@@ -606,28 +615,45 @@ export function SettingsWorkspace({
                     <span class="agent-integration-copy">
                       <b>{integration.name}</b>
                       <small>{integration.message}</small>
+                      {profileSummary && (
+                        <small class="agent-integration-profile-summary">{profileSummary}</small>
+                      )}
+                      {integration.profiles && integration.profiles.length > 0 && (
+                        <span class="agent-integration-profiles" aria-label={`${integration.name} profile status`}>
+                          {integration.profiles.map((profile) => (
+                            <span class="agent-integration-profile" key={profile.id}>
+                              <span
+                                class={`agent-integration-state ${profile.state}`}
+                                aria-hidden="true"
+                              />
+                              <span>
+                                <b>{profile.label}</b>
+                                <small>{profile.message}</small>
+                              </span>
+                            </span>
+                          ))}
+                        </span>
+                      )}
                     </span>
                     <span class="agent-integration-actions">
-                      {integration.state === "notInstalled" ? (
-                        <button
-                          class="settings-update-action primary"
-                          disabled={busy}
-                          onClick={() => onAgentIntegration(integration.provider, "install")}
-                        >
-                          {busy && <LoaderCircle class="spin" size={13} />}
-                          {busy ? "Installing…" : "Install"}
-                        </button>
-                      ) : unavailable ? (
+                      {unavailable ? (
                         <button class="settings-update-action" disabled>Unavailable</button>
+                      ) : noProfiles ? (
+                        <button class="settings-update-action" disabled>No profiles</button>
                       ) : (
                         <>
                           <button
-                            class="settings-update-action"
+                            class={`settings-update-action ${primaryAction === "install" ? "primary" : ""}`}
                             disabled={busy}
-                            onClick={() => onAgentIntegration(integration.provider, "repair")}
+                            onClick={() => onAgentIntegration(
+                              integration.provider,
+                              primaryAction ?? "repair",
+                            )}
                           >
                             {busy && <LoaderCircle class="spin" size={13} />}
-                            {busy ? "Working…" : "Repair"}
+                            {busy
+                              ? primaryAction === "install" ? "Installing…" : "Working…"
+                              : primaryAction === "install" ? "Install" : "Repair"}
                           </button>
                           <button
                             class="settings-update-action danger"

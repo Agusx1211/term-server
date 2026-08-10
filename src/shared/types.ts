@@ -204,11 +204,19 @@ export type AgentIntegrationState =
   | "needsRepair";
 export type AgentIntegrationAction = "install" | "repair" | "remove";
 
+export interface AgentIntegrationProfileStatus {
+  id: string;
+  label: string;
+  state: AgentIntegrationState;
+  message: string;
+}
+
 export interface AgentIntegrationStatus {
   provider: AgentIntegrationProvider;
   name: string;
   state: AgentIntegrationState;
   message: string;
+  profiles?: AgentIntegrationProfileStatus[];
 }
 
 export interface AgentIntegrationsConfig {

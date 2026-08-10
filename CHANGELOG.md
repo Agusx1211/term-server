@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.12.1 - 2026-08-10
+
+### Fixed
+
+- Terminal panes now use the active terminal theme background for the surrounding margin instead of
+  rendering black, including when the theme changes at runtime.
+- OMP installation and repair now apply the managed extension to every discovered profile, with
+  per-profile state shown in **Settings → Live agent activity**.
+- Desktop terminal copy and paste now use xterm's native browser clipboard events, preserving
+  selections and bracketed-paste input without duplicate or permission-swallowed shortcuts.
+
 ## 0.12.0 - 2026-08-10
 
 ### Changed
