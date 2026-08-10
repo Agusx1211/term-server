@@ -597,6 +597,7 @@ struct SessionActivity {
     generated_title: Option<String>,
     initial_title_prompt: Option<String>,
     agent_pid: Option<u32>,
+    agent_start_ticks: Option<u64>,
     last_cpu_ticks: u64,
     last_sample_output_bytes: u64,
     active_samples: u8,
@@ -611,6 +612,8 @@ struct SessionActivity {
     native_provider: Option<String>,
     native_status: Option<AgentStatus>,
     native_updated_at: u64,
+    native_sequence_provider: Option<String>,
+    last_native_sequence: Option<u64>,
     foreground_command: ForegroundCommandTracker,
 }
 
@@ -621,6 +624,7 @@ impl Default for SessionActivity {
             generated_title: None,
             initial_title_prompt: None,
             agent_pid: None,
+            agent_start_ticks: None,
             last_cpu_ticks: 0,
             last_sample_output_bytes: 0,
             active_samples: 0,
@@ -635,6 +639,8 @@ impl Default for SessionActivity {
             native_provider: None,
             native_status: None,
             native_updated_at: 0,
+            native_sequence_provider: None,
+            last_native_sequence: None,
             foreground_command: ForegroundCommandTracker::default(),
         }
     }
@@ -657,6 +663,45 @@ impl SessionActivity {
         self.native_status = None;
         self.native_updated_at = 0;
         true
+    }
+
+    fn clear_native_sequence(&mut self) {
+        self.native_sequence_provider = None;
+        self.last_native_sequence = None;
+    }
+
+    /// Accept a native report only if it cannot be older than a sequenced
+    /// report from the same active source. Legacy unsequenced reports remain
+    /// valid until that source has established sequence authority.
+    fn accept_native_sequence(&mut self, provider: &str, sequence: Option<u64>) -> bool {
+        match self.native_sequence_provider.as_deref() {
+            Some(active_provider) if active_provider == provider => {
+                match (self.last_native_sequence, sequence) {
+                    (Some(last), Some(next)) if next <= last => false,
+                    (Some(_), None) => false,
+                    (_, Some(next)) => {
+                        self.last_native_sequence = Some(next);
+                        true
+                    }
+                    (None, None) => true,
+                }
+            }
+            Some(_) => {
+                self.clear_native_sequence();
+                if let Some(next) = sequence {
+                    self.native_sequence_provider = Some(provider.to_owned());
+                    self.last_native_sequence = Some(next);
+                }
+                true
+            }
+            None => {
+                if let Some(next) = sequence {
+                    self.native_sequence_provider = Some(provider.to_owned());
+                    self.last_native_sequence = Some(next);
+                }
+                true
+            }
+        }
     }
 
     fn queue_title_for_submission(
@@ -1843,12 +1888,27 @@ impl TerminalSession {
 
         let mut outcome = RefreshOutcome::default();
         if let Some(agent) = observation.agent {
+            let process_identity_changed = activity.agent_pid.is_some()
+                && (activity.agent_pid != Some(agent.pid)
+                    || activity
+                        .agent_start_ticks
+                        .is_some_and(|start_ticks| start_ticks != agent.start_ticks));
+            let provider_changed = info
+                .agent
+                .as_ref()
+                .is_some_and(|current| current.kind != agent.kind);
             let is_new_agent = activity.agent_pid != Some(agent.pid)
+                || activity
+                    .agent_start_ticks
+                    .is_some_and(|start_ticks| start_ticks != agent.start_ticks)
                 || info
                     .agent
                     .as_ref()
                     .is_none_or(|current| current.kind != agent.kind);
             if is_new_agent {
+                if process_identity_changed || provider_changed {
+                    activity.clear_native_sequence();
+                }
                 let preserve_native_state = activity.native_provider.as_deref()
                     == Some(agent.kind.as_str())
                     && info
@@ -1865,6 +1925,7 @@ impl TerminalSession {
                                 && submission.agent_kind == agent.kind
                         });
                 activity.agent_pid = Some(agent.pid);
+                activity.agent_start_ticks = Some(agent.start_ticks);
                 activity.last_cpu_ticks = agent.cpu_ticks;
                 activity.last_sample_output_bytes = output_bytes;
                 activity.active_samples = 0;
@@ -2012,7 +2073,6 @@ impl TerminalSession {
             {
                 let completed_task = activity.input_submitted_at > 0;
                 current.status = AgentStatus::Closed;
-                current.status_changed_at = now;
                 current.revision = current.revision.saturating_add(1);
                 current.activity = None;
                 if completed_task {
@@ -2031,6 +2091,7 @@ impl TerminalSession {
                 }
             }
             activity.agent_pid = None;
+            activity.agent_start_ticks = None;
             activity.active_samples = 0;
             activity.quiet_samples = 0;
             activity.input_submitted_at = 0;
@@ -2039,6 +2100,7 @@ impl TerminalSession {
             activity.native_provider = None;
             activity.native_status = None;
             activity.native_updated_at = 0;
+            activity.clear_native_sequence();
             *self.signals.lock() = TerminalSignals::default();
             if !observation.shell_foreground {
                 activity.generated_title = None;
@@ -2073,6 +2135,9 @@ impl TerminalSession {
     ) -> RefreshOutcome {
         let mut activity = self.activity.lock();
         let mut info = self.info.write();
+        if !activity.accept_native_sequence(&event.provider, event.sequence) {
+            return RefreshOutcome::default();
+        }
         activity.foreground_command.candidate = None;
         info.command = None;
         let next_status = match event.kind {
@@ -4228,6 +4293,7 @@ mod tests {
                 AgentEvent {
                     provider: "codex".to_owned(),
                     kind,
+                    sequence: None,
                     title: None,
                 },
                 pi.clone(),
@@ -4257,6 +4323,7 @@ mod tests {
             AgentEvent {
                 provider: "codex".to_owned(),
                 kind: AgentEventKind::Completed,
+                sequence: None,
                 title: None,
             },
             pi.clone(),
@@ -4272,6 +4339,7 @@ mod tests {
             AgentEvent {
                 provider: "codex".to_owned(),
                 kind: AgentEventKind::Closed,
+                sequence: None,
                 title: None,
             },
             pi,
@@ -4281,6 +4349,78 @@ mod tests {
         assert_eq!(closed.revision, 3);
         assert!(closed.activity.is_none());
         assert!(manager.remove(info.id));
+    }
+
+    #[test]
+    fn sequenced_native_events_ignore_stale_reports_and_reset_for_new_sources() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = TerminalManager {
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            default_shell: RwLock::new(Some("/bin/sh".into())),
+            replay_bytes: AtomicUsize::new(1024 * 1024),
+            home_directory: directory.path().to_path_buf(),
+            agent_event_socket: None,
+            executable: None,
+        };
+        let info = manager
+            .create(CreateTerminal {
+                path: None,
+                cwd: None,
+                shell: None,
+                clone_from: None,
+            })
+            .unwrap();
+        let pi = Arc::new(PiService::new(directory.path()));
+        let event = |provider: &str, kind: AgentEventKind, sequence: Option<u64>| AgentEvent {
+            provider: provider.to_owned(),
+            kind,
+            sequence,
+            title: None,
+        };
+        let apply = |provider, kind, sequence| {
+            manager.apply_agent_event(info.id, event(provider, kind, sequence), pi.clone())
+        };
+        let agent = || manager.get(info.id).unwrap().info().agent.unwrap();
+
+        // Legacy unsequenced sources remain usable until they establish
+        // sequence authority.
+        assert!(apply("codex", AgentEventKind::Thinking, None));
+        assert!(apply("codex", AgentEventKind::Completed, None));
+        assert_eq!(agent().status, AgentStatus::Idle);
+
+        assert!(apply("omp", AgentEventKind::Thinking, Some(10)));
+        assert!(apply("omp", AgentEventKind::Completed, Some(12)));
+        assert!(apply("omp", AgentEventKind::Thinking, Some(13)));
+        let working = agent();
+        assert_eq!(working.status, AgentStatus::Working);
+
+        // A delayed completion and a duplicate sequence cannot finish the
+        // newer turn.
+        assert!(apply("omp", AgentEventKind::Completed, Some(12)));
+        assert_eq!(agent().status, AgentStatus::Working);
+        assert!(apply("omp", AgentEventKind::Completed, Some(13)));
+        assert_eq!(agent().status, AgentStatus::Working);
+        assert_eq!(agent().revision, working.revision);
+
+        assert!(apply("omp", AgentEventKind::Completed, Some(14)));
+        assert_eq!(agent().status, AgentStatus::Idle);
+
+        // Taking over with another provider starts a fresh sequence domain.
+        assert!(apply("codex", AgentEventKind::Thinking, Some(1)));
+        assert!(apply("omp", AgentEventKind::Thinking, Some(1)));
+        assert_eq!(agent().status, AgentStatus::Working);
+        assert!(manager.remove(info.id));
+    }
+
+    #[test]
+    fn clearing_native_lifecycle_allows_a_fresh_sequence_source() {
+        let mut activity = SessionActivity::default();
+        assert!(activity.accept_native_sequence("omp", Some(9)));
+        assert!(!activity.accept_native_sequence("omp", Some(9)));
+        assert!(!activity.accept_native_sequence("omp", None));
+
+        activity.clear_native_sequence();
+        assert!(activity.accept_native_sequence("omp", Some(1)));
     }
 
     #[test]
@@ -4310,6 +4450,7 @@ mod tests {
             AgentEvent {
                 provider: "omp".to_owned(),
                 kind: AgentEventKind::Thinking,
+                sequence: None,
                 title: Some("checkout latency fix".to_owned()),
             },
             pi,
@@ -4838,6 +4979,7 @@ mod tests {
         let event = |kind| AgentEvent {
             provider: "claude".to_owned(),
             kind,
+            sequence: None,
             title: None,
         };
 

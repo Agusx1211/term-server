@@ -584,9 +584,14 @@ export function App() {
 
   useEffect(() => {
     if (!authenticated) return;
+    let disposed = false;
+    let refreshing = false;
     const refresh = () => {
+      if (disposed || refreshing) return;
+      refreshing = true;
       void Promise.all([api.terminals(), api.artifacts()])
         .then(([next, artifacts]) => {
+          if (disposed) return;
           const running = next.filter((terminal) => terminal.status === "running");
           setTerminals((current) => mergeTerminalActivityViews(running, current));
           setConfig((current) => ({
@@ -598,11 +603,19 @@ export function App() {
           syncArtifacts(artifacts, activeIdRef.current, running);
         })
         .catch((error) => {
-          if (error instanceof ApiError && error.status === 401) setAuthenticated(false);
+          if (!disposed && error instanceof ApiError && error.status === 401) {
+            setAuthenticated(false);
+          }
+        })
+        .finally(() => {
+          refreshing = false;
         });
     };
     const timer = window.setInterval(refresh, 1500);
-    return () => clearInterval(timer);
+    return () => {
+      disposed = true;
+      clearInterval(timer);
+    };
   }, [authenticated]);
 
   useEffect(() => {

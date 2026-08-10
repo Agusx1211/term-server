@@ -10,9 +10,15 @@
 - OSC 52 clipboard requests now follow the browser that most recently sent terminal input, and
   clipboard permission or secure-context failures are shown instead of being silently ignored.
 
+- OMP activity now accepts lifecycle events only from the interactive root session, distinguishes
+  intermediate continuations from final settlement, keeps silent subagents active with heartbeats,
+  and rejects reordered hook reports. Stale browser refreshes and terminal-stream callbacks can no
+  longer replay an older completion state.
+
 ### Upgrade notes
 
-- There are no breaking changes or data migrations.
+- There are no breaking changes or data migrations. Use **Repair** under **Settings → Live agent
+  activity** and start a new OMP session to load the corrected managed extension.
 
 ## 0.12.1 - 2026-08-10
 

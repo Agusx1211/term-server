@@ -1299,6 +1299,7 @@ mod tests {
                 &AgentEvent {
                     provider: "codex".to_owned(),
                     kind: crate::agent_events::AgentEventKind::Thinking,
+                    sequence: None,
                     title: None,
                 },
             )
