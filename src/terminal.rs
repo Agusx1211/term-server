@@ -308,6 +308,12 @@ impl ClientViewports {
         }
     }
 
+    fn activate(&mut self, client_id: Uuid) {
+        if self.sizes.contains_key(&client_id) {
+            self.responder_client = Some(client_id);
+        }
+    }
+
     /// Drops a client's contribution to the negotiated size while leaving it
     /// attached. A cached pane holds its stream open so that returning to it
     /// never costs a resynchronization, but it is not being read and must not
@@ -1475,6 +1481,10 @@ impl TerminalSession {
         focused: bool,
     ) -> Result<TerminalSizeState, TerminalError> {
         self.update_viewports(|viewports| viewports.focus(client_id, focused))
+    }
+
+    pub fn activate_client(&self, client_id: Uuid) -> Result<TerminalSizeState, TerminalError> {
+        self.update_viewports(|viewports| viewports.activate(client_id))
     }
 
     /// Stops measuring the terminal against a client that is still connected.
@@ -3882,6 +3892,21 @@ mod tests {
                 epoch: 0,
             }
         );
+    }
+
+    #[test]
+    fn terminal_responder_follows_the_client_sending_input() {
+        let desktop = Uuid::from_u128(1);
+        let mobile = Uuid::from_u128(2);
+        let mut viewports = ClientViewports::default();
+
+        viewports.attach(desktop, Some(TerminalViewport::new(180, 50, 1800, 1000)));
+        viewports.attach(mobile, Some(TerminalViewport::new(60, 22, 600, 440)));
+        viewports.activate(mobile);
+
+        assert_eq!(viewports.state().responder_client, Some(mobile));
+        assert_eq!((viewports.state().cols, viewports.state().rows), (60, 22));
+        assert_eq!(viewports.state().focused_client, None);
     }
 
     #[test]

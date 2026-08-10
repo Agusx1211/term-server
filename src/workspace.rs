@@ -773,8 +773,15 @@ async fn handle_client_message(
                 if let Some(recorder) = recorder {
                     recorder.input(&terminal_id, data.as_bytes());
                 }
-                forward_terminal_input(sender, terminal, data.as_bytes(), terminal_id, recorder)
-                    .await?;
+                forward_terminal_input(
+                    sender,
+                    terminal,
+                    client_id,
+                    data.as_bytes(),
+                    terminal_id,
+                    recorder,
+                )
+                .await?;
             }
             Ok(TerminalClientMessage::Resize {
                 cols,
@@ -844,7 +851,8 @@ async fn handle_client_message(
             if let Some(recorder) = recorder {
                 recorder.input(&terminal_id, &data);
             }
-            forward_terminal_input(sender, terminal, &data, terminal_id, recorder).await?;
+            forward_terminal_input(sender, terminal, client_id, &data, terminal_id, recorder)
+                .await?;
         }
         Message::Close(_) => return Err(()),
         Message::Ping(payload) => {
@@ -928,10 +936,12 @@ async fn write_terminal_input(
 async fn forward_terminal_input(
     sender: &mut SplitSink<WebSocket, Message>,
     terminal: &TerminalSession,
+    client_id: Uuid,
     data: &[u8],
     terminal_id: Uuid,
     recorder: Option<&DebugRecordingManager>,
 ) -> Result<(), ()> {
+    terminal.activate_client(client_id).map_err(|_| ())?;
     let Err(error) = write_terminal_input(terminal, data).await else {
         return Ok(());
     };

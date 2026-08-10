@@ -1,23 +1,57 @@
-export interface TerminalCopyShortcutEvent {
+export interface TerminalClipboardShortcutEvent {
   altKey: boolean;
   code: string;
   ctrlKey: boolean;
   metaKey: boolean;
+  preventDefault: () => void;
   shiftKey: boolean;
   type: string;
 }
 
-export function isTerminalCopyShortcut(
-  event: TerminalCopyShortcutEvent,
+export type TerminalClipboardShortcut = "copy" | "paste";
+
+function isMacPlatform(platform: string): boolean {
+  return /Mac|iPhone|iPad|iPod/i.test(platform);
+}
+
+export function terminalClipboardShortcut(
+  event: TerminalClipboardShortcutEvent,
   platform: string,
+): TerminalClipboardShortcut | undefined {
+  if (!isMacPlatform(platform)) {
+    if (
+      event.code === "Insert"
+      && !event.altKey
+      && !event.metaKey
+      && event.ctrlKey !== event.shiftKey
+    ) return event.ctrlKey ? "copy" : "paste";
+    if (!event.ctrlKey || !event.shiftKey || event.altKey || event.metaKey) return;
+  } else if (!event.metaKey || event.altKey || event.ctrlKey) {
+    return;
+  }
+
+  if (event.code === "KeyC") return "copy";
+  if (event.code === "KeyV") return "paste";
+}
+
+/**
+ * Stops xterm from encoding native clipboard shortcuts as terminal input.
+ * Copy is dispatched synchronously through xterm's DOM listener. Paste keeps
+ * the browser default so xterm receives the resulting ClipboardEvent.
+ */
+export function handleTerminalClipboardShortcut(
+  event: TerminalClipboardShortcutEvent,
+  platform: string,
+  copy: () => void,
 ): boolean {
-  return event.type === "keydown"
-    && event.code === "KeyC"
-    && event.ctrlKey
-    && event.shiftKey
-    && !event.altKey
-    && !event.metaKey
-    && !/Mac|iPhone|iPad|iPod/i.test(platform);
+  const shortcut = terminalClipboardShortcut(event, platform);
+  if (!shortcut) return true;
+  if (event.type !== "keydown") return false;
+  if (shortcut === "copy") {
+    event.preventDefault();
+    copy();
+  }
+  return false;
 }
 
 export interface TerminalClipboardApi {
@@ -27,6 +61,38 @@ export interface TerminalClipboardApi {
 
 const CLIPBOARD_CONTEXT_NOTICE = "Clipboard access requires HTTPS or localhost";
 const CLIPBOARD_PERMISSION_NOTICE = "Clipboard permission was denied";
+
+export async function readTerminalOsc52Clipboard(
+  clipboard: TerminalClipboardApi | undefined,
+  onNotice: (message: string) => void,
+): Promise<string> {
+  if (!clipboard?.readText) {
+    onNotice(CLIPBOARD_CONTEXT_NOTICE);
+    return "";
+  }
+  try {
+    return await clipboard.readText();
+  } catch {
+    onNotice(CLIPBOARD_PERMISSION_NOTICE);
+    return "";
+  }
+}
+
+export async function writeTerminalOsc52Clipboard(
+  text: string,
+  clipboard: TerminalClipboardApi | undefined,
+  onNotice: (message: string) => void,
+): Promise<void> {
+  if (!clipboard?.writeText) {
+    onNotice(CLIPBOARD_CONTEXT_NOTICE);
+    return;
+  }
+  try {
+    await clipboard.writeText(text);
+  } catch {
+    onNotice(CLIPBOARD_PERMISSION_NOTICE);
+  }
+}
 
 export async function copyTerminalSelection(
   selection: string | undefined,

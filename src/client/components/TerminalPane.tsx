@@ -75,8 +75,10 @@ import {
 } from "../lib/terminal-input";
 import {
   copyTerminalSelection,
-  isTerminalCopyShortcut,
+  handleTerminalClipboardShortcut,
   pasteTerminalClipboard,
+  readTerminalOsc52Clipboard,
+  writeTerminalOsc52Clipboard,
 } from "../lib/terminal-clipboard";
 import {
   TERMINAL_FRAME_OUTPUT,
@@ -288,20 +290,12 @@ export function TerminalPane({
     term.loadAddon(serialize);
     term.loadAddon(new ClipboardAddon(undefined, {
       async readText() {
-        if (!responder || !navigator.clipboard?.readText) return "";
-        try {
-          return await navigator.clipboard.readText();
-        } catch {
-          return "";
-        }
+        if (!responder) return "";
+        return readTerminalOsc52Clipboard(navigator.clipboard, onNotice);
       },
       async writeText(_selection, text) {
-        if (!responder || !navigator.clipboard?.writeText) return;
-        try {
-          await navigator.clipboard.writeText(text);
-        } catch {
-          // Clipboard permission failures must not reject xterm's parser write.
-        }
+        if (!responder) return;
+        await writeTerminalOsc52Clipboard(text, navigator.clipboard, onNotice);
       },
     }));
     term.loadAddon(new PanoptesUnicode17Addon());
@@ -576,12 +570,13 @@ export function TerminalPane({
     const scrollDisposable = term.onScroll((position) => {
       setScrolledBack(position < term.buffer.active.baseY);
     });
-    term.attachCustomKeyEventHandler((event) => {
-      if (!isTerminalCopyShortcut(event, navigator.platform)) return true;
-      event.preventDefault();
-      if (term.hasSelection()) term.element?.ownerDocument.execCommand("copy");
-      return false;
-    });
+    term.attachCustomKeyEventHandler((event) => handleTerminalClipboardShortcut(
+      event,
+      navigator.platform,
+      () => {
+        if (term.hasSelection()) term.element?.ownerDocument.execCommand("copy");
+      },
+    ));
     const disposeTouchScroll = installTerminalTouchScroll(container.current, term, () => {
       const screen = container.current?.querySelector<HTMLElement>(".xterm-screen");
       return screen && term.rows ? screen.getBoundingClientRect().height / term.rows : 15;
