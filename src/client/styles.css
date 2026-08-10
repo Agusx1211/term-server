@@ -454,6 +454,15 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
 .agent-integration-copy small { color: var(--muted); font-size: 9px; line-height: 1.35; }
 .agent-integration-actions { flex: none; display: flex; align-items: center; gap: 5px; }
 .agent-integration-actions .settings-update-action { width: auto; min-width: 70px; }
+.agent-integration-profile-summary { color: var(--subtle) !important; }
+.agent-integration-profiles {
+  display: grid; gap: 3px; margin-top: 3px; padding: 4px 5px;
+  border-left: 1px solid var(--border-strong); background: color-mix(in srgb, var(--editor) 25%, transparent);
+}
+.agent-integration-profile { min-width: 0; display: flex; align-items: flex-start; gap: 6px; }
+.agent-integration-profile > span:last-child { min-width: 0; display: grid; gap: 1px; }
+.agent-integration-profile b { font-size: 9px; font-weight: 600; }
+.agent-integration-profile small { font-size: 8.5px; }
 .settings-update { display: grid; gap: 7px; }
 .settings-update-version, .settings-update-available {
   display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 0; color: var(--muted); font-size: 10.5px;
@@ -728,7 +737,7 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
   flex: 1; overscroll-behavior: contain;
 }
 .xterm-host .xterm { height: 100%; padding: 7px 7px 3px 9px; }
-.xterm-host .xterm-viewport { background-color: var(--terminal-background); scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
+.xterm-host .xterm .xterm-viewport { background-color: var(--terminal-background); scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
 .terminal-search {
   position: absolute; top: 35px; right: 8px; z-index: 12; width: min(370px, calc(100% - 16px)); height: 31px;
   display: flex; align-items: center; gap: 4px; padding: 3px 4px 3px 8px; border: 1px solid var(--border-strong); border-radius: 4px;

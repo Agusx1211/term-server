@@ -74,6 +74,11 @@ import {
   trackTerminalUserInput,
 } from "../lib/terminal-input";
 import {
+  copyTerminalSelection,
+  isTerminalCopyShortcut,
+  pasteTerminalClipboard,
+} from "../lib/terminal-clipboard";
+import {
   TERMINAL_FRAME_OUTPUT,
   TerminalOutputAck,
   TerminalRenderBacklog,
@@ -571,25 +576,15 @@ export function TerminalPane({
     const scrollDisposable = term.onScroll((position) => {
       setScrolledBack(position < term.buffer.active.baseY);
     });
+    term.attachCustomKeyEventHandler((event) => {
+      if (!isTerminalCopyShortcut(event, navigator.platform)) return true;
+      event.preventDefault();
+      if (term.hasSelection()) term.element?.ownerDocument.execCommand("copy");
+      return false;
+    });
     const disposeTouchScroll = installTerminalTouchScroll(container.current, term, () => {
       const screen = container.current?.querySelector<HTMLElement>(".xterm-screen");
       return screen && term.rows ? screen.getBoundingClientRect().height / term.rows : 15;
-    });
-    term.attachCustomKeyEventHandler((event) => {
-      const modifier = event.ctrlKey || event.metaKey;
-      if (modifier && event.shiftKey && event.code === "KeyC" && event.type === "keydown") {
-        event.preventDefault();
-        if (term.hasSelection()) {
-          void navigator.clipboard?.writeText(term.getSelection()).catch(() => onNotice("Clipboard permission was denied"));
-        }
-        return false;
-      }
-      if (modifier && event.shiftKey && event.code === "KeyV" && event.type === "keydown") {
-        event.preventDefault();
-        void navigator.clipboard?.readText().then((value) => term.paste(value)).catch(() => onNotice("Clipboard permission was denied"));
-        return false;
-      }
-      return true;
     });
 
     // Frames are handed to xterm as they arrive rather than one per settled
@@ -1157,33 +1152,19 @@ export function TerminalPane({
   };
 
   const copy = async () => {
-    const selection = xterm.current?.getSelection();
-    if (!selection) {
-      onNotice("Select terminal text before copying");
-      return;
-    }
-    if (!navigator.clipboard?.writeText) {
-      onNotice("Clipboard access requires HTTPS or localhost");
-      return;
-    }
-    try {
-      await navigator.clipboard.writeText(selection);
-      onNotice("Copied selection");
-    } catch {
-      onNotice("Clipboard permission was denied");
-    }
+    await copyTerminalSelection(
+      xterm.current?.getSelection(),
+      navigator.clipboard,
+      onNotice,
+    );
   };
   const paste = async () => {
-    if (!navigator.clipboard?.readText) {
-      onNotice("Clipboard access requires HTTPS or localhost");
-      xterm.current?.focus();
-      return;
-    }
-    try {
-      xterm.current?.paste(await navigator.clipboard.readText());
-    } catch {
-      onNotice("Clipboard permission was denied");
-    }
+    await pasteTerminalClipboard(
+      navigator.clipboard,
+      (text) => xterm.current?.paste(text),
+      () => xterm.current?.focus(),
+      onNotice,
+    );
   };
   const toggleSizeFocus = () => {
     if (socket.current?.readyState !== WebSocket.OPEN) return;
@@ -1379,11 +1360,6 @@ export function TerminalPane({
         <div
           ref={container}
           class="xterm-host"
-          onContextMenu={(event) => {
-            event.preventDefault();
-            if (xterm.current?.hasSelection()) void copy();
-            else void paste();
-          }}
         />
         {artifactsVisible && (
           <ArtifactDrawer
