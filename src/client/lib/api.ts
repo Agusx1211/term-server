@@ -21,6 +21,7 @@ import type {
   FileTarget,
   SaveFileRequest,
   SessionBrokerInfo,
+  StatusModulesResponse,
   UpdateStatus,
   ReleaseInfo,
   DebugRecordingStatus,
@@ -73,6 +74,7 @@ export const api = {
       body: JSON.stringify({ currentPassword, newPassword }),
     }),
   config: () => request<ClientConfig>("/api/config"),
+  statusModules: (signal?: AbortSignal) => request<StatusModulesResponse>("/api/status-modules", { signal }),
   updateStatus: () => request<UpdateStatus>("/api/update"),
   installUpdate: (commit: string) =>
     request<ReleaseInfo>("/api/update", {

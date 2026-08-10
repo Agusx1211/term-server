@@ -1,7 +1,15 @@
 import { spawn } from "node:child_process";
+import { createSubagentActivityTracker } from "./subagent-activity";
 
 // Minimal, self-contained view of the omp extension API this module uses.
 // Kept local so the asset has no build-time dependency on omp's type package.
+interface TermServerEventBus {
+  on(
+    channel: "task:subagent:lifecycle",
+    handler: (event: unknown) => void,
+  ): () => void;
+}
+
 interface TermServerExtensionApi {
   getSessionName?(): string | undefined | null;
   on(event: "agent_start", handler: () => void): void;
@@ -11,6 +19,7 @@ interface TermServerExtensionApi {
   on(event: "session_before_compact", handler: () => void): void;
   on(event: "session_compact", handler: () => void): void;
   on(event: "session_shutdown", handler: () => void): void;
+  events: TermServerEventBus;
 }
 
 // Reports coarse lifecycle activity to the private term-server session broker.
@@ -57,13 +66,23 @@ export default function termServerAgentEvents(pi: TermServerExtensionApi): void 
     }
   }
 
-  pi.on("agent_start", () => send("agent_start"));
+  const tracker = createSubagentActivityTracker(send);
+  const unsubscribeSubagentLifecycle = pi.events.on(
+    "task:subagent:lifecycle",
+    (event: unknown) => tracker.onSubagentLifecycle(event),
+  );
+
+  pi.on("agent_start", () => tracker.onParentStart());
   pi.on("tool_execution_start", (event: { toolName?: string }) =>
     send("tool_execution_start", event.toolName),
   );
   pi.on("tool_execution_end", () => send("tool_execution_end"));
-  pi.on("agent_end", () => send("agent_settled"));
+  pi.on("agent_end", () => tracker.onParentEnd());
   pi.on("session_before_compact", () => send("session_before_compact"));
   pi.on("session_compact", () => send("session_compact"));
-  pi.on("session_shutdown", () => send("session_shutdown"));
+  pi.on("session_shutdown", () => {
+    send("session_shutdown");
+    unsubscribeSubagentLifecycle();
+    tracker.shutdown();
+  });
 }

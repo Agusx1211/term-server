@@ -23,6 +23,7 @@ use term_server::{
     config::Cli,
     debug_recording::DebugRecordingManager,
     pushover::PushoverService,
+    status::StatusService,
     tls::load_tls,
     update::UpdateService,
     workspace::WorkspaceBackend,
@@ -89,6 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.password_file.as_ref(),
     )
     .await?;
+    let status_modules = Arc::new(StatusService::from_path(cli.status_config.as_deref())?);
     let tls = load_tls(&cli).await?;
     let address = cli.socket_addr()?;
     let workspace = load_workspace(&cli, &executable).await?;
@@ -125,6 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         server_control: server_control.clone(),
         debug_recording: Arc::new(DebugRecordingManager::new()),
         pushover: Arc::new(PushoverService::new(&cli.data_dir)),
+        status_modules,
     };
     let app = build_router(state, client_directory);
     tokio::spawn(shutdown_signal(server_control.clone()));

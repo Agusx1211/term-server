@@ -202,6 +202,7 @@ Run `term-server --help` for generated CLI help. CLI flags take precedence over 
 | `--password-file` | `TERM_SERVER_PASSWORD_FILE` | generated password | Read the password from a secret file |
 | — | `TERM_SERVER_PASSWORD` | — | Password; takes precedence over the file |
 | `--data-dir` | `TERM_SERVER_DATA_DIR` | `$XDG_DATA_HOME/term-server` | Credentials, TLS files, and settings |
+| `--status-config` | `TERM_SERVER_STATUS_CONFIG` | off | Optional version-1 TOML file for authenticated provider status modules |
 | `--shell` | `TERM_SERVER_SHELL` | `$SHELL` | Default shell executable |
 | `--allowed-origin` | `TERM_SERVER_ALLOWED_ORIGINS` | same origin | Extra reverse-proxy origins |
 | `--replay-mb` | `TERM_SERVER_REPLAY_MB` | `64` | Canonical reconnect state and recent output per terminal |
@@ -213,6 +214,165 @@ Run `term-server --help` for generated CLI help. CLI flags take precedence over 
 | `--update-channel` | `TERM_SERVER_UPDATE_CHANNEL` | `main` | Signed release channel to follow |
 | — | `TERM_SERVER_RELEASE_BASE_URL` | GitHub releases | Alternate HTTPS release base URL |
 | `--log` | `TERM_SERVER_LOG` | `term_server=info,tower_http=info` | Rust tracing filter |
+
+### Optional provider status modules
+
+The provider-neutral status line is disabled when neither `--status-config` nor
+`TERM_SERVER_STATUS_CONFIG` is supplied. The selected file is read at startup; a
+missing, unreadable, malformed, or unsupported-version file fails startup with a
+short secret-free error. As with the other options, an explicit CLI value takes
+precedence over its environment value. Restart term-server after changing the
+path, file, or provider environment.
+
+The version-1 file is non-secret TOML. Its complete schema is:
+
+```toml
+version = 1
+enabled = true
+show_on_mobile = false
+
+[defaults]
+refresh_seconds = 300
+timeout_seconds = 5
+
+[[modules]]
+id = "codex"
+provider = "codex"
+label = "Codex"
+enabled = true
+
+[[modules]]
+id = "claude"
+provider = "claude"
+label = "Claude"
+enabled = true
+
+[[modules]]
+id = "zai"
+provider = "zai"
+label = "Z.AI"
+enabled = true
+```
+
+`version` is required and must be `1`. The top-level `enabled` and
+`show_on_mobile` values default to `false`; module `enabled` defaults to `true`.
+Modules with `enabled = false` are omitted from the runtime module list; the
+top-level `enabled` flag controls the entire status line.
+`refresh_seconds` defaults to `300` and accepts `1..=86400`; `timeout_seconds`
+defaults to `5` and accepts `1..=60`. There may be at most 64 modules. Module
+IDs are required, unique, at most 64 characters, and may contain only ASCII
+letters, digits, `.`, `_`, and `-`; labels are at most 80 characters and
+providers at most 32 characters. Matching admin modules may use
+`project_id` or `workspace_id`, each at most 128 characters and containing only
+ASCII letters, digits, `_`, and `-`. Configured order is retained. Unknown
+TOML keys are rejected.
+
+Every module requires `id`, `provider`, and `label`. Supported providers are
+`codex`, `openai`, `anthropic` (also `claude`), and `zai`. Optional
+provider-specific, non-secret fields are:
+
+- `credential_env`: an allowlisted environment-variable **name**, not a
+  credential value. Its allowlist depends on `provider` and `admin`; when it is
+  present, the named variable is used without falling back to discovery.
+- `admin`: defaults to `false`; it is valid only for `openai`, `anthropic`, or
+  `claude` and selects the separate provider-admin credential.
+- `project_id`: accepted only for `admin = true` OpenAI modules and selects the
+  official project rate-limits endpoint.
+- `workspace_id`: accepted only for `admin = true` Anthropic/Claude modules and
+  selects the official workspace rate-limits endpoint. Workspace responses are
+  overrides only: omitted or null limit types inherit organization settings and
+  are not presented as complete effective limits.
+
+There is no `base_url` field. Custom outbound URLs and dashboard/private
+provider endpoints are intentionally out of scope.
+
+#### Provider capabilities and credential discovery
+
+The status line never performs model inference. Ordinary provider credential
+presence only establishes configured state; the service does not make regular
+model requests to obtain rate-limit headers.
+
+| Provider/module | Credential discovery (highest precedence first) | Authoritative data currently shown |
+| --- | --- | --- |
+| `codex` | `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`, `OPENAI_API_KEY` | Configured-only with a warning that this service has no standalone Codex quota source. No private dashboard route is called. |
+| `openai` | `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`, `OPENAI_API_KEY` | A normal credential is configured-only. With `admin = true`, `OPENAI_ADMIN_KEY`, and `project_id`, the official project rate-limits endpoint can show configured requests/minute and tokens/minute; these are limits, not remaining quota or billing balance. |
+| `anthropic` / `claude` | `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY` | Normal credentials are configured-only. With `admin = true` and `ANTHROPIC_ADMIN_KEY`, the official organization rate-limits endpoint can show configured limits; `workspace_id` selects the official workspace endpoint and reports workspace overrides (omitted/null values inherit organization settings). These are not remaining quota or billing balance. |
+| `zai` | `ZAI_API_KEY` | Configured-only with an explicit warning that Z.AI publishes no standalone public quota endpoint used by this service. No dashboard scraping is performed. |
+
+For `codex`, `openai`, and `zai`, a discovered normal credential is never
+reused as an Anthropic/OpenAI admin credential. For an admin module, discovery
+uses `OPENAI_ADMIN_KEY` or `ANTHROPIC_ADMIN_KEY` only; setting `credential_env`
+to that corresponding allowlisted name is an explicit alternative. Admin
+credentials are never auto-discovered by normal modules. Provider credential
+values belong in the term-server parent process environment, never in this
+TOML file.
+
+#### Status API, refresh, and stale data
+
+After authentication, the browser fetches the no-store endpoint
+`GET /api/status-modules`. It returns this camelCase shape:
+
+```text
+{
+  enabled: boolean,
+  display: { showOnMobile: boolean },
+  modules: [{
+    id: string,
+    label: string,
+    provider: string,
+    state: "ok" | "warn" | "error" | "unconfigured",
+    primary: string | null,
+    details: [{ label: string, value: string }],
+    refresh: {
+      updatedAt: number | null,
+      nextAt: number | null,
+      intervalSeconds: number,
+      stale: boolean
+    },
+    error: { code: string, message: string, retryable: boolean } | null
+  }],
+  generatedAt: number
+}
+```
+
+The timestamp fields are Unix seconds. A missing credential yields
+`unconfigured` without a provider request. Configured-only providers yield
+`warn` with `primary = "configured"` and a detail explaining that no
+standalone quota source is available. Successful admin-limit reads yield
+`ok` with `primary = "configured limits"`; they still describe configured
+limits rather than remaining quota. A workspace admin response uses
+`primary = "workspace overrides"` and does not fill omitted or null values
+with an effective inherited limit. An initial provider failure is `error`.
+When a later refresh fails after an `ok` or `warn` snapshot, the service keeps
+the prior safe value, changes the module to `warn`, sets `refresh.stale` to
+`true`, retains `updatedAt`, schedules the next refresh with bounded retry
+backoff (starting at the larger of 5 seconds and the configured interval, then
+doubling up to 300 seconds or that interval), and includes a fixed sanitized
+error. Browser transport retries start at 2 seconds and cap at 30 seconds.
+
+Snapshots are cached until the earliest module refresh (300 seconds by default),
+and one server-side refresh lock deduplicates concurrent browser requests.
+Due provider results retain configured order; at most eight upstream requests
+run concurrently under a 60-second total refresh deadline. Unfinished modules
+receive a retryable `refresh_deadline` error. Admin requests are also bounded
+by `timeout_seconds` (5 seconds by default, 60 seconds maximum) and a 256 KiB
+response limit. Normal provider modules do not make outbound calls. The
+normalized error codes are `unsupported_provider`, `timeout`,
+`upstream_unavailable`, `auth_failed`, `rate_limited`, `upstream_error`,
+`refresh_deadline`, `response_too_large`, and `invalid_response`; messages
+never contain provider response bodies, URLs, credentials, or authorization
+headers.
+
+On mobile, the existing footer stays hidden unless `show_on_mobile = true`.
+When enabled, only the compact horizontally scrollable status-module row is
+shown, with all 32px of controls reserved above the bottom safe-area inset;
+the normal connection/host/build items remain desktop-only.
+
+Status credentials are read from term-server's startup environment. On Unix, the
+same-user session broker and terminal children intentionally inherit these
+variables, so commands run by that user may observe them. They are not accepted
+from the browser, written to this configuration, serialized in
+`/api/status-modules`, or logged; browser/API/log isolation remains intact.
 
 For an unattended deployment, provide the password through the environment or a protected file:
 
