@@ -73,7 +73,7 @@ async function waitForEventAfter(
   return page.evaluate(async ({ id, after, eventType, timeout }) => {
     const api = (window as E2EWindow).__TERM_SERVER_E2E__;
     if (!api) throw new Error("term-server E2E diagnostics are unavailable");
-    return api.waitForEvent(id, (event) => event.id > after && event.type === eventType, { timeout });
+    return api.waitForEvent(id, (event) => event.id > after && event.type === eventType, { timeout, afterId: after });
   }, { id: terminalId, after: afterEventId, eventType: type, timeout: WAIT_TIMEOUT_MS });
 }
 
@@ -89,7 +89,7 @@ async function waitForViewportAfter(
       event.id > after
       && event.type === "viewport"
       && event.data.source === "proposed"
-    ), { timeout });
+    ), { timeout, afterId: after });
   }, { id: terminalId, after: afterEventId, timeout: WAIT_TIMEOUT_MS });
 }
 

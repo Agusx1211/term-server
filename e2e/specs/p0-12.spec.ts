@@ -66,7 +66,7 @@ async function waitForViewportEvent(
         || data.rows !== previousViewport.rows
         || data.pixelWidth !== previousViewport.pixelWidth
         || data.pixelHeight !== previousViewport.pixelHeight;
-    }, { timeout });
+    }, { timeout, afterId: cursor });
   }, { id: terminalId, cursor: afterEventId, previousViewport: previous, timeout: DIAGNOSTICS_TIMEOUT });
 }
 

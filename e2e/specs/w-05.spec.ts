@@ -126,7 +126,7 @@ async function waitForRenderAfter(
   return page.evaluate(async ({ id, floor, timeout }) => {
     const api = (window as E2EWindow).__TERM_SERVER_E2E__;
     if (!api) throw new Error("term-server E2E diagnostics are unavailable");
-    return api.waitForEvent(id, (event) => event.id > floor && event.type === "render", { timeout });
+    return api.waitForEvent(id, (event) => event.id > floor && event.type === "render", { timeout, afterId: floor });
   }, { id: terminalId, floor: eventFloor, timeout: WAIT_TIMEOUT_MS });
 }
 
@@ -142,7 +142,7 @@ async function waitForHiddenVisibilityAfter(
       event.id > floor
       && event.type === "visibility"
       && event.data.visible === false
-    ), { timeout });
+    ), { timeout, afterId: floor });
   }, { id: terminalId, floor: eventFloor, timeout: WAIT_TIMEOUT_MS });
 }
 

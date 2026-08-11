@@ -304,7 +304,7 @@ async function waitForEventAfter(
         && event.snapshot.socketGeneration <= eventMatch.socketGenerationGreaterThan
       ) return false;
       return true;
-    }, { timeout });
+    }, { timeout, afterId: after });
   }, {
     id: terminalId,
     after: afterEventId,

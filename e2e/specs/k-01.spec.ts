@@ -123,7 +123,7 @@ async function waitForCommittedMarker(
         && event.type === "parser-commit"
         && event.snapshot.committedSequence !== undefined
         && event.snapshot.xterm.text.includes(markerText),
-      { timeout },
+      { timeout, afterId: after },
     );
   }, { id: terminalId, after: afterEventId, markerText: visibleMarker, timeout: WAIT_TIMEOUT_MS });
 }
@@ -142,7 +142,7 @@ async function waitForRenderedMarker(
       (event) => event.id > after
         && event.type === "render"
         && event.snapshot.xterm.text.includes(markerText),
-      { timeout },
+      { timeout, afterId: after },
     );
   }, { id: terminalId, after: afterEventId, markerText: visibleMarker, timeout: WAIT_TIMEOUT_MS });
 }
@@ -162,7 +162,7 @@ async function waitForCheckpoint(
         && event.type === "checkpoint"
         && event.data.result === "sent"
         && event.data.sequence === targetSequence,
-      { timeout },
+      { timeout, afterId: after },
     );
   }, { id: terminalId, after: afterEventId, sequence, timeout: WAIT_TIMEOUT_MS });
 }

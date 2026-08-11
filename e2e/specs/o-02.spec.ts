@@ -132,7 +132,7 @@ async function waitForTerminalEventAfter(
     return api.waitForEvent(
       id,
       (event) => event.id > after && event.type === eventType,
-      { timeout },
+      { timeout, afterId: after },
     );
   }, { id: terminalId, after: afterId, eventType: type, timeout: WAIT_TIMEOUT_MS });
 }

@@ -143,7 +143,7 @@ async function waitForViewportSent(page: Page, terminalId: string, after: number
       (event) => event.id > afterEventId
         && event.type === "viewport"
         && event.data["source"] === "sent",
-      { timeout },
+      { timeout, afterId: afterEventId },
     );
   }, { id: terminalId, afterEventId: after, timeout: WAIT_TIMEOUT_MS });
 }

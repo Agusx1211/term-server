@@ -193,7 +193,7 @@ async function waitForCheckpointAfter(
       && event.type === "checkpoint"
       && event.snapshot.socketGeneration === expectedGeneration
       && event.data.result === "sent"
-    ), { timeout });
+    ), { timeout, afterId: after });
   }, { id: terminalId, after: afterEventId, expectedGeneration: generation, timeout: WAIT_TIMEOUT_MS });
 }
 
@@ -209,7 +209,7 @@ async function waitForSnapshotSyncAfter(
       event.id > after
       && event.type === "sync"
       && event.data.mode === "snapshot"
-    ), { timeout });
+    ), { timeout, afterId: after });
   }, { id: terminalId, after: afterEventId, timeout: WAIT_TIMEOUT_MS });
 }
 

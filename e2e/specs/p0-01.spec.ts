@@ -81,7 +81,7 @@ test("@p0 @smoke P0-01 Cold start renders and accepts input", async ({ page, ser
       event.terminalId === id
       && event.type === "font-load"
       && event.data.result === "settled"
-    ), { timeout: 15_000 });
+    ), { timeout: 15_000, afterId: 0 });
   }, { id: terminalId });
 
   const token = `${testInfo.workerIndex}-${testInfo.parallelIndex}-${Date.now()}`;

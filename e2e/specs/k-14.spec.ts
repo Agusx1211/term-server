@@ -153,7 +153,7 @@ async function waitForSentCheckpoint(
       (event) => event.id > afterId
         && event.type === "checkpoint"
         && event.data.result === "sent",
-      { timeout },
+      { timeout, afterId },
     );
   }, { id: terminalId, afterId, timeout: WAIT_TIMEOUT_MS });
 }
@@ -172,7 +172,7 @@ async function forceReconnect(
       (event) => event.id > afterId
         && event.type === "socket-close"
         && event.data.generation === generation,
-      { timeout },
+      { timeout, afterId },
     );
   }, { id: terminalId, afterId, generation: before.socketGeneration, timeout: WAIT_TIMEOUT_MS });
   const syncPromise = page.evaluate(async ({ id, afterId, generation, timeout }) => {
@@ -184,7 +184,7 @@ async function forceReconnect(
         && event.type === "sync"
         && event.snapshot.socketGeneration > generation
         && (event.data.mode === "resume" || event.data.mode === "snapshot"),
-      { timeout },
+      { timeout, afterId },
     );
   }, { id: terminalId, afterId, generation: before.socketGeneration, timeout: WAIT_TIMEOUT_MS });
   const syncedPromise = page.evaluate(async ({ id, afterId, generation, timeout }) => {
@@ -195,7 +195,7 @@ async function forceReconnect(
       (event) => event.id > afterId
         && event.type === "synced"
         && event.snapshot.socketGeneration > generation,
-      { timeout },
+      { timeout, afterId },
     );
   }, { id: terminalId, afterId, generation: before.socketGeneration, timeout: WAIT_TIMEOUT_MS });
 

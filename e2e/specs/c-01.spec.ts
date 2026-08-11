@@ -151,7 +151,7 @@ async function waitForPostFontViewport(
     await api.waitForEvent(
       id,
       (event) => event.id > fontEventId && event.type === "viewport" && event.data.source === "proposed",
-      { timeout },
+      { timeout, afterId: fontEventId },
     );
     return api.waitForTerminal(id, aligned, { timeout });
   }, { id: terminalId, fontEventId: fontLoaded.id, timeout: WAIT_TIMEOUT_MS });
@@ -222,9 +222,13 @@ async function assertFixtureGeometry(
 }
 
 async function verifyRecoveredPath(path: RecoveredPath): Promise<E2ETerminalSnapshot> {
+  const fontLoadedPromise = waitForTerminalEvent(path.page, path.terminalId, "font-load", {
+    timeout: WAIT_TIMEOUT_MS,
+    afterId: 0,
+  });
   const synchronizedRaw = await expectTerminalSynchronized(path.page, path.terminalId, { timeout: WAIT_TIMEOUT_MS });
   expect(synchronizedRaw.socketGeneration).toBe(1);
-  const fontLoaded = await waitForTerminalEvent(path.page, path.terminalId, "font-load", { timeout: WAIT_TIMEOUT_MS });
+  const fontLoaded = await fontLoadedPromise;
   expect(fontLoaded.data.result).toBe("settled");
   const synchronized = await waitForPostFontViewport(path.page, path.terminalId, fontLoaded);
   expect(synchronized.socketState).toBe("connected");
@@ -358,11 +362,15 @@ test("C-01 Soft reload, hard reload, and fresh context @p1 @nightly", async ({ b
   const pane = new TerminalPanePage(page, terminalId, created.name);
   await pane.expectVisible();
 
+  const fontLoadedPromise = waitForTerminalEvent(page, terminalId, "font-load", {
+    timeout: WAIT_TIMEOUT_MS,
+    afterId: 0,
+  });
   const synchronized = await expectTerminalSynchronized(page, terminalId, { timeout: WAIT_TIMEOUT_MS });
   expect(synchronized.socketGeneration).toBe(1);
   expect(synchronized.activeSocketCount).toBe(1);
   expect(synchronized.acceptingInput).toBe(true);
-  const fontLoaded = await waitForTerminalEvent(page, terminalId, "font-load", { timeout: WAIT_TIMEOUT_MS });
+  const fontLoaded = await fontLoadedPromise;
   expect(fontLoaded.data.result).toBe("settled");
   const initial = await waitForPostFontViewport(page, terminalId, fontLoaded);
   const dimensions = {

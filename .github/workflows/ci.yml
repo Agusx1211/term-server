@@ -37,6 +37,10 @@ jobs:
     needs: check
     runs-on: ubuntu-22.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -48,17 +52,17 @@ jobs:
       - run: npm ci
       - run: npm run build:e2e
       - run: npm exec -- playwright install --with-deps chromium
-      - run: npx playwright test --config=e2e/playwright.config.ts --project=chromium-pr --workers=2
+      - run: npx playwright test --config=e2e/playwright.config.ts --project=chromium-pr --workers=1 --shard=${{ matrix.shard }}/2
         env:
           CI: true
-      - run: npx playwright test --config=e2e/playwright.config.ts --project=chromium-fallback --workers=2
-        if: always()
+      - run: npx playwright test --config=e2e/playwright.config.ts --project=chromium-fallback --workers=1
+        if: always() && matrix.shard == 1
         env:
           CI: true
       - uses: actions/upload-artifact@v7
         if: failure()
         with:
-          name: e2e-pr-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          name: e2e-pr-smoke-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: artifacts/e2e
           if-no-files-found: ignore
           retention-days: 14

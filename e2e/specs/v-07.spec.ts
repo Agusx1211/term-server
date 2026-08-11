@@ -246,7 +246,7 @@ async function resizeToColumns(
       event.id > boundary
       && event.type === "viewport"
       && ["proposed", "sent"].includes(String(event.data["source"]))
-    ), { timeout });
+    ), { timeout, afterId: boundary });
   }, { id: terminalId, boundary: beforeEventId, timeout: WAIT_TIMEOUT_MS });
   const converged = page.evaluate(async ({ id, previousCols, rows, timeout }) => {
     const api = (window as E2EWindow).__TERM_SERVER_E2E__;

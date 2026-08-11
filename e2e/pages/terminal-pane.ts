@@ -259,11 +259,11 @@ export class TerminalPanePage {
     event: E2ETerminalEvent["type"],
     options: E2EWaitOptions = {},
   ): Promise<E2ETerminalEvent> {
-    return this.page.evaluate(async ({ id, event, timeout }) => {
+    return this.page.evaluate(async ({ id, event, timeout, afterId }) => {
       const api = (window as E2EWindow).__TERM_SERVER_E2E__;
       if (!api) throw new Error("term-server E2E diagnostics are unavailable");
-      return api.waitForEvent(id, event, { timeout });
-    }, { id: this.terminalId, event, timeout: options.timeout });
+      return api.waitForEvent(id, event, { timeout, afterId });
+    }, { id: this.terminalId, event, timeout: options.timeout, afterId: options.afterId });
   }
 
   async waitForConnected(options: E2EWaitOptions = {}): Promise<E2ETerminalSnapshot> {
@@ -275,9 +275,15 @@ export class TerminalPanePage {
   }
 
   async waitForSynchronized(options: E2EWaitOptions = {}): Promise<E2ETerminalSnapshot> {
-    await this.waitForEvent("synced", options);
-    const snapshot = await this.snapshot();
-    if (!snapshot) throw new Error(`No diagnostics snapshot for terminal ${this.terminalId}`);
+    const snapshot = await this.page.evaluate(async ({ id, timeout }) => {
+      const api = (window as E2EWindow).__TERM_SERVER_E2E__;
+      if (!api) throw new Error("term-server E2E diagnostics are unavailable");
+      return api.waitForTerminal(id, {
+        socketState: "connected",
+        activeSocketCount: 1,
+        acceptingInput: true,
+      }, { timeout });
+    }, { id: this.terminalId, timeout: options.timeout });
     return snapshot;
   }
 }

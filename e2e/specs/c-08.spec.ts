@@ -157,7 +157,7 @@ async function waitForDiagnosticEventAfter(
       && event.type === eventType
       && (exactGeneration === undefined || event.snapshot.socketGeneration === exactGeneration)
       && (minimumGeneration === undefined || event.snapshot.socketGeneration >= minimumGeneration)
-    ), { timeout });
+    ), { timeout, afterId: after });
   }, {
     id: terminalId,
     after: afterEventId,

@@ -129,7 +129,7 @@ async function waitForEventAfter(
           event.snapshot.lifecycle[key as keyof typeof event.snapshot.lifecycle] === value
         ));
       },
-      { timeout },
+      { timeout, afterId: after },
     );
   }, {
     id: terminalId,

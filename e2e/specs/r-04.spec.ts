@@ -138,7 +138,7 @@ async function waitForRenderAfterVisibility(
     return api.waitForEvent(
       id,
       (event) => event.id > floor && event.type === "render" && event.timestamp >= timestamp,
-      { timeout },
+      { timeout, afterId: floor },
     );
   }, { id: terminalId, floor: eventFloor, timestamp: visibleAt, timeout: WAIT_TIMEOUT_MS });
 }

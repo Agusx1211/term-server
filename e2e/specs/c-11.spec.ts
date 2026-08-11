@@ -109,7 +109,7 @@ async function waitForSocketEvent(
     return api.waitForEvent(
       id,
       (event) => event.id > afterEventId && event.type === type && event.data.generation === generation,
-      { timeout },
+      { timeout, afterId: afterEventId },
     );
   }, { id: terminalId, type, generation, afterEventId, timeout: WAIT_TIMEOUT_MS });
 }

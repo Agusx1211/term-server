@@ -122,7 +122,7 @@ async function waitForDiagnosticEvent(
         if (received === undefined || received < minimumReceivedSequence) return false;
       }
       return true;
-    }, { timeout });
+    }, { timeout, afterId: afterEventId });
   }, {
     id: terminalId,
     eventType: type,

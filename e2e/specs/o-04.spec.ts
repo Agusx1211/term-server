@@ -117,7 +117,7 @@ async function waitForEvent(
     return api.waitForEvent(id, (event) => {
       if (event.id <= after || event.type !== expectedType) return false;
       return Object.entries(expectedFields).every(([key, value]) => event.data[key] === value);
-    }, { timeout });
+    }, { timeout, afterId: after });
   }, { id: terminalId, after: afterId, type, fields, timeout: EVENT_TIMEOUT_MS }).then((event) => event as NumericEvent);
 }
 

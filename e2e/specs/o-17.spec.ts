@@ -258,9 +258,10 @@ async function modelFromRecording(
       if (typeof event.sequence !== "number" || !Number.isSafeInteger(event.sequence)) throw new Error("recorded output omitted a safe sequence");
       if (outputEnd !== undefined) expect(event.sequence).toBe(outputEnd);
       outputEnd = event.sequence + bytes.byteLength;
-      // The fixture transcript floor is captured after the baseline sequence has
-      // committed, so compare the same strictly post-baseline output interval.
-      if (baseline.committedSequence === undefined || event.sequence > baseline.committedSequence) {
+      // A frame starts at the stream's committed offset. Include the frame
+      // whose start equals the baseline boundary; filtering strictly above it
+      // drops the first post-baseline command output.
+      if (baseline.committedSequence === undefined || event.sequence >= baseline.committedSequence) {
         outputChunks.push(bytes);
       }
       outputCount += 1;

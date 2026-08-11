@@ -210,7 +210,7 @@ async function waitForPaneEvent(
           && (responder === undefined || event.data.responder === responder)
           && (!settled || event.snapshot.pendingParserWrites === 0 && event.snapshot.pendingParserBytes === 0)
       ),
-      { timeout },
+      { timeout, afterId: after },
     );
   }, {
     id: terminalId,

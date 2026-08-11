@@ -152,7 +152,7 @@ async function waitForParserMarker(
       (event) => event.id > after
         && event.type === "parser-commit"
         && event.snapshot.xterm.text.includes(markerText),
-      { timeout },
+      { timeout, afterId: after },
     );
   }, { id: terminalId, after: afterEventId, markerText: expected, timeout: WAIT_TIMEOUT_MS });
 }
@@ -201,7 +201,7 @@ async function waitForCheckpointSent(
       && event.data.result === "sent"
       && typeof event.data.sequence === "number"
       && event.data.sequence >= minimum
-    ), { timeout });
+    ), { timeout, afterId: after });
   }, { id: terminalId, after: afterEventId, minimum: minimumSequence, timeout: WAIT_TIMEOUT_MS });
 }
 
@@ -465,7 +465,7 @@ async function waitForSocketEvent(
       event.id > after
       && event.type === eventType
       && (socketGeneration === undefined || event.snapshot.socketGeneration === socketGeneration)
-    ), { timeout });
+    ), { timeout, afterId: after });
   }, { id: terminalId, after: afterEventId, eventType: type, socketGeneration: generation, timeout: WAIT_TIMEOUT_MS });
 }
 

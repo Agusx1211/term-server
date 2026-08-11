@@ -301,7 +301,7 @@ async function waitForDiagnosticEventMatch(
       if (generation !== undefined && eventGeneration !== generation) return false;
       if (minimumGeneration !== undefined && eventGeneration < minimumGeneration) return false;
       return state === undefined || event.data.state === state;
-    }, { timeout });
+    }, { timeout, afterId: after });
   }, {
     id: terminalId,
     after: afterEventId,

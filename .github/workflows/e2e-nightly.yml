@@ -19,6 +19,7 @@ jobs:
     timeout-minutes: 45
     strategy:
       fail-fast: false
+      max-parallel: 4
       matrix:
         browser: [chromium, firefox, webkit]
         dpr: [1, 1.25, 1.8, 2]

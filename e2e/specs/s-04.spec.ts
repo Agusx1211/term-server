@@ -312,7 +312,7 @@ async function waitForEventAfter(
   return page.evaluate(async ({ id, floor, type, timeout }) => {
     const api = (window as E2EWindow).__TERM_SERVER_E2E__;
     if (!api) throw new Error("term-server E2E diagnostics are unavailable");
-    return api.waitForEvent(id, (event) => event.type === type && event.id > floor, { timeout });
+    return api.waitForEvent(id, (event) => event.type === type && event.id > floor, { timeout, afterId: floor });
   }, { id: terminalId, floor, type, timeout: WAIT_TIMEOUT_MS });
 }
 

@@ -38,7 +38,7 @@ const waitForViewportAfter = (
   return api.waitForEvent(
     id,
     (event) => event.type === "viewport" && event.id > after,
-    { timeout: wait },
+    { timeout: wait, afterId: after },
   );
 }, { id: terminalId, after: eventId, wait: timeout });
 

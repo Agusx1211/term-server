@@ -42,14 +42,14 @@ async function waitForPrimaryViewport(
     const fontLoad = await api.waitForEvent(
       id,
       (event) => event.type === "font-load",
-      { timeout },
+      { timeout, afterId: 0 },
     );
     await api.waitForEvent(
       id,
       (event) => event.id > fontLoad.id
         && event.type === "viewport"
         && event.data.source === "proposed",
-      { timeout },
+      { timeout, afterId: fontLoad.id },
     );
     return api.waitForTerminal(id, (snapshot) => {
       const sameViewport = (

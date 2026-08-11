@@ -88,7 +88,7 @@ async function waitForEventAfter(
       if (minimum === undefined) return true;
       const sequence = event.data.sequence;
       return typeof sequence === "number" && sequence >= minimum;
-    }, { timeout });
+    }, { timeout, afterId: after });
   }, {
     id: terminalId,
     after: afterEventId,

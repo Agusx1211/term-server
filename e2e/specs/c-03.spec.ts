@@ -184,7 +184,7 @@ async function waitForPostFontViewport(
     await api.waitForEvent(
       id,
       (event) => event.id > fontEventId && event.type === "viewport" && event.data.source === "proposed",
-      { timeout },
+      { timeout, afterId: fontEventId },
     );
     return api.waitForTerminal(id, aligned, { timeout });
   }, { id: terminalId, fontEventId: fontLoaded.id, timeout: WAIT_TIMEOUT_MS });
@@ -235,8 +235,12 @@ test("C-03 Offline and online transition @p1 @recovery @offline @online @nightly
   const terminalId = mounted.terminalId;
   const pane = new TerminalPanePage(page, terminalId);
   await pane.expectVisible();
+  const fontLoadedPromise = waitForTerminalEvent(page, terminalId, "font-load", {
+    timeout: WAIT_TIMEOUT_MS,
+    afterId: 0,
+  });
   const synchronized = await expectTerminalSynchronized(page, terminalId, { timeout: WAIT_TIMEOUT_MS });
-  const fontLoaded = await waitForTerminalEvent(page, terminalId, "font-load", { timeout: WAIT_TIMEOUT_MS });
+  const fontLoaded = await fontLoadedPromise;
   expect(fontLoaded.data.result).toBe("settled");
   const initial = await waitForPostFontViewport(page, terminalId, fontLoaded);
   expect(synchronized.socketGeneration).toBe(1);

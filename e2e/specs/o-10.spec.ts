@@ -136,7 +136,7 @@ async function waitForDiagnosticEvent(
       if (kind === "sync") return event.type === "sync";
       if (kind === "synced") return event.type === "synced";
       return event.type === "exit";
-    }, { timeout });
+    }, { timeout, afterId: after });
   }, {
     id: terminalId,
     kind,

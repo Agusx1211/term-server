@@ -94,7 +94,7 @@ async function waitForEventAfter(
   return page.evaluate(async ({ id, type, after, timeout }) => {
     const api = (window as E2EWindow).__TERM_SERVER_E2E__;
     if (!api) throw new Error("term-server E2E diagnostics are unavailable");
-    return api.waitForEvent(id, (event) => event.id > after && event.type === type, { timeout });
+    return api.waitForEvent(id, (event) => event.id > after && event.type === type, { timeout, afterId: after });
   }, {
     id: terminalId,
     type: eventType,

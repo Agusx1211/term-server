@@ -251,7 +251,7 @@ async function waitForEventTypeAfter(
   return page.evaluate(async ({ id, floor, eventType, timeout }) => {
     const api = (window as E2EWindow).__TERM_SERVER_E2E__;
     if (!api) throw new Error("term-server E2E diagnostics are unavailable");
-    return api.waitForEvent(id, (event) => event.id > floor && event.type === eventType, { timeout });
+    return api.waitForEvent(id, (event) => event.id > floor && event.type === eventType, { timeout, afterId: floor });
   }, { id: terminalId, floor: boundary, eventType: type, timeout: WAIT_TIMEOUT_MS });
 }
 
@@ -267,7 +267,7 @@ async function waitForParserCommit(
     return api.waitForEvent(id, (event) => event.id > floor
       && event.type === "parser-commit"
       && typeof event.data.sequence === "number"
-      && event.data.sequence >= minimum, { timeout });
+      && event.data.sequence >= minimum, { timeout, afterId: floor });
   }, { id: terminalId, floor: boundary, minimum: minimumSequence, timeout: WAIT_TIMEOUT_MS });
 }
 
@@ -346,7 +346,7 @@ async function waitForResizeSizeEvent(
         && typeof cols === "number"
         && typeof rows === "number"
         && (cols !== previous.cols || rows !== previous.rows);
-    }, { timeout });
+    }, { timeout, afterId: floor });
   }, { id: terminalId, floor: boundary, previous: before, timeout: WAIT_TIMEOUT_MS });
 }
 async function waitForCheckpoint(
@@ -364,7 +364,7 @@ async function waitForCheckpoint(
       && event.data.result === "sent"
       && typeof event.data.sequence === "number"
       && event.data.sequence >= minimum
-    ), { timeout });
+    ), { timeout, afterId: after });
   }, { id: terminalId, after: afterEventId, minimum: minimumSequence, timeout: WAIT_TIMEOUT_MS });
 }
 

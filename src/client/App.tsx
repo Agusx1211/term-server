@@ -312,6 +312,7 @@ export function App() {
     installE2EDiagnostics();
   }, []);
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
+  const authGeneration = useRef(0);
   const [workspaceLoaded, setWorkspaceLoaded] = useState(false);
   const [terminals, setTerminals] = useState<TerminalInfo[]>([]);
   const [config, setConfig] = useState(defaultConfig);
@@ -360,6 +361,7 @@ export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsActive, setSettingsActive] = useState(false);
   const agentIntegrationsRequested = useRef(false);
+  const authControllers = useRef(new Set<AbortController>());
   const agentEventsInitialized = useRef(false);
   const deliveredAgentEvents = useRef(new Map<string, number>());
   const commandEventsInitialized = useRef(false);
@@ -378,6 +380,24 @@ export function App() {
   configRef.current = config;
   const activeIdRef = useRef(activeId);
   activeIdRef.current = activeId;
+
+  const trackAuthRequest = (): AbortController => {
+    const controller = new AbortController();
+    authControllers.current.add(controller);
+    return controller;
+  };
+
+  const releaseAuthRequest = (controller: AbortController): void => {
+    authControllers.current.delete(controller);
+  };
+
+  const invalidateAuthentication = (): void => {
+    authGeneration.current += 1;
+    for (const controller of authControllers.current) controller.abort();
+    authControllers.current.clear();
+    agentIntegrationsRequested.current = false;
+    setAuthenticated(false);
+  };
   const editorGridRef = useRef<HTMLElement>(null);
   const layoutRef = useRef(layout);
   layoutRef.current = layout;
@@ -547,13 +567,17 @@ export function App() {
   };
 
   const loadWorkspace = async () => {
+    const generation = ++authGeneration.current;
+    const controller = trackAuthRequest();
     try {
       const [nextConfig, nextTerminals, artifacts] = await Promise.all([
-        api.config(),
+        api.config({ agentIntegrations: "lazy", signal: controller.signal }),
         api.terminals(),
         api.artifacts(),
       ]);
+      if (generation !== authGeneration.current) return;
       const workspaceTerminals = await migrateLegacyActivityViews(nextTerminals);
+      if (generation !== authGeneration.current) return;
       const focusedSession = activeIdRef.current
         && workspaceTerminals.some((terminal) => terminal.id === activeIdRef.current)
         ? activeIdRef.current
@@ -577,35 +601,63 @@ export function App() {
           : workspaceTerminals[0]?.id,
       );
       syncArtifacts(artifacts, focusedSession, workspaceTerminals);
-      setAuthenticated(true);
+      if (generation === authGeneration.current) setAuthenticated(true);
     } catch (error) {
-      if (error instanceof ApiError && error.status === 401) setAuthenticated(false);
+      if (generation !== authGeneration.current) return;
+      if (error instanceof ApiError && error.status === 401) invalidateAuthentication();
       else showNotice(error instanceof Error ? error.message : "Unable to load workspace");
+    } finally {
+      releaseAuthRequest(controller);
     }
   };
 
   useEffect(() => {
+    const generation = authGeneration.current;
+    const controller = trackAuthRequest();
     void api
-      .session()
+      .session(controller.signal)
       .then(({ authenticated: active }) => {
+        if (generation !== authGeneration.current) return;
         setAuthenticated(active);
         if (active) void loadWorkspace();
       })
-      .catch(() => setAuthenticated(false));
+      .catch((error) => {
+        if (generation === authGeneration.current && !(error instanceof DOMException && error.name === "AbortError")) {
+          invalidateAuthentication();
+        }
+      });
+    return () => {
+      controller.abort();
+      releaseAuthRequest(controller);
+    };
   }, []);
 
   useEffect(() => {
     if (!authenticated || !settingsActive || agentIntegrationsRequested.current) return;
+    const generation = authGeneration.current;
+    const controller = trackAuthRequest();
+    let disposed = false;
     agentIntegrationsRequested.current = true;
     void api
-      .agentIntegrations()
+      .agentIntegrations(controller.signal)
       .then((agentIntegrations) => {
+        if (disposed || generation !== authGeneration.current) return;
         setConfig((current) => ({ ...current, agentIntegrations }));
       })
       .catch((error) => {
+        if (disposed || generation !== authGeneration.current) return;
         agentIntegrationsRequested.current = false;
-        showNotice(error instanceof Error ? error.message : "Unable to inspect agent integrations");
+        if (error instanceof ApiError && error.status === 401) invalidateAuthentication();
+        else if (!(error instanceof DOMException && error.name === "AbortError")) {
+          showNotice(error instanceof Error ? error.message : "Unable to inspect agent integrations");
+        }
       });
+    return () => {
+      disposed = true;
+      agentIntegrationsRequested.current = false;
+      controller.abort();
+      releaseAuthRequest(controller);
+    };
   }, [authenticated, settingsActive]);
 
   useEffect(() => {
@@ -661,6 +713,7 @@ export function App() {
 
   useEffect(() => {
     if (!authenticated) return;
+    const generation = authGeneration.current;
     let disposed = false;
     let refreshing = false;
     const refresh = () => {
@@ -668,7 +721,7 @@ export function App() {
       refreshing = true;
       void Promise.all([api.terminals(), api.artifacts()])
         .then(([next, artifacts]) => {
-          if (disposed) return;
+          if (disposed || generation !== authGeneration.current) return;
           const workspaceTerminals = next;
           setTerminals((current) => mergeTerminalActivityViews(workspaceTerminals, current));
           setConfig((current) => ({
@@ -680,8 +733,8 @@ export function App() {
           syncArtifacts(artifacts, activeIdRef.current, workspaceTerminals);
         })
         .catch((error) => {
-          if (!disposed && error instanceof ApiError && error.status === 401) {
-            setAuthenticated(false);
+          if (!disposed && generation === authGeneration.current && error instanceof ApiError && error.status === 401) {
+            invalidateAuthentication();
           }
         })
         .finally(() => {
@@ -1372,7 +1425,7 @@ export function App() {
     for (let attempt = 0; attempt < 120; attempt += 1) {
       await new Promise((resolve) => window.setTimeout(resolve, 500));
       try {
-        if (ready(await api.config())) return true;
+        if (ready(await api.config({ agentIntegrations: "lazy" }))) return true;
       } catch {
         // The server is expected to be briefly unavailable during a restart.
       }
@@ -1557,11 +1610,12 @@ export function App() {
   }, [recordingStatus?.active]);
 
   const logout = async () => {
+    invalidateAuthentication();
     try {
       await api.logout();
     } finally {
-      setAuthenticated(false);
       setWorkspaceLoaded(false);
+      setConfig(defaultConfig);
       setTerminals([]);
       setTerminalStreamIssues(new Map());
       setLayout(null);

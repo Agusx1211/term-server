@@ -95,7 +95,7 @@ async function waitForDiagnosticEventAfter(
       (event) => event.id > eventFloor
         && event.type === eventType
         && (eventSource === undefined || event.data.source === eventSource),
-      { timeout },
+      { timeout, afterId: eventFloor },
     );
   }, { id: terminalId, floor, eventType: type, eventSource: source, timeout: WAIT_TIMEOUT_MS });
 }

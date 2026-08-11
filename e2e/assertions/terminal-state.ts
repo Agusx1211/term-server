@@ -74,11 +74,11 @@ export async function waitForTerminalEvent(
   event: E2ETerminalEventType,
   options: E2EWaitOptions = {},
 ): Promise<E2ETerminalEvent> {
-  return page.evaluate(async ({ id, event, timeout }) => {
+  return page.evaluate(async ({ id, event, timeout, afterId }) => {
     const api = (window as E2EWindow).__TERM_SERVER_E2E__;
     if (!api) throw new Error("term-server E2E diagnostics are unavailable");
-    return api.waitForEvent(id, event, { timeout });
-  }, { id: terminalId, event, timeout: options.timeout });
+    return api.waitForEvent(id, event, { timeout, afterId });
+  }, { id: terminalId, event, timeout: options.timeout, afterId: options.afterId });
 }
 
 export async function waitForTerminalBuffer(
@@ -239,10 +239,14 @@ export async function expectTerminalSynchronized(
   terminalId: string,
   options: E2EWaitOptions = {},
 ): Promise<E2ETerminalSnapshot> {
-  await waitForTerminalEvent(page, terminalId, "synced", options);
-  const snapshot = await terminalSnapshot(page, terminalId);
-  if (!snapshot) throw new Error(`No diagnostics snapshot for terminal ${terminalId}`);
+  const snapshot = await waitForTerminalState(page, terminalId, {
+    socketState: "connected",
+    activeSocketCount: 1,
+    acceptingInput: true,
+    pendingParserWrites: 0,
+  }, options);
   expect(snapshot.socketState).toBe("connected");
+  expect(snapshot.activeSocketCount).toBe(1);
   expect(snapshot.acceptingInput).toBe(true);
   expect(snapshot.pendingParserWrites).toBe(0);
   return snapshot;

@@ -67,8 +67,13 @@ export default defineConfig({
   projects: [
     {
       name: "chromium-pr",
-      grep: /@p0|@pr|@smoke/,
-      use: { ...commonUse, browserName: selectedBrowser },
+      // Match complete tags: `@pr` must not select `@protocol` or `@preview`.
+      grep: /@(p0|pr|smoke)\b/,
+      use: {
+        ...commonUse,
+        browserName: selectedBrowser,
+        launchOptions: { args: ["--use-angle=swiftshader"] },
+      },
     },
     {
       name: "chromium-packaged",

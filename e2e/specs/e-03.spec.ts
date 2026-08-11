@@ -57,7 +57,7 @@ async function waitForEventAfter(
     return api.waitForEvent(
       id,
       (event) => event.id > after && event.type === eventType,
-      { timeout },
+      { timeout, afterId: after },
     );
   }, { id: terminalId, eventType: type, after: afterEventId, timeout: WAIT_TIMEOUT_MS });
 }
@@ -76,7 +76,7 @@ async function waitForStateAfter(
       (event) => event.id > after
         && event.type === "state"
         && expectedStates.includes(String(event.data.state)),
-      { timeout },
+      { timeout, afterId: after },
     );
   }, { id: terminalId, after: afterEventId, expectedStates: states, timeout: WAIT_TIMEOUT_MS });
 }

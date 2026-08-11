@@ -85,7 +85,7 @@ async function waitForCheckpointAfter(
       && event.data.result === "sent"
       && typeof event.data.sequence === "number"
       && event.data.sequence >= minimum
-    ), { timeout });
+    ), { timeout, afterId: eventFloor });
   }, { id: terminalId, floor, minimum: minimumSequence, timeout: WAIT_TIMEOUT_MS });
 }
 

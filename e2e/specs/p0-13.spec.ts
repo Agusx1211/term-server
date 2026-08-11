@@ -38,7 +38,7 @@ async function waitForSentViewport(
     return api.waitForEvent(
       id,
       (event) => event.id > after && event.type === "viewport" && event.data.source === "sent",
-      { timeout },
+      { timeout, afterId: after },
     );
   }, { id: terminalId, after: afterEventId, timeout: DIAGNOSTIC_TIMEOUT });
 }

@@ -238,7 +238,7 @@ async function resizeHeightOnly(
       && event.data.source === "proposed"
       && event.data.cols === cols
       && event.data.rows === rows
-    ), { timeout });
+    ), { timeout, afterId: eventBoundary });
   }, {
     id: terminalId,
     rows: targetRows,

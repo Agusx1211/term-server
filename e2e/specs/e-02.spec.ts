@@ -93,7 +93,7 @@ async function waitForDiagnosticEventAfter(
     return api.waitForEvent(
       id,
       (event) => event.id > after && event.type === type,
-      { timeout },
+      { timeout, afterId: after },
     );
   }, { id: terminalId, after: afterEventId, type: eventType, timeout: WAIT_TIMEOUT_MS });
 }

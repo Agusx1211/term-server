@@ -65,12 +65,16 @@ test("@p0 P0-14 Font completes after initial layout", async ({ page, server }, t
     artifactName: "p0-14-fallback-font-crop",
   });
 
+  const fontLoadedPromise = waitForTerminalEvent(page, terminalId, "font-load", {
+    timeout: 15_000,
+    afterId: 0,
+  });
   await page.evaluate(() => {
     const api = (window as E2EWindow).__TERM_SERVER_E2E__;
     if (!api) throw new Error("term-server E2E diagnostics are unavailable");
     api.controls.font.release();
   });
-  const fontLoaded = await waitForTerminalEvent(page, terminalId, "font-load", { timeout: 15_000 });
+  const fontLoaded = await fontLoadedPromise;
   expect(fontLoaded.data.result).toBe("settled");
 
   const final = await page.evaluate(async (id) => {

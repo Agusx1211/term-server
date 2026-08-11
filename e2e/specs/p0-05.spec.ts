@@ -90,11 +90,11 @@ async function waitForEventAfter(
       waitForEvent: (
         terminalId: string,
         predicate: (event: E2ETerminalEvent) => boolean,
-        options?: { timeout?: number },
+        options?: { timeout?: number; afterId?: number },
       ) => Promise<E2ETerminalEvent>;
     } }).__TERM_SERVER_E2E__;
     if (!api) throw new Error("term-server E2E diagnostics are unavailable");
-    return api.waitForEvent(id, (event) => event.id > boundary && event.type === eventName, { timeout });
+    return api.waitForEvent(id, (event) => event.id > boundary && event.type === eventName, { timeout, afterId: boundary });
   }, { id: terminalId, boundary, eventName, timeout: WAIT_TIMEOUT_MS });
 }
 

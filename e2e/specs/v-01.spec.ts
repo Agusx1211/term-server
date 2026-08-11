@@ -55,7 +55,7 @@ async function waitForMeasuredViewport(
           return typeof value === "number" && Number.isFinite(value) && value > 0;
         });
       },
-      { timeout },
+      { timeout, afterId: after },
     );
   }, { id: terminalId, after: afterEventId, timeout: WAIT_TIMEOUT_MS });
 }

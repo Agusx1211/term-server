@@ -159,7 +159,7 @@ async function waitForDiagnosticEventAfter(
         && event.type === eventType
         && (sequence === undefined || event.data.sequence === sequence)
         && (generation === undefined || event.data.generation === generation),
-      { timeout },
+      { timeout, afterId: after },
     );
   }, {
     id: terminalId,

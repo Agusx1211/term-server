@@ -63,6 +63,9 @@ const TERMINAL_RESPONSE_QUEUE_MESSAGES: usize = 256;
 /// queued output before sending, so this only has to cover what accumulates
 /// behind one in-flight write rather than a whole slow client.
 const TERMINAL_EVENT_CAPACITY: usize = 1024;
+/// Keep exited terminals available for history/reconnect without retaining an
+/// unbounded PTY, input queue, and replay buffer for every session ever run.
+const MAX_RETAINED_EXITED_SESSIONS: usize = 32;
 /// Unacknowledged output bytes before the pty read loop stops draining the
 /// master. The master's buffer then fills and the process writing to it blocks,
 /// which is the only backpressure that reaches a TUI. Matches VS Code's
@@ -1504,6 +1507,7 @@ pub struct TerminalSession {
     signals: Mutex<TerminalSignals>,
     process_tracker: Mutex<ProcessTracker>,
     flow: FlowControl,
+    exit_order: AtomicU64,
     home_directory: PathBuf,
 }
 
@@ -1826,8 +1830,12 @@ impl TerminalSession {
         }
     }
 
-    fn exited(&self, exit_code: u32) {
+    fn exited(&self, exit_code: u32, exit_order: u64) {
         self.flow_release();
+        // Publish the retention order before exposing the exited status so a
+        // concurrent prune can never mistake a freshly exited session for the
+        // oldest retained entry (the default order is zero).
+        self.exit_order.store(exit_order, Ordering::Release);
         {
             let mut info = self.info.write();
             info.status = TerminalStatus::Exited;
@@ -2357,6 +2365,7 @@ pub struct TerminalManager {
     sessions: Arc<RwLock<HashMap<Uuid, Arc<TerminalSession>>>>,
     default_shell: RwLock<Option<String>>,
     replay_bytes: AtomicUsize,
+    next_exit_order: Arc<AtomicU64>,
     home_directory: PathBuf,
     agent_event_socket: Option<PathBuf>,
     executable: Option<PathBuf>,
@@ -2371,6 +2380,7 @@ impl TerminalManager {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             default_shell: RwLock::new(default_shell),
             replay_bytes: AtomicUsize::new(replay_bytes),
+            next_exit_order: Arc::new(AtomicU64::new(0)),
             home_directory,
             agent_event_socket: None,
             executable: std::env::current_exe().ok(),
@@ -2387,7 +2397,35 @@ impl TerminalManager {
         self.replay_bytes.store(replay_bytes, Ordering::Relaxed);
     }
 
+    fn prune_exited_sessions(&self) {
+        let mut sessions = self.sessions.write();
+        let mut exited = sessions
+            .iter()
+            .filter_map(|(id, session)| {
+                (session.info.read().status == TerminalStatus::Exited)
+                    .then_some((*id, session.exit_order.load(Ordering::Acquire)))
+            })
+            .collect::<Vec<_>>();
+        if exited.len() <= MAX_RETAINED_EXITED_SESSIONS {
+            return;
+        }
+        exited.sort_unstable_by_key(|(id, order)| (*order, *id));
+        let remove_count = exited.len() - MAX_RETAINED_EXITED_SESSIONS;
+        let removed = exited
+            .into_iter()
+            .take(remove_count)
+            .filter_map(|(id, _)| sessions.remove(&id))
+            .collect::<Vec<_>>();
+        drop(sessions);
+        // Dropping the manager's Arc releases replay/PTY resources once any
+        // active socket has released its own reference. Never kill here: all
+        // selected sessions have already reported Exited, and running sessions
+        // are not candidates for this list.
+        drop(removed);
+    }
+
     pub fn list(&self) -> Vec<TerminalInfo> {
+        self.prune_exited_sessions();
         let mut terminals: Vec<_> = self
             .sessions
             .read()
@@ -2399,7 +2437,17 @@ impl TerminalManager {
     }
 
     pub fn get(&self, id: Uuid) -> Option<Arc<TerminalSession>> {
+        self.prune_exited_sessions();
         self.sessions.read().get(&id).cloned()
+    }
+
+    pub fn running_count(&self) -> usize {
+        self.prune_exited_sessions();
+        self.sessions
+            .read()
+            .values()
+            .filter(|session| session.info.read().status == TerminalStatus::Running)
+            .count()
     }
 
     pub fn start_monitor(self: &Arc<Self>, pi: Arc<PiService>) {
@@ -2428,6 +2476,7 @@ impl TerminalManager {
     }
 
     fn refresh_processes(&self, pi: Arc<PiService>) {
+        self.prune_exited_sessions();
         let sessions = self.sessions.read().values().cloned().collect::<Vec<_>>();
         let shell_pids = sessions
             .iter()
@@ -2462,6 +2511,7 @@ impl TerminalManager {
     }
 
     pub fn create(&self, request: CreateTerminal) -> Result<TerminalInfo, TerminalError> {
+        self.prune_exited_sessions();
         let requested_name = request
             .path
             .as_deref()
@@ -2588,18 +2638,21 @@ impl TerminalManager {
             signals: Mutex::new(TerminalSignals::default()),
             process_tracker: Mutex::new(ProcessTracker::default()),
             flow: FlowControl::default(),
+            exit_order: AtomicU64::new(0),
             home_directory: self.home_directory.clone(),
         });
         sessions.insert(id, session.clone());
         drop(sessions);
 
         let output_session = session.clone();
+        let next_exit_order = self.next_exit_order.clone();
         thread::Builder::new()
             .name(format!("terminal-output-{id}"))
             .spawn(move || {
                 read_output(reader, output_session.clone());
                 let exit_code = child.wait().map(|status| status.exit_code()).unwrap_or(1);
-                output_session.exited(exit_code);
+                let exit_order = next_exit_order.fetch_add(1, Ordering::Relaxed);
+                output_session.exited(exit_code, exit_order);
             })
             .map_err(|error| TerminalError::Io(error.to_string()))?;
 
@@ -4262,12 +4315,101 @@ mod tests {
     }
 
     #[test]
+    fn bounds_exited_session_retention_and_preserves_running_sessions() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = TerminalManager {
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            default_shell: RwLock::new(Some("/bin/sh".into())),
+            replay_bytes: AtomicUsize::new(1024 * 1024),
+            next_exit_order: Arc::new(AtomicU64::new(0)),
+            home_directory: directory.path().to_path_buf(),
+            agent_event_socket: None,
+            executable: None,
+        };
+        let running = manager
+            .create(CreateTerminal {
+                path: None,
+                cwd: None,
+                shell: None,
+                clone_from: None,
+            })
+            .unwrap();
+        let running_session = manager.get(running.id).unwrap();
+        let mut exited_ids = Vec::with_capacity(MAX_RETAINED_EXITED_SESSIONS + 1);
+        let mut first_weak = None;
+
+        for index in 0..=MAX_RETAINED_EXITED_SESSIONS {
+            let info = manager
+                .create(CreateTerminal {
+                    path: None,
+                    cwd: None,
+                    shell: None,
+                    clone_from: None,
+                })
+                .unwrap();
+            let session = manager.get(info.id).unwrap();
+            if index == 0 {
+                first_weak = Some(Arc::downgrade(&session));
+            }
+            session.write(b"exit\n").unwrap();
+            let exited = (0..100).find(|_| {
+                let status = manager
+                    .get(info.id)
+                    .map(|candidate| candidate.info().status);
+                if status == Some(TerminalStatus::Exited) {
+                    true
+                } else {
+                    thread::sleep(Duration::from_millis(10));
+                    false
+                }
+            });
+            assert!(exited.is_some(), "terminal {id} did not exit", id = info.id);
+            exited_ids.push(info.id);
+        }
+        drop(running_session);
+
+        assert!(manager.get(exited_ids[0]).is_none());
+        assert!(
+            manager
+                .list()
+                .into_iter()
+                .filter(|info| info.status == TerminalStatus::Exited)
+                .count()
+                <= MAX_RETAINED_EXITED_SESSIONS
+        );
+        assert_eq!(
+            manager.get(running.id).unwrap().info().status,
+            TerminalStatus::Running
+        );
+
+        let first_weak = first_weak.expect("first exited session was not captured");
+        let released = (0..100).any(|_| {
+            if first_weak.upgrade().is_none() {
+                true
+            } else {
+                thread::sleep(Duration::from_millis(10));
+                false
+            }
+        });
+        assert!(
+            released,
+            "evicted exited session still retains PTY resources"
+        );
+
+        manager.remove(running.id);
+        for id in exited_ids {
+            manager.remove(id);
+        }
+    }
+
+    #[test]
     fn starts_writes_resizes_and_retains_an_exited_terminal() {
         let directory = tempfile::tempdir().unwrap();
         let manager = TerminalManager {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             default_shell: RwLock::new(Some("/bin/sh".into())),
             replay_bytes: AtomicUsize::new(1024 * 1024),
+            next_exit_order: Arc::new(AtomicU64::new(0)),
             home_directory: directory.path().to_path_buf(),
             agent_event_socket: None,
             executable: None,
@@ -4343,6 +4485,7 @@ mod tests {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             default_shell: RwLock::new(Some("/bin/sh".into())),
             replay_bytes: AtomicUsize::new(1024 * 1024),
+            next_exit_order: Arc::new(AtomicU64::new(0)),
             home_directory: directory.path().to_path_buf(),
             agent_event_socket: None,
             executable: None,
@@ -4431,6 +4574,7 @@ mod tests {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             default_shell: RwLock::new(Some("/bin/sh".into())),
             replay_bytes: AtomicUsize::new(1024 * 1024),
+            next_exit_order: Arc::new(AtomicU64::new(0)),
             home_directory: directory.path().to_path_buf(),
             agent_event_socket: None,
             executable: None,
@@ -4503,6 +4647,7 @@ mod tests {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             default_shell: RwLock::new(Some("/bin/sh".into())),
             replay_bytes: AtomicUsize::new(1024 * 1024),
+            next_exit_order: Arc::new(AtomicU64::new(0)),
             home_directory: directory.path().to_path_buf(),
             agent_event_socket: None,
             executable: None,
@@ -5145,6 +5290,7 @@ mod tests {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             default_shell: RwLock::new(Some("/bin/sh".into())),
             replay_bytes: AtomicUsize::new(1024 * 1024),
+            next_exit_order: Arc::new(AtomicU64::new(0)),
             home_directory: directory.path().to_path_buf(),
             agent_event_socket: None,
             executable: None,

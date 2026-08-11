@@ -279,7 +279,7 @@ async function waitForSentViewport(
       event.id > after
         && event.type === "viewport"
         && event.data.source === "sent"
-    ), { timeout });
+    ), { timeout, afterId: after });
   }, { id: terminalId, after: afterId, timeout: WAIT_TIMEOUT_MS });
 }
 
@@ -296,7 +296,7 @@ async function waitForVisibility(
       event.id > after
         && event.type === "visibility"
         && event.data.visible === expectedVisible
-    ), { timeout });
+    ), { timeout, afterId: after });
   }, { id: terminalId, after: afterId, expectedVisible: visible, timeout: WAIT_TIMEOUT_MS });
 }
 

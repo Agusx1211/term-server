@@ -315,7 +315,7 @@ async function waitForOutputCommit(
   return page.evaluate(async ({ id, after, timeout }) => {
     const api = (window as E2EWindow).__TERM_SERVER_E2E__;
     if (!api) throw new Error("term-server E2E diagnostics are unavailable");
-    return api.waitForEvent(id, (event) => event.id > after && event.type === "parser-commit", { timeout });
+    return api.waitForEvent(id, (event) => event.id > after && event.type === "parser-commit", { timeout, afterId: after });
   }, { id: terminalId, after: floor, timeout: WAIT_TIMEOUT_MS });
 }
 

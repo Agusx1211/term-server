@@ -68,7 +68,7 @@ async function waitForEventAfter(
         && event.type === eventType
         && (generation === undefined || event.data.generation === generation)
         && (states === undefined || states.includes(String(event.data.state))),
-      { timeout },
+      { timeout, afterId: eventId },
     );
   }, {
     id: terminalId,

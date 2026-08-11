@@ -219,7 +219,7 @@ async function waitForParserMarker(
       (event) => event.id > after
         && event.type === "parser-commit"
         && event.snapshot.xterm.text.includes(expected),
-      { timeout },
+      { timeout, afterId: after },
     );
   }, { id: terminalId, after: afterEventId, expected: expectedMarker, timeout: WAIT_TIMEOUT_MS });
 }
@@ -240,7 +240,7 @@ async function waitForCheckpoint(
         && event.data.result === "sent"
         && typeof event.data.sequence === "number"
         && event.data.sequence >= minimum,
-      { timeout },
+      { timeout, afterId: after },
     );
   }, { id: terminalId, after: afterEventId, minimum: minimumSequence, timeout: WAIT_TIMEOUT_MS });
 }

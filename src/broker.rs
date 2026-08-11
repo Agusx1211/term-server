@@ -886,7 +886,7 @@ async fn broker_health(State(state): State<BrokerState>) -> Json<serde_json::Val
     Json(serde_json::json!({
         "protocolVersion": PROTOCOL_VERSION,
         "build": build::info(),
-        "sessions": state.terminals.list().len(),
+        "sessions": state.terminals.running_count(),
     }))
 }
 

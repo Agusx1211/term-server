@@ -103,7 +103,7 @@ async function waitForRendererOutcome(page: Page, terminalId: string, afterEvent
     return api.waitForEvent(
       id,
       (event) => event.id > after && (event.type === "renderer-load" || event.type === "renderer-fallback"),
-      { timeout },
+      { timeout, afterId: after },
     );
   }, { id: terminalId, after: afterEventId, timeout: WAIT_TIMEOUT_MS });
 }
@@ -120,7 +120,7 @@ async function waitForRendererEvent(
     return api.waitForEvent(
       id,
       (event) => event.id > after && event.type === eventType,
-      { timeout },
+      { timeout, afterId: after },
     );
   }, { id: terminalId, eventType: type, after: afterEventId, timeout: WAIT_TIMEOUT_MS });
 }
@@ -138,7 +138,7 @@ async function waitForViewportAfter(page: Page, terminalId: string, afterEventId
           && [data.cols, data.rows, data.pixelWidth, data.pixelHeight]
             .every((value) => typeof value === "number" && Number.isFinite(value) && value > 0);
       },
-      { timeout },
+      { timeout, afterId: after },
     );
   }, { id: terminalId, after: afterEventId, timeout: WAIT_TIMEOUT_MS });
 }
@@ -334,6 +334,8 @@ test("R-02 Renderer transition dimension refresh @p1 @nightly @rendering @transi
   const preLine = `[E2E:PRINT:${preId}:${preText}]`;
   const webglLine = `[E2E:PRINT:${webglId}:${webglText}]`;
   const fallbackLine = `[E2E:PRINT:${fallbackId}:${fallbackText}]`;
+  const echoReadyLine = `[E2E:ECHO_INPUT:${echoId}:READY]`;
+  const echoPayloadLine = `[E2E:ECHO_INPUT:${echoId}:${Buffer.from(inputMarker, "utf8").toString("base64")}]`;
 
   await terminal.sendInput(`READY ${readyId}`, true);
   await server.waitForTranscript(created.id, (entry) => entry.event === "ready" && entry.id === readyId, { timeoutMs: WAIT_TIMEOUT_MS });
@@ -562,7 +564,7 @@ test("R-02 Renderer transition dimension refresh @p1 @nightly @rendering @transi
   const echoed = await echoPayload;
   expect(echoed.payload_base64).toBe(Buffer.from(inputMarker, "utf8").toString("base64"));
 
-  await expectTerminalBuffer(page, created.id, { contains: `[E2E:ECHO_INPUT:${echoId}:`, occurrences: 1 }, { timeout: WAIT_TIMEOUT_MS });
+  await expectTerminalBuffer(page, created.id, { contains: echoReadyLine, occurrences: 1 }, { timeout: WAIT_TIMEOUT_MS });
   const finalSnapshot = await expectTerminalInteractive(page, created.id, { timeout: WAIT_TIMEOUT_MS });
   expect(finalSnapshot.renderer).toBe(finalRenderer);
   expect(finalSnapshot.webglLoadCount).toBe(1);
@@ -579,10 +581,14 @@ test("R-02 Renderer transition dimension refresh @p1 @nightly @rendering @transi
   expect(finalSnapshot.rows).toBe(finalSize.rows);
 
   const finalText = finalSnapshot.xterm.text;
-  expect(countOccurrences(finalText, preLine)).toBe(1);
-  expect(countOccurrences(finalText, fallbackLine)).toBe(1);
-  if (webglBranchExecuted) expect(countOccurrences(finalText, webglLine)).toBe(1);
-  expect(countOccurrences(finalText, `[E2E:ECHO_INPUT:${echoId}:`)).toBe(1);
+  // xterm inserts line breaks when a marker crosses a reflowed terminal row;
+  // compare marker occurrences against the logical buffer text.
+  const normalizedFinalText = finalText.replaceAll("\n", "");
+  expect(countOccurrences(normalizedFinalText, preLine)).toBe(1);
+  expect(countOccurrences(normalizedFinalText, fallbackLine)).toBe(1);
+  if (webglBranchExecuted) expect(countOccurrences(normalizedFinalText, webglLine)).toBe(1);
+  expect(countOccurrences(normalizedFinalText, echoReadyLine)).toBe(1);
+  expect(countOccurrences(normalizedFinalText, echoPayloadLine)).toBe(1);
   const transcript = await server.readTranscript(created.id);
   expect(transcript.filter((entry) => entry.event === "print" && entry.id === preId)).toHaveLength(1);
   expect(transcript.filter((entry) => entry.event === "print" && entry.id === fallbackId)).toHaveLength(1);

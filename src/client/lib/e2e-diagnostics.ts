@@ -193,6 +193,8 @@ export interface E2ETerminalEvent<T extends Record<string, unknown> = Record<str
 
 export interface E2EWaitOptions {
   readonly timeout?: number;
+  /** Resolve only an event whose id is strictly greater than this floor. */
+  readonly afterId?: number;
   readonly signal?: AbortSignal;
 }
 
@@ -823,7 +825,33 @@ function isEventType(value: unknown): value is E2ETerminalEventType {
 }
 
 function isWaitOptions(value: unknown): value is E2EWaitOptions {
-  return value !== null && typeof value === "object" && ("timeout" in value || "signal" in value);
+  return value !== null && typeof value === "object"
+    && ("timeout" in value || "afterId" in value || "signal" in value);
+}
+
+/** Return the event floor for a wait started against an existing event list. */
+export function initialEventCursor(
+  events: readonly Pick<E2ETerminalEvent, "id">[],
+  afterId?: number,
+): number {
+  if (afterId !== undefined) {
+    if (!Number.isSafeInteger(afterId) || afterId < 0) {
+      throw new Error(`afterId must be a non-negative safe integer, received ${String(afterId)}`);
+    }
+    return afterId;
+  }
+  return events.reduce((cursor, event) => Math.max(cursor, event.id), 0);
+}
+
+/** Select the first matching event after a caller's floor. */
+export function firstEventAfter<T extends { readonly id: number }>(
+  events: readonly T[],
+  afterId: number,
+  predicate: (event: T) => boolean,
+): T | undefined {
+  return [...events]
+    .sort((left, right) => left.id - right.id)
+    .find((event) => event.id > afterId && predicate(event));
 }
 
 function normalizeEventType(value: E2ETerminalEventType | E2EEventPredicate | undefined): E2EEventPredicate {
@@ -1131,16 +1159,18 @@ function installApi(): E2ETerminalDiagnosticsApi | undefined {
         options = (args[2] ?? second) as E2EWaitOptions | undefined;
       }
       const predicate = normalizeEventType(predicateOrType);
-      let cursor = 0;
-      const current = () => {
+      const selectEvents = () => {
         const selected = terminalId ? [findEntry(terminalId)].filter((entry): entry is InternalEntry => Boolean(entry)) : [...entries.values()];
-        const events = selected.flatMap((entry) => entry.events).sort((left, right) => left.id - right.id);
-        const next = events.find((event) => event.id > cursor && predicate(event));
+        return selected.flatMap((entry) => entry.events);
+      };
+      let cursor = initialEventCursor(selectEvents(), options?.afterId);
+      const current = () => {
+        const events = selectEvents();
+        const next = firstEventAfter(events, cursor, predicate);
         if (next) {
           cursor = next.id;
           return cloneEvent(next);
         }
-        if (events.length) cursor = Math.max(cursor, events[events.length - 1]!.id);
         return undefined;
       };
       return waitUntil(

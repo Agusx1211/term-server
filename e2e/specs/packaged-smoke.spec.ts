@@ -10,7 +10,7 @@ import { WorkbenchPage } from "../pages/workbench-page.js";
 
 const WAIT_TIMEOUT_MS = 20_000;
 
-test("Packaged production client PTY smoke @packaged @smoke", async ({ page, server, baseURL }, testInfo) => {
+test("Packaged production client PTY smoke @packaged", async ({ page, server, baseURL }, testInfo) => {
   await page.goto(baseURL);
   const login = new LoginPage(page);
   await login.expectVisible();

@@ -101,7 +101,7 @@ async function waitForSocketCreated(
     return api.waitForEvent(
       id,
       (candidate) => candidate.id > after && candidate.type === "socket-created",
-      { timeout },
+      { timeout, afterId: after },
     );
   }, { id: terminalId, after: afterEventId, timeout: WAIT_TIMEOUT_MS });
 }

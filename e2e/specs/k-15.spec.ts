@@ -252,7 +252,7 @@ async function waitForParserCommit(
         && event.type === "parser-commit"
         && typeof event.data.sequence === "number"
         && event.data.sequence >= minimum,
-      { timeout },
+      { timeout, afterId: after },
     );
   }, { id: terminalId, after: afterEventId, minimum: minimumSequence, timeout: WAIT_TIMEOUT_MS });
 }
@@ -274,7 +274,7 @@ async function waitForCheckpoint(
         && event.data.result === "sent"
         && typeof event.data.sequence === "number"
         && event.data.sequence >= minimum,
-      { timeout },
+      { timeout, afterId: after },
     );
   }, { id: terminalId, after: afterEventId, minimum: minimumSequence, timeout: WAIT_TIMEOUT_MS });
 }
@@ -291,7 +291,7 @@ async function waitForTerminalEventAfter(
     return api.waitForEvent(
       id,
       (event) => event.id > after && event.type === eventType,
-      { timeout },
+      { timeout, afterId: after },
     );
   }, { id: terminalId, after: afterEventId, eventType: type, timeout: WAIT_TIMEOUT_MS });
 }

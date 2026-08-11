@@ -87,7 +87,7 @@ async function waitForDiagnosticEventAfter(
         && event.type === eventType
         && (field === undefined || event.data[field] === value)
       ),
-      { timeout },
+      { timeout, afterId: after },
     );
   }, {
     id: terminalId,

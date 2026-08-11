@@ -236,7 +236,7 @@ async function waitForDiagnosticEventAfter(
       if (exactGeneration !== undefined && eventGeneration !== exactGeneration) return false;
       if (minimumGeneration !== undefined && eventGeneration < minimumGeneration) return false;
       return true;
-    }, { timeout });
+    }, { timeout, afterId: afterEventId });
   }, {
     id: terminalId,
     afterEventId,

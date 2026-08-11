@@ -443,7 +443,10 @@ test("@p1 @nightly @rendering @cache @churn @soak R-10 Renderer cache churn", as
     };
     const pane = workbench.terminal(terminal.id, terminal.name);
     await pane.expectVisible();
-    const synchronized = waitForTerminalEvent(page, terminal.id, "synced", { timeout: WAIT_TIMEOUT_MS });
+    const synchronized = waitForTerminalEvent(page, terminal.id, "synced", {
+      timeout: WAIT_TIMEOUT_MS,
+      afterId: 0,
+    });
     const rendered = waitForInteractiveRendered(page, terminal.id);
     const [syncEvent, initialSnapshot] = await Promise.all([synchronized, rendered]);
     expect(syncEvent.terminalId).toBe(terminal.id);

@@ -115,7 +115,7 @@ async function waitForSentViewport(
           const value = event.data[key];
           return typeof value === "number" && Number.isFinite(value) && value > 0;
         }),
-      { timeout },
+      { timeout, afterId: after },
     );
   }, { id: terminalId, after: afterEventId, timeout: WAIT_TIMEOUT_MS });
 }

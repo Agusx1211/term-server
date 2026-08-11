@@ -279,6 +279,12 @@ struct ClientConfig {
     updates: UpdateConfig,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct ConfigQuery {
+    #[serde(rename = "agentIntegrations")]
+    agent_integrations: Option<String>,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ClientTerminalInfo {
@@ -605,10 +611,20 @@ async fn change_password(
 async fn config(
     State(state): State<AppState>,
     jar: CookieJar,
+    Query(query): Query<ConfigQuery>,
 ) -> Result<Json<ClientConfig>, ApiError> {
     require_auth(&jar, &state)?;
-    let (pi, broker) =
-        tokio::try_join!(state.workspace.pi_config(), state.workspace.broker_info())?;
+    let workspace_config =
+        tokio::try_join!(state.workspace.pi_config(), state.workspace.broker_info());
+    let (pi, broker) = workspace_config?;
+    let agent_integrations = if query.agent_integrations.as_deref() == Some("lazy") {
+        AgentIntegrationsConfig {
+            providers: Vec::new(),
+            fallbacks_enabled: true,
+        }
+    } else {
+        state.agent_integrations.status().await
+    };
     Ok(Json(ClientConfig {
         scrollback_lines: state.scrollback_lines,
         max_panes: state.max_panes,
@@ -617,10 +633,7 @@ async fn config(
         hostname: state.hostname.clone(),
         password_managed_externally: state.auth.password_is_externally_managed(),
         pi,
-        agent_integrations: AgentIntegrationsConfig {
-            providers: Vec::new(),
-            fallbacks_enabled: true,
-        },
+        agent_integrations,
         artifact_skill: state.artifact_skill.status(),
         pushover: state.pushover.client_config(),
         build: build::info(),
@@ -1943,7 +1956,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/api/config")
+                    .uri("/api/config?agentIntegrations=lazy")
                     .header(header::COOKIE, cookie)
                     .body(Body::empty())
                     .unwrap(),
@@ -1964,6 +1977,40 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn config_keeps_agent_integrations_compatible_with_split_endpoint() {
+        let (app, cookie) = authenticated_app().await;
+        let config = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let config: serde_json::Value =
+            serde_json::from_slice(&to_bytes(config.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+
+        let split = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config/agent-integrations")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let split: serde_json::Value =
+            serde_json::from_slice(&to_bytes(split.into_body(), 64 * 1024).await.unwrap()).unwrap();
+
+        assert_eq!(config["agentIntegrations"], split);
     }
 
     #[tokio::test]

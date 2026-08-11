@@ -972,7 +972,7 @@ async function createTerminal(
     if (!api) throw new Error("term-server E2E diagnostics are unavailable");
     const event = await api.waitForEvent(
       (candidate) => candidate.id > floor && candidate.type === "mount" && candidate.snapshot.kind === "pane",
-      { timeout },
+      { timeout, afterId: floor },
     );
     return { terminalId: event.terminalId, paneId: event.paneId };
   }, { floor: eventFloor, timeout: WAIT_TIMEOUT_MS });

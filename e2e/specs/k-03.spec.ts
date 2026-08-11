@@ -62,7 +62,7 @@ async function waitForParserCommitContaining(
       (event) => event.id > after
         && event.type === "parser-commit"
         && event.snapshot.xterm.text.replace(/\s+/g, "").includes(expected.replace(/\s+/g, "")),
-      { timeout },
+      { timeout, afterId: after },
     );
   }, { id: terminalId, after: afterEventId, expected: marker, timeout: WAIT_TIMEOUT_MS });
 }
@@ -80,7 +80,7 @@ async function waitForCheckpointSent(
       (event) => event.id > after
         && event.type === "checkpoint"
         && event.data.result === "sent",
-      { timeout },
+      { timeout, afterId: after },
     );
   }, { id: terminalId, after: afterEventId, timeout: WAIT_TIMEOUT_MS });
 }
@@ -100,7 +100,7 @@ async function expectNoEvent(
       const event = await api.waitForEvent(
         id,
         (candidate) => candidate.id > after && candidate.type === type,
-        { timeout: duration },
+        { timeout: duration, afterId: after },
       );
       return { timedOut: false as const, eventId: event.id };
     } catch (error) {

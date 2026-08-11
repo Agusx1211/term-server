@@ -182,7 +182,7 @@ async function waitForLifecycleEvent(
     return api.waitForEvent(
       id,
       (event) => event.id > cursor && allowed.has(event.type as LifecycleEventType),
-      { timeout },
+      { timeout, afterId: cursor },
     );
   }, { id: terminalId, cursor: afterId, eventTypes: types, timeout: WAIT_TIMEOUT_MS });
 }

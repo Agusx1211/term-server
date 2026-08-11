@@ -100,7 +100,7 @@ async function waitForDiagnosticEventAfter(
         if (eventGeneration !== generation) return false;
       }
       return state === undefined || event.data.state === state;
-    }, { timeout });
+    }, { timeout, afterId: after });
   }, {
     id: terminalId,
     after: afterEventId,

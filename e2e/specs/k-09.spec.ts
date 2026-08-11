@@ -168,7 +168,7 @@ async function waitForCheckpoint(
       && event.data.result === "sent"
       && event.data.sequence === expectedSequence
       && event.data.epoch === expectedEpoch
-    ), { timeout });
+    ), { timeout, afterId: afterEventId });
   }, {
     id: terminalId,
     afterEventId,

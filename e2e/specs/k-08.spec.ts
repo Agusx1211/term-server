@@ -184,7 +184,7 @@ async function waitForCheckpoint(
       && event.data.epoch === expectedEpoch
       && event.snapshot.checkpointSequence === expectedSequence
       && event.snapshot.checkpointEpoch === expectedEpoch
-    ), { timeout });
+    ), { timeout, afterId: after });
   }, {
     id: terminalId,
     after: afterEventId,
@@ -209,7 +209,7 @@ async function waitForDisconnected(
       && event.snapshot.socketState === "disconnected"
       && event.snapshot.activeSocketCount === 0
       && !event.snapshot.acceptingInput
-    ), { timeout });
+    ), { timeout, afterId: after });
   }, { id: terminalId, after: afterEventId, timeout: WAIT_TIMEOUT_MS });
 }
 
@@ -227,7 +227,7 @@ async function waitForRecoverySync(
       && event.type === "sync"
       && event.snapshot.socketGeneration > oldGeneration
       && (event.data.mode === "snapshot" || event.data.mode === "resume")
-    ), { timeout });
+    ), { timeout, afterId: after });
   }, { id: terminalId, oldGeneration: generation, after: afterEventId, timeout: WAIT_TIMEOUT_MS });
 }
 
@@ -244,7 +244,7 @@ async function waitForRecoverySynced(
       event.id > after
       && event.type === "synced"
       && event.snapshot.socketGeneration > oldGeneration
-    ), { timeout });
+    ), { timeout, afterId: after });
   }, { id: terminalId, oldGeneration: generation, after: afterEventId, timeout: WAIT_TIMEOUT_MS });
 }
 
@@ -288,7 +288,7 @@ async function waitForSocketCreated(
       event.id > after
       && event.type === "socket-created"
       && event.snapshot.socketGeneration > oldGeneration
-    ), { timeout });
+    ), { timeout, afterId: after });
   }, { id: terminalId, oldGeneration: generation, after: afterEventId, timeout: WAIT_TIMEOUT_MS });
 }
 
@@ -385,7 +385,7 @@ async function waitForSocketCloseEvent(
       && event.type === "socket-close"
       && event.snapshot.socketGeneration === expectedGeneration
       && event.data.generation === expectedGeneration
-    ), { timeout });
+    ), { timeout, afterId: after });
   }, { id: terminalId, expectedGeneration: generation, after: afterEventId, timeout: WAIT_TIMEOUT_MS });
 }
 

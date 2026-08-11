@@ -55,7 +55,7 @@ async function waitForSizeAfter(
         if (event.id <= cursor || event.type !== "size") return false;
         return Object.entries(wanted).every(([key, value]) => event.data[key] === value);
       },
-      { timeout },
+      { timeout, afterId: cursor },
     );
   }, { terminalId, afterId, expected, timeout: SIZE_EVENT_TIMEOUT });
 }

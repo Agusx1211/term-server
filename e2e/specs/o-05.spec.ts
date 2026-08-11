@@ -236,7 +236,7 @@ async function waitForSentViewport(page: Page, terminalId: string, afterEventId:
       && event.data.source === "sent"
       && event.data.cols === expectedViewport.cols
       && event.data.rows === expectedViewport.rows
-    ), { timeout: 45_000 });
+    ), { timeout: 45_000, afterId: after });
   }, { id: terminalId, after: afterEventId, expectedViewport: expected });
 }
 
@@ -249,7 +249,7 @@ async function waitForSizeEvent(page: Page, terminalId: string, afterEventId: nu
       && event.type === "size"
       && event.data.cols === expectedViewport.cols
       && event.data.rows === expectedViewport.rows
-    ), { timeout: 45_000 });
+    ), { timeout: 45_000, afterId: after });
   }, { id: terminalId, after: afterEventId, expectedViewport: expected });
 }
 

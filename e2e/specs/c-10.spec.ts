@@ -202,7 +202,7 @@ test("C-10 Terminal removed during reconnect @p1 @nightly", async ({
     return api.waitForEvent(
       id,
       (event) => event.id > afterId && event.type === "socket-created",
-      { timeout },
+      { timeout, afterId },
     );
   }, { id: terminalId, afterId: beforeEventId, timeout: WAIT_TIMEOUT_MS });
   const socketClosePromise = pane.waitForEvent("socket-close", { timeout: WAIT_TIMEOUT_MS });

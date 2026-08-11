@@ -89,7 +89,7 @@ async function waitForEventAfter(
     const event = await api.waitForEvent(
       id,
       (candidate) => candidate.id > after && candidate.type === eventType,
-      { timeout: 30_000 },
+      { timeout: 30_000, afterId: after },
     );
     return event.id;
   }, { id: terminalId, after: afterId, eventType: type });
