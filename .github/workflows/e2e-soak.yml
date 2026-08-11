@@ -1,0 +1,44 @@
+name: E2E Soak
+
+on:
+  schedule:
+    - cron: "23 3 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-soak
+  cancel-in-progress: false
+
+jobs:
+  soak:
+    name: E2E scheduled soak
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    env:
+      CI: true
+      TERM_SERVER_E2E_BROWSER: chromium
+      TERM_SERVER_E2E_DPR: 1
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build:e2e
+      - run: npm exec -- playwright install --with-deps chromium
+      - run: npx playwright test --config=e2e/playwright.config.ts --project=soak --grep @soak --workers=1
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: e2e-soak-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/e2e
+          if-no-files-found: ignore
+          retention-days: 30

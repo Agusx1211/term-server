@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 
 use bytes::Bytes;
+use unicode_width::UnicodeWidthChar;
 
 // Half the budget goes to the delta ring. Resuming from it is what preserves a
 // browser's own scrollback, which is two orders of magnitude deeper than the
@@ -335,6 +336,8 @@ struct CanonicalTerminal {
     pending: Vec<u8>,
     utf8_pending: Vec<u8>,
     utf8_expected: u8,
+    parser_utf8_pending: Vec<u8>,
+    parser_utf8_expected: u8,
     responses: VecDeque<Vec<u8>>,
     pixel_width: u16,
     pixel_height: u16,
@@ -354,6 +357,8 @@ impl CanonicalTerminal {
             pending: Vec::new(),
             utf8_pending: Vec::new(),
             utf8_expected: 0,
+            parser_utf8_pending: Vec::new(),
+            parser_utf8_expected: 0,
             responses: VecDeque::new(),
             pixel_width: 0,
             pixel_height: 0,
@@ -362,12 +367,15 @@ impl CanonicalTerminal {
 
     fn process(&mut self, bytes: &[u8]) {
         let mut start = 0;
+        let mut parser_sequence = self.sequence;
         for (index, byte) in bytes.iter().copied().enumerate() {
+            let sequence_before = self.sequence;
             let completed = self.observe_byte(byte);
             let Some(sequence) = completed else {
                 continue;
             };
-            self.parser.process(&bytes[start..index]);
+            self.process_parser_bytes(&bytes[start..index], parser_sequence);
+            parser_sequence = EscapeSequence::Ground;
             if let Some(entry) = sequence.alternate_mode.entry()
                 && !self.parser.screen().alternate_screen()
             {
@@ -375,7 +383,7 @@ impl CanonicalTerminal {
                 self.normal_execution_before_alt = Some(self.execution.clone());
                 self.alternate_entry = Some(entry);
             }
-            self.parser.process(&bytes[index..=index]);
+            self.process_parser_bytes(&bytes[index..=index], sequence_before);
             if sequence.alternate_mode == AlternateMode::Enter1047 {
                 self.parser.process(b"\x1b[?47h");
             } else if sequence.alternate_mode == AlternateMode::Exit1047 {
@@ -408,7 +416,119 @@ impl CanonicalTerminal {
             }
             start = index + 1;
         }
-        self.parser.process(&bytes[start..]);
+        self.process_parser_bytes(&bytes[start..], parser_sequence);
+    }
+
+    /// panoptes-vt100 0.16.2 underflows its one-row wrap source row before
+    /// indexing it. Temporarily giving the parser a second row lets it perform
+    /// the real wrap and scroll; moving the resulting row to the top before
+    /// shrinking back preserves the visible row and wrapped scrollback.
+    fn process_parser_bytes(&mut self, bytes: &[u8], mut sequence: EscapeSequence) {
+        if self.parser.screen().size().0 != 1 {
+            self.flush_parser_utf8_pending();
+            self.parser.process(bytes);
+            return;
+        }
+
+        let mut index = 0;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if sequence != EscapeSequence::Ground {
+                self.flush_parser_utf8_pending();
+                self.parser.process(&[byte]);
+                sequence = sequence.advance(byte);
+                index += 1;
+                continue;
+            }
+
+            if self.parser_utf8_expected > 0 {
+                if byte & 0b1100_0000 == 0b1000_0000 {
+                    self.parser_utf8_pending.push(byte);
+                    self.parser_utf8_expected -= 1;
+                    index += 1;
+                    if self.parser_utf8_expected == 0 {
+                        let scalar = std::mem::take(&mut self.parser_utf8_pending);
+                        self.process_ground_scalar(&scalar);
+                    }
+                    continue;
+                }
+                self.flush_parser_utf8_pending();
+                continue;
+            }
+
+            if let Some(expected) = utf8_expected(byte) {
+                self.parser_utf8_pending.push(byte);
+                self.parser_utf8_expected = expected;
+                index += 1;
+                continue;
+            }
+
+            self.process_ground_byte(byte);
+            sequence = sequence.advance(byte);
+            index += 1;
+        }
+    }
+
+    fn flush_parser_utf8_pending(&mut self) {
+        if self.parser_utf8_pending.is_empty() {
+            self.parser_utf8_expected = 0;
+            return;
+        }
+        let pending = std::mem::take(&mut self.parser_utf8_pending);
+        self.parser_utf8_expected = 0;
+        self.parser.process(&pending);
+    }
+
+    fn process_ground_byte(&mut self, byte: u8) {
+        if is_printable_byte(byte) {
+            self.process_ground_scalar(&[byte]);
+        } else {
+            self.parser.process(&[byte]);
+        }
+    }
+
+    fn process_ground_scalar(&mut self, bytes: &[u8]) {
+        let width = std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|scalar| scalar.chars().next())
+            .and_then(|character| character.width())
+            .unwrap_or(0);
+        let (_, cols) = self.parser.screen().size();
+        let pending_wrap = self.parser.screen().cursor_position().1 >= cols;
+        if width > 0 && pending_wrap {
+            self.process_one_row_wrap(bytes);
+        } else {
+            self.parser.process(bytes);
+        }
+    }
+
+    fn process_one_row_wrap(&mut self, bytes: &[u8]) {
+        let (_, cols) = self.parser.screen().size();
+        // Expanding clamps a delayed-wrap cursor back onto the last cell.
+        // Replaying the formatted live row after the expansion restores that
+        // exact cell state and the pending wrap without disturbing scrollback.
+        let live_state = self.parser.screen().state_formatted();
+        self.parser.screen_mut().set_size(2, cols);
+        self.parser.process(&live_state);
+        self.parser.process(bytes);
+        let (_, cursor_col) = self.parser.screen().cursor_position();
+        self.parser.process(b"\x1b[1S");
+        let cursor_position = cursor_col.min(cols.saturating_sub(1)).saturating_add(1);
+        let mut cursor_restore = [0u8; 10];
+        cursor_restore[..4].copy_from_slice(b"\x1b[1;");
+        let mut divisor = 1u16;
+        while cursor_position / divisor >= 10 {
+            divisor *= 10;
+        }
+        let mut offset = 4;
+        while divisor > 0 {
+            cursor_restore[offset] = b'0' + ((cursor_position / divisor) % 10) as u8;
+            offset += 1;
+            divisor /= 10;
+        }
+        cursor_restore[offset] = b'H';
+        self.parser.process(&cursor_restore[..=offset]);
+        self.parser.screen_mut().set_size(1, cols);
     }
 
     fn observe_byte(&mut self, byte: u8) -> Option<CompletedSequence> {
@@ -526,7 +646,7 @@ impl CanonicalTerminal {
             self.kitty_keyboard
                 .write_buffer_restore(&mut output, true, true);
             output.extend_from_slice(&self.pending);
-            output.extend_from_slice(&self.utf8_pending);
+            self.append_utf8_pending(&mut output);
             output
         } else {
             let plan = reflow_plan(self.parser.screen(), rows, cols);
@@ -538,7 +658,7 @@ impl CanonicalTerminal {
                 .write_buffer_restore(&mut output, false, false);
             self.kitty_keyboard.write_hidden_alt_restore(&mut output);
             output.extend_from_slice(&self.pending);
-            output.extend_from_slice(&self.utf8_pending);
+            self.append_utf8_pending(&mut output);
             output
         }
     }
@@ -558,6 +678,14 @@ impl CanonicalTerminal {
             text.push_str(&row);
         }
         text
+    }
+
+    fn append_utf8_pending(&self, output: &mut Vec<u8>) {
+        if self.parser_utf8_pending.is_empty() {
+            output.extend_from_slice(&self.utf8_pending);
+        } else {
+            output.extend_from_slice(&self.parser_utf8_pending);
+        }
     }
 
     fn snapshot(&self) -> Vec<u8> {
@@ -593,7 +721,7 @@ impl CanonicalTerminal {
             bytes
         };
         snapshot.extend_from_slice(&self.pending);
-        snapshot.extend_from_slice(&self.utf8_pending);
+        self.append_utf8_pending(&mut snapshot);
         snapshot
     }
 
@@ -974,10 +1102,9 @@ impl ExecutionState {
 
     fn remap_positions(&mut self, plan: &ReflowPlan) {
         self.rows = plan.rows;
-        self.scroll_region = self.scroll_region.and_then(|(top, bottom)| {
-            let bottom = bottom.min(plan.rows.saturating_sub(1));
-            (top < bottom).then_some((top, bottom))
-        });
+        // xterm resets DECSTBM to the full viewport on every real resize while
+        // preserving origin mode and the absolute cursor position.
+        self.scroll_region = None;
         if let Some(saved) = self.saved_cursor.as_mut() {
             (saved.row, saved.col) = plan.map_position(saved.row, saved.col);
         }
@@ -1223,6 +1350,19 @@ fn formatted_mode_enabled(screen: &vt100::Screen, enabled_sequence: &[u8]) -> bo
         .input_mode_formatted()
         .windows(enabled_sequence.len())
         .any(|bytes| bytes == enabled_sequence)
+}
+
+fn is_printable_byte(byte: u8) -> bool {
+    byte >= 0x20 && byte != 0x7f && !(0x80..=0x9f).contains(&byte)
+}
+
+fn utf8_expected(byte: u8) -> Option<u8> {
+    match byte {
+        0xc2..=0xdf => Some(1),
+        0xe0..=0xef => Some(2),
+        0xf0..=0xf4 => Some(3),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1474,7 +1614,7 @@ fn reflow_plan(screen: &vt100::Screen, rows: u16, cols: u16) -> ReflowPlan {
             || source.row_wrapped(u16::try_from(row).unwrap())
             || row_content_width(&source, u16::try_from(row).unwrap(), source_cols) > 0
         {
-            last_live_row = row;
+            last_live_row = last_live_row.max(row);
         }
     }
     for (row, bytes) in formatted_rows
@@ -1934,6 +2074,56 @@ mod tests {
     }
 
     #[test]
+    fn one_row_wraps_and_snapshots_preserve_scrollback() {
+        let mut terminal = CanonicalTerminal::new(1, 4, 20);
+        terminal.process(b"abcdefghij");
+        assert_eq!(terminal.parser.screen().contents(), "ij");
+        assert_eq!(terminal.parser.screen().cursor_position(), (0, 2));
+
+        let mut history = terminal.parser.screen().clone();
+        history.set_scrollback(1);
+        assert!(history.row_wrapped(0));
+        assert!(history.contents().contains("efgh"));
+
+        let mut reconstructed = CanonicalTerminal::new(1, 4, 20);
+        reconstructed.process(&terminal.snapshot());
+        assert_eq!(
+            reconstructed.parser.screen().contents(),
+            terminal.parser.screen().contents()
+        );
+        assert_eq!(
+            reconstructed.parser.screen().cursor_position(),
+            terminal.parser.screen().cursor_position()
+        );
+    }
+
+    #[test]
+    fn one_row_buffers_split_wide_scalars_before_wrapping() {
+        let encoded = "界".as_bytes();
+        let mut split = CanonicalTerminal::new(1, 4, 20);
+        split.process(b"abcd");
+        split.process(&encoded[..1]);
+        assert_eq!(split.parser.screen().cursor_position(), (0, 4));
+        assert_eq!(split.parser.screen().contents(), "abcd");
+        assert_eq!(split.parser_utf8_pending, encoded[..1]);
+        split.process(&encoded[1..]);
+
+        let mut whole = CanonicalTerminal::new(1, 4, 20);
+        whole.process("abcd界".as_bytes());
+        assert_screen_eq(split.parser.screen(), whole.parser.screen());
+        assert_eq!(split.parser.screen().cursor_position(), (0, 2));
+    }
+
+    #[test]
+    fn one_row_combining_scalars_attach_at_the_pending_wrap_edge() {
+        let mut terminal = CanonicalTerminal::new(1, 4, 20);
+        terminal.process(b"abcd");
+        terminal.process("\u{0301}".as_bytes());
+        assert_eq!(terminal.parser.screen().cursor_position(), (0, 4));
+        assert!(terminal.parser.screen().contents().contains("d\u{0301}"));
+    }
+
+    #[test]
     fn resize_reflows_completed_lines_at_narrower_and_wider_widths() {
         let mut terminal = CanonicalTerminal::new(4, 5, 20);
         terminal.process(b"abcdefghij\r\nEND");
@@ -1950,6 +2140,38 @@ mod tests {
         assert!(terminal.parser.screen().row_wrapped(0));
         assert!(!terminal.parser.screen().row_wrapped(1));
         assert_eq!(terminal.parser.screen().cursor_position(), (2, 3));
+    }
+
+    #[test]
+    fn resize_keeps_wrapped_history_before_the_next_newline_output() {
+        let mut terminal = CanonicalTerminal::new(38, 139, 20);
+        terminal.process(
+            b"[E2E:WINCH:1:38:125]\n\
+[E2E:WINCH:2:38:139]\n\
+[E2E:READY:P002_READY_W1R0I0]\n\
+[E2E:PRINT:P002_HISTORY_A_W1R0I0:P002_HISTORY_TEXT_A_W1R0I0]\n\
+[E2E:PRINT:P002_HISTORY_B_W1R0I0:P002_HISTORY_TEXT_B_W1R0I0]\n",
+        );
+
+        terminal.resize(38, 125, 20, 975, 646);
+        assert_eq!(terminal.parser.screen().cursor_position(), (7, 50));
+        assert!(
+            terminal
+                .parser
+                .screen()
+                .contents()
+                .contains("[E2E:PRINT:P002_HISTORY_B_W1R0I0:P002_HISTORY_TEXT_B_W1R0I0]")
+        );
+
+        terminal.process(b"[E2E:WINCH:3:38:125]\n");
+        assert_eq!(terminal.parser.screen().cursor_position(), (8, 70));
+        assert!(
+            terminal
+                .parser
+                .screen()
+                .contents()
+                .contains("[E2E:PRINT:P002_HISTORY_B_W1R0I0:P002_HISTORY_TEXT_B_W1R0I0]")
+        );
     }
 
     #[test]
@@ -2269,6 +2491,23 @@ mod tests {
             vec![
                 Bytes::from_static(b"\x1b[2;4R"),
                 Bytes::from_static(b"\x1b[?2;4R")
+            ]
+        );
+    }
+
+    #[test]
+    fn resize_resets_scroll_region_while_preserving_origin_mode() {
+        let mut state = TerminalOutputState::new(1024 * 1024, 8, 20);
+        state.publish(Bytes::from_static(b"\x1b[3;7r\x1b[?6h\x1b[2;4H"));
+
+        state.resize(10, 20, 0, 0);
+        state.publish(Bytes::from_static(b"\x1b[6n\x1b[?6$p"));
+
+        assert_eq!(
+            state.drain_responses(),
+            vec![
+                Bytes::from_static(b"\x1b[4;4R"),
+                Bytes::from_static(b"\x1b[?6;1$y"),
             ]
         );
     }

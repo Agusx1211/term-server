@@ -146,6 +146,7 @@ function TreeNode({
     return (
       <div
         class={`tree-row terminal-row ${activityClass} ${needsAttention ? "activity-attention" : ""} ${activeIds.includes(terminal.id) ? "active" : ""}`}
+        data-terminal-id={terminal.id}
         style={{ "--depth": depth, "--workspace-color": terminal.color }}
         onPointerEnter={(event) => (
           onPreview(terminal, event.currentTarget, event.pointerType)
@@ -362,6 +363,12 @@ export function Sidebar({
     previewTimer.current = undefined;
     previewLeaveTimer.current = undefined;
   };
+
+  useEffect(() => {
+    if (!preview || terminals.some((terminal) => terminal.id === preview.terminal.id)) return;
+    clearPreviewTimers();
+    setPreview(undefined);
+  }, [preview, terminals]);
 
   useEffect(() => {
     if (filesOpen || mobileOpen || !previewSettings.enabled) {

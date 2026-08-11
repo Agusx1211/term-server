@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use futures_util::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::process::Command;
@@ -214,9 +215,10 @@ impl AgentIntegrationService {
 
     async fn codex_status(&self, executable: &Path) -> Result<AgentIntegrationStatus, String> {
         let marketplace_root = self.provider_root(AgentIntegrationProvider::Codex);
-        let marketplaces =
-            command_json(executable, ["plugin", "marketplace", "list", "--json"]).await?;
-        let plugins = command_json(executable, ["plugin", "list", "--json"]).await?;
+        let (marketplaces, plugins) = tokio::try_join!(
+            command_json(executable, ["plugin", "marketplace", "list", "--json"]),
+            command_json(executable, ["plugin", "list", "--json"]),
+        )?;
         let marketplace = marketplace_entry(&marketplaces, MARKETPLACE_NAME);
         let registered = marketplace
             .and_then(|entry| entry.get("root"))
@@ -240,9 +242,10 @@ impl AgentIntegrationService {
 
     async fn claude_status(&self, executable: &Path) -> Result<AgentIntegrationStatus, String> {
         let marketplace_root = self.provider_root(AgentIntegrationProvider::Claude);
-        let marketplaces =
-            command_json(executable, ["plugin", "marketplace", "list", "--json"]).await?;
-        let plugins = command_json(executable, ["plugin", "list", "--json"]).await?;
+        let (marketplaces, plugins) = tokio::try_join!(
+            command_json(executable, ["plugin", "marketplace", "list", "--json"]),
+            command_json(executable, ["plugin", "list", "--json"]),
+        )?;
         let marketplace = marketplace_entry(&marketplaces, MARKETPLACE_NAME);
         let registered = marketplace
             .and_then(|entry| entry.get("installLocation"))
@@ -281,51 +284,55 @@ impl AgentIntegrationService {
     async fn omp_status(&self, executable: &Path) -> Result<AgentIntegrationStatus, String> {
         let profiles = self.omp_profiles();
         let source_root = self.provider_root(AgentIntegrationProvider::Omp);
+        let source_root = &source_root;
         let assets_current = self.assets_current(AgentIntegrationProvider::Omp);
-        let mut profile_statuses = Vec::with_capacity(profiles.len());
-        for profile in profiles {
-            let result = self.inspect_omp_profile(executable, &profile).await;
-            let profile_status = match result {
-                Ok(inspection) => {
-                    let plugin = omp_plugin_entry(&inspection.plugins, PLUGIN_SELECTOR);
-                    let registered = inspection
-                        .source
-                        .as_ref()
-                        .is_some_and(|source| paths_match(source, &source_root));
-                    let collision = inspection.source.is_some() && !registered;
-                    let installed = plugin.is_some();
-                    let enabled = plugin.is_some_and(omp_plugin_enabled);
-                    let plugin_assets_current = plugin.is_some_and(omp_plugin_assets_current);
-                    classify_omp_profile_status(
+        let profile_statuses = stream::iter(profiles)
+            .map(|profile| async move {
+                match self.inspect_omp_profile(executable, &profile).await {
+                    Ok(inspection) => {
+                        let plugin = omp_plugin_entry(&inspection.plugins, PLUGIN_SELECTOR);
+                        let registered = inspection
+                            .source
+                            .as_ref()
+                            .is_some_and(|source| paths_match(source, source_root));
+                        let collision = inspection.source.is_some() && !registered;
+                        let installed = plugin.is_some();
+                        let enabled = plugin.is_some_and(omp_plugin_enabled);
+                        let plugin_assets_current = plugin.is_some_and(omp_plugin_assets_current);
+                        classify_omp_profile_status(
+                            &profile,
+                            collision,
+                            registered,
+                            installed,
+                            enabled,
+                            assets_current && plugin_assets_current,
+                        )
+                    }
+                    Err(_) => omp_profile_status(
                         &profile,
-                        collision,
-                        registered,
-                        installed,
-                        enabled,
-                        assets_current && plugin_assets_current,
-                    )
+                        AgentIntegrationState::NeedsRepair,
+                        "Unable to inspect this OMP profile; process/output inference remains active.",
+                    ),
                 }
-                Err(_) => omp_profile_status(
-                    &profile,
-                    AgentIntegrationState::NeedsRepair,
-                    "Unable to inspect this OMP profile; process/output inference remains active.",
-                ),
-            };
-            profile_statuses.push(profile_status);
-        }
+            })
+            .buffered(4)
+            .collect()
+            .await;
         Ok(aggregate_omp_status(profile_statuses))
     }
+
     async fn inspect_omp_profile(
         &self,
         executable: &Path,
         profile: &OmpProfile,
     ) -> Result<OmpProfileInspection, String> {
-        let source = omp_marketplace_source(executable, profile).await?;
-        let plugins = command_json(
-            executable,
-            omp_profile_args(profile, ["plugin", "list", "--json"]),
-        )
-        .await?;
+        let (source, plugins) = tokio::try_join!(
+            omp_marketplace_source(executable, profile),
+            command_json(
+                executable,
+                omp_profile_args(profile, ["plugin", "list", "--json"]),
+            ),
+        )?;
         Ok(OmpProfileInspection { source, plugins })
     }
     async fn install_omp_profile(

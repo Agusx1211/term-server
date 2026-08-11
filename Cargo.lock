@@ -2122,6 +2122,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "ignore",
+ "libc",
  "mime_guess",
  "panoptes-vt100",
  "parking_lot",
@@ -2147,6 +2148,7 @@ dependencies = [
  "tower-http 0.7.0",
  "tracing",
  "tracing-subscriber",
+ "unicode-width",
  "uuid",
 ]
 

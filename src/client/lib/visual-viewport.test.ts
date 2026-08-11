@@ -29,10 +29,17 @@ describe("visual viewport sizing", () => {
     viewport.dispatchEvent(new Event("resize"));
     expect(properties.get("--visual-viewport-height")).toBe("390.25px");
     expect(properties.get("--visual-viewport-top")).toBe("102.5px");
+    viewport.width = 512;
+    view.dispatchEvent(new Event("resize"));
+    expect(properties.get("--visual-viewport-width")).toBe("512px");
 
     dispose();
     viewport.height = 300;
+    viewport.width = 600;
     viewport.dispatchEvent(new Event("resize"));
+    view.dispatchEvent(new Event("resize"));
     expect(properties.get("--visual-viewport-height")).toBe("390.25px");
+    expect(properties.get("--visual-viewport-width")).toBe("512px");
+
   });
 });

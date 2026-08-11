@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  MAX_SNAPSHOT_RENDER_BACKLOG_BYTES,
+  MAX_SNAPSHOT_RENDER_BACKLOG_FRAMES,
   TERMINAL_ACK_BYTES,
   TERMINAL_FRAME_OUTPUT,
   TERMINAL_FRAME_SNAPSHOT,
@@ -99,6 +101,27 @@ describe("terminal renderer backlog", () => {
       expect(backlog.enqueue(1, 4_000)).toBe(false);
     }
     expect(backlog.enqueue(1, 4_000)).toBe(true);
+  });
+
+  it("tracks snapshot parser writes with a separate bounded policy", () => {
+    const backlog = new TerminalRenderBacklog();
+    const validSnapshotBytes = 20 * 1024 * 1024;
+    expect(backlog.enqueue(validSnapshotBytes, 1_000, "snapshot")).toBe(false);
+    expect(backlog.pendingBytes).toBe(validSnapshotBytes);
+    expect(backlog.enqueue(1, 6_001, "snapshot")).toBe(true);
+
+    backlog.reset();
+    expect(backlog.enqueue(MAX_SNAPSHOT_RENDER_BACKLOG_BYTES, 2_000, "snapshot")).toBe(false);
+    expect(backlog.enqueue(1, 2_001, "snapshot")).toBe(true);
+
+    backlog.reset();
+    for (let index = 0; index < MAX_SNAPSHOT_RENDER_BACKLOG_FRAMES; index += 1) {
+      expect(backlog.enqueue(1, 3_000, "snapshot")).toBe(false);
+    }
+    expect(backlog.enqueue(1, 3_000, "snapshot")).toBe(true);
+
+    backlog.reset();
+    expect(backlog.enqueue(16 * 1024 * 1024 + 1, 4_000, "output")).toBe(true);
   });
 
   it("tolerates a full-screen redraw the renderer keeps up with", () => {

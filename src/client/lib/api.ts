@@ -56,6 +56,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+interface ConfigRequestOptions {
+  readonly agentIntegrations?: "lazy";
+  readonly signal?: AbortSignal;
+}
+
 function fileQuery(target: FileTarget): string {
   const query = new URLSearchParams({ path: target.path });
   if (target.cwd) query.set("cwd", target.cwd);
@@ -63,7 +68,7 @@ function fileQuery(target: FileTarget): string {
 }
 
 export const api = {
-  session: () => request<{ authenticated: boolean }>("/api/session"),
+  session: (signal?: AbortSignal) => request<{ authenticated: boolean }>("/api/session", { signal }),
   login: (password: string) =>
     request<{ ok: true }>("/api/login", { method: "POST", body: JSON.stringify({ password }) }),
   logout: () => request<{ ok: true }>("/api/logout", { method: "POST" }),
@@ -73,7 +78,12 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify({ currentPassword, newPassword }),
     }),
-  config: () => request<ClientConfig>("/api/config"),
+  config: (options: ConfigRequestOptions = {}) => {
+    const query = options.agentIntegrations === "lazy"
+      ? "?agentIntegrations=lazy"
+      : "";
+    return request<ClientConfig>(`/api/config${query}`, { signal: options.signal });
+  },
   statusModules: (signal?: AbortSignal) => request<StatusModulesResponse>("/api/status-modules", { signal }),
   updateStatus: () => request<UpdateStatus>("/api/update"),
   installUpdate: (commit: string) =>
@@ -88,8 +98,8 @@ export const api = {
     }),
   updatePiConfig: (config: UpdatePiConfig) =>
     request<PiConfig>("/api/config/pi", { method: "PATCH", body: JSON.stringify(config) }),
-  agentIntegrations: () =>
-    request<AgentIntegrationsConfig>("/api/config/agent-integrations"),
+  agentIntegrations: (signal?: AbortSignal) =>
+    request<AgentIntegrationsConfig>("/api/config/agent-integrations", { signal }),
   updateAgentIntegration: (
     provider: AgentIntegrationProvider,
     action: AgentIntegrationAction,

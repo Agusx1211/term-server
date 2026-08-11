@@ -19,6 +19,136 @@ export interface PaneRect {
   height: number;
 }
 
+export interface NormalizedBounds {
+  readonly x: number;
+  readonly y: number;
+  readonly width: number;
+  readonly height: number;
+}
+
+export type PanePathStep = "first" | "second";
+export type PanePath = readonly PanePathStep[];
+
+export interface PaneDivider {
+  readonly path: PanePath;
+  readonly direction: SplitDirection;
+  readonly ratio: number;
+  /** The zero-width or zero-height normalized split boundary. */
+  readonly bounds: NormalizedBounds;
+  /** The normalized rectangle whose ratio this divider controls. */
+  readonly parentBounds: NormalizedBounds;
+}
+
+export const MIN_SPLIT_RATIO = 0.15;
+export const MAX_SPLIT_RATIO = 0.85;
+
+export function clampSplitRatio(ratio: number): number {
+  if (Number.isNaN(ratio)) return 0.5;
+  if (ratio === Number.POSITIVE_INFINITY) return MAX_SPLIT_RATIO;
+  if (ratio === Number.NEGATIVE_INFINITY) return MIN_SPLIT_RATIO;
+  return Math.min(MAX_SPLIT_RATIO, Math.max(MIN_SPLIT_RATIO, ratio));
+}
+
+export function splitDividers(layout: PaneLayout | null): PaneDivider[] {
+  if (!layout) return [];
+  const dividers: PaneDivider[] = [];
+  const visit = (
+    node: PaneLayout,
+    path: PanePath,
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+  ) => {
+    if (node.type === "leaf") return;
+
+    const ratio = clampSplitRatio(node.ratio);
+    const parentBounds = { x, y, width, height };
+    if (node.direction === "horizontal") {
+      const firstWidth = width * ratio;
+      dividers.push({
+        path,
+        direction: node.direction,
+        ratio,
+        bounds: { x: x + firstWidth, y, width: 0, height },
+        parentBounds,
+      });
+      visit(node.first, [...path, "first"], x, y, firstWidth, height);
+      visit(node.second, [...path, "second"], x + firstWidth, y, width - firstWidth, height);
+      return;
+    }
+
+    const firstHeight = height * ratio;
+    dividers.push({
+      path,
+      direction: node.direction,
+      ratio,
+      bounds: { x, y: y + firstHeight, width, height: 0 },
+      parentBounds,
+    });
+    visit(node.first, [...path, "first"], x, y, width, firstHeight);
+    visit(node.second, [...path, "second"], x, y + firstHeight, width, height - firstHeight);
+  };
+
+  visit(layout, [], 0, 0, 1, 1);
+  return dividers;
+}
+
+export function splitDividerAt(layout: PaneLayout | null, path: PanePath): PaneDivider | undefined {
+  return splitDividers(layout).find((divider) => (
+    divider.path.length === path.length
+    && divider.path.every((step, index) => step === path[index])
+  ));
+}
+
+export function dividerRatioAtPoint(
+  divider: PaneDivider,
+  viewport: Pick<DOMRect, "left" | "top" | "width" | "height">,
+  clientX: number,
+  clientY: number,
+): number {
+  const { parentBounds } = divider;
+  if (divider.direction === "horizontal") {
+    const size = parentBounds.width * viewport.width;
+    return clampSplitRatio(
+      size > 0
+        ? (clientX - viewport.left - parentBounds.x * viewport.width) / size
+        : divider.ratio,
+    );
+  }
+  const size = parentBounds.height * viewport.height;
+  return clampSplitRatio(
+    size > 0
+      ? (clientY - viewport.top - parentBounds.y * viewport.height) / size
+      : divider.ratio,
+  );
+}
+
+export function updateSplitRatio(
+  layout: PaneLayout | null,
+  path: PanePath,
+  ratio: number,
+): PaneLayout | null {
+  if (!layout) return null;
+  if (layout.type === "leaf") return layout;
+  if (!path.length) {
+    const nextRatio = clampSplitRatio(ratio);
+    return nextRatio === layout.ratio ? layout : { ...layout, ratio: nextRatio };
+  }
+
+  const [step, ...rest] = path;
+  if (!step) return layout;
+  const child = layout[step];
+  const nextChild = updateSplitRatio(child, rest, ratio);
+  if (!nextChild || nextChild === child) return layout;
+  return step === "first"
+    ? { ...layout, first: nextChild }
+    : { ...layout, second: nextChild };
+}
+
+export const MIN_PANE_RATIO = MIN_SPLIT_RATIO;
+export const MAX_PANE_RATIO = MAX_SPLIT_RATIO;
+
 export const TERMINAL_DRAG_TYPE = "application/x-term-server-terminal";
 
 export function configureTerminalDrag(
@@ -55,7 +185,7 @@ export function paneRects(layout: PaneLayout | null): PaneRect[] {
       rectangles.push({ id: node.id, x, y, width, height });
       return;
     }
-    const ratio = Math.min(0.85, Math.max(0.15, node.ratio));
+    const ratio = clampSplitRatio(node.ratio);
     if (node.direction === "horizontal") {
       const firstWidth = width * ratio;
       visit(node.first, x, y, firstWidth, height);
@@ -135,6 +265,38 @@ export function removePane(layout: PaneLayout | null, id: string): PaneLayout | 
   if (first === layout.first && second === layout.second) return layout;
   return { ...layout, first, second };
 }
+export interface PaneRemoval {
+  readonly layout: PaneLayout | null;
+  readonly activeId: string | undefined;
+}
+
+/**
+ * Remove one visible pane and choose the next active pane in the same state
+ * transition. Closing the active pane prefers the next sibling at its former
+ * position, then the previous sibling when it was last; closing a background
+ * pane preserves the current active pane.
+ */
+export function removePaneAndSelect(
+  layout: PaneLayout | null,
+  id: string,
+  activeId: string | undefined,
+): PaneRemoval {
+  const ids = paneIds(layout);
+  const removedIndex = ids.indexOf(id);
+  if (removedIndex < 0) return { layout, activeId };
+
+  const nextLayout = removePane(layout, id);
+  if (activeId !== id && activeId !== undefined && ids.includes(activeId)) {
+    return { layout: nextLayout, activeId };
+  }
+
+  const remainingIds = ids.filter((paneId) => paneId !== id);
+  return {
+    layout: nextLayout,
+    activeId: remainingIds[removedIndex] ?? remainingIds[removedIndex - 1],
+  };
+}
+
 
 export function pruneLayout(layout: PaneLayout | null, available: Set<string>): PaneLayout | null {
   if (!layout) return null;
@@ -163,8 +325,8 @@ export function isPaneLayout(value: unknown): value is PaneLayout {
       (split.direction === "horizontal" || split.direction === "vertical") &&
       typeof split.ratio === "number" &&
       Number.isFinite(split.ratio) &&
-      split.ratio >= 0.15 &&
-      split.ratio <= 0.85 &&
+      split.ratio >= MIN_SPLIT_RATIO &&
+      split.ratio <= MAX_SPLIT_RATIO &&
       check(split.first) &&
       check(split.second)
     );

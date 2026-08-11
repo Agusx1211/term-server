@@ -10,7 +10,15 @@ const MAX_RENDER_BACKLOG_BYTES = 16 * 1024 * 1024;
 const MAX_RENDER_BACKLOG_AGE_MS = 5_000;
 const MAX_RENDER_BACKLOG_FRAMES = 8_192;
 const MIN_AGED_RENDER_BACKLOG_BYTES = 4 * 1024 * 1024;
+// A canonical/browser snapshot may legitimately be larger than an ordinary
+// output burst. It still needs a hard resource ceiling and an oldest-frame
+// deadline, but must not be abandoned at the ordinary-output byte limit.
+export const MAX_SNAPSHOT_RENDER_BACKLOG_BYTES = 64 * 1024 * 1024;
+export const MAX_SNAPSHOT_RENDER_BACKLOG_FRAMES = 65_536;
+export const MAX_SNAPSHOT_RENDER_BACKLOG_AGE_MS = MAX_RENDER_BACKLOG_AGE_MS;
 const RENDER_BACKLOG_COMPACT_FRAMES = 256;
+
+export type TerminalBacklogKind = "output" | "snapshot";
 
 // Acknowledgements are batched rather than sent per frame, so a burst costs a
 // handful of small messages instead of one per chunk. The batch size matches the
@@ -23,6 +31,9 @@ export const TERMINAL_ACK_BYTES = 5_000;
 export class TerminalOutputAck {
   private pending = 0;
 
+  get pendingBytes(): number {
+    return this.pending;
+  }
   /**
    * Records bytes the parser has consumed and returns the batch to acknowledge
    * once one is due. The remainder is carried, never dropped, so the server's
@@ -53,37 +64,80 @@ export interface TerminalStreamIssue {
 
 export class TerminalRenderBacklog {
   private bytes = 0;
-  // Frames settle in the order they were enqueued, so a queue of arrival times
-  // dates the oldest frame the parser still owes. Tracking only the last moment
-  // the backlog stood empty would age out any terminal that never falls idle,
-  // however well the renderer is keeping up.
-  private queued: number[] = [];
+  private outputBytes = 0;
+  private snapshotBytes = 0;
+  private outputFrames = 0;
+  private snapshotFrames = 0;
+  // Frames settle in the order they were enqueued, so each entry dates the
+  // oldest parser write still owed. Keeping the kind with the entry lets a
+  // large valid snapshot use its own ceiling without masking a stuck output
+  // stream that is queued behind it.
+  private queued: Array<{ readonly bytes: number; readonly kind: TerminalBacklogKind; readonly at: number }> = [];
   private settled = 0;
+  private settledBytes = 0;
+  private oldestOutputAt: number | undefined;
+  private oldestSnapshotAt: number | undefined;
 
   get pendingBytes(): number {
     return this.bytes;
+  }
+  get pendingFrames(): number {
+    return this.frames;
+  }
+
+  get oldestAgeMs(): number {
+    const oldest = this.queued[this.settled]?.at;
+    return oldest === undefined ? 0 : Math.max(0, Date.now() - oldest);
   }
 
   private get frames(): number {
     return this.queued.length - this.settled;
   }
 
-  enqueue(bytes: number, now = Date.now()): boolean {
-    if (bytes <= 0) return false;
+  enqueue(bytes: number, now = Date.now(), kind: TerminalBacklogKind = "output"): boolean {
+    if (!Number.isFinite(bytes) || bytes <= 0) return false;
+    const entry = { bytes, kind, at: now };
     this.bytes += bytes;
-    this.queued.push(now);
-    if (this.bytes > MAX_RENDER_BACKLOG_BYTES || this.frames > MAX_RENDER_BACKLOG_FRAMES) {
-      return true;
+    this.queued.push(entry);
+    if (kind === "snapshot") {
+      this.snapshotBytes += bytes;
+      this.snapshotFrames += 1;
+      if (this.oldestSnapshotAt === undefined) this.oldestSnapshotAt = now;
+      return this.snapshotBacklogExceeded(now);
     }
-    const oldest = this.queued[this.settled] ?? now;
-    return this.bytes >= MIN_AGED_RENDER_BACKLOG_BYTES
-      && now - oldest > MAX_RENDER_BACKLOG_AGE_MS;
+    this.outputBytes += bytes;
+    this.outputFrames += 1;
+    if (this.oldestOutputAt === undefined) this.oldestOutputAt = now;
+    return this.outputBacklogExceeded(now);
   }
 
   settle(bytes: number): void {
-    if (bytes <= 0) return;
-    this.bytes = Math.max(0, this.bytes - bytes);
-    if (this.settled < this.queued.length) this.settled += 1;
+    if (!Number.isFinite(bytes) || bytes <= 0) return;
+    let remaining = bytes;
+    while (remaining > 0 && this.settled < this.queued.length) {
+      const entry = this.queued[this.settled];
+      if (!entry) break;
+      const available = entry.bytes - this.settledBytes;
+      const settledBytes = Math.min(remaining, available);
+      this.bytes = Math.max(0, this.bytes - settledBytes);
+      if (entry.kind === "snapshot") {
+        this.snapshotBytes = Math.max(0, this.snapshotBytes - settledBytes);
+      } else {
+        this.outputBytes = Math.max(0, this.outputBytes - settledBytes);
+      }
+      remaining -= settledBytes;
+      this.settledBytes += settledBytes;
+      if (this.settledBytes < entry.bytes) break;
+      if (entry.kind === "snapshot") {
+        this.snapshotFrames = Math.max(0, this.snapshotFrames - 1);
+        this.oldestSnapshotAt = this.findOldest("snapshot", this.settled + 1);
+      } else {
+        this.outputFrames = Math.max(0, this.outputFrames - 1);
+        this.oldestOutputAt = this.findOldest("output", this.settled + 1);
+      }
+      this.settled += 1;
+      this.settledBytes = 0;
+    }
     if (this.settled >= this.queued.length) {
       this.reset();
     } else if (this.settled >= RENDER_BACKLOG_COMPACT_FRAMES) {
@@ -94,8 +148,34 @@ export class TerminalRenderBacklog {
 
   reset(): void {
     this.bytes = 0;
+    this.outputBytes = 0;
+    this.snapshotBytes = 0;
+    this.outputFrames = 0;
+    this.snapshotFrames = 0;
     this.queued = [];
     this.settled = 0;
+    this.settledBytes = 0;
+    this.oldestOutputAt = undefined;
+    this.oldestSnapshotAt = undefined;
+  }
+
+  private findOldest(kind: TerminalBacklogKind, from: number): number | undefined {
+    for (let index = from; index < this.queued.length; index += 1) {
+      if (this.queued[index]?.kind === kind) return this.queued[index]!.at;
+    }
+    return undefined;
+  }
+
+  private outputBacklogExceeded(now: number): boolean {
+    if (this.outputBytes > MAX_RENDER_BACKLOG_BYTES || this.outputFrames > MAX_RENDER_BACKLOG_FRAMES) return true;
+    return this.outputBytes >= MIN_AGED_RENDER_BACKLOG_BYTES
+      && this.oldestOutputAt !== undefined
+      && now - this.oldestOutputAt > MAX_RENDER_BACKLOG_AGE_MS;
+  }
+
+  private snapshotBacklogExceeded(now: number): boolean {
+    if (this.snapshotBytes > MAX_SNAPSHOT_RENDER_BACKLOG_BYTES || this.snapshotFrames > MAX_SNAPSHOT_RENDER_BACKLOG_FRAMES) return true;
+    return this.oldestSnapshotAt !== undefined && now - this.oldestSnapshotAt > MAX_SNAPSHOT_RENDER_BACKLOG_AGE_MS;
   }
 }
 
@@ -124,6 +204,22 @@ export class TerminalStreamState {
 
   get synchronizing(): boolean {
     return this.syncMode !== undefined;
+  }
+
+  get committed(): number | undefined {
+    return this.committedSequence;
+  }
+
+  get received(): number | undefined {
+    return this.receivedSequence;
+  }
+
+  get mode(): TerminalSyncMode | undefined {
+    return this.syncMode;
+  }
+
+  get target(): number | undefined {
+    return this.syncTarget;
   }
 
   get resumeSequence(): number | undefined {

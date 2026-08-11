@@ -182,24 +182,35 @@ describe("terminal xterm checkpoints", () => {
     restored.dispose();
   });
 
-  it("chunks checkpoints with exact ordered offsets below the websocket limit", () => {
-    const bytes = Uint8Array.from({ length: TERMINAL_CHECKPOINT_CHUNK_BYTES * 2 + 17 }, (_, i) => i % 251);
-    const send = vi.fn();
-    sendTerminalCheckpoint({ send }, 123, 7, bytes);
-
-    const messages = send.mock.calls.map(([message]) => JSON.parse(message as string));
-    expect(messages.map((message) => message.offset)).toEqual([
-      0,
+  it("chunks checkpoints at exact boundaries with ordered offsets below the websocket limit", () => {
+    const lengths = [
+      TERMINAL_CHECKPOINT_CHUNK_BYTES - 1,
       TERMINAL_CHECKPOINT_CHUNK_BYTES,
-      TERMINAL_CHECKPOINT_CHUNK_BYTES * 2,
-    ]);
-    expect(messages.map((message) => message.final)).toEqual([false, false, true]);
-    expect(messages.every((message) => JSON.stringify(message).length < 64 * 1024)).toBe(true);
+      TERMINAL_CHECKPOINT_CHUNK_BYTES + 1,
+      TERMINAL_CHECKPOINT_CHUNK_BYTES * 2 + 17,
+    ];
 
-    const restored = Uint8Array.from(messages.flatMap((message) =>
-      Array.from(atob(message.data), (character) => character.charCodeAt(0))
-    ));
-    expect(restored).toEqual(bytes);
+    for (const length of lengths) {
+      const bytes = Uint8Array.from({ length }, (_, i) => i % 251);
+      const send = vi.fn();
+      sendTerminalCheckpoint({ send }, 123, 7, bytes);
+
+      const messages = send.mock.calls.map(([message]) => JSON.parse(message as string));
+      expect(messages.map((message) => message.offset)).toEqual(
+        Array.from({ length: Math.ceil(length / TERMINAL_CHECKPOINT_CHUNK_BYTES) }, (_, index) =>
+          index * TERMINAL_CHECKPOINT_CHUNK_BYTES
+        ),
+      );
+      expect(messages.map((message) => message.final)).toEqual(
+        messages.map((_, index) => index === messages.length - 1),
+      );
+      expect(messages.every((message) => JSON.stringify(message).length < 64 * 1024)).toBe(true);
+
+      const restored = Uint8Array.from(messages.flatMap((message) =>
+        Array.from(atob(message.data), (character) => character.charCodeAt(0))
+      ));
+      expect(restored).toEqual(bytes);
+    }
   });
 });
 

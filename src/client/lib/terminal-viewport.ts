@@ -40,8 +40,28 @@ export function terminalViewportSize(
   };
 }
 
+export function terminalViewportForServerSize(
+  selected: TerminalGridSize,
+  latest?: Pick<TerminalViewportSize, "pixelWidth" | "pixelHeight">,
+): TerminalViewportSize {
+  return {
+    ...selected,
+    pixelWidth: latest?.pixelWidth ?? 0,
+    pixelHeight: latest?.pixelHeight ?? 0,
+  };
+}
+
 function terminalViewportValue(value: number): number {
   return Math.min(TERMINAL_VIEWPORT_MAX_VALUE, Math.max(1, Math.round(value)));
+}
+
+export function nextTerminalViewportReport(
+  reportedKey: string,
+  nextKey: string,
+  socketOpen: boolean,
+): string | undefined {
+  if (!socketOpen || reportedKey === nextKey) return undefined;
+  return nextKey;
 }
 
 export function createSettledTask(

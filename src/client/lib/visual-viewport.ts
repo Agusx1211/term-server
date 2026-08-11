@@ -15,11 +15,13 @@ export function installVisualViewportCssVars(
   sync();
   viewport?.addEventListener("resize", sync);
   viewport?.addEventListener("scroll", sync);
+  view.addEventListener("resize", sync);
   view.addEventListener("orientationchange", sync);
 
   return () => {
     viewport?.removeEventListener("resize", sync);
     viewport?.removeEventListener("scroll", sync);
+    view.removeEventListener("resize", sync);
     view.removeEventListener("orientationchange", sync);
   };
 }

@@ -756,10 +756,7 @@ async fn handle_client_message(
                     serde_json::to_string(&TerminalServerMessage::Pong).expect("serializable pong");
                 send_or_stop!(Message::Text(pong.into()));
             }
-            // Acknowledgements are read-only, so observers are not rejected for
-            // sending them. An observer never registered, and acknowledging an
-            // unregistered client is a no-op.
-            Ok(TerminalClientMessage::Ack { bytes }) => {
+            Ok(TerminalClientMessage::Ack { bytes }) if !observer => {
                 terminal.flow_acknowledged(bytes);
             }
             Ok(_) if observer => {
@@ -863,6 +860,26 @@ async fn handle_client_message(
     Ok(())
 }
 
+fn start_checkpoint(
+    pending: &mut Option<PendingCheckpoint>,
+    sequence: u64,
+    epoch: u64,
+    offset: usize,
+) -> Result<(), &'static str> {
+    if offset != 0 {
+        return Ok(());
+    }
+    if pending.is_some() {
+        *pending = None;
+        return Err("terminal checkpoint chunks are out of order");
+    }
+    *pending = Some(PendingCheckpoint {
+        sequence,
+        epoch,
+        bytes: Vec::new(),
+    });
+    Ok(())
+}
 /// Appends one base64 checkpoint chunk. WebSocket ordering makes an offset
 /// sufficient to reject missing, duplicated, or interleaved chunks, and the
 /// terminal's replay budget bounds the assembly before it is retained.
@@ -875,13 +892,7 @@ fn append_checkpoint(
     data: &str,
     final_chunk: bool,
 ) -> Result<bool, &'static str> {
-    if offset == 0 {
-        *pending = Some(PendingCheckpoint {
-            sequence,
-            epoch,
-            bytes: Vec::new(),
-        });
-    }
+    start_checkpoint(pending, sequence, epoch, offset)?;
     let maximum = terminal.checkpoint_maximum_bytes();
     let Some(current) = pending.as_mut() else {
         return Err("terminal checkpoint is missing its first chunk");
@@ -901,7 +912,7 @@ fn append_checkpoint(
     if decoded.len() > TERMINAL_CHECKPOINT_CHUNK_BYTES {
         *pending = None;
         return Err("terminal checkpoint chunk exceeds the message limit");
-    }
+    };
     if current.bytes.len().saturating_add(decoded.len()) > maximum {
         *pending = None;
         return Err("terminal checkpoint exceeds the replay limit");
@@ -1230,5 +1241,29 @@ mod tests {
         );
         assert!(merged.bytes.len() >= TERMINAL_OUTPUT_COALESCE_BYTES);
         assert!(merged.bytes.len() < TERMINAL_OUTPUT_COALESCE_BYTES + 4095);
+    }
+
+    #[test]
+    fn duplicate_checkpoint_offset_zero_clears_pending_assembly() {
+        let mut pending = Some(PendingCheckpoint {
+            sequence: 7,
+            epoch: 3,
+            bytes: vec![1, 2, 3],
+        });
+
+        let error =
+            start_checkpoint(&mut pending, 7, 3, 0).expect_err("duplicate offset must reject");
+
+        assert_eq!(error, "terminal checkpoint chunks are out of order");
+        assert!(
+            pending.is_none(),
+            "a rejected duplicate must not leave bytes available for final storage"
+        );
+        start_checkpoint(&mut pending, 8, 4, 0)
+            .expect("a new offset-zero upload may start after rejection");
+        let fresh = pending.as_ref().expect("fresh checkpoint assembly");
+        assert_eq!(fresh.sequence, 8);
+        assert_eq!(fresh.epoch, 4);
+        assert!(fresh.bytes.is_empty());
     }
 }

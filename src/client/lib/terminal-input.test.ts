@@ -193,6 +193,18 @@ describe("terminal input encoding", () => {
       userInput: true,
     })).toBe("ignore");
   });
+  it("rejects keyboard and keybar data while connecting or recovering", () => {
+    for (const data of ["keyboard", "\u001b", "\t", "\u001b[D"]) {
+      expect(terminalDataDisposition({
+        acceptingInput: false,
+        data,
+        parsingOutput: false,
+        responder: true,
+        userInput: true,
+      })).toBe("ignore");
+    }
+  });
+
 });
 
 function concatenate(chunks: readonly Uint8Array[]): Uint8Array {
