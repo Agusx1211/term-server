@@ -1,14 +1,56 @@
 # Changelog
 
-## Unreleased
+## 0.13.0 - 2026-08-11
+
+### Added
+
+- Terminal panes can now be resized with the mouse or keyboard. The browser can also override its
+  terminal scrollback under **Settings → Terminal behavior**, with a reset action that returns to
+  the server default. This limit applies to the browser renderer and does not change the terminal
+  process or server replay history.
+- The repository now runs a comprehensive isolated end-to-end suite. Pull requests run two serial
+  Chromium shards and a fallback-renderer gate; release builds run packaged smoke tests; scheduled
+  workflows cover Chromium, Firefox, and WebKit at multiple device pixel ratios, plus a weekly
+  Chromium soak.
+
+### Changed
+
+- Exited terminals remain available in workspace history after the process exits, up to a bounded
+  retention of 32 sessions. The oldest exited sessions are evicted and their PTY, input-queue, and
+  replay resources are released, while running sessions are never candidates for eviction.
+- Initial workspace configuration now loads agent integration status lazily. The authenticated
+  integration inspection runs when its settings are opened instead of delaying the first workspace
+  render, and concurrent authentication transitions cancel stale requests before they can restore
+  old terminal or integration state.
 
 ### Fixed
 
-- The agent activity pill now treats a connector's own status report as the source of truth. When
-  omp, pi, codex, or claude reports its state through its hook connector, that signal outranks the
-  screen-content heuristics, so an agent driving subagents (which reports itself as working even when
-  its own TUI looks idle) no longer flips to "ready" prematurely. Screen detection and CPU/output
-  heuristics still drive terminals without a live connector.
+- Terminal output flow control now distinguishes ordinary PTY output from canonical snapshots. Large
+  valid snapshots no longer trigger a false render-backlog reconnect, while stalled renderer memory
+  remains bounded. Read-only observer panes can no longer acknowledge bytes on behalf of the
+  controlling browser.
+- Terminal reconnect and resize paths preserve split UTF-8 sequences, one-row wrapping, wrapped
+  scrollback, cursor state, and terminal modes. Viewport election no longer chooses a disconnected
+  or size-less client, and cached panes no longer override the size selected by visible panes.
+- Terminal panes stop accepting input while disconnected, cached, or exited. Repeated pre-sync
+  protocol failures stop retrying forever and tell the user to reload, while renderer load failures
+  and WebGL context loss fall back to the built-in canvas renderer without losing terminal state.
+- Pane layout now keeps the next appropriate pane active when a pane is closed, and its splitters
+  expose pointer and keyboard controls with bounded ratios. The agent activity pill also treats a
+  connector's own status report as authoritative, so an agent driving subagents no longer flips to
+  "ready" while its connector still reports working.
+
+### Security
+
+- The server restart and session-expiry controls used by the E2E suite are compiled only with the
+  `e2e` feature and require authenticated same-origin requests. They are absent from normal builds;
+  no production credential or session format changes are introduced.
+
+### Upgrade notes
+
+- There are no breaking changes, database migrations, or manual upgrade steps. The scrollback
+  override is browser-local; clear it under **Settings → Terminal behavior** to follow the server
+  default again.
 
 ## 0.12.2 - 2026-08-10
 
