@@ -279,6 +279,12 @@ struct ClientConfig {
     updates: UpdateConfig,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct ConfigQuery {
+    #[serde(rename = "agentIntegrations")]
+    agent_integrations: Option<String>,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ClientTerminalInfo {
@@ -605,11 +611,20 @@ async fn change_password(
 async fn config(
     State(state): State<AppState>,
     jar: CookieJar,
+    Query(query): Query<ConfigQuery>,
 ) -> Result<Json<ClientConfig>, ApiError> {
     require_auth(&jar, &state)?;
-    let (pi, broker) =
-        tokio::try_join!(state.workspace.pi_config(), state.workspace.broker_info())?;
-    let agent_integrations = state.agent_integrations.status().await;
+    let workspace_config =
+        tokio::try_join!(state.workspace.pi_config(), state.workspace.broker_info());
+    let (pi, broker) = workspace_config?;
+    let agent_integrations = if query.agent_integrations.as_deref() == Some("lazy") {
+        AgentIntegrationsConfig {
+            providers: Vec::new(),
+            fallbacks_enabled: true,
+        }
+    } else {
+        state.agent_integrations.status().await
+    };
     Ok(Json(ClientConfig {
         scrollback_lines: state.scrollback_lines,
         max_panes: state.max_panes,
@@ -750,6 +765,32 @@ async fn restart_broker(
         control.restart_broker();
     });
     Ok(Json(broker))
+}
+
+#[cfg(feature = "e2e")]
+async fn e2e_server_restart(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_origin(&headers, &uri, &state)?;
+    require_auth(&jar, &state)?;
+    state.server_control.restart();
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[cfg(feature = "e2e")]
+async fn e2e_auth_expire(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_origin(&headers, &uri, &state)?;
+    require_auth(&jar, &state)?;
+    state.auth.expire_sessions();
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 async fn update_pi_config(
@@ -1355,9 +1396,12 @@ async fn debug_recording_status(
 
 async fn debug_recording_control(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
     jar: CookieJar,
     Json(body): Json<DebugRecordingControl>,
 ) -> Result<Json<DebugRecordingStatus>, ApiError> {
+    require_origin(&headers, &uri, &state)?;
     require_auth(&jar, &state)?;
     let status = match body.action {
         DebugRecordingAction::Start => state.debug_recording.start(),
@@ -1447,6 +1491,11 @@ pub fn build_router(state: AppState, client_directory: Option<PathBuf>) -> Route
             header::CACHE_CONTROL,
             HeaderValue::from_static("no-store"),
         ));
+
+    #[cfg(feature = "e2e")]
+    let api = api
+        .route("/e2e/server/restart", post(e2e_server_restart))
+        .route("/e2e/auth/expire", post(e2e_auth_expire));
     let secure = state.secure;
     let mut router = Router::new()
         .route("/healthz", get(health))
@@ -1907,7 +1956,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/api/config")
+                    .uri("/api/config?agentIntegrations=lazy")
                     .header(header::COOKIE, cookie)
                     .body(Body::empty())
                     .unwrap(),
@@ -1926,8 +1975,42 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            4
+            0
         );
+    }
+
+    #[tokio::test]
+    async fn config_keeps_agent_integrations_compatible_with_split_endpoint() {
+        let (app, cookie) = authenticated_app().await;
+        let config = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let config: serde_json::Value =
+            serde_json::from_slice(&to_bytes(config.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+
+        let split = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config/agent-integrations")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let split: serde_json::Value =
+            serde_json::from_slice(&to_bytes(split.into_body(), 64 * 1024).await.unwrap()).unwrap();
+
+        assert_eq!(config["agentIntegrations"], split);
     }
 
     #[tokio::test]
@@ -2664,5 +2747,121 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+    #[cfg(feature = "e2e")]
+    #[tokio::test]
+    async fn e2e_server_restart_requires_auth_and_origin() {
+        let (app, cookie) = authenticated_app().await;
+
+        let unauthenticated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/e2e/server/restart")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let cross_origin = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/e2e/server/restart")
+                    .header(header::COOKIE, &cookie)
+                    .header(header::ORIGIN, "https://attacker.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cross_origin.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("http://localhost/api/e2e/server/restart")
+                    .header(header::HOST, "localhost")
+                    .header(header::ORIGIN, "http://localhost")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .as_ref(),
+            br#"{"ok":true}"#,
+        );
+    }
+
+    #[cfg(feature = "e2e")]
+    #[tokio::test]
+    async fn e2e_auth_expire_revokes_existing_cookie_without_changing_password() {
+        let (app, cookie) = authenticated_app().await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("http://localhost/api/e2e/auth/expire")
+                    .header(header::HOST, "localhost")
+                    .header(header::ORIGIN, "http://localhost")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .as_ref(),
+            br#"{"ok":true}"#,
+        );
+
+        let after_expiry = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(after_expiry.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[cfg(not(feature = "e2e"))]
+    #[tokio::test]
+    async fn e2e_control_routes_are_absent_from_normal_builds() {
+        let app = build_router(test_state().await, None);
+        for path in ["/api/e2e/server/restart", "/api/e2e/auth/expire"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
     }
 }

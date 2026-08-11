@@ -55,6 +55,10 @@ import {
   describeCachedTerminals,
 } from "../lib/cached-terminals";
 import {
+  clampTerminalScrollback,
+  TERMINAL_SCROLLBACK_LIMITS,
+} from "../lib/terminal-scrollback";
+import {
   agentIntegrationActionFor,
   agentIntegrationProfileSummary,
 } from "../lib/agent-integrations";
@@ -86,6 +90,9 @@ interface SettingsWorkspaceProps {
   cachedTerminals: number;
   cachedTerminalsOverridden: boolean;
   serverCachedTerminals: number;
+  scrollbackLines: number;
+  scrollbackLinesOverridden: boolean;
+  serverScrollbackLines: number;
   recording: DebugRecordingStatus | null;
   frontendRecordingEvents: number;
   recordingBusy: boolean;
@@ -110,6 +117,7 @@ interface SettingsWorkspaceProps {
   onConfirmTerminalKillsChange: (enabled: boolean) => void;
   onTerminalPreviewSettingsChange: (settings: TerminalPreviewSettings) => void;
   onCachedTerminalsChange: (limit: number | undefined) => void;
+  onScrollbackLinesChange: (lines: number | undefined) => void;
   onRecordingStart: () => void;
   onRecordingStop: () => void;
   onRecordingDownload: () => void;
@@ -212,6 +220,9 @@ export function SettingsWorkspace({
   cachedTerminals,
   cachedTerminalsOverridden,
   serverCachedTerminals,
+  scrollbackLines,
+  scrollbackLinesOverridden,
+  serverScrollbackLines,
   recording,
   frontendRecordingEvents,
   recordingBusy,
@@ -230,6 +241,7 @@ export function SettingsWorkspace({
   onConfirmTerminalKillsChange,
   onTerminalPreviewSettingsChange,
   onCachedTerminalsChange,
+  onScrollbackLinesChange,
   onRecordingStart,
   onRecordingStop,
   onRecordingDownload,
@@ -449,6 +461,42 @@ export function SettingsWorkspace({
                   onClick={() => onCachedTerminalsChange(undefined)}
                 >
                   Use the server default ({describeCachedTerminals(serverCachedTerminals)})
+                </button>
+              )}
+            </fieldset>
+            <fieldset class="terminal-preview-setting">
+              <legend>Terminal scrollback</legend>
+              <p class="settings-hint">
+                This browser keeps its own terminal history. Changing the limit recreates each
+                mounted renderer without changing the terminal process or server history.
+              </p>
+              <label class="terminal-preview-range">
+                <span>
+                  <b>Scrollback lines</b>
+                  <output>{scrollbackLines.toLocaleString()} lines</output>
+                </span>
+                <input
+                  type="number"
+                  aria-label="Terminal scrollback lines"
+                  min={TERMINAL_SCROLLBACK_LIMITS.min}
+                  max={TERMINAL_SCROLLBACK_LIMITS.max}
+                  step={TERMINAL_SCROLLBACK_LIMITS.step}
+                  value={scrollbackLines}
+                  onInput={(event) => onScrollbackLinesChange(
+                    clampTerminalScrollback(Number(event.currentTarget.value)),
+                  )}
+                />
+                <small>
+                  Resolved browser value; the server default is {serverScrollbackLines.toLocaleString()} lines.
+                </small>
+              </label>
+              {scrollbackLinesOverridden && (
+                <button
+                  type="button"
+                  class="terminal-preview-reset"
+                  onClick={() => onScrollbackLinesChange(undefined)}
+                >
+                  Use the server default ({serverScrollbackLines.toLocaleString()} lines)
                 </button>
               )}
             </fieldset>

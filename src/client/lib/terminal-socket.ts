@@ -9,6 +9,26 @@ export function addTerminalStreamProtocol(url: URL): URL {
   return url;
 }
 
+/** A pre-sync stream may retry transiently, but must not loop forever on a bad handshake. */
+export const TERMINAL_SOCKET_PRE_SYNC_FAILURE_LIMIT = 4;
+
+export class TerminalSocketFailureTracker {
+  private failures = 0;
+
+  recordBeforeReady(): boolean {
+    this.failures += 1;
+    return this.failures >= TERMINAL_SOCKET_PRE_SYNC_FAILURE_LIMIT;
+  }
+
+  reset(): void {
+    this.failures = 0;
+  }
+
+  get count(): number {
+    return this.failures;
+  }
+}
+
 const CLOSE_DETAILS: Record<TerminalSocketCloseCause, { code: number; reason: string }> = {
   backlog: { code: 4003, reason: "Terminal renderer fell behind" },
   "protocol-error": { code: 4002, reason: "Invalid terminal stream" },

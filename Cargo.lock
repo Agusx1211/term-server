@@ -2105,7 +2105,7 @@ dependencies = [
 
 [[package]]
 name = "term-server"
-version = "0.12.2"
+version = "0.13.0"
 dependencies = [
  "argon2",
  "axum",
@@ -2122,6 +2122,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "ignore",
+ "libc",
  "mime_guess",
  "panoptes-vt100",
  "parking_lot",
@@ -2147,6 +2148,7 @@ dependencies = [
  "tower-http 0.7.0",
  "tracing",
  "tracing-subscriber",
+ "unicode-width",
  "uuid",
 ]
 

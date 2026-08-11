@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 import {
   addTerminalStreamProtocol,
   closeTerminalSocket,
+  TERMINAL_SOCKET_PRE_SYNC_FAILURE_LIMIT,
+  TerminalSocketFailureTracker,
   TERMINAL_STREAM_PROTOCOL,
   type TerminalSocketCloseCause,
 } from "./terminal-socket";
@@ -11,6 +13,23 @@ describe("terminal stream negotiation", () => {
     const url = addTerminalStreamProtocol(new URL("wss://terminal.test/api/terminals/1/socket"));
 
     expect(url.searchParams.get("stream")).toBe(String(TERMINAL_STREAM_PROTOCOL));
+  });
+});
+
+describe("terminal WebSocket pre-sync failure tracking", () => {
+  it("bounds failures before synced and resets after a successful sync", () => {
+    const tracker = new TerminalSocketFailureTracker();
+
+    for (let attempt = 1; attempt < TERMINAL_SOCKET_PRE_SYNC_FAILURE_LIMIT; attempt += 1) {
+      expect(tracker.recordBeforeReady()).toBe(false);
+      expect(tracker.count).toBe(attempt);
+    }
+    expect(tracker.recordBeforeReady()).toBe(true);
+    expect(tracker.count).toBe(TERMINAL_SOCKET_PRE_SYNC_FAILURE_LIMIT);
+
+    tracker.reset();
+    expect(tracker.count).toBe(0);
+    expect(tracker.recordBeforeReady()).toBe(false);
   });
 });
 

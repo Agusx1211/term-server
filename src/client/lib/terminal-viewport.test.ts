@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createSettledTask,
+  nextTerminalViewportReport,
+  terminalViewportForServerSize,
   terminalViewportSize,
 } from "./terminal-viewport";
 
@@ -24,6 +26,37 @@ describe("terminal viewport sizing", () => {
       { cols: 80, rows: 24 },
       { cols: 80, rows: 24, pixelWidth: 0, pixelHeight: 408 },
     )).toBeUndefined();
+  });
+});
+
+describe("server-selected terminal viewport diagnostics", () => {
+  it("pairs size control cells with the latest sent or URL viewport pixels", () => {
+    const initial = { cols: 80, rows: 24, pixelWidth: 720, pixelHeight: 408 };
+    const latest = { cols: 120, rows: 36, pixelWidth: 1080, pixelHeight: 612 };
+
+    expect(terminalViewportForServerSize(
+      { cols: latest.cols, rows: latest.rows },
+      latest,
+    )).toEqual(latest);
+    expect(terminalViewportForServerSize(
+      { cols: 120, rows: 36 },
+      initial,
+    )).toEqual({
+      cols: 120,
+      rows: 36,
+      pixelWidth: initial.pixelWidth,
+      pixelHeight: initial.pixelHeight,
+    });
+  });
+});
+
+describe("socket-ready viewport reporting", () => {
+  it("keeps a connecting resize pending until the socket opens", () => {
+    const initial = "80x24@720x408";
+    const resized = "120x36@1080x612";
+
+    expect(nextTerminalViewportReport(initial, resized, false)).toBeUndefined();
+    expect(nextTerminalViewportReport(initial, resized, true)).toBe(resized);
   });
 });
 

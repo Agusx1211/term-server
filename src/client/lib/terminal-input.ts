@@ -86,10 +86,14 @@ function chunkBytes(
   bytes: TerminalInputChunk,
   maximum = MAX_TERMINAL_INPUT_CHUNK_BYTES,
 ): TerminalInputChunk[] {
-  const size = Math.max(1, Math.floor(maximum));
+  const size = Number.isFinite(maximum)
+    ? Math.max(1, Math.floor(maximum))
+    : maximum === Number.POSITIVE_INFINITY
+      ? Math.max(1, bytes.byteLength)
+      : 1;
   const chunks: TerminalInputChunk[] = [];
   for (let offset = 0; offset < bytes.byteLength; offset += size) {
-    chunks.push(bytes.slice(offset, Math.min(bytes.byteLength, offset + size)));
+    chunks.push(bytes.subarray(offset, Math.min(bytes.byteLength, offset + size)));
   }
   return chunks;
 }

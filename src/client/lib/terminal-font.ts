@@ -1,3 +1,5 @@
+import { waitForE2EFontLoad } from "./e2e-diagnostics";
+
 export const TERMINAL_FONT_FAMILY =
   "'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, 'Symbols Nerd Font Mono', monospace";
 
@@ -13,10 +15,12 @@ const fontLoads = new WeakMap<TerminalFontLoader, Promise<void>>();
 /** Starts the bundled symbol fallback once and treats font loading as best effort. */
 export function loadTerminalNerdFont(
   fonts: TerminalFontLoader = document.fonts,
+  waitForGate: () => Promise<void> = waitForE2EFontLoad,
 ): Promise<void> {
   const existing = fontLoads.get(fonts);
   if (existing) return existing;
   const ready = Promise.resolve()
+    .then(() => waitForGate())
     .then(() => fonts.load(NERD_FONT_LOAD_SPEC, NERD_FONT_PROBE))
     .then(() => undefined, () => undefined);
   fontLoads.set(fonts, ready);

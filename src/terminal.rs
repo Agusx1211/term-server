@@ -63,6 +63,9 @@ const TERMINAL_RESPONSE_QUEUE_MESSAGES: usize = 256;
 /// queued output before sending, so this only has to cover what accumulates
 /// behind one in-flight write rather than a whole slow client.
 const TERMINAL_EVENT_CAPACITY: usize = 1024;
+/// Keep exited terminals available for history/reconnect without retaining an
+/// unbounded PTY, input queue, and replay buffer for every session ever run.
+const MAX_RETAINED_EXITED_SESSIONS: usize = 32;
 /// Unacknowledged output bytes before the pty read loop stops draining the
 /// master. The master's buffer then fills and the process writing to it blocks,
 /// which is the only backpressure that reaches a TUI. Matches VS Code's
@@ -298,7 +301,13 @@ impl ClientViewports {
             self.focused_client = None;
         }
         if self.responder_client == Some(client_id) {
-            self.responder_client = self.sizes.keys().copied().min();
+            self.responder_client = self
+                .sizes
+                .iter()
+                .filter(|(_, size)| size.is_some())
+                .map(|(id, _)| *id)
+                .min()
+                .or_else(|| self.sizes.keys().copied().min());
         }
     }
 
@@ -597,6 +606,7 @@ struct SessionActivity {
     generated_title: Option<String>,
     initial_title_prompt: Option<String>,
     agent_pid: Option<u32>,
+    agent_start_ticks: Option<u64>,
     last_cpu_ticks: u64,
     last_sample_output_bytes: u64,
     active_samples: u8,
@@ -611,6 +621,8 @@ struct SessionActivity {
     native_provider: Option<String>,
     native_status: Option<AgentStatus>,
     native_updated_at: u64,
+    native_sequence_provider: Option<String>,
+    last_native_sequence: Option<u64>,
     foreground_command: ForegroundCommandTracker,
 }
 
@@ -621,6 +633,7 @@ impl Default for SessionActivity {
             generated_title: None,
             initial_title_prompt: None,
             agent_pid: None,
+            agent_start_ticks: None,
             last_cpu_ticks: 0,
             last_sample_output_bytes: 0,
             active_samples: 0,
@@ -635,6 +648,8 @@ impl Default for SessionActivity {
             native_provider: None,
             native_status: None,
             native_updated_at: 0,
+            native_sequence_provider: None,
+            last_native_sequence: None,
             foreground_command: ForegroundCommandTracker::default(),
         }
     }
@@ -657,6 +672,45 @@ impl SessionActivity {
         self.native_status = None;
         self.native_updated_at = 0;
         true
+    }
+
+    fn clear_native_sequence(&mut self) {
+        self.native_sequence_provider = None;
+        self.last_native_sequence = None;
+    }
+
+    /// Accept a native report only if it cannot be older than a sequenced
+    /// report from the same active source. Legacy unsequenced reports remain
+    /// valid until that source has established sequence authority.
+    fn accept_native_sequence(&mut self, provider: &str, sequence: Option<u64>) -> bool {
+        match self.native_sequence_provider.as_deref() {
+            Some(active_provider) if active_provider == provider => {
+                match (self.last_native_sequence, sequence) {
+                    (Some(last), Some(next)) if next <= last => false,
+                    (Some(_), None) => false,
+                    (_, Some(next)) => {
+                        self.last_native_sequence = Some(next);
+                        true
+                    }
+                    (None, None) => true,
+                }
+            }
+            Some(_) => {
+                self.clear_native_sequence();
+                if let Some(next) = sequence {
+                    self.native_sequence_provider = Some(provider.to_owned());
+                    self.last_native_sequence = Some(next);
+                }
+                true
+            }
+            None => {
+                if let Some(next) = sequence {
+                    self.native_sequence_provider = Some(provider.to_owned());
+                    self.last_native_sequence = Some(next);
+                }
+                true
+            }
+        }
     }
 
     fn queue_title_for_submission(
@@ -917,6 +971,72 @@ pub(crate) fn screen_detection_outcome(
         }
         agent_detection::DetectedState::Idle => DetectionOutcome::Undecided,
         agent_detection::DetectedState::Unknown => DetectionOutcome::Keep,
+    }
+}
+
+/// Resolve the next agent status from the available signals, in priority order.
+///
+/// 1. A connector-reported status (`native_status`) is authoritative. omp, pi,
+///    codex and claude each ship a hook connector that delivers the agent's own
+///    state here, and every one of them covers the waiting-for-input case
+///    (PermissionRequest / Notification → Blocked). The agent knows whether it
+///    is working or settled, and that report outranks a screen-content guess:
+///    an agent driving subagents reports itself as working even when its own
+///    TUI is idle, and a settled agent reports itself as idle even when a
+///    spinner frame lingers on screen. `Keep` (an overlay hiding the agent)
+///    does not override a live connector signal — the agent is still reporting
+///    behind the overlay.
+/// 2. Screen-content detection: `blocked` and `working` from a matched rule,
+///    or a visible idle prompt.
+/// 3. The OSC-reported state and the CPU/output heuristics
+///    ([`select_agent_status`]).
+///
+/// Freshness is enforced upstream: [`SessionActivity::expire_native_state`]
+/// clears a non-`Blocked` status once it is older than
+/// `NATIVE_EVENT_FRESH_MILLIS`, so a `native_status` present here is either
+/// fresh or a held `Blocked`. When the connector stops reporting, the field is
+/// `None` and the screen + heuristic tiers take over.
+/// Inputs for the fallback tiers (screen detection, then heuristics) of
+/// [`resolve_agent_status`], gathered so the resolver stays readable.
+struct StatusFallback<'a> {
+    agent_kind: &'a str,
+    current_status: AgentStatus,
+    reported_state: Option<(ReportedAgentState, u64)>,
+    now: u64,
+    input_submitted_at: u64,
+    active_samples: u8,
+    quiet_samples: u8,
+}
+
+fn resolve_agent_status(
+    native_status: Option<AgentStatus>,
+    detection: Option<&agent_detection::Detection>,
+    fallback: StatusFallback,
+) -> AgentStatus {
+    if let Some(native) = native_status {
+        return native;
+    }
+    let StatusFallback {
+        agent_kind,
+        current_status,
+        reported_state,
+        now,
+        input_submitted_at,
+        active_samples,
+        quiet_samples,
+    } = fallback;
+    match screen_detection_outcome(detection) {
+        DetectionOutcome::Keep => current_status,
+        DetectionOutcome::Status(status) => status,
+        DetectionOutcome::Undecided => select_agent_status(
+            agent_kind,
+            current_status,
+            reported_state,
+            now,
+            input_submitted_at,
+            active_samples,
+            quiet_samples,
+        ),
     }
 }
 
@@ -1387,6 +1507,7 @@ pub struct TerminalSession {
     signals: Mutex<TerminalSignals>,
     process_tracker: Mutex<ProcessTracker>,
     flow: FlowControl,
+    exit_order: AtomicU64,
     home_directory: PathBuf,
 }
 
@@ -1709,8 +1830,12 @@ impl TerminalSession {
         }
     }
 
-    fn exited(&self, exit_code: u32) {
+    fn exited(&self, exit_code: u32, exit_order: u64) {
         self.flow_release();
+        // Publish the retention order before exposing the exited status so a
+        // concurrent prune can never mistake a freshly exited session for the
+        // oldest retained entry (the default order is zero).
+        self.exit_order.store(exit_order, Ordering::Release);
         {
             let mut info = self.info.write();
             info.status = TerminalStatus::Exited;
@@ -1843,12 +1968,27 @@ impl TerminalSession {
 
         let mut outcome = RefreshOutcome::default();
         if let Some(agent) = observation.agent {
+            let process_identity_changed = activity.agent_pid.is_some()
+                && (activity.agent_pid != Some(agent.pid)
+                    || activity
+                        .agent_start_ticks
+                        .is_some_and(|start_ticks| start_ticks != agent.start_ticks));
+            let provider_changed = info
+                .agent
+                .as_ref()
+                .is_some_and(|current| current.kind != agent.kind);
             let is_new_agent = activity.agent_pid != Some(agent.pid)
+                || activity
+                    .agent_start_ticks
+                    .is_some_and(|start_ticks| start_ticks != agent.start_ticks)
                 || info
                     .agent
                     .as_ref()
                     .is_none_or(|current| current.kind != agent.kind);
             if is_new_agent {
+                if process_identity_changed || provider_changed {
+                    activity.clear_native_sequence();
+                }
                 let preserve_native_state = activity.native_provider.as_deref()
                     == Some(agent.kind.as_str())
                     && info
@@ -1865,6 +2005,7 @@ impl TerminalSession {
                                 && submission.agent_kind == agent.kind
                         });
                 activity.agent_pid = Some(agent.pid);
+                activity.agent_start_ticks = Some(agent.start_ticks);
                 activity.last_cpu_ticks = agent.cpu_ticks;
                 activity.last_sample_output_bytes = output_bytes;
                 activity.active_samples = 0;
@@ -1944,23 +2085,19 @@ impl TerminalSession {
                     .as_ref()
                     .map(|current| current.status.clone())
                     .unwrap_or(AgentStatus::Idle);
-                let next_status = match screen_detection_outcome(detection.as_ref()) {
-                    DetectionOutcome::Keep => current_status,
-                    DetectionOutcome::Status(status) => status,
-                    DetectionOutcome::Undecided => {
-                        activity.native_status.clone().unwrap_or_else(|| {
-                            select_agent_status(
-                                &agent.kind,
-                                current_status,
-                                reported_state,
-                                now,
-                                activity.input_submitted_at,
-                                activity.active_samples,
-                                activity.quiet_samples,
-                            )
-                        })
-                    }
-                };
+                let next_status = resolve_agent_status(
+                    activity.native_status.clone(),
+                    detection.as_ref(),
+                    StatusFallback {
+                        agent_kind: &agent.kind,
+                        current_status,
+                        reported_state,
+                        now,
+                        input_submitted_at: activity.input_submitted_at,
+                        active_samples: activity.active_samples,
+                        quiet_samples: activity.quiet_samples,
+                    },
+                );
                 if let Some(current) = info.agent.as_mut()
                     && current.status != next_status
                 {
@@ -2012,7 +2149,6 @@ impl TerminalSession {
             {
                 let completed_task = activity.input_submitted_at > 0;
                 current.status = AgentStatus::Closed;
-                current.status_changed_at = now;
                 current.revision = current.revision.saturating_add(1);
                 current.activity = None;
                 if completed_task {
@@ -2031,6 +2167,7 @@ impl TerminalSession {
                 }
             }
             activity.agent_pid = None;
+            activity.agent_start_ticks = None;
             activity.active_samples = 0;
             activity.quiet_samples = 0;
             activity.input_submitted_at = 0;
@@ -2039,6 +2176,7 @@ impl TerminalSession {
             activity.native_provider = None;
             activity.native_status = None;
             activity.native_updated_at = 0;
+            activity.clear_native_sequence();
             *self.signals.lock() = TerminalSignals::default();
             if !observation.shell_foreground {
                 activity.generated_title = None;
@@ -2073,6 +2211,9 @@ impl TerminalSession {
     ) -> RefreshOutcome {
         let mut activity = self.activity.lock();
         let mut info = self.info.write();
+        if !activity.accept_native_sequence(&event.provider, event.sequence) {
+            return RefreshOutcome::default();
+        }
         activity.foreground_command.candidate = None;
         info.command = None;
         let next_status = match event.kind {
@@ -2224,6 +2365,7 @@ pub struct TerminalManager {
     sessions: Arc<RwLock<HashMap<Uuid, Arc<TerminalSession>>>>,
     default_shell: RwLock<Option<String>>,
     replay_bytes: AtomicUsize,
+    next_exit_order: Arc<AtomicU64>,
     home_directory: PathBuf,
     agent_event_socket: Option<PathBuf>,
     executable: Option<PathBuf>,
@@ -2238,6 +2380,7 @@ impl TerminalManager {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             default_shell: RwLock::new(default_shell),
             replay_bytes: AtomicUsize::new(replay_bytes),
+            next_exit_order: Arc::new(AtomicU64::new(0)),
             home_directory,
             agent_event_socket: None,
             executable: std::env::current_exe().ok(),
@@ -2254,7 +2397,35 @@ impl TerminalManager {
         self.replay_bytes.store(replay_bytes, Ordering::Relaxed);
     }
 
+    fn prune_exited_sessions(&self) {
+        let mut sessions = self.sessions.write();
+        let mut exited = sessions
+            .iter()
+            .filter_map(|(id, session)| {
+                (session.info.read().status == TerminalStatus::Exited)
+                    .then_some((*id, session.exit_order.load(Ordering::Acquire)))
+            })
+            .collect::<Vec<_>>();
+        if exited.len() <= MAX_RETAINED_EXITED_SESSIONS {
+            return;
+        }
+        exited.sort_unstable_by_key(|(id, order)| (*order, *id));
+        let remove_count = exited.len() - MAX_RETAINED_EXITED_SESSIONS;
+        let removed = exited
+            .into_iter()
+            .take(remove_count)
+            .filter_map(|(id, _)| sessions.remove(&id))
+            .collect::<Vec<_>>();
+        drop(sessions);
+        // Dropping the manager's Arc releases replay/PTY resources once any
+        // active socket has released its own reference. Never kill here: all
+        // selected sessions have already reported Exited, and running sessions
+        // are not candidates for this list.
+        drop(removed);
+    }
+
     pub fn list(&self) -> Vec<TerminalInfo> {
+        self.prune_exited_sessions();
         let mut terminals: Vec<_> = self
             .sessions
             .read()
@@ -2266,7 +2437,17 @@ impl TerminalManager {
     }
 
     pub fn get(&self, id: Uuid) -> Option<Arc<TerminalSession>> {
+        self.prune_exited_sessions();
         self.sessions.read().get(&id).cloned()
+    }
+
+    pub fn running_count(&self) -> usize {
+        self.prune_exited_sessions();
+        self.sessions
+            .read()
+            .values()
+            .filter(|session| session.info.read().status == TerminalStatus::Running)
+            .count()
     }
 
     pub fn start_monitor(self: &Arc<Self>, pi: Arc<PiService>) {
@@ -2295,6 +2476,7 @@ impl TerminalManager {
     }
 
     fn refresh_processes(&self, pi: Arc<PiService>) {
+        self.prune_exited_sessions();
         let sessions = self.sessions.read().values().cloned().collect::<Vec<_>>();
         let shell_pids = sessions
             .iter()
@@ -2329,6 +2511,7 @@ impl TerminalManager {
     }
 
     pub fn create(&self, request: CreateTerminal) -> Result<TerminalInfo, TerminalError> {
+        self.prune_exited_sessions();
         let requested_name = request
             .path
             .as_deref()
@@ -2455,20 +2638,21 @@ impl TerminalManager {
             signals: Mutex::new(TerminalSignals::default()),
             process_tracker: Mutex::new(ProcessTracker::default()),
             flow: FlowControl::default(),
+            exit_order: AtomicU64::new(0),
             home_directory: self.home_directory.clone(),
         });
         sessions.insert(id, session.clone());
         drop(sessions);
 
         let output_session = session.clone();
-        let sessions_on_exit = self.sessions.clone();
+        let next_exit_order = self.next_exit_order.clone();
         thread::Builder::new()
             .name(format!("terminal-output-{id}"))
             .spawn(move || {
                 read_output(reader, output_session.clone());
                 let exit_code = child.wait().map(|status| status.exit_code()).unwrap_or(1);
-                output_session.exited(exit_code);
-                sessions_on_exit.write().remove(&id);
+                let exit_order = next_exit_order.fetch_add(1, Ordering::Relaxed);
+                output_session.exited(exit_code, exit_order);
             })
             .map_err(|error| TerminalError::Io(error.to_string()))?;
 
@@ -4131,12 +4315,101 @@ mod tests {
     }
 
     #[test]
-    fn starts_writes_resizes_and_removes_a_terminal() {
+    fn bounds_exited_session_retention_and_preserves_running_sessions() {
         let directory = tempfile::tempdir().unwrap();
         let manager = TerminalManager {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             default_shell: RwLock::new(Some("/bin/sh".into())),
             replay_bytes: AtomicUsize::new(1024 * 1024),
+            next_exit_order: Arc::new(AtomicU64::new(0)),
+            home_directory: directory.path().to_path_buf(),
+            agent_event_socket: None,
+            executable: None,
+        };
+        let running = manager
+            .create(CreateTerminal {
+                path: None,
+                cwd: None,
+                shell: None,
+                clone_from: None,
+            })
+            .unwrap();
+        let running_session = manager.get(running.id).unwrap();
+        let mut exited_ids = Vec::with_capacity(MAX_RETAINED_EXITED_SESSIONS + 1);
+        let mut first_weak = None;
+
+        for index in 0..=MAX_RETAINED_EXITED_SESSIONS {
+            let info = manager
+                .create(CreateTerminal {
+                    path: None,
+                    cwd: None,
+                    shell: None,
+                    clone_from: None,
+                })
+                .unwrap();
+            let session = manager.get(info.id).unwrap();
+            if index == 0 {
+                first_weak = Some(Arc::downgrade(&session));
+            }
+            session.write(b"exit\n").unwrap();
+            let exited = (0..100).find(|_| {
+                let status = manager
+                    .get(info.id)
+                    .map(|candidate| candidate.info().status);
+                if status == Some(TerminalStatus::Exited) {
+                    true
+                } else {
+                    thread::sleep(Duration::from_millis(10));
+                    false
+                }
+            });
+            assert!(exited.is_some(), "terminal {id} did not exit", id = info.id);
+            exited_ids.push(info.id);
+        }
+        drop(running_session);
+
+        assert!(manager.get(exited_ids[0]).is_none());
+        assert!(
+            manager
+                .list()
+                .into_iter()
+                .filter(|info| info.status == TerminalStatus::Exited)
+                .count()
+                <= MAX_RETAINED_EXITED_SESSIONS
+        );
+        assert_eq!(
+            manager.get(running.id).unwrap().info().status,
+            TerminalStatus::Running
+        );
+
+        let first_weak = first_weak.expect("first exited session was not captured");
+        let released = (0..100).any(|_| {
+            if first_weak.upgrade().is_none() {
+                true
+            } else {
+                thread::sleep(Duration::from_millis(10));
+                false
+            }
+        });
+        assert!(
+            released,
+            "evicted exited session still retains PTY resources"
+        );
+
+        manager.remove(running.id);
+        for id in exited_ids {
+            manager.remove(id);
+        }
+    }
+
+    #[test]
+    fn starts_writes_resizes_and_retains_an_exited_terminal() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = TerminalManager {
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            default_shell: RwLock::new(Some("/bin/sh".into())),
+            replay_bytes: AtomicUsize::new(1024 * 1024),
+            next_exit_order: Arc::new(AtomicU64::new(0)),
             home_directory: directory.path().to_path_buf(),
             agent_event_socket: None,
             executable: None,
@@ -4184,15 +4457,22 @@ mod tests {
         assert_eq!(clone.color, moved.color);
 
         session.write(b"exit\n").unwrap();
-        let removed_on_exit = (0..100).any(|_| {
-            if manager.get(info.id).is_none() {
-                true
+        let exited = (0..100).find_map(|_| {
+            let next = manager.get(info.id)?.info();
+            if next.status == TerminalStatus::Exited {
+                Some(next)
             } else {
                 thread::sleep(std::time::Duration::from_millis(10));
-                false
+                None
             }
         });
-        assert!(removed_on_exit);
+        let exited = exited.unwrap();
+        assert_eq!(exited.exit_code, Some(0));
+        assert_eq!(
+            manager.get(info.id).unwrap().info().status,
+            TerminalStatus::Exited
+        );
+        assert!(manager.remove(info.id));
         assert!(!manager.remove(info.id));
         assert!(manager.remove(clone.id));
         assert!(manager.list().is_empty());
@@ -4205,6 +4485,7 @@ mod tests {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             default_shell: RwLock::new(Some("/bin/sh".into())),
             replay_bytes: AtomicUsize::new(1024 * 1024),
+            next_exit_order: Arc::new(AtomicU64::new(0)),
             home_directory: directory.path().to_path_buf(),
             agent_event_socket: None,
             executable: None,
@@ -4228,6 +4509,7 @@ mod tests {
                 AgentEvent {
                     provider: "codex".to_owned(),
                     kind,
+                    sequence: None,
                     title: None,
                 },
                 pi.clone(),
@@ -4257,6 +4539,7 @@ mod tests {
             AgentEvent {
                 provider: "codex".to_owned(),
                 kind: AgentEventKind::Completed,
+                sequence: None,
                 title: None,
             },
             pi.clone(),
@@ -4272,6 +4555,7 @@ mod tests {
             AgentEvent {
                 provider: "codex".to_owned(),
                 kind: AgentEventKind::Closed,
+                sequence: None,
                 title: None,
             },
             pi,
@@ -4284,12 +4568,86 @@ mod tests {
     }
 
     #[test]
+    fn sequenced_native_events_ignore_stale_reports_and_reset_for_new_sources() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = TerminalManager {
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            default_shell: RwLock::new(Some("/bin/sh".into())),
+            replay_bytes: AtomicUsize::new(1024 * 1024),
+            next_exit_order: Arc::new(AtomicU64::new(0)),
+            home_directory: directory.path().to_path_buf(),
+            agent_event_socket: None,
+            executable: None,
+        };
+        let info = manager
+            .create(CreateTerminal {
+                path: None,
+                cwd: None,
+                shell: None,
+                clone_from: None,
+            })
+            .unwrap();
+        let pi = Arc::new(PiService::new(directory.path()));
+        let event = |provider: &str, kind: AgentEventKind, sequence: Option<u64>| AgentEvent {
+            provider: provider.to_owned(),
+            kind,
+            sequence,
+            title: None,
+        };
+        let apply = |provider, kind, sequence| {
+            manager.apply_agent_event(info.id, event(provider, kind, sequence), pi.clone())
+        };
+        let agent = || manager.get(info.id).unwrap().info().agent.unwrap();
+
+        // Legacy unsequenced sources remain usable until they establish
+        // sequence authority.
+        assert!(apply("codex", AgentEventKind::Thinking, None));
+        assert!(apply("codex", AgentEventKind::Completed, None));
+        assert_eq!(agent().status, AgentStatus::Idle);
+
+        assert!(apply("omp", AgentEventKind::Thinking, Some(10)));
+        assert!(apply("omp", AgentEventKind::Completed, Some(12)));
+        assert!(apply("omp", AgentEventKind::Thinking, Some(13)));
+        let working = agent();
+        assert_eq!(working.status, AgentStatus::Working);
+
+        // A delayed completion and a duplicate sequence cannot finish the
+        // newer turn.
+        assert!(apply("omp", AgentEventKind::Completed, Some(12)));
+        assert_eq!(agent().status, AgentStatus::Working);
+        assert!(apply("omp", AgentEventKind::Completed, Some(13)));
+        assert_eq!(agent().status, AgentStatus::Working);
+        assert_eq!(agent().revision, working.revision);
+
+        assert!(apply("omp", AgentEventKind::Completed, Some(14)));
+        assert_eq!(agent().status, AgentStatus::Idle);
+
+        // Taking over with another provider starts a fresh sequence domain.
+        assert!(apply("codex", AgentEventKind::Thinking, Some(1)));
+        assert!(apply("omp", AgentEventKind::Thinking, Some(1)));
+        assert_eq!(agent().status, AgentStatus::Working);
+        assert!(manager.remove(info.id));
+    }
+
+    #[test]
+    fn clearing_native_lifecycle_allows_a_fresh_sequence_source() {
+        let mut activity = SessionActivity::default();
+        assert!(activity.accept_native_sequence("omp", Some(9)));
+        assert!(!activity.accept_native_sequence("omp", Some(9)));
+        assert!(!activity.accept_native_sequence("omp", None));
+
+        activity.clear_native_sequence();
+        assert!(activity.accept_native_sequence("omp", Some(1)));
+    }
+
+    #[test]
     fn omp_title_is_adopted_and_suppresses_term_server_generation() {
         let directory = tempfile::tempdir().unwrap();
         let manager = TerminalManager {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             default_shell: RwLock::new(Some("/bin/sh".into())),
             replay_bytes: AtomicUsize::new(1024 * 1024),
+            next_exit_order: Arc::new(AtomicU64::new(0)),
             home_directory: directory.path().to_path_buf(),
             agent_event_socket: None,
             executable: None,
@@ -4310,6 +4668,7 @@ mod tests {
             AgentEvent {
                 provider: "omp".to_owned(),
                 kind: AgentEventKind::Thinking,
+                sequence: None,
                 title: Some("checkout latency fix".to_owned()),
             },
             pi,
@@ -4764,6 +5123,116 @@ mod tests {
     }
 
     #[test]
+    fn native_connector_signal_is_authoritative_over_screen_detection() {
+        use agent_detection::DetectedState;
+
+        // A connector reporting Working wins over a visible-idle screen rule:
+        // an agent driving subagents reports itself as working even when its
+        // own TUI looks idle.
+        let mut idle_screen = detection(DetectedState::Idle, "live_prompt_box");
+        idle_screen.visible_idle = true;
+        assert_eq!(
+            resolve_agent_status(
+                Some(AgentStatus::Working),
+                Some(&idle_screen),
+                StatusFallback {
+                    agent_kind: "omp",
+                    current_status: AgentStatus::Idle,
+                    reported_state: None,
+                    now: 5_000,
+                    input_submitted_at: 1_000,
+                    active_samples: 0,
+                    quiet_samples: 5,
+                },
+            ),
+            AgentStatus::Working
+        );
+
+        // Symmetric: a connector reporting Idle wins over a working screen rule.
+        let working_screen = detection(DetectedState::Working, "spinner");
+        assert_eq!(
+            resolve_agent_status(
+                Some(AgentStatus::Idle),
+                Some(&working_screen),
+                StatusFallback {
+                    agent_kind: "codex",
+                    current_status: AgentStatus::Working,
+                    reported_state: None,
+                    now: 5_000,
+                    input_submitted_at: 1_000,
+                    active_samples: 3,
+                    quiet_samples: 0,
+                },
+            ),
+            AgentStatus::Idle
+        );
+
+        // A connector Blocked wins even when the screen holds an overlay that
+        // would otherwise Keep the previous status.
+        let mut overlay = detection(DetectedState::Unknown, "transcript_viewer");
+        overlay.skip_state_update = true;
+        assert_eq!(
+            resolve_agent_status(
+                Some(AgentStatus::Blocked),
+                Some(&overlay),
+                StatusFallback {
+                    agent_kind: "claude",
+                    current_status: AgentStatus::Working,
+                    reported_state: None,
+                    now: 5_000,
+                    input_submitted_at: 1_000,
+                    active_samples: 0,
+                    quiet_samples: 0,
+                },
+            ),
+            AgentStatus::Blocked
+        );
+    }
+
+    #[test]
+    fn resolve_agent_status_falls_back_to_screen_then_heuristics_without_a_connector() {
+        use agent_detection::DetectedState;
+
+        // No connector signal: a screen Blocked rule decides.
+        let blocked_screen = detection(DetectedState::Blocked, "permission_prompt");
+        assert_eq!(
+            resolve_agent_status(
+                None,
+                Some(&blocked_screen),
+                StatusFallback {
+                    agent_kind: "codex",
+                    current_status: AgentStatus::Working,
+                    reported_state: None,
+                    now: 5_000,
+                    input_submitted_at: 1_000,
+                    active_samples: 0,
+                    quiet_samples: 0,
+                },
+            ),
+            AgentStatus::Blocked
+        );
+
+        // No connector signal, screen Undecided: the OSC reported state and
+        // CPU/output heuristics decide, exactly as before.
+        assert_eq!(
+            resolve_agent_status(
+                None,
+                None,
+                StatusFallback {
+                    agent_kind: "pi",
+                    current_status: AgentStatus::Working,
+                    reported_state: None,
+                    now: 5_000,
+                    input_submitted_at: 1_000,
+                    active_samples: 0,
+                    quiet_samples: 2,
+                },
+            ),
+            AgentStatus::Idle
+        );
+    }
+
+    #[test]
     fn osc_payloads_are_retained_with_original_case_and_bounded() {
         let mut signals = TerminalSignals::default();
         signals.observe(b"\x1b]2;Claude Code\x07", 1_000);
@@ -4821,6 +5290,7 @@ mod tests {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             default_shell: RwLock::new(Some("/bin/sh".into())),
             replay_bytes: AtomicUsize::new(1024 * 1024),
+            next_exit_order: Arc::new(AtomicU64::new(0)),
             home_directory: directory.path().to_path_buf(),
             agent_event_socket: None,
             executable: None,
@@ -4838,6 +5308,7 @@ mod tests {
         let event = |kind| AgentEvent {
             provider: "claude".to_owned(),
             kind,
+            sequence: None,
             title: None,
         };
 

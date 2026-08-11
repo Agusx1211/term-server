@@ -1,6 +1,6 @@
 {
   "name": "term-server",
-  "version": "0.12.2",
+  "version": "0.13.0",
   "description": "A fast, secure, Rust-powered web terminal workspace.",
   "type": "module",
   "private": true,
@@ -24,12 +24,21 @@
     "build": "npm run clean && npm run build:server && npm run build:client",
     "build:server": "cargo build --release",
     "build:client": "vite build",
+    "build:e2e:client": "VITE_E2E=true vite build",
+    "build:e2e:server": "cargo build --release --locked --bin term-server --features e2e",
+    "build:e2e:fixture": "cargo build --release --locked --bin e2e-pty-fixture --features e2e",
+    "build:e2e": "npm run build:e2e:client && npm run build:e2e:server && npm run build:e2e:fixture",
     "package": "bash scripts/package-release.sh",
     "start": "target/release/term-server",
     "typecheck": "tsc -p tsconfig.client.json --noEmit",
     "test": "cargo test && vitest run",
     "test:web": "vitest run",
     "test:watch": "vitest",
+    "test:e2e": "npm run build:e2e && sh -c 'has_project=0; for arg do case \"$arg\" in --project|--project=*) has_project=1;; esac; done; if [ \"$has_project\" -eq 0 ]; then set -- --project=chromium-pr \"$@\"; fi; exec playwright test --config=e2e/playwright.config.ts \"$@\"' --",
+    "test:e2e:headed": "npm run build:e2e && sh -c 'has_project=0; for arg do case \"$arg\" in --project|--project=*) has_project=1;; esac; done; if [ \"$has_project\" -eq 0 ]; then set -- --project=chromium-pr \"$@\"; fi; exec playwright test --config=e2e/playwright.config.ts --headed \"$@\"' --",
+    "test:e2e:debug": "npm run build:e2e && sh -c 'has_project=0; for arg do case \"$arg\" in --project|--project=*) has_project=1;; esac; done; if [ \"$has_project\" -eq 0 ]; then set -- --project=chromium-pr \"$@\"; fi; exec playwright test --config=e2e/playwright.config.ts --debug \"$@\"' --",
+    "test:e2e:nightly": "npm run build:e2e && sh -c 'has_project=0; for arg do case \"$arg\" in --project|--project=*) has_project=1;; esac; done; if [ \"$has_project\" -eq 0 ]; then set -- --project=chromium-nightly --project=firefox-nightly --project=webkit-nightly \"$@\"; fi; exec playwright test --config=e2e/playwright.config.ts \"$@\"' --",
+    "test:e2e:soak": "npm run build:e2e && sh -c 'has_project=0; for arg do case \"$arg\" in --project|--project=*) has_project=1;; esac; done; if [ \"$has_project\" -eq 0 ]; then set -- --project=soak \"$@\"; fi; exec playwright test --config=e2e/playwright.config.ts \"$@\"' --",
     "check": "cargo fmt --check && cargo clippy --all-targets -- -D warnings && npm run typecheck && npm run check:terminal-unicode && npm test && npm run build:client"
   },
   "dependencies": {
@@ -49,11 +58,14 @@
     "preact": "^10.29.7"
   },
   "devDependencies": {
+    "@playwright/test": "1.62.1",
     "@preact/preset-vite": "^2.10.6",
+    "@types/ws": "8.18.1",
     "@xterm/headless": "6.1.0-beta.291",
     "concurrently": "9.2.4",
     "typescript": "^7.0.2",
     "vite": "^8.1.5",
-    "vitest": "^4.1.10"
+    "vitest": "^4.1.10",
+    "ws": "8.21.3"
   }
 }

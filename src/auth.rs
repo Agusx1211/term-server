@@ -300,6 +300,10 @@ impl AuthService {
         };
         payload.iat <= now && payload.exp >= now
     }
+    #[cfg(feature = "e2e")]
+    pub fn expire_sessions(&self) {
+        self.inner.state.write().cookie_secret = rand::random::<[u8; 32]>().to_vec();
+    }
 }
 
 async fn verify_password(encoded: String, password: String) -> Result<bool, AuthError> {
@@ -484,5 +488,28 @@ mod tests {
         assert_eq!(limiter.consume("client", 1_000), Err(900));
         limiter.reset("client");
         assert!(limiter.consume("client", 1_000).is_ok());
+    }
+    #[cfg(feature = "e2e")]
+    #[tokio::test]
+    async fn e2e_session_expiry_rotates_only_the_cookie_secret() {
+        let directory = tempfile::tempdir().unwrap();
+        let loaded = load_auth(directory.path(), Some("fixed-e2e-password".into()), None)
+            .await
+            .unwrap();
+        let existing = loaded.service.create_session();
+        assert!(loaded.service.verify_session(Some(&existing)));
+
+        loaded.service.expire_sessions();
+
+        assert!(!loaded.service.verify_session(Some(&existing)));
+        assert!(
+            loaded
+                .service
+                .verify_password("fixed-e2e-password".into())
+                .await
+                .unwrap()
+        );
+        let replacement = loaded.service.create_session();
+        assert!(loaded.service.verify_session(Some(&replacement)));
     }
 }

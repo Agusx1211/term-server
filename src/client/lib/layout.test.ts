@@ -8,6 +8,10 @@ import {
   placeNewTerminal,
   pruneLayout,
   reconcileMounted,
+  paneLeaf,
+  removePaneAndSelect,
+  splitDividers,
+  updateSplitRatio,
 } from "./layout";
 
 describe("split layouts", () => {
@@ -70,6 +74,82 @@ describe("split layouts", () => {
     expect(paneIds(placeNewTerminal(layout, "three", "two", 4))).toEqual(["one", "three"]);
     expect(paneIds(placeNewTerminal(layout, "three", "two", 4, true))).toEqual(["one", "three", "two"]);
     expect(paneIds(placeNewTerminal(layout, "three", "two", 2, true))).toEqual(["one", "three"]);
+  });
+});
+
+describe("split divider geometry and updates", () => {
+  it("reports deterministic normalized bounds and paths for nested dividers", () => {
+    const layout = {
+      type: "split" as const,
+      direction: "horizontal" as const,
+      ratio: 0.4,
+      first: paneLeaf("one"),
+      second: {
+        type: "split" as const,
+        direction: "vertical" as const,
+        ratio: 0.25,
+        first: paneLeaf("two"),
+        second: paneLeaf("three"),
+      },
+    };
+
+    expect(splitDividers(layout)).toEqual([
+      {
+        path: [],
+        direction: "horizontal",
+        ratio: 0.4,
+        bounds: { x: 0.4, y: 0, width: 0, height: 1 },
+        parentBounds: { x: 0, y: 0, width: 1, height: 1 },
+      },
+      {
+        path: ["second"],
+        direction: "vertical",
+        ratio: 0.25,
+        bounds: { x: 0.4, y: 0.25, width: 0.6, height: 0 },
+        parentBounds: { x: 0.4, y: 0, width: 0.6, height: 1 },
+      },
+    ]);
+  });
+
+  it("clamps resize ratios and preserves unrelated subtrees immutably", () => {
+    const layout = layoutFromIds(["one", "two", "three"])!;
+    const next = updateSplitRatio(layout, [], 2)!;
+    const nested = updateSplitRatio(next, ["first"], -1)!;
+
+    expect(next).not.toBe(layout);
+    expect(next.type).toBe("split");
+    if (next.type !== "split" || nested.type !== "split" || nested.first.type !== "split" || next.first.type !== "split") {
+      throw new Error("expected nested split layout");
+    }
+    expect(next.ratio).toBe(0.85);
+    expect(nested.first.ratio).toBe(0.15);
+    expect(nested.second).toBe(next.second);
+    expect(nested.first).not.toBe(next.first);
+    expect(nested.first.first).toBe(next.first.first);
+    expect(nested.first.second).toBe(next.first.second);
+  });
+});
+
+describe("pane removal selection", () => {
+  it("selects the next sibling when the active pane is closed", () => {
+    const result = removePaneAndSelect(layoutFromIds(["one", "two", "three"]), "two", "two");
+
+    expect(paneIds(result.layout)).toEqual(["one", "three"]);
+    expect(result.activeId).toBe("three");
+  });
+
+  it("falls back to the previous sibling when the active pane is last", () => {
+    const result = removePaneAndSelect(layoutFromIds(["one", "two", "three"]), "three", "three");
+
+    expect(paneIds(result.layout)).toEqual(["one", "two"]);
+    expect(result.activeId).toBe("two");
+  });
+
+  it("preserves the active pane when a background pane is closed", () => {
+    const result = removePaneAndSelect(layoutFromIds(["one", "two", "three"]), "one", "three");
+
+    expect(paneIds(result.layout)).toEqual(["three", "two"]);
+    expect(result.activeId).toBe("three");
   });
 });
 
