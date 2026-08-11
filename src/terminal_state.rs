@@ -113,10 +113,14 @@ impl TerminalOutputState {
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16, pixel_width: u16, pixel_height: u16) {
-        self.grid_epoch = self.grid_epoch.saturating_add(1);
-        // Output sequences do not advance for a resize. A checkpoint from the
-        // previous grid therefore cannot be paired safely with later bytes.
-        self.browser_checkpoint = None;
+        if self.terminal.parser.screen().size() != (rows, cols) {
+            self.grid_epoch = self.grid_epoch.saturating_add(1);
+            // Output sequences do not advance for a grid resize. A checkpoint
+            // from the previous grid therefore cannot be paired safely with
+            // later bytes. Pixel dimensions do not reflow xterm, so changing
+            // only those must retain the exact browser checkpoint.
+            self.browser_checkpoint = None;
+        }
         self.terminal.resize(
             rows,
             cols,
@@ -1881,17 +1885,44 @@ mod tests {
     }
 
     #[test]
-    fn resize_invalidates_a_browser_checkpoint_without_a_byte_sequence_change() {
+    fn grid_resize_invalidates_a_browser_checkpoint_without_a_byte_sequence_change() {
         let mut state = TerminalOutputState::new(1024 * 1024, 4, 20);
+        let epoch = state.grid_epoch();
         assert!(state.store_browser_checkpoint(
             0,
-            state.grid_epoch(),
+            epoch,
             Bytes::from_static(b"official-xterm-snapshot"),
         ));
         state.resize(4, 10, 0, 0);
 
+        assert!(state.grid_epoch() > epoch);
         let snapshot = state.sync(None).snapshot.unwrap();
         assert!(!snapshot.starts_with(b"official-xterm-snapshot"));
+    }
+
+    #[test]
+    fn pixel_resize_preserves_the_browser_checkpoint_and_grid_epoch() {
+        let mut state = TerminalOutputState::new(1024 * 1024, 4, 20);
+        let epoch = state.grid_epoch();
+        assert!(state.store_browser_checkpoint(
+            0,
+            epoch,
+            Bytes::from_static(b"official-xterm-snapshot"),
+        ));
+
+        state.resize(4, 20, 200, 80);
+
+        assert_eq!(state.grid_epoch(), epoch);
+        assert_eq!(
+            state.sync(None).snapshot.unwrap().as_ref(),
+            b"official-xterm-snapshot"
+        );
+
+        state.publish(Bytes::from_static(b"\x1b[14t"));
+        assert_eq!(
+            state.drain_responses(),
+            vec![Bytes::from_static(b"\x1b[4;80;200t")]
+        );
     }
 
     #[test]
