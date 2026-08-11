@@ -250,7 +250,12 @@ impl PiService {
             return Err("Pi is not available to the term-server process".to_owned());
         }
         let model = input.model.trim().to_owned();
-        if !model.is_empty() && !self.client_models().iter().any(|candidate| candidate.id == model) {
+        if !model.is_empty()
+            && !self
+                .client_models()
+                .iter()
+                .any(|candidate| candidate.id == model)
+        {
             return Err("the selected Pi model is not available".to_owned());
         }
         let settings = PiSettings {
@@ -284,21 +289,40 @@ impl PiService {
         let system_prompt = system_prompt_for(request.kind);
         let user_message = user_prompt_for(&request);
         let raw = match self
-            .complete(&base_url, &api_key, &model_id, &system_prompt, &user_message)
+            .complete(
+                &base_url,
+                &api_key,
+                &model_id,
+                &system_prompt,
+                &user_message,
+            )
             .await
         {
             Ok(raw) => raw,
             Err(error) => {
                 // Record the failed attempt too so the raw request is captured for training.
                 let result: Result<String, String> = Err(error.clone());
-                let _ = self
-                    .save_completion(&label, request.kind, &system_prompt, &user_message, "", &result);
+                let _ = self.save_completion(
+                    &label,
+                    request.kind,
+                    &system_prompt,
+                    &user_message,
+                    "",
+                    &result,
+                );
                 return Err(error);
             }
         };
 
         let validated = validate_result(request.kind, &raw);
-        let _ = self.save_completion(&label, request.kind, &system_prompt, &user_message, &raw, &validated);
+        let _ = self.save_completion(
+            &label,
+            request.kind,
+            &system_prompt,
+            &user_message,
+            &raw,
+            &validated,
+        );
         validated
     }
 
@@ -321,7 +345,11 @@ impl PiService {
             .providers
             .iter()
             .find(|provider| provider.name == provider_name)?;
-        if !provider.model_ids.iter().any(|candidate| candidate == model_id) {
+        if !provider
+            .model_ids
+            .iter()
+            .any(|candidate| candidate == model_id)
+        {
             return None;
         }
         Some((
@@ -367,8 +395,8 @@ impl PiService {
             let snippet = text.chars().take(400).collect::<String>();
             return Err(format!("completion endpoint returned {status}: {snippet}"));
         }
-        let parsed: ChatResponse =
-            serde_json::from_str(&text).map_err(|error| format!("invalid completion response: {error}"))?;
+        let parsed: ChatResponse = serde_json::from_str(&text)
+            .map_err(|error| format!("invalid completion response: {error}"))?;
         let content = parsed
             .choices
             .into_iter()
@@ -558,7 +586,12 @@ fn discover_providers(json: &str) -> Vec<PiProvider> {
 
 fn default_models_path() -> Option<PathBuf> {
     let home = env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".pi").join("agent").join("models.json"))
+    Some(
+        PathBuf::from(home)
+            .join(".pi")
+            .join("agent")
+            .join("models.json"),
+    )
 }
 
 pub(crate) fn find_executable(name: &str) -> Option<PathBuf> {
@@ -836,7 +869,10 @@ mod tests {
         }"#;
         let providers = discover_providers(json);
         assert_eq!(
-            providers.iter().map(|provider| provider.name.as_str()).collect::<Vec<_>>(),
+            providers
+                .iter()
+                .map(|provider| provider.name.as_str())
+                .collect::<Vec<_>>(),
             ["local", "openrouter"]
         );
         assert_eq!(providers[0].model_ids, ["qwen3.5-0.8b"]);
