@@ -10,6 +10,7 @@ import {
   assertMonotonicSequences,
   expectTerminalBuffer,
   terminalEvents,
+  waitForFontSettledViewport,
 } from "../assertions/terminal-state.js";
 import { expectTerminalInvariants } from "../assertions/invariants.js";
 import type { E2ETerminalDiagnosticsApi } from "../../src/client/lib/e2e-diagnostics.js";
@@ -91,6 +92,7 @@ test("@p0 @smoke P0-16 Flow control pauses and resumes correctly", async ({ page
   expect(initial.flowAcknowledgedBytes + initial.flowPendingAcknowledgementBytes).toBeLessThanOrEqual(initial.committedSequence ?? 0);
 
   const terminalViewport = terminal.xtermHost.locator(".xterm-screen");
+  await waitForFontSettledViewport(page, terminalId, { timeout: FLOW_TIMEOUT_MS });
   const beforeBurst = await screenshotRegion(page, terminalViewport);
 
   const pauseRule = faultController.pause("server-to-browser", { terminalId });

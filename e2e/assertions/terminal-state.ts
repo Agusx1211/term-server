@@ -88,7 +88,9 @@ export async function waitForFontSettledViewport(
   }, { id: terminalId, afterId: fontSettled.id, timeoutMs: timeout });
   const proposedCols = typeof proposed.data.cols === "number" ? proposed.data.cols : undefined;
   const proposedRows = typeof proposed.data.rows === "number" ? proposed.data.rows : undefined;
-  return page.evaluate(async ({ id, timeoutMs, proposedTimestamp, proposedCols, proposedRows }) => {
+  const proposedPixelWidth = typeof proposed.data.pixelWidth === "number" ? proposed.data.pixelWidth : undefined;
+  const proposedPixelHeight = typeof proposed.data.pixelHeight === "number" ? proposed.data.pixelHeight : undefined;
+  return page.evaluate(async ({ id, timeoutMs, proposedTimestamp, proposedCols, proposedRows, proposedPixelWidth, proposedPixelHeight }) => {
     const api = (window as E2EWindow).__TERM_SERVER_E2E__;
     if (!api) throw new Error("term-server E2E diagnostics are unavailable");
     return api.waitForTerminal(id, (snapshot) => {
@@ -102,10 +104,16 @@ export async function waitForFontSettledViewport(
         && server !== undefined
         && desired.cols === sent.cols
         && desired.rows === sent.rows
+        && desired.pixelWidth === sent.pixelWidth
+        && desired.pixelHeight === sent.pixelHeight
         && sent.cols === server.cols
         && sent.rows === server.rows
+        && sent.pixelWidth === server.pixelWidth
+        && sent.pixelHeight === server.pixelHeight
         && (proposedCols === undefined || server.cols === proposedCols)
-        && (proposedRows === undefined || server.rows === proposedRows);
+        && (proposedRows === undefined || server.rows === proposedRows)
+        && (proposedPixelWidth === undefined || server.pixelWidth === proposedPixelWidth)
+        && (proposedPixelHeight === undefined || server.pixelHeight === proposedPixelHeight);
     }, { timeout: timeoutMs });
   }, {
     id: terminalId,
@@ -113,6 +121,8 @@ export async function waitForFontSettledViewport(
     proposedTimestamp: proposed.timestamp,
     proposedCols,
     proposedRows,
+    proposedPixelWidth,
+    proposedPixelHeight,
   });
 }
 

@@ -16,6 +16,7 @@ import {
   expectTerminalBuffer,
   expectTerminalSynchronized,
   terminalEvents,
+  waitForTerminalBuffer,
 } from "../assertions/terminal-state.js";
 import type { BrowserContext, Page } from "@playwright/test";
 import type { E2ETerminalDiagnosticsApi, E2ETerminalSnapshot } from "../../src/client/lib/e2e-diagnostics.js";
@@ -198,6 +199,10 @@ async function assertPtySize(
   expect(entry.rows).toBe(expected.rows);
   expect(entry.pixel_width).toBe(expected.pixelWidth);
   expect(entry.pixel_height).toBe(expected.pixelHeight);
+  await waitForTerminalBuffer(pane.page, terminalId, {
+    contains: `[E2E:SIZE:${marker}:${expected.rows}:${expected.cols}]`,
+    occurrences: 1,
+  }, { timeout: WAIT_TIMEOUT_MS });
 }
 
 async function assertQueryResponses(

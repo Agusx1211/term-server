@@ -37,6 +37,20 @@ async function terminalIdInPane(page: Page, selector: string): Promise<string> {
   return id;
 }
 
+async function waitForDistinctTerminalIdInPane(page: Page, selector: string, excludedId: string): Promise<string> {
+  const panes = page.locator(selector);
+  const findDistinctId = async (): Promise<string> => {
+    const ids = await panes.evaluateAll((nodes) => nodes
+      .map((node) => node.getAttribute("data-terminal-id"))
+      .filter((id): id is string => Boolean(id)));
+    return ids.find((id) => id !== excludedId) ?? "";
+  };
+  await expect.poll(findDistinctId, { timeout: 10_000 }).not.toBe("");
+  const id = await findDistinctId();
+  if (!id) throw new Error(`terminal pane did not expose a terminal distinct from ${excludedId}`);
+  return id;
+}
+
 async function waitForWideVisibleViewport(
   page: Page,
   terminalId: string,
@@ -105,6 +119,9 @@ test("P0-09 Cached pane remains live and restores visibly @p0 @smoke", async ({ 
   const workbench = new WorkbenchPage(page);
 
   await page.setViewportSize(INITIAL_VIEWPORT);
+  await page.addInitScript(() => {
+    localStorage.setItem("term-server:tile-new-terminals", "false");
+  });
   await page.goto(baseURL);
   await login.login();
   await workbench.expectVisible();
@@ -148,7 +165,7 @@ test("P0-09 Cached pane remains live and restores visibly @p0 @smoke", async ({ 
 
   await workbench.createTerminal();
   const paneBSelector = ".editor-grid .pane-slot:not(.cached) section[role=\"region\"][data-terminal-id]";
-  const terminalBId = await terminalIdInPane(page, paneBSelector);
+  const terminalBId = await waitForDistinctTerminalIdInPane(page, paneBSelector, terminalAId);
   expect(terminalBId).not.toBe(terminalAId);
   const paneB = workbench.terminal(terminalBId);
 

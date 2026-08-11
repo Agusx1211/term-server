@@ -362,6 +362,14 @@ test("R-02 Renderer transition dimension refresh @p1 @nightly @rendering @transi
 
   const beforeRendererEvents = await terminalEvents(page, created.id);
   const rendererCursor = beforeRendererEvents.at(-1)?.id ?? 0;
+  // Capture the pre-transition state before waiting for renderer activation. The
+  // transition can emit its resize before the renderer event resolves, so a
+  // later transcript read could otherwise establish a baseline after that
+  // SIGWINCH and make the exact occurrence check impossible.
+  const beforeWebgl = await terminal.snapshot();
+  if (!beforeWebgl) throw new Error("missing diagnostics snapshot before WebGL refresh");
+  const sigwinchCountBeforeWebgl = (await server.readTranscript(created.id))
+    .filter((entry) => entry.event === "sigwinch").length;
   const rendererOutcome = await waitForRendererOutcome(page, created.id, rendererCursor);
   const outcomeIsWebgl = rendererOutcome.type === "renderer-load" && rendererOutcome.snapshot.renderer === "webgl";
   testInfo.annotations.push({
@@ -380,9 +388,6 @@ test("R-02 Renderer transition dimension refresh @p1 @nightly @rendering @transi
     expect(rendererOutcome.snapshot.webglLoadCount).toBe(1);
     expect(rendererOutcome.snapshot.fallbackCount).toBe(0);
     expect(rendererOutcome.snapshot.contextLossCount).toBe(0);
-    const beforeWebgl = await terminal.snapshot();
-    if (!beforeWebgl) throw new Error("missing diagnostics snapshot before WebGL refresh");
-    const sigwinchCountBeforeWebgl = (await server.readTranscript(created.id)).filter((entry) => entry.event === "sigwinch").length;
     const webglViewportEvent = await waitForViewportAfter(page, created.id, rendererOutcome.id);
     const webglRefresh = await assertDimensionRefresh(
       page,
