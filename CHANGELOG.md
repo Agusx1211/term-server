@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.13.2 - 2026-08-11
+
+### Fixed
+
+- Reconnecting at the same terminal rows and columns with different pixel dimensions no longer
+  discards the exact browser checkpoint. Redraw-heavy terminal interfaces now recover without
+  duplicated or corrupted output after a browser window restart, while pixel-size terminal query
+  responses still use the updated dimensions.
+
+### Upgrade notes
+
+- There are no breaking changes, data migrations, or configuration changes. Automatic updates
+  preserve the running session broker; restart it from **Settings → Updates** to activate this fix.
+  Restarting the broker closes its open terminals, so let active terminal work finish first.
+- The release is safe for automatic installation over `0.13.1`.
+
 ## 0.13.1 - 2026-08-11
 
 ### Changed
