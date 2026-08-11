@@ -139,8 +139,12 @@ async function exerciseQuery(
 
   const before = await waitForSettledViewport(page, terminalId);
   const beforeViewport = viewportOf(before);
-  const parserCommitsBeforeQuery = (await terminalEventHistory(page, terminalId))
-    .filter((event) => event.type === "parser-commit").length;
+  const beforeEvents = await terminalEventHistory(page, terminalId);
+  const beforeParserIds = beforeEvents
+    .filter((event) => event.type === "parser-commit")
+    .map((event) => event.id);
+  const parserCommitsBeforeQuery = beforeParserIds.length;
+  const lastParserCommitBeforeQuery = Math.max(0, ...beforeParserIds);
   expect(parserCommitsBeforeQuery).toBeGreaterThan(0);
 
   await pane.sendInput(`HOLD ${holdId}`, true);
@@ -217,9 +221,14 @@ async function exerciseQuery(
     }
   }
 
+  // The diagnostics event history is a bounded ring buffer (MAX_EVENTS) that
+  // evicts old parser-commit entries, so comparing raw counts across the query
+  // is racy once the buffer fills. Compare event ids instead (monotonic and
+  // unaffected by eviction): the query must produce at least one new commit.
   const parserCommitsAfterQuery = (await terminalEventHistory(page, terminalId))
-    .filter((event) => event.type === "parser-commit").length;
-  expect(parserCommitsAfterQuery).toBeGreaterThanOrEqual(parserCommitsBeforeQuery);
+    .filter((event) => event.type === "parser-commit" && event.id > lastParserCommitBeforeQuery)
+    .length;
+  expect(parserCommitsAfterQuery).toBeGreaterThan(0);
 }
 
 test("V-15 Window-size terminal queries @nightly @pr @p1 @resize @queries", async ({ page, server }, testInfo: TestInfo) => {
