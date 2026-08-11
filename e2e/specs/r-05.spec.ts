@@ -15,6 +15,7 @@ import {
   expectNoPendingRecovery,
   expectSingleTerminalSocket,
   expectTerminalConverged,
+  waitForFontSettledViewport,
   terminalEvents,
 } from "../assertions/terminal-state.js";
 import {
@@ -108,6 +109,20 @@ async function writeModel(terminal: Terminal, bytes: Buffer): Promise<void> {
   });
 }
 
+async function replayTranscript(
+  terminal: Terminal,
+  entries: readonly TranscriptEntry[],
+): Promise<void> {
+  for (const entry of entries) {
+    if (entry.event === "sigwinch") {
+      const rows = transcriptNumber(entry, "rows");
+      const cols = transcriptNumber(entry, "cols");
+      if (rows !== undefined && cols !== undefined && rows > 0 && cols > 0) terminal.resize(cols, rows);
+    }
+    if (entry.event === "write") await writeModel(terminal, writeBytes(entry));
+  }
+}
+
 function countOccurrences(value: string, needle: string): number {
   let count = 0;
   let offset = 0;
@@ -189,7 +204,9 @@ async function waitForSettledTerminal(
       && snapshot.receivedSequence !== undefined
       && snapshot.committedSequence === snapshot.receivedSequence
       && snapshot.renderCount > minimumRender
-      && (expectedMarker === undefined || snapshot.xterm.text.includes(expectedMarker))
+      && (expectedMarker === undefined
+        || snapshot.xterm.text.includes(expectedMarker)
+        || snapshot.xterm.text.replaceAll("\n", "").includes(expectedMarker))
     ), { timeout });
   }, {
     id: terminalId,
@@ -261,6 +278,7 @@ test("R-05 Browser lifecycle freeze and resume @p1 @pr @nightly @lifecycle @free
   const terminalId = mounted.terminalId;
   const pane = new TerminalPanePage(page, terminalId);
   await pane.expectVisible();
+  await waitForFontSettledViewport(page, terminalId, { timeout: WAIT_TIMEOUT_MS });
   await pane.waitForSynchronized({ timeout: WAIT_TIMEOUT_MS });
 
   const initial = await waitForSettledTerminal(page, terminalId, undefined, -1);
@@ -368,7 +386,10 @@ test("R-05 Browser lifecycle freeze and resume @p1 @pr @nightly @lifecycle @free
       { timeoutMs: WAIT_TIMEOUT_MS },
     );
 
-    pausedInput.dispose();
+    faultController.resume("browser-to-server", {
+      terminalId,
+      generation: initialGeneration,
+    });
     pausedInput = undefined;
     await faultController.waitFor(
       (event) => event.type === "resumed"
@@ -455,7 +476,7 @@ test("R-05 Browser lifecycle freeze and resume @p1 @pr @nightly @lifecycle @free
   expect(final.lifecycle.visible).toBe(true);
   expect(final.lifecycle.cached).toBe(false);
   expect(final.lifecycle.active).toBe(true);
-  expect(final.lifecycle.focused).toBe(true);
+  await expect(pane.xtermHost.locator(".xterm-helper-textarea")).toBeFocused();
   expect(final.syncMode).toBeUndefined();
   expect(final.syncTarget).toBeUndefined();
   expect(final.pendingParserWrites).toBe(0);
@@ -506,14 +527,15 @@ test("R-05 Browser lifecycle freeze and resume @p1 @pr @nightly @lifecycle @free
     scrollback: 200_000,
     ...tuiCompatibilityOptions(),
   });
-  for (const write of writes) await writeModel(model, writeBytes(write));
+  await replayTranscript(model, [...initialTranscript, ...scenarioEntries]);
   expect(final.xterm.text).toBe(activeText(model));
   expect(final.xterm.activeBuffer).toBe(model.buffer.active.type);
   expect(final.xterm.cursorX).toBe(model.buffer.active.cursorX);
   expect(final.xterm.cursorY).toBe(model.buffer.active.cursorY);
-  expect(countOccurrences(final.xterm.text, beforeMarker)).toBe(1);
-  expect(countOccurrences(final.xterm.text, frozenMarker)).toBe(1);
-  expect(countOccurrences(final.xterm.text, echoMarker)).toBe(1);
+  const finalText = final.xterm.text.replaceAll("\n", "");
+  expect(countOccurrences(finalText, beforeMarker)).toBe(1);
+  expect(countOccurrences(finalText, frozenMarker)).toBe(1);
+  expect(countOccurrences(finalText, echoMarker)).toBe(1);
 
   const events = await terminalEvents(page, terminalId);
   await assertMonotonicSequences(events);

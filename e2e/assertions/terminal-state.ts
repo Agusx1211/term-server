@@ -55,6 +55,67 @@ export async function terminalEvents(
   }, { id: terminalId, pane: paneId });
 }
 
+/**
+ * Wait until the terminal's post-font viewport report has reached the server.
+ * Font metrics settle after xterm's first report and can legitimately change
+ * the PTY size; callers that sample a baseline must observe that transition.
+ */
+export async function waitForFontSettledViewport(
+  page: Page,
+  terminalId: string,
+  options: E2EWaitOptions = {},
+): Promise<E2ETerminalSnapshot> {
+  const timeout = options.timeout;
+  const existing = await terminalEvents(page, terminalId);
+  const existingFloor = existing.reduce((floor, event) => Math.max(floor, event.id), 0);
+  const fontSettled = existing.findLast((event) => (
+    event.type === "font-load" && event.data.result === "settled"
+  )) ?? await page.evaluate(async ({ id, afterId, timeoutMs }) => {
+    const api = (window as E2EWindow).__TERM_SERVER_E2E__;
+    if (!api) throw new Error("term-server E2E diagnostics are unavailable");
+    return api.waitForEvent(id, (event) => event.type === "font-load" && event.data.result === "settled", {
+      timeout: timeoutMs,
+      afterId,
+    });
+  }, { id: terminalId, afterId: existingFloor, timeoutMs: timeout });
+  const proposed = await page.evaluate(async ({ id, afterId, timeoutMs }) => {
+    const api = (window as E2EWindow).__TERM_SERVER_E2E__;
+    if (!api) throw new Error("term-server E2E diagnostics are unavailable");
+    return api.waitForEvent(id, (event) => event.type === "viewport" && event.data.source === "proposed", {
+      timeout: timeoutMs,
+      afterId,
+    });
+  }, { id: terminalId, afterId: fontSettled.id, timeoutMs: timeout });
+  const proposedCols = typeof proposed.data.cols === "number" ? proposed.data.cols : undefined;
+  const proposedRows = typeof proposed.data.rows === "number" ? proposed.data.rows : undefined;
+  return page.evaluate(async ({ id, timeoutMs, proposedTimestamp, proposedCols, proposedRows }) => {
+    const api = (window as E2EWindow).__TERM_SERVER_E2E__;
+    if (!api) throw new Error("term-server E2E diagnostics are unavailable");
+    return api.waitForTerminal(id, (snapshot) => {
+      const desired = snapshot.desiredViewport;
+      const sent = snapshot.sentViewport;
+      const server = snapshot.serverViewport;
+      return snapshot.updatedAt >= proposedTimestamp
+        && snapshot.socketState === "connected"
+        && desired !== undefined
+        && sent !== undefined
+        && server !== undefined
+        && desired.cols === sent.cols
+        && desired.rows === sent.rows
+        && sent.cols === server.cols
+        && sent.rows === server.rows
+        && (proposedCols === undefined || server.cols === proposedCols)
+        && (proposedRows === undefined || server.rows === proposedRows);
+    }, { timeout: timeoutMs });
+  }, {
+    id: terminalId,
+    timeoutMs: timeout,
+    proposedTimestamp: proposed.timestamp,
+    proposedCols,
+    proposedRows,
+  });
+}
+
 export async function waitForTerminalState(
   page: Page,
   terminalId: string,

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "preact/hooks";
+import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import {
   Activity,
   Bell,
@@ -1445,7 +1445,7 @@ export function TerminalPane({
     };
   }, [terminal.id, config.scrollbackLines]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     setTerminalVisibility.current?.(visible);
   }, [visible]);
 
@@ -1865,6 +1865,7 @@ export function TerminalPane({
           <Search size={13} aria-hidden="true" />
           <input
             ref={searchInput}
+            type="search"
             value={searchQuery}
             onInput={(event) => setSearchQuery(event.currentTarget.value)}
             onKeyDown={(event) => {

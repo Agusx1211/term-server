@@ -25,7 +25,6 @@ import { WorkbenchPage } from "../pages/workbench-page.js";
 import type {
   E2ETerminalDiagnosticsApi,
   E2ETerminalEvent,
-  E2ETerminalSnapshot,
 } from "../../src/client/lib/e2e-diagnostics.js";
 import { TERMINAL_ACK_BYTES } from "../../src/client/lib/terminal-stream.js";
 
@@ -106,24 +105,21 @@ async function waitForSocketCreated(
   }, { id: terminalId, after: afterEventId, timeout: WAIT_TIMEOUT_MS });
 }
 
-async function waitForTerminalQuiescent(page: Page, terminalId: string): Promise<E2ETerminalSnapshot> {
-  return page.evaluate(async ({ id, timeout, acknowledgementLimit }) => {
+async function waitForSocketClosed(
+  page: Page,
+  terminalId: string,
+  generation: number,
+  afterEventId: number,
+): Promise<E2ETerminalEvent> {
+  return page.evaluate(async ({ id, generation, after, timeout }) => {
     const api = (window as E2EWindow).__TERM_SERVER_E2E__;
     if (!api) throw new Error("term-server E2E diagnostics are unavailable");
-    return api.waitForTerminal(
+    return api.waitForEvent(
       id,
-      (snapshot) => snapshot.socketState === "connected"
-        && snapshot.acceptingInput
-        && snapshot.pendingParserWrites === 0
-        && snapshot.renderBacklogBytes === 0
-        && snapshot.flowPendingAcknowledgementBytes < acknowledgementLimit,
-      { timeout },
+      (candidate) => candidate.type === "socket-close" && candidate.data.generation === generation,
+      { timeout, afterId: after },
     );
-  }, {
-    id: terminalId,
-    timeout: WAIT_TIMEOUT_MS,
-    acknowledgementLimit: TERMINAL_ACK_BYTES,
-  });
+  }, { id: terminalId, generation, after: afterEventId, timeout: WAIT_TIMEOUT_MS });
 }
 
 function countTranscriptEntries(
@@ -159,6 +155,7 @@ test("P0-07 Abrupt disconnect during live output @p0 @smoke", async ({ page, ser
   const duringMarker = `[E2E:PRINT:${duringId}:${duringText}]`;
   const afterMarker = `[E2E:PRINT:${afterId}:${afterText}]`;
   const inputMarker = `[E2E:ECHO_INPUT:${inputId}:${Buffer.from(inputText, "utf8").toString("base64")}]`;
+  const inputWriteBase64 = Buffer.from(`${inputMarker}\n`, "utf8").toString("base64");
 
   await page.goto(baseURL);
   await new LoginPage(page).login();
@@ -200,6 +197,13 @@ test("P0-07 Abrupt disconnect during live output @p0 @smoke", async ({ page, ser
   expect(beforeDisconnect.committedSequence).toEqual(expect.any(Number));
   const baselineEvents = await terminalEvents(page, terminalId);
   const baselineEventId = baselineEvents.at(-1)?.id ?? mounted.eventId;
+  const initialConnection = [...faultController.events].reverse().find(
+    (event) => event.type === "connection-open" && event.terminalId === terminalId,
+  );
+  if (!initialConnection || initialConnection.generation === undefined) {
+    throw new Error("initial terminal connection has no proxy generation");
+  }
+  const initialProxyGeneration = initialConnection.generation;
 
   const recoverySyncPromise = waitForRecoverySync(page, terminalId, baselineEventId);
   const reconnectSocketPromise = waitForSocketCreated(page, terminalId, baselineEventId);
@@ -228,19 +232,29 @@ test("P0-07 Abrupt disconnect during live output @p0 @smoke", async ({ page, ser
     (entry) => entry.event === "burst" && entry.id === burstId && entry.bytes === BURST_BYTES,
     { timeoutMs: WAIT_TIMEOUT_MS },
   );
-  const socketClosedPromise = pane.waitForEvent("socket-close", { timeout: WAIT_TIMEOUT_MS });
+  const socketClosedPromise = waitForSocketClosed(
+    page,
+    terminalId,
+    beforeDisconnect.socketGeneration,
+    baselineEventId,
+  );
   const terminatedPromise = faultController.waitFor(
-    (event) => event.type === "connection-terminated" && event.terminalId === terminalId,
+    (event) => event.type === "connection-terminated"
+      && event.terminalId === terminalId
+      && event.generation === initialProxyGeneration,
     { timeoutMs: WAIT_TIMEOUT_MS },
   );
-  const terminateRule = faultController.terminate({ terminalId });
+  const terminateRule = faultController.terminate({ terminalId, generation: initialProxyGeneration });
   const [terminated, socketClosed] = await Promise.all([terminatedPromise, socketClosedPromise]);
   terminateRule.dispose();
   pausedRule.dispose();
   expect(terminated.abrupt).toBe(true);
   expect(terminated.code).toBe(1006);
   expect(socketClosed.type).toBe("socket-close");
-  expect(socketClosed.data.generation).toBe(beforeDisconnect.socketGeneration);
+  const closedGeneration = socketClosed.data.generation;
+  expect(typeof closedGeneration).toBe("number");
+  if (typeof closedGeneration !== "number") throw new Error("socket-close diagnostic omitted its generation");
+  expect(closedGeneration).toBe(beforeDisconnect.socketGeneration);
 
   const duringPrint = await server.waitForTranscript(
     terminalId,
@@ -291,13 +305,6 @@ test("P0-07 Abrupt disconnect during live output @p0 @smoke", async ({ page, ser
   );
   expect(echoed.payload_base64).toBe(Buffer.from(inputText, "utf8").toString("base64"));
 
-  const finalSnapshot = await waitForTerminalQuiescent(page, terminalId);
-  await expectTerminalConverged(page, terminalId, {
-    cols: beforeDisconnect.cols,
-    rows: beforeDisconnect.rows,
-  }, { timeout: WAIT_TIMEOUT_MS });
-  await expectTerminalInteractive(page, terminalId, { timeout: WAIT_TIMEOUT_MS });
-  await expectNoPendingRecovery(page, terminalId, { timeout: WAIT_TIMEOUT_MS });
   for (const markerText of [duringMarker, afterMarker, inputMarker]) {
     await expectTerminalBuffer(page, terminalId, {
       contains: markerText,
@@ -305,14 +312,47 @@ test("P0-07 Abrupt disconnect during live output @p0 @smoke", async ({ page, ser
     }, { timeout: WAIT_TIMEOUT_MS });
   }
 
+  await server.waitForTranscript(
+    terminalId,
+    (entry) => entry.event === "write" && entry.data_base64 === inputWriteBase64,
+    { timeoutMs: WAIT_TIMEOUT_MS },
+  );
   const finalTranscript = await server.readTranscript(terminalId);
+  const expectedOutputBytes = outputByteCount(finalTranscript);
+  const finalSnapshot = await page.evaluate(async ({ id, timeout, acknowledgementLimit, expected }) => {
+    const api = (window as E2EWindow).__TERM_SERVER_E2E__;
+    if (!api) throw new Error("term-server E2E diagnostics are unavailable");
+    return api.waitForTerminal(
+      id,
+      (snapshot) => snapshot.socketState === "connected"
+        && snapshot.acceptingInput
+        && snapshot.pendingParserWrites === 0
+        && snapshot.renderBacklogBytes === 0
+        && snapshot.flowPendingAcknowledgementBytes < acknowledgementLimit
+        && snapshot.receivedSequence === expected
+        && snapshot.committedSequence === expected,
+      { timeout },
+    );
+  }, {
+    id: terminalId,
+    timeout: WAIT_TIMEOUT_MS,
+    acknowledgementLimit: TERMINAL_ACK_BYTES,
+    expected: expectedOutputBytes,
+  });
+  await expectTerminalConverged(page, terminalId, {
+    cols: beforeDisconnect.cols,
+    rows: beforeDisconnect.rows,
+  }, { timeout: WAIT_TIMEOUT_MS });
+  await expectTerminalInteractive(page, terminalId, { timeout: WAIT_TIMEOUT_MS });
+  await expectNoPendingRecovery(page, terminalId, { timeout: WAIT_TIMEOUT_MS });
+
   expect(countTranscriptEntries(finalTranscript, (entry) => entry.event === "print" && entry.id === beforeId)).toBe(1);
   expect(countTranscriptEntries(finalTranscript, (entry) => entry.event === "print" && entry.id === duringId)).toBe(1);
   expect(countTranscriptEntries(finalTranscript, (entry) => entry.event === "print" && entry.id === afterId)).toBe(1);
   expect(countTranscriptEntries(finalTranscript, (entry) => entry.event === "echo_input" && entry.id === inputId && entry.phase === "payload")).toBe(1);
   expect(countTranscriptEntries(finalTranscript, (entry) => entry.event === "error")).toBe(0);
-  expect(finalSnapshot.receivedSequence).toBe(outputByteCount(finalTranscript));
-  expect(finalSnapshot.committedSequence).toBe(outputByteCount(finalTranscript));
+  expect(finalSnapshot.receivedSequence).toBe(expectedOutputBytes);
+  expect(finalSnapshot.committedSequence).toBe(expectedOutputBytes);
   expect(finalSnapshot.renderBacklogBytes).toBe(0);
   expect(finalSnapshot.renderBacklogFrames).toBe(0);
   expect(finalSnapshot.flowPendingAcknowledgementBytes).toBeLessThan(TERMINAL_ACK_BYTES);

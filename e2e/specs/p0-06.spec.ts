@@ -107,18 +107,35 @@ test("P0-06 Reload during continuous TUI repaint @p0 @smoke", async ({
     );
     expect(repaint.bytes).toBe(REPAINT_BYTES);
     // Arm this before reload: the fixture records the repaint before its
-    // full write, but the write cannot pass the paused server-to-browser
-    // stream until the fault is disposed.
+    // full PTY write completes, because the paused server-to-browser path
+    // eventually backpressures the fixture's output.
     const repaintWritten = server.waitForTranscript(
       terminalId,
       (entry) => entry.event === "write" && entry.bytes === REPAINT_BYTES,
       { timeoutMs: WAIT_TIMEOUT_MS },
     );
-    // Keep the original connection paused through reload to exercise recovery
-    // during the active repaint, then release it at the navigation boundary.
-    await page.reload();
-    pausedServerOutput.dispose();
-    await repaintWritten;
+    // Start navigation while the original connection is paused, then terminate
+    // exactly that proxy generation at the navigation boundary. The exact
+    // matcher keeps the termination rule from affecting the replacement socket.
+    const terminatedPromise = faultController.waitFor(
+      (event) => event.type === "connection-terminated"
+        && event.terminalId === terminalId
+        && event.generation === initialGeneration,
+      { timeoutMs: WAIT_TIMEOUT_MS },
+    );
+    const reload = page.reload();
+    const termination = faultController.terminate({ terminalId, generation: initialGeneration });
+    try {
+      const terminated = await terminatedPromise;
+      expect(terminated.generation).toBe(initialGeneration);
+      expect(terminated.abrupt).toBe(true);
+      termination.dispose();
+      pausedServerOutput.dispose();
+      await Promise.all([reload, repaintWritten]);
+    } finally {
+      termination.dispose();
+      pausedServerOutput.dispose();
+    }
   } finally {
     pausedServerOutput.dispose();
   }
@@ -128,6 +145,11 @@ test("P0-06 Reload during continuous TUI repaint @p0 @smoke", async ({
   await expectTerminalConnected(page, terminalId, { timeout: WAIT_TIMEOUT_MS });
   await waitForTerminalState(page, terminalId, { acceptingInput: true, pendingParserWrites: 0 }, { timeout: WAIT_TIMEOUT_MS });
   await pane.expectConnected();
+
+  await expectTerminalBuffer(page, terminalId, {
+    contains: `[E2E:REPAINT:${repaintId}:FRAME]`,
+    occurrences: 1,
+  }, { timeout: WAIT_TIMEOUT_MS });
 
   await faultController.waitFor(
     (event) => event.type === "connection-open"

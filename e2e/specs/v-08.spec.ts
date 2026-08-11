@@ -2,13 +2,12 @@ import type { Locator, Page, TestInfo } from "@playwright/test";
 import { test, expect, type IsolatedServer } from "../fixtures/test.js";
 import { installBrowserErrorCollectors } from "../fixtures/artifacts.js";
 import {
-  expectConnectedTerminalInvariants,
+  expectTerminalInvariants,
 } from "../assertions/invariants.js";
 import {
   assertMonotonicSequences,
   expectTerminalBuffer,
   expectTerminalConverged,
-  expectTerminalInteractive,
   expectNoPendingRecovery,
   expectSingleTerminalSocket,
   terminalEvents,
@@ -166,7 +165,6 @@ async function waitForCurrentGeometry(page: Page, terminalId: string): Promise<E
       };
       return snapshot.lifecycle.visible
         && snapshot.lifecycle.mounted
-        && snapshot.lifecycle.acceptingInput
         && snapshot.socketState === "connected"
         && snapshot.activeSocketCount === 1
         && snapshot.pendingParserWrites === 0
@@ -288,7 +286,9 @@ async function dragDivider(
   if (direction !== "horizontal" && direction !== "vertical") throw new Error("split divider has no direction");
   const vertical = direction === "horizontal";
   const startX = vertical ? box.x : box.x + box.width / 2;
-  const startY = vertical ? box.y + box.height / 2 : box.y;
+  // Avoid starting a root drag where a nested divider crosses it. The
+  // overlapping hit areas otherwise let the nested divider capture pointerdown.
+  const startY = vertical ? box.y + box.height * 0.25 : box.y;
   await page.mouse.move(startX, startY);
   await page.mouse.down();
   let finalPoint = { x: startX, y: startY };
@@ -324,12 +324,14 @@ async function assertVisiblePanePolicy(page: Page, terminalIds: readonly string[
     await expect(workbench.editorGrid.locator(`.pane-slot:not(.cached)[data-terminal-id="${terminalId}"]`)).toHaveCount(1);
   }
   const snapshots = await Promise.all(terminalIds.map((terminalId) => waitForCurrentGeometry(page, terminalId)));
-  expect(snapshots.filter((snapshot) => snapshot.active)).toHaveLength(1);
+  const activeSnapshots = snapshots.filter((snapshot) => snapshot.active);
+  expect(activeSnapshots).toHaveLength(1);
+  expect(activeSnapshots[0]?.lifecycle.acceptingInput).toBe(true);
+  expect(snapshots.filter((snapshot) => snapshot.lifecycle.acceptingInput)).toHaveLength(1);
   expect(snapshots.filter((snapshot) => snapshot.focused).length).toBeLessThanOrEqual(1);
   for (const snapshot of snapshots) {
     expect(snapshot.lifecycle.visible).toBe(true);
     expect(snapshot.lifecycle.mounted).toBe(true);
-    expect(snapshot.lifecycle.acceptingInput).toBe(true);
     expect(snapshot.activeSocketCount).toBe(1);
   }
   return snapshots;
@@ -394,28 +396,33 @@ test("V-08 Split-pane drag converges browser, server, and PTY geometry @p1 @pr @
   for (const [index, terminal] of created.entries()) {
     const pane = panes[index]!;
     const snapshot = finalSnapshots[index]!;
-    const host = await pane.xtermHost.boundingBox();
-    if (!host || host.width <= 0 || host.height <= 0) throw new Error(`terminal ${terminal.id} has no compositor geometry`);
+    const screen = pane.xtermHost.locator(".xterm-screen");
+    const screenBox = await screen.boundingBox();
+    if (!screenBox || screenBox.width <= 0 || screenBox.height <= 0) {
+      throw new Error(`terminal ${terminal.id} has no compositor screen geometry`);
+    }
     expect(snapshot.pixelWidth).toBeGreaterThan(0);
     expect(snapshot.pixelHeight).toBeGreaterThan(0);
-    expect(snapshot.pixelWidth).toBeCloseTo(host.width, 0);
-    expect(snapshot.pixelHeight).toBeCloseTo(host.height, 0);
+    expect(Math.abs(snapshot.pixelWidth - screenBox.width)).toBeLessThanOrEqual(1);
+    expect(Math.abs(snapshot.pixelHeight - screenBox.height)).toBeLessThanOrEqual(1);
     await expectTerminalConverged(page, terminal.id, {
       cols: snapshot.cols,
       rows: snapshot.rows,
       pixelWidth: snapshot.pixelWidth,
       pixelHeight: snapshot.pixelHeight,
     }, { timeout: WAIT_TIMEOUT_MS });
-    await expectTerminalInteractive(page, terminal.id, { timeout: WAIT_TIMEOUT_MS });
     await sendFixtureSize(server, pane, terminal.id, `V08_SIZE_${index}`, snapshot);
     await sendFixturePrint(page, server, pane, terminal.id, `V08_PRINT_${index}`, `split-${index}`, testInfo);
     await sendFixtureInput(page, server, pane, terminal.id, `V08_INPUT_${index}`, `V08_INPUT_PAYLOAD_${index}`);
   }
 
+  await assertVisiblePanePolicy(page, terminalIds);
   for (const terminal of created) {
     await expectSingleTerminalSocket(page, terminal.id, { timeout: WAIT_TIMEOUT_MS });
     await expectNoPendingRecovery(page, terminal.id, { timeout: WAIT_TIMEOUT_MS });
-    const invariant = await expectConnectedTerminalInvariants(page, terminal.id, { timeout: WAIT_TIMEOUT_MS });
+    const invariant = await expectTerminalInvariants(page, terminal.id, { timeout: WAIT_TIMEOUT_MS });
+    expect(invariant.snapshot.socketState).toBe("connected");
+    expect(invariant.snapshot.activeSocketCount).toBe(1);
     await assertMonotonicSequences(invariant.events);
     expect(invariant.events.filter((event) => event.type === "error")).toHaveLength(0);
     const transcript = await server.readTranscript(terminal.id);

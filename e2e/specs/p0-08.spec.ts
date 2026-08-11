@@ -37,9 +37,10 @@ async function waitForDiagnosticEvent(
     readonly exactGeneration?: number;
     readonly syncMode?: "snapshot" | "resume";
     readonly parserStarted?: boolean;
+    readonly afterId?: number;
   } = {},
 ): Promise<E2ETerminalEvent> {
-  return page.evaluate(async ({ id, type, minimumGeneration, exactGeneration, syncMode, parserStarted, timeout }) => {
+  return page.evaluate(async ({ id, type, minimumGeneration, exactGeneration, syncMode, parserStarted, afterId, timeout }) => {
     const api = (window as E2EWindow).__TERM_SERVER_E2E__;
     if (!api) throw new Error("term-server E2E diagnostics are unavailable");
     return api.waitForEvent(id, (event) => (
@@ -48,7 +49,7 @@ async function waitForDiagnosticEvent(
       && (minimumGeneration === undefined || event.snapshot.socketGeneration >= minimumGeneration)
       && (syncMode === undefined || event.snapshot.syncMode === syncMode)
       && (!parserStarted || event.snapshot.pendingParserWrites > 0)
-    ), { timeout });
+    ), { timeout, afterId });
   }, {
     id: terminalId,
     type,
@@ -173,10 +174,14 @@ test("P0-08 Disconnect during snapshot recovery @p0 @smoke", async ({
         && event.generation === baselineProxyOpen.generation,
       { timeoutMs: WAIT_TIMEOUT_MS },
     );
+    const socketCloseBoundary = (await terminalEvents(page, terminalId)).at(-1)?.id ?? 0;
     const closeInitialSocket = faultController.terminate({ terminalId });
     closeInitialSocket.dispose();
     await firstTermination;
-    await waitForDiagnosticEvent(page, terminalId, "socket-close", { exactGeneration: baseline.socketGeneration });
+    await waitForDiagnosticEvent(page, terminalId, "socket-close", {
+      exactGeneration: baseline.socketGeneration,
+      afterId: socketCloseBoundary,
+    });
 
     const reconnectOpen = faultController.waitFor(
       (event) => event.type === "connection-open"
@@ -188,6 +193,14 @@ test("P0-08 Disconnect during snapshot recovery @p0 @smoke", async ({
     const secondProxyOpen = await reconnectOpen;
     if (secondProxyOpen.generation === undefined) throw new Error("snapshot recovery proxy connection has no generation");
     interruptedProxyGeneration = secondProxyOpen.generation;
+
+    const nextSocketOpen = waitForDiagnosticEvent(page, terminalId, "socket-open", {
+      minimumGeneration: interruptedProxyGeneration + 1,
+    });
+    const nextSnapshotStart = waitForDiagnosticEvent(page, terminalId, "snapshot", {
+      minimumGeneration: interruptedProxyGeneration + 1,
+      syncMode: "snapshot",
+    });
 
     // The generation-specific frame rule is armed before reconnect. It forwards
     // the first snapshot frame, then terminates the proxy connection so xterm
@@ -211,13 +224,6 @@ test("P0-08 Disconnect during snapshot recovery @p0 @smoke", async ({
     expect(parserStart.snapshot.pendingParserBytes).toBeGreaterThan(0);
     expect(parserStart.snapshot.syncMode).toBe("snapshot");
 
-    const nextSocketOpen = waitForDiagnosticEvent(page, terminalId, "socket-open", {
-      minimumGeneration: interruptedProxyGeneration + 1,
-    });
-    const nextSnapshotStart = waitForDiagnosticEvent(page, terminalId, "snapshot", {
-      minimumGeneration: interruptedProxyGeneration + 1,
-      syncMode: "snapshot",
-    });
     pausedBrowserOutput.dispose();
     await nextSocketOpen;
     const nextRecoverySnapshot = await nextSnapshotStart;

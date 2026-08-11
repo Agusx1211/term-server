@@ -22,7 +22,6 @@ type E2EWindow = Window & {
 };
 
 const cssAttribute = (value: string): string => value.replace(/(["\\])/g, "\\$1");
-const regexEscape = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 /**
  * A small semantic facade for one terminal pane. The stable terminal ID is the
@@ -46,23 +45,10 @@ export class TerminalPanePage {
     return this.identity.terminalId;
   }
 
-  /**
-   * Prefer the accessible region identity. The attribute selector is a narrow
-   * fallback for panes whose accessible name has not rendered yet.
-   */
+  /** The server terminal ID is the stable pane identity across renderer churn. */
   get root(): Locator {
     const id = cssAttribute(this.terminalId);
-    const region = this.page.getByRole("region", {
-      name: this.identity.name
-        ? new RegExp(`^Terminal(?: pane)? ${regexEscape(this.identity.name)}$`)
-        : /^Terminal(?: pane)? .+$/,
-    });
-    const identifiedRegion = region.filter({
-      has: this.page.locator(`[data-terminal-id="${id}"]`),
-    });
-    return identifiedRegion.or(
-      this.page.locator(`section[role="region"][data-terminal-id="${id}"]`),
-    ).first();
+    return this.page.locator(`section[role="region"][data-terminal-id="${id}"]`).first();
   }
 
   get xtermHost(): Locator {

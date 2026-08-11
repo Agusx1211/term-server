@@ -229,8 +229,15 @@ async function installPerformanceMetrics(page: Page): Promise<void> {
 
 async function beginResizeMetric(page: Page): Promise<void> {
   await page.evaluate((key) => {
-    const metrics = (window as unknown as Record<string, unknown>)[key] as { activeResizeStart?: number } | undefined;
+    const metrics = (window as unknown as Record<string, unknown>)[key] as {
+      activeResizeStart?: number;
+      longTasks: { startTime: number; duration: number }[];
+      resizeWindows: readonly ResizeWindow[];
+    } | undefined;
     if (!metrics) throw new Error("P0-05 performance metrics are unavailable");
+    // Discard setup and prior-command work before the first resize. Retain
+    // observations for later windows so the final gate covers every resize.
+    if (metrics.resizeWindows.length === 0) metrics.longTasks.length = 0;
     metrics.activeResizeStart = performance.now();
   }, METRICS_KEY);
 }

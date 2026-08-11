@@ -10,6 +10,7 @@ import {
 } from "../assertions/terminal-pixels.js";
 import {
   expectTerminalBuffer,
+  waitForFontSettledViewport,
   terminalEvents,
 } from "../assertions/terminal-state.js";
 import { expectTerminalInvariants } from "../assertions/invariants.js";
@@ -74,15 +75,7 @@ test("@p0 @smoke P0-01 Cold start renders and accepts input", async ({ page, ser
     }, { id: terminalId, minimumRenderCount });
   };
 
-  await page.evaluate(async ({ id }) => {
-    const api = (window as E2EWindow).__TERM_SERVER_E2E__;
-    if (!api) throw new Error("term-server E2E diagnostics are unavailable");
-    await api.waitForEvent((event) => (
-      event.terminalId === id
-      && event.type === "font-load"
-      && event.data.result === "settled"
-    ), { timeout: 15_000, afterId: 0 });
-  }, { id: terminalId });
+  await waitForFontSettledViewport(page, terminalId, { timeout: 15_000 });
 
   const token = `${testInfo.workerIndex}-${testInfo.parallelIndex}-${Date.now()}`;
   const readyId = `COLD-READY-${token}`;

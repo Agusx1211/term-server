@@ -106,10 +106,12 @@ test("P0-13 WebGL initialization failure falls back @p0", async ({ page, baseURL
     api.controls.renderer.failWebGL(id, { message: "P0-13 forced WebGL initialization failure" });
   }, { id: terminalId });
 
-  const pane = await workbench.openTerminal({ id: terminalId, name: terminalName });
+  const pane = new TerminalPanePage(page, terminalId, terminalName);
+  const fallbackEventPromise = pane.waitForEvent("renderer-fallback", { timeout: DIAGNOSTIC_TIMEOUT });
+  await workbench.openTerminal({ id: terminalId, name: terminalName });
   await pane.expectVisible();
 
-  const fallbackEvent = await pane.waitForEvent("renderer-fallback", { timeout: DIAGNOSTIC_TIMEOUT });
+  const fallbackEvent = await fallbackEventPromise;
   expect(fallbackEvent.data.reason).toBe("load-failed");
 
   const synchronized = await expectTerminalSynchronized(page, terminalId, { timeout: DIAGNOSTIC_TIMEOUT });

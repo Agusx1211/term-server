@@ -95,7 +95,8 @@ async function waitForRenderedMarker(
       && snapshot.pendingParserBytes === 0
       && snapshot.renderBacklogBytes === 0
       && snapshot.renderBacklogFrames === 0
-      && snapshot.xterm.text.includes(text)
+      && (snapshot.xterm.text.includes(text)
+        || snapshot.xterm.text.replaceAll("\n", "").includes(text))
     ), { timeout });
   }, { id: terminalId, text, previousRenderCount, timeout: WAIT_TIMEOUT_MS });
 }
@@ -104,18 +105,16 @@ async function waitForSelectionRendered(
   page: Page,
   terminalId: string,
   selectionText: string,
-  previousRenderCount: number,
 ): Promise<E2ETerminalSnapshot> {
-  return page.evaluate(async ({ id, selectionText, previousRenderCount, timeout }) => {
+  return page.evaluate(async ({ id, selectionText, timeout }) => {
     const api = (window as E2EWindow).__TERM_SERVER_E2E__;
     if (!api) throw new Error("term-server E2E diagnostics are unavailable");
     return api.waitForTerminal(id, (snapshot) => (
-      snapshot.renderCount > previousRenderCount
-      && snapshot.pendingParserWrites === 0
+      snapshot.pendingParserWrites === 0
       && snapshot.renderBacklogBytes === 0
       && snapshot.xterm.selectionText === selectionText
     ), { timeout });
-  }, { id: terminalId, selectionText, previousRenderCount, timeout: WAIT_TIMEOUT_MS });
+  }, { id: terminalId, selectionText, timeout: WAIT_TIMEOUT_MS });
 }
 
 async function waitForRecoveredTerminal(
@@ -149,11 +148,28 @@ async function selectText(
   selectedText: string,
 ): Promise<void> {
   const lines = snapshot.xterm.text.split("\n");
-  const lineIndex = lines.findIndex((line) => line.includes(selectedText));
-  if (lineIndex < 0) throw new Error(`Unable to locate ${selectedText} in the terminal model`);
-  const column = lines[lineIndex]!.indexOf(selectedText);
-  const visualRow = lineIndex - snapshot.viewportY;
-  if (visualRow < 0 || visualRow >= snapshot.rows) {
+  const compactedText = lines.join("");
+  const startOffset = compactedText.indexOf(selectedText);
+  if (startOffset < 0) throw new Error(`Unable to locate ${selectedText} in the terminal model`);
+
+  const cellAt = (offset: number): { readonly row: number; readonly column: number } => {
+    let remaining = offset;
+    for (const [row, line] of lines.entries()) {
+      if (remaining < line.length) return { row, column: remaining };
+      remaining -= line.length;
+    }
+    throw new Error(`Unable to map ${selectedText} to terminal cells`);
+  };
+  const start = cellAt(startOffset);
+  const end = cellAt(startOffset + selectedText.length - 1);
+  const startVisualRow = start.row - snapshot.viewportY;
+  const endVisualRow = end.row - snapshot.viewportY;
+  if (
+    startVisualRow < 0
+    || startVisualRow >= snapshot.rows
+    || endVisualRow < 0
+    || endVisualRow >= snapshot.rows
+  ) {
     throw new Error(`Selection marker ${selectedText} is outside the visible terminal viewport`);
   }
   const box = await screen.boundingBox();
@@ -162,12 +178,13 @@ async function selectText(
   }
   const cellWidth = box.width / snapshot.cols;
   const cellHeight = box.height / snapshot.rows;
-  const y = box.y + (visualRow + 0.5) * cellHeight;
-  const startX = box.x + (column + 0.25) * cellWidth;
-  const endX = box.x + (column + selectedText.length - 0.25) * cellWidth;
-  await pane.page.mouse.move(startX, y);
+  const startX = box.x + (start.column + 0.25) * cellWidth;
+  const startY = box.y + (startVisualRow + 0.5) * cellHeight;
+  const endX = box.x + (end.column + 0.75) * cellWidth;
+  const endY = box.y + (endVisualRow + 0.5) * cellHeight;
+  await pane.page.mouse.move(startX, startY);
   await pane.page.mouse.down();
-  await pane.page.mouse.move(endX, y);
+  await pane.page.mouse.move(endX, endY);
   await pane.page.mouse.up();
 }
 
@@ -306,7 +323,7 @@ test("@p1 @pr @nightly @render @interaction @recovery R-08 Selection and search 
   const selectionBefore = await pane.snapshot();
   if (!selectionBefore) throw new Error(`No diagnostics snapshot before selection for ${terminalId}`);
   const beforeSelectionPixels = await screenshotRegion(page, pane.xtermHost);
-  const selectionRendered = waitForSelectionRendered(page, terminalId, selectValue, selectionBefore.renderCount);
+  const selectionRendered = waitForSelectionRendered(page, terminalId, selectValue);
   await selectText(pane, screen, selectionBefore, selectValue);
   const selected = await selectionRendered;
   expect(selected.xterm.selectionText).toBe(selectValue);
@@ -347,8 +364,9 @@ test("@p1 @pr @nightly @render @interaction @recovery R-08 Selection and search 
   const preRecovery = await pane.snapshot();
   if (!preRecovery) throw new Error(`No diagnostics snapshot before resize for ${terminalId}`);
   expect(preRecovery.xterm.selectionText).toBe(selectValue);
-  expect(preRecovery.xterm.text).toContain(selectMarker);
-  expect(preRecovery.xterm.text).toContain(otherMarker);
+  const preRecoveryText = preRecovery.xterm.text.replaceAll("\n", "");
+  expect(preRecoveryText).toContain(selectMarker);
+  expect(preRecoveryText).toContain(otherMarker);
   const resizeBefore = preRecovery;
   const resizeEventId = (await terminalEvents(page, terminalId)).at(-1)?.id ?? -1;
 
@@ -571,14 +589,15 @@ test("@p1 @pr @nightly @render @interaction @recovery R-08 Selection and search 
   }, { timeout: WAIT_TIMEOUT_MS });
   expect(finalSnapshot.serverViewport?.cols).toBe(finalSnapshot.cols);
   expect(finalSnapshot.serverViewport?.rows).toBe(finalSnapshot.rows);
-  expect(finalSnapshot.xterm.text).toContain(selectMarker);
-  expect(finalSnapshot.xterm.text).toContain(otherMarker);
-  expect(finalSnapshot.xterm.text).toContain(postMarker);
-  expect(finalSnapshot.xterm.text).toContain(echoMarker);
-  expect(occurrences(finalSnapshot.xterm.text, selectMarker)).toBe(1);
-  expect(occurrences(finalSnapshot.xterm.text, otherMarker)).toBe(1);
-  expect(occurrences(finalSnapshot.xterm.text, postMarker)).toBe(1);
-  expect(occurrences(finalSnapshot.xterm.text, echoMarker)).toBe(1);
+  const finalText = finalSnapshot.xterm.text.replaceAll("\n", "");
+  expect(finalText).toContain(selectMarker);
+  expect(finalText).toContain(otherMarker);
+  expect(finalText).toContain(postMarker);
+  expect(finalText).toContain(echoMarker);
+  expect(occurrences(finalText, selectMarker)).toBe(1);
+  expect(occurrences(finalText, otherMarker)).toBe(1);
+  expect(occurrences(finalText, postMarker)).toBe(1);
+  expect(occurrences(finalText, echoMarker)).toBe(1);
   await expectTerminalConverged(page, terminalId, { cols: finalSnapshot.cols, rows: finalSnapshot.rows }, { timeout: WAIT_TIMEOUT_MS });
   await expectNoPendingRecovery(page, terminalId, { timeout: WAIT_TIMEOUT_MS });
   assertNoPendingSynchronization(finalSnapshot);

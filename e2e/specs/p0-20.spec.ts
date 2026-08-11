@@ -93,13 +93,17 @@ test("P0-20 Terminal exit across reconnect boundary @p0", async ({
     throw new Error("initial terminal connection has no proxy generation");
   }
   const initialGeneration = initialConnection.generation;
+  const socketEventFloor = Math.max(0, ...(await terminalEvents(page, terminalId)).map((event) => event.id));
   const disconnected = faultController.waitFor(
     (event) => event.type === "connection-terminated"
       && event.terminalId === terminalId
       && event.generation === initialGeneration,
     { timeoutMs: WAIT_TIMEOUT_MS },
   );
-  const socketClosed = pane.waitForEvent("socket-close", { timeout: WAIT_TIMEOUT_MS });
+  const socketClosed = pane.waitForEvent("socket-close", {
+    timeout: WAIT_TIMEOUT_MS,
+    afterId: socketEventFloor,
+  });
   const disconnectRule = faultController.terminate({ terminalId, generation: initialGeneration });
   try {
     await disconnected;
@@ -107,7 +111,11 @@ test("P0-20 Terminal exit across reconnect boundary @p0", async ({
   } finally {
     disconnectRule.dispose();
   }
-  const primaryExit = pane.waitForEvent("exit", { timeout: WAIT_TIMEOUT_MS });
+  const primaryExitEventFloor = Math.max(0, ...(await terminalEvents(page, terminalId)).map((event) => event.id));
+  const primaryExit = pane.waitForEvent("exit", {
+    timeout: WAIT_TIMEOUT_MS,
+    afterId: primaryExitEventFloor,
+  });
 
   // Keep the first browser disconnected while a second real browser drives the
   // fixture to exit. This makes the PTY exit boundary independent of reconnect

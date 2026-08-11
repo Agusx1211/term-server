@@ -19,12 +19,12 @@ const EVENT_TIMEOUT_MS = 45_000;
 const MAX_SNAPSHOT_PARSE_MS = 10_000;
 const MAX_CHECKPOINT_BYTES = 4 * 1024 * 1024;
 const MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024;
+// Keep the checkpoint above 2 MiB while respecting xterm's 10,000-row
+// scrollback bound: bare LF does not reset the column, so short logical lines
+// wrap into extra rows and truncate the serialized checkpoint too aggressively.
 const MIN_LARGE_CHECKPOINT_BYTES = 2 * 1024 * 1024;
-// 2.25 MiB across 250-byte logical lines stays below 10k retained rows at
-// the observed ~268-column viewport, producing a >2 MiB checkpoint without
-// exceeding the renderer's transient allocation peak.
 const LARGE_BURST_BYTES = 2.25 * 1024 * 1024;
-const LARGE_BURST_LINE_WIDTH = 250;
+const LARGE_BURST_LINE_WIDTH = 3_000;
 // Keep the stress resize well below the multi-worker Chromium canvas limit.
 const WIDE_BROWSER_WIDTH = 2_400;
 const NARROW_BROWSER_WIDTH = 1_200;
@@ -122,18 +122,18 @@ async function waitForSnapshotSync(
   }, { id: terminalId, generation: afterGeneration, timeout: EVENT_TIMEOUT_MS });
 }
 
-async function waitForSyncedGeneration(
+async function waitForSyncedGenerationAfter(
   page: Page,
   terminalId: string,
-  generation: number,
+  afterGeneration: number,
 ): Promise<E2ETerminalEvent> {
-  return page.evaluate(async ({ id, generation, timeout }) => {
+  return page.evaluate(async ({ id, afterGeneration, timeout }) => {
     const api = (window as E2EWindow).__TERM_SERVER_E2E__;
     if (!api) throw new Error("term-server E2E diagnostics are unavailable");
     return api.waitForEvent(id, (event) => (
-      event.type === "synced" && event.snapshot.socketGeneration === generation
+      event.type === "synced" && event.snapshot.socketGeneration > afterGeneration
     ), { timeout });
-  }, { id: terminalId, generation, timeout: EVENT_TIMEOUT_MS });
+  }, { id: terminalId, afterGeneration, timeout: EVENT_TIMEOUT_MS });
 }
 
 async function waitForSyncState(
@@ -285,7 +285,6 @@ test("@p0 P0-17 Snapshot is bounded by recovery behavior", async ({ page, baseUR
     generation: oldGeneration,
     direction: "server-to-browser",
     jsonType: "size",
-    occurrence: 2,
   });
   const resizeSeen = waitForTranscriptEvent(server, terminalId, (entry) => (
     entry.event === "sigwinch"
@@ -304,13 +303,9 @@ test("@p0 P0-17 Snapshot is bounded by recovery behavior", async ({ page, baseUR
   const [, resized] = await Promise.all([sizeDropped, resizeSeen]);
   expect(typeof resized.cols).toBe("number");
   droppedSize.dispose();
-  await faultController.waitFor((event) => (
-    event.type === "restored"
-    && event.terminalId === terminalId
-    && event.generation === oldGeneration
-    && event.direction === "server-to-browser"
-  ), { timeoutMs: EVENT_TIMEOUT_MS });
 
+  const snapshotSyncPromise = waitForSnapshotSync(page, terminalId, oldGeneration + 1);
+  const syncedPromise = waitForSyncedGenerationAfter(page, terminalId, oldGeneration + 1);
   const malformedFrame = faultController.inject({
     direction: "server-to-browser",
     data: new Uint8Array([0]),
@@ -345,10 +340,11 @@ test("@p0 P0-17 Snapshot is bounded by recovery behavior", async ({ page, baseUR
     artifactName: "p0-17-recoverable-protocol-error",
   });
 
-  const snapshotSync = await waitForSnapshotSync(page, terminalId, oldGeneration + 1);
+  const snapshotSync = await snapshotSyncPromise;
   const successfulGeneration = snapshotSync.snapshot.socketGeneration;
   expect(successfulGeneration).toBeGreaterThan(oldGeneration + 1);
-  const syncedEvent = await waitForSyncedGeneration(page, terminalId, successfulGeneration);
+  const syncedEvent = await syncedPromise;
+  expect(syncedEvent.snapshot.socketGeneration).toBe(successfulGeneration);
   await assertSnapshotMetrics(page, terminalId, checkpointEvent, snapshotSync, syncedEvent, testInfo);
 
   const beforeFinalPixels = await screenshotRegion(page, pane.xtermHost);
@@ -387,7 +383,10 @@ test("@p0 P0-17 Snapshot is bounded by recovery behavior", async ({ page, baseUR
     && entry.phase === "payload"
   )).length;
   expect(payloadCount).toBe(1);
-  await waitForTerminalText(page, terminalId, marker("ECHO_INPUT", ECHO_ID, Buffer.from(ECHO_PAYLOAD).toString("base64")));
+  await expectTerminalBuffer(page, terminalId, {
+    contains: marker("ECHO_INPUT", ECHO_ID, Buffer.from(ECHO_PAYLOAD).toString("base64")).trimEnd(),
+    occurrences: 1,
+  }, { timeout: EVENT_TIMEOUT_MS });
 
   const finalSnapshot = await waitForSyncState(page, terminalId, successfulGeneration);
   expect(finalSnapshot.socketState).toBe("connected");

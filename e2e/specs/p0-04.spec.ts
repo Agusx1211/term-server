@@ -8,6 +8,7 @@ import {
   expectTerminalBuffer,
   expectTerminalSynchronized,
   terminalEvents,
+  waitForFontSettledViewport,
 } from "../assertions/terminal-state.js";
 import { expectConnectedTerminalInvariants } from "../assertions/invariants.js";
 import { LoginPage } from "../pages/login-page.js";
@@ -110,6 +111,7 @@ test("@p0 @smoke P0-04 Rapid resize storm converges", async ({ page, server, fau
   const echoId = `${token}-ECHO`;
   const inputText = `${token}-INPUT`;
 
+  await waitForFontSettledViewport(page, terminalId, { timeout: WAIT_TIMEOUT_MS });
   const initial = await expectTerminalSynchronized(page, terminalId, { timeout: WAIT_TIMEOUT_MS });
   expect(initial.cols).toBeGreaterThan(0);
   expect(initial.rows).toBeGreaterThan(0);

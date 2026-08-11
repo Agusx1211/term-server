@@ -13,6 +13,7 @@ import {
   expectTerminalSynchronized,
   terminalSnapshot,
   waitForTerminalBuffer,
+  waitForFontSettledViewport,
   waitForTerminalState,
 } from "../assertions/terminal-state.js";
 import {
@@ -116,6 +117,7 @@ test("P0-09 Cached pane remains live and restores visibly @p0 @smoke", async ({ 
   const terminalAName = (await paneA.root.getAttribute("aria-label"))?.replace(/^Terminal(?: pane)?\s+/i, "");
   if (!terminalAName) throw new Error("terminal A did not expose an accessible name");
 
+  await waitForFontSettledViewport(page, terminalAId, { timeout: 15_000 });
   const initialA = await expectTerminalSynchronized(page, terminalAId);
   const initialSentViewport = initialA.sentViewport ?? initialA.urlViewport;
   if (!initialSentViewport) throw new Error("initial terminal A viewport was not reported");

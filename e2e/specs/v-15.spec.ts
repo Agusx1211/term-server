@@ -151,7 +151,7 @@ async function exerciseQuery(
   await pane.sendInput(`SIZE ${sizeId}`, true);
   await waitForFixtureCommand(server, terminalId, "SIZE", `SIZE ${sizeId}`);
   await pane.sendInput(`QUERY ${queryId}`, true);
-  await waitForFixtureCommand(server, terminalId, "QUERY", `QUERY ${queryId}`);
+  const queryCommandPromise = waitForFixtureCommand(server, terminalId, "QUERY", `QUERY ${queryId}`);
 
   const sizePromise = server.waitForTranscript<SizeEntry>(terminalId, (entry) => (
     entry.event === "size" && entry.id === sizeId
@@ -164,6 +164,7 @@ async function exerciseQuery(
   await server.waitForTranscript(terminalId, (entry) => entry.event === "release" && entry.token === holdId, {
     timeoutMs: WAIT_TIMEOUT_MS,
   });
+  await queryCommandPromise;
   const [sizeEntry, queryComplete] = await Promise.all([sizePromise, completePromise]);
   await waitForTerminalBuffer(page, terminalId, {
     contains: `[E2E:QUERY:${queryId}:COMPLETE:${QUERY_NAMES.length}]`,
@@ -271,7 +272,6 @@ test("V-15 Window-size terminal queries @nightly @pr @p1 @resize @queries", asyn
       },
     },
     { id: "browser", apply: async () => page.setViewportSize({ width: 1_440, height: 900 }) },
-    { id: "terminal-zoom", apply: async () => pane.zoomIn() },
     {
       id: "dpr-context",
       apply: async () => {
@@ -281,6 +281,7 @@ test("V-15 Window-size terminal queries @nightly @pr @p1 @resize @queries", asyn
       },
     },
     { id: "mobile", apply: async () => page.setViewportSize({ width: 430, height: 740 }) },
+    { id: "terminal-zoom", apply: async () => pane.zoomIn() },
     { id: "bounds", apply: async () => page.setViewportSize({ width: 360, height: 260 }) },
   ];
 
