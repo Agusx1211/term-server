@@ -22,6 +22,8 @@ import type {
   SaveFileRequest,
   SessionBrokerInfo,
   StatusModulesResponse,
+  StatusModulesSettings,
+  UpdateStatusModulesSettings,
   UpdateStatus,
   ReleaseInfo,
   DebugRecordingStatus,
@@ -85,6 +87,12 @@ export const api = {
     return request<ClientConfig>(`/api/config${query}`, { signal: options.signal });
   },
   statusModules: (signal?: AbortSignal) => request<StatusModulesResponse>("/api/status-modules", { signal }),
+  statusModulesConfig: () => request<StatusModulesSettings>("/api/config/status-modules"),
+  updateStatusModulesConfig: (config: UpdateStatusModulesSettings) =>
+    request<StatusModulesSettings>("/api/config/status-modules", {
+      method: "PATCH",
+      body: JSON.stringify(config),
+    }),
   updateStatus: () => request<UpdateStatus>("/api/update"),
   installUpdate: (commit: string) =>
     request<ReleaseInfo>("/api/update", {

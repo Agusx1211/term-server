@@ -314,6 +314,7 @@ export class IsolatedServer implements IsolatedServerSnapshot {
         TERM_SERVER_PORT: String(this.port),
         TERM_SERVER_ALLOWED_ORIGINS: this.baseURL,
         TERM_SERVER_DISABLE_UPDATES: "true",
+        TERM_SERVER_NO_STATUS_AUTO: "true",
         TMPDIR: temporaryDirectory,
         TMP: temporaryDirectory,
         TEMP: temporaryDirectory,

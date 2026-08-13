@@ -90,7 +90,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.password_file.as_ref(),
     )
     .await?;
-    let status_modules = Arc::new(StatusService::from_path(cli.status_config.as_deref())?);
+    let status_modules = Arc::new(StatusService::new(
+        cli.status_config.as_deref(),
+        &cli.data_dir,
+        !cli.no_status_auto,
+    )?);
     let tls = load_tls(&cli).await?;
     let address = cli.socket_addr()?;
     let workspace = load_workspace(&cli, &executable).await?;
