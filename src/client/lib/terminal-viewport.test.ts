@@ -119,3 +119,26 @@ describe("xterm scroll area re-sync", () => {
     expect(resyncTerminalScrollArea({ _core: { viewport: {} } })).toBe(false);
   });
 });
+
+describe("synchronized-output gating", () => {
+  it("lifts the DECSET 2026 gate for the duration of the re-sync", () => {
+    const modes = { synchronizedOutput: true };
+    const observed: boolean[] = [];
+    const scrollToLine = vi.fn();
+    const terminal = {
+      buffer: { active: { viewportY: 7 } },
+      _core: {
+        viewport: {
+          _sync: () => observed.push(modes.synchronizedOutput),
+          scrollToLine,
+          _coreService: { decPrivateModes: modes },
+        },
+      },
+    };
+
+    expect(resyncTerminalScrollArea(terminal)).toBe(true);
+    expect(observed).toEqual([false]);
+    expect(scrollToLine).toHaveBeenCalledWith(7, true);
+    expect(modes.synchronizedOutput).toBe(true);
+  });
+});

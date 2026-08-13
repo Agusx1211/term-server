@@ -68,6 +68,7 @@ interface XtermViewportInternal {
   _sync?: () => void;
   queueSync?: () => void;
   scrollToLine?: (line: number, disableSmoothScroll?: boolean) => void;
+  _coreService?: { decPrivateModes?: { synchronizedOutput?: boolean } };
 }
 
 interface XtermWithViewport {
@@ -89,17 +90,31 @@ interface XtermWithViewport {
  * ends short of the real bottom, so the last lines become unreachable until
  * new output happens to arrive. There is no public API for this, so poke the
  * private viewport when it is reachable and fall back to doing nothing.
+ *
+ * The viewport's sync silently defers while DECSET 2026 (synchronized
+ * output) is set, and an agent TUI holds that mode for the whole of every
+ * frame — including indefinitely when it stops mid-frame. A deferred sync
+ * only flushes on the next render, which a paused or backgrounded renderer
+ * never produces, so the gate is lifted for the duration of the explicit
+ * re-sync exactly like xterm's own synchronized-output watchdog does.
  */
 export function resyncTerminalScrollArea(terminal: unknown): boolean {
   const term = terminal as XtermWithViewport | undefined;
   const core = term?._core;
   const viewport = core?.viewport ?? core?._viewport;
   if (!viewport) return false;
-  if (viewport._sync) viewport._sync();
-  else if (viewport.queueSync) viewport.queueSync();
-  else return false;
-  const viewportY = term?.buffer?.active?.viewportY;
-  if (typeof viewportY === "number") viewport.scrollToLine?.(viewportY, true);
+  const modes = viewport._coreService?.decPrivateModes;
+  const gated = modes?.synchronizedOutput === true;
+  if (gated) modes!.synchronizedOutput = false;
+  try {
+    if (viewport._sync) viewport._sync();
+    else if (viewport.queueSync) viewport.queueSync();
+    else return false;
+    const viewportY = term?.buffer?.active?.viewportY;
+    if (typeof viewportY === "number") viewport.scrollToLine?.(viewportY, true);
+  } finally {
+    if (gated) modes!.synchronizedOutput = true;
+  }
   return true;
 }
 

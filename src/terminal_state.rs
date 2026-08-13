@@ -1582,6 +1582,125 @@ struct ReflowRow {
     content_width: usize,
 }
 
+/// The cell attributes the reflow replay reproduces explicitly.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct FlowAttrs {
+    fgcolor: vt100::Color,
+    bgcolor: vt100::Color,
+    bold: bool,
+    dim: bool,
+    italic: bool,
+    underline: bool,
+    inverse: bool,
+}
+
+impl FlowAttrs {
+    fn of(cell: &vt100::Cell) -> Self {
+        Self {
+            fgcolor: cell.fgcolor(),
+            bgcolor: cell.bgcolor(),
+            bold: cell.bold(),
+            dim: cell.dim(),
+            italic: cell.italic(),
+            underline: cell.underline(),
+            inverse: cell.inverse(),
+        }
+    }
+
+    fn write_sgr(&self, output: &mut Vec<u8>) {
+        output.extend_from_slice(b"\x1b[0");
+        if self.bold {
+            output.extend_from_slice(b";1");
+        }
+        if self.dim {
+            output.extend_from_slice(b";2");
+        }
+        if self.italic {
+            output.extend_from_slice(b";3");
+        }
+        if self.underline {
+            output.extend_from_slice(b";4");
+        }
+        if self.inverse {
+            output.extend_from_slice(b";7");
+        }
+        write_sgr_color(output, self.fgcolor, 30, 90, 38);
+        write_sgr_color(output, self.bgcolor, 40, 100, 48);
+        output.push(b'm');
+    }
+}
+
+fn write_sgr_color(output: &mut Vec<u8>, color: vt100::Color, base: u8, bright: u8, extended: u8) {
+    match color {
+        vt100::Color::Default => {}
+        vt100::Color::Idx(index) if index < 8 => {
+            output.extend_from_slice(format!(";{}", base + index).as_bytes());
+        }
+        vt100::Color::Idx(index) if index < 16 => {
+            output.extend_from_slice(format!(";{}", bright + (index - 8)).as_bytes());
+        }
+        vt100::Color::Idx(index) => {
+            output.extend_from_slice(format!(";{extended};5;{index}").as_bytes());
+        }
+        vt100::Color::Rgb(red, green, blue) => {
+            output.extend_from_slice(format!(";{extended};2;{red};{green};{blue}").as_bytes());
+        }
+    }
+}
+
+/// Number of leading cells a row must reproduce: content, wide-character
+/// continuations, and erased-with-attributes runs (a colored status bar).
+fn row_flow_width(screen: &vt100::Screen, row: u16, cols: u16) -> usize {
+    (0..cols)
+        .rev()
+        .find_map(|col| {
+            let cell = screen.cell(row, col)?;
+            (cell.has_contents()
+                || cell.is_wide_continuation()
+                || FlowAttrs::of(cell) != FlowAttrs::default())
+            .then_some(usize::from(col) + 1)
+        })
+        .unwrap_or(0)
+}
+
+/// One source row's cells as pure flowing content: SGR changes and text,
+/// never cursor movement. `vt100::Screen::rows_formatted` formats each row
+/// against a fresh cursor, so a continuation of a soft-wrapped row starts
+/// with a cursor movement — which, replayed at the wrap boundary, cancels
+/// the pending wrap and lands the continuation on top of the previous row's
+/// tail. Flowing bytes wrap exactly like the linear model `map_position`
+/// assumes, at any target width.
+fn row_flow_bytes(screen: &vt100::Screen, row: u16, width: usize) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut current = FlowAttrs::default();
+    let mut col = 0u16;
+    while usize::from(col) < width {
+        let Some(cell) = screen.cell(row, col) else {
+            break;
+        };
+        if cell.is_wide_continuation() {
+            col += 1;
+            continue;
+        }
+        let attrs = FlowAttrs::of(cell);
+        if attrs != current {
+            attrs.write_sgr(&mut bytes);
+            current = attrs;
+        }
+        let contents = cell.contents();
+        if contents.is_empty() {
+            bytes.push(b' ');
+        } else {
+            bytes.extend_from_slice(contents.as_bytes());
+        }
+        col += if cell.is_wide() { 2 } else { 1 };
+    }
+    if current != FlowAttrs::default() {
+        bytes.extend_from_slice(b"\x1b[m");
+    }
+    bytes
+}
+
 #[derive(Clone, Debug)]
 struct PendingWrap {
     start_col: u16,
@@ -1598,39 +1717,44 @@ fn reflow_plan(screen: &vt100::Screen, rows: u16, cols: u16) -> ReflowPlan {
 
     for offset in (1..=history_rows).rev() {
         source.set_scrollback(offset);
-        let bytes = source
-            .rows_formatted(0, source_cols)
-            .next()
-            .unwrap_or_default();
+        let wrapped = source.row_wrapped(0);
+        let content_width = row_flow_width(&source, 0, source_cols);
+        let width = if wrapped {
+            usize::from(source_cols)
+        } else {
+            content_width
+        };
         source_rows.push(ReflowRow {
-            bytes,
-            wrapped: source.row_wrapped(0),
-            content_width: row_content_width(&source, 0, source_cols),
+            bytes: row_flow_bytes(&source, 0, width),
+            wrapped,
+            content_width,
         });
     }
 
     source.set_scrollback(0);
-    let formatted_rows = source.rows_formatted(0, source_cols).collect::<Vec<_>>();
+    let live_rows = source.size().0;
     let cursor_row = usize::from(source.cursor_position().0);
     let mut last_live_row = cursor_row;
-    for (row, bytes) in formatted_rows.iter().enumerate() {
-        if !bytes.is_empty()
-            || source.row_wrapped(u16::try_from(row).unwrap())
-            || row_content_width(&source, u16::try_from(row).unwrap(), source_cols) > 0
-        {
-            last_live_row = last_live_row.max(row);
+    for row in 0..live_rows {
+        if source.row_wrapped(row) || row_flow_width(&source, row, source_cols) > 0 {
+            last_live_row = last_live_row.max(usize::from(row));
         }
     }
-    for (row, bytes) in formatted_rows
-        .into_iter()
-        .enumerate()
-        .take(last_live_row + 1)
-    {
-        let row = u16::try_from(row).unwrap();
+    for row in 0..live_rows {
+        if usize::from(row) > last_live_row {
+            break;
+        }
+        let wrapped = source.row_wrapped(row);
+        let content_width = row_flow_width(&source, row, source_cols);
+        let width = if wrapped {
+            usize::from(source_cols)
+        } else {
+            content_width
+        };
         source_rows.push(ReflowRow {
-            bytes,
-            wrapped: source.row_wrapped(row),
-            content_width: row_content_width(&source, row, source_cols),
+            bytes: row_flow_bytes(&source, row, width),
+            wrapped,
+            content_width,
         });
     }
 
@@ -1682,16 +1806,6 @@ fn reflow_plan(screen: &vt100::Screen, rows: u16, cols: u16) -> ReflowPlan {
         });
     }
     plan
-}
-
-fn row_content_width(screen: &vt100::Screen, row: u16, cols: u16) -> usize {
-    (0..cols)
-        .rev()
-        .find_map(|col| {
-            let cell = screen.cell(row, col)?;
-            (cell.has_contents() || cell.is_wide_continuation()).then_some(usize::from(col) + 1)
-        })
-        .unwrap_or(0)
 }
 
 fn pending_wrap_cell(screen: &vt100::Screen) -> Option<PendingWrap> {
@@ -2601,5 +2715,106 @@ mod tests {
             terminal.process(format!("\x1b[Hframe {frame}\x1b[J\x1b[40;160Hstatus").as_bytes());
         }
         assert!(terminal.snapshot().len() < 128 * 1024);
+    }
+
+    #[test]
+    fn resize_reflow_does_not_bleed_attributes_between_rows() {
+        let mut terminal = CanonicalTerminal::new(4, 10, 20);
+        terminal.process(b"\x1b[31mred\x1b[m\r\nplain\r\nmore");
+
+        terminal.resize(4, 12, 20, 0, 0);
+
+        let screen = terminal.parser.screen();
+        assert_eq!(screen.cell(0, 0).unwrap().fgcolor(), vt100::Color::Idx(1));
+        assert_eq!(screen.cell(1, 0).unwrap().contents(), "p");
+        assert_eq!(screen.cell(1, 0).unwrap().fgcolor(), vt100::Color::Default);
+        assert_eq!(screen.cell(2, 0).unwrap().fgcolor(), vt100::Color::Default);
+    }
+
+    #[test]
+    fn resize_preserves_wrapped_history_whose_continuation_starts_blank() {
+        let mut terminal = CanonicalTerminal::new(2, 8, 40);
+        terminal.process(b"12345678abc");
+        terminal.process(b"\x1b[2;1H\x1b[2X");
+        terminal.process(b"\x1b[2;4H\r\ntail1\r\ntail2\r\n");
+
+        terminal.resize(3, 8, 40, 0, 0);
+
+        let mut screen = terminal.parser.screen().clone();
+        screen.set_scrollback(usize::MAX);
+        let mut lines = Vec::new();
+        for offset in (1..=screen.scrollback()).rev() {
+            screen.set_scrollback(offset);
+            lines.push(screen.contents().lines().next().unwrap_or("").to_owned());
+        }
+        screen.set_scrollback(0);
+        for line in screen.contents().lines() {
+            lines.push(line.to_owned());
+        }
+        let contents = lines.join("\n");
+        // The wrapped pair must survive as one logical line whose continuation
+        // keeps its blanked prefix, not merge onto the first row's tail.
+        assert!(
+            contents.contains("12345678"),
+            "history head lost: {contents}"
+        );
+        assert!(contents.contains("  c"), "continuation lost: {contents}");
+        assert!(!contents.contains("12345678c"), "rows merged: {contents}");
+        assert!(contents.contains("tail1"), "tail lost: {contents}");
+        assert!(contents.contains("tail2"), "tail lost: {contents}");
+    }
+
+    #[test]
+    fn resize_restores_the_cursor_below_wrapped_history() {
+        let mut terminal = CanonicalTerminal::new(4, 8, 40);
+        for _ in 0..3 {
+            terminal.process(b"1234567812345678");
+            terminal.process(b"\r\n");
+        }
+        terminal.process(b"prompt");
+        let column_before = terminal.parser.screen().cursor_position().1;
+
+        terminal.resize(3, 8, 40, 0, 0);
+
+        let screen = terminal.parser.screen();
+        let (cursor_row, cursor_col) = screen.cursor_position();
+        assert_eq!(cursor_col, column_before);
+        let row_text: String = (0..8)
+            .filter_map(|col| {
+                screen
+                    .cell(cursor_row, col)
+                    .map(|cell| cell.contents().to_owned())
+            })
+            .collect();
+        assert!(
+            row_text.starts_with("prompt"),
+            "cursor restored on {row_text:?} instead of the prompt row"
+        );
+    }
+
+    #[test]
+    fn resize_keeps_content_after_an_erased_run_at_a_new_width() {
+        let mut terminal = CanonicalTerminal::new(2, 8, 40);
+        // A wrapped logical line whose continuation starts with an
+        // erased-with-attributes run: the blank cells carry a background.
+        terminal.process(b"12345678\x1b[42m\x1b[2Xzz");
+        terminal.process(b"\x1b[m\r\ntail\r\n");
+
+        terminal.resize(2, 10, 40, 0, 0);
+
+        let mut screen = terminal.parser.screen().clone();
+        screen.set_scrollback(usize::MAX);
+        let history = screen.scrollback();
+        let mut contents = Vec::new();
+        for offset in (1..=history).rev() {
+            screen.set_scrollback(offset);
+            contents.push(screen.contents().lines().next().unwrap_or("").to_owned());
+        }
+        screen.set_scrollback(0);
+        contents.extend(screen.contents().lines().map(str::to_owned));
+        let joined = contents.join("\n");
+        assert!(joined.contains("12345678"), "head lost: {joined}");
+        assert!(joined.contains("zz"), "continuation content lost: {joined}");
+        assert!(joined.contains("tail"), "tail lost: {joined}");
     }
 }
