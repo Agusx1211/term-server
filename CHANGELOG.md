@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.13.5 - 2026-08-13
+
+omp agents no longer show as idle while they are still working.
+
+### Fixed
+
+- An omp terminal flipped to idle mid-run: the runtime settles its status connector at each turn
+  boundary, the reported completion expires shortly after, and the heuristic fallback then held
+  the agent at idle because completion resets the input gate and an autonomous agent never
+  produces a new human prompt. Long thinking stretches with no tool events — routine for slow
+  local models — read as idle for minutes while the agent visibly worked.
+- The server now reads the agent's own title glyphs: omp animates a busy spinner after its `π`
+  prefix on every frame while running and shows a `>` marker at the prompt. A fresh self-reported
+  working state outranks the input gate once the agent has completed a task, a spinner that stops
+  animating goes idle within seconds, and a resumption records itself as a task so its eventual
+  end still produces a completion notification. Startup banners before the first task still read
+  as idle.
+
+### Upgrade notes
+
+- There are no breaking changes, data migrations, or configuration changes. The fix applies to
+  session brokers started by this version; terminals on an existing broker keep the previous
+  behavior until the broker is restarted from **Settings → Updates**, which closes its open
+  terminals — let active work finish first.
+- The release is safe for automatic installation over `0.13.4`.
+
 ## 0.13.4 - 2026-08-13
 
 Completes the 0.13.3 scrollback work: terminals no longer strand the user above the bottom of the
