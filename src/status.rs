@@ -7,6 +7,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use base64::Engine;
 use futures_util::{FutureExt, StreamExt, stream};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -435,6 +436,9 @@ struct SecretCredential {
 struct ResolvedCredential {
     secret: Arc<SecretCredential>,
     source: Option<String>,
+    /// ChatGPT account id required by the Codex usage endpoint; discovered
+    /// alongside OAuth tokens in `$CODEX_HOME/auth.json`.
+    account_id: Option<String>,
 }
 
 /// Non-secret pointers to the local agent credential stores that auto-discovery
@@ -527,12 +531,11 @@ impl DiscoveryContext {
         if let Some(key) = non_empty_string(value.get("OPENAI_API_KEY")) {
             return Some(resolved_credential(&key, self.display_path(&path)));
         }
-        let token = non_empty_string(
-            value
-                .get("tokens")
-                .and_then(|tokens| tokens.get("access_token")),
-        )?;
-        Some(resolved_credential(&token, self.display_path(&path)))
+        let tokens = value.get("tokens");
+        let token = non_empty_string(tokens.and_then(|tokens| tokens.get("access_token")))?;
+        let mut resolved = resolved_credential(&token, self.display_path(&path));
+        resolved.account_id = non_empty_string(tokens.and_then(|tokens| tokens.get("account_id")));
+        Some(resolved)
     }
 
     /// pi and Oh My Pi share the auth-store format: `~/.pi/agent/auth.json` and
@@ -576,6 +579,7 @@ fn resolved_credential(secret: &str, source: String) -> ResolvedCredential {
             value: secret.to_owned(),
         }),
         source: Some(source),
+        account_id: None,
     }
 }
 
@@ -660,8 +664,26 @@ pub struct StatusService {
     refresh_lock: Arc<Mutex<()>>,
     client: Client,
     refresh_deadline: Duration,
+    endpoints: Arc<ProviderEndpoints>,
     #[cfg(test)]
     test_refresh_delays: Arc<Vec<Duration>>,
+}
+
+/// Provider quota endpoints, injectable so tests never reach the network.
+struct ProviderEndpoints {
+    claude_usage: String,
+    codex_usage: String,
+    zai_quota: String,
+}
+
+impl Default for ProviderEndpoints {
+    fn default() -> Self {
+        Self {
+            claude_usage: "https://api.anthropic.com/api/oauth/usage".to_owned(),
+            codex_usage: "https://chatgpt.com/backend-api/wham/usage".to_owned(),
+            zai_quota: "https://api.z.ai/api/monitor/usage/quota/limit".to_owned(),
+        }
+    }
 }
 
 impl StatusService {
@@ -804,6 +826,7 @@ impl StatusService {
             refresh_lock: Arc::new(Mutex::new(())),
             client,
             refresh_deadline: Duration::from_secs(STATUS_REFRESH_DEADLINE_SECONDS),
+            endpoints: Arc::new(ProviderEndpoints::default()),
             #[cfg(test)]
             test_refresh_delays: Arc::new(Vec::new()),
         }
@@ -817,6 +840,12 @@ impl StatusService {
     ) -> Self {
         self.refresh_deadline = refresh_deadline;
         self.test_refresh_delays = Arc::new(refresh_delays);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_test_endpoints(mut self, endpoints: ProviderEndpoints) -> Self {
+        self.endpoints = Arc::new(endpoints);
         self
     }
 
@@ -1049,6 +1078,7 @@ impl StatusService {
             ModuleCredential::Static(Some(secret)) => Some(ResolvedCredential {
                 secret: Arc::clone(secret),
                 source: None,
+                account_id: None,
             }),
             ModuleCredential::Static(None) => None,
             ModuleCredential::Discovered => self
@@ -1065,10 +1095,83 @@ impl StatusService {
             "anthropic" | "claude" if runtime.admin => {
                 self.anthropic_admin_limits(runtime, &resolved.secret).await
             }
+            "anthropic" | "claude" => self.claude_usage(&resolved).await,
+            "codex" | "openai" => self.codex_usage(&resolved).await,
+            "zai" => self.zai_quota(&resolved).await,
             _ => Ok(ProviderObservation::configured_only(
                 resolved.source.as_deref(),
+                CONFIGURED_ONLY_NO_ENDPOINT,
             )),
         }
+    }
+
+    /// Claude subscription usage. Only OAuth access tokens (Claude Code /
+    /// claude.ai logins) can read the usage endpoint; plain API keys have no
+    /// subscription windows to report.
+    async fn claude_usage(
+        &self,
+        credential: &ResolvedCredential,
+    ) -> Result<ProviderObservation, ProviderFailure> {
+        if !credential.secret.value.starts_with("sk-ant-oat") {
+            return Ok(ProviderObservation::configured_only(
+                credential.source.as_deref(),
+                CONFIGURED_ONLY_NEEDS_OAUTH,
+            ));
+        }
+        let response = self
+            .get_json(
+                &self.endpoints.claude_usage,
+                &credential.secret,
+                AuthHeader::ClaudeOauth,
+            )
+            .await?;
+        let mut observation = parse_claude_usage(&response, unix_seconds())?;
+        observation.push_source(credential.source.as_deref());
+        Ok(observation)
+    }
+
+    /// Codex subscription usage. Requires a ChatGPT OAuth token (a JWT);
+    /// plain OpenAI API keys cannot read the ChatGPT usage endpoint.
+    async fn codex_usage(
+        &self,
+        credential: &ResolvedCredential,
+    ) -> Result<ProviderObservation, ProviderFailure> {
+        if !looks_like_jwt(&credential.secret.value) {
+            return Ok(ProviderObservation::configured_only(
+                credential.source.as_deref(),
+                CONFIGURED_ONLY_NEEDS_OAUTH,
+            ));
+        }
+        let account_id = credential
+            .account_id
+            .clone()
+            .or_else(|| chatgpt_account_id_from_jwt(&credential.secret.value));
+        let response = self
+            .get_json(
+                &self.endpoints.codex_usage,
+                &credential.secret,
+                AuthHeader::ChatGpt { account_id },
+            )
+            .await?;
+        let mut observation = parse_codex_usage(&response)?;
+        observation.push_source(credential.source.as_deref());
+        Ok(observation)
+    }
+
+    async fn zai_quota(
+        &self,
+        credential: &ResolvedCredential,
+    ) -> Result<ProviderObservation, ProviderFailure> {
+        let response = self
+            .get_json(
+                &self.endpoints.zai_quota,
+                &credential.secret,
+                AuthHeader::Bearer,
+            )
+            .await?;
+        let mut observation = parse_zai_quota(&response, unix_millis())?;
+        observation.push_source(credential.source.as_deref());
+        Ok(observation)
     }
 
     async fn openai_admin_limits(
@@ -1081,7 +1184,7 @@ impl StatusService {
         };
         let url =
             format!("https://api.openai.com/v1/organization/projects/{project_id}/rate_limits");
-        let response = self.get_json(&url, credential, AdminHeader::Bearer).await?;
+        let response = self.get_json(&url, credential, AuthHeader::Bearer).await?;
         let details = parse_openai_limits(&response)?;
         Ok(ProviderObservation {
             state: StatusModuleState::Ok,
@@ -1104,7 +1207,7 @@ impl StatusService {
             "https://api.anthropic.com/v1/organizations/rate_limits".to_owned()
         };
         let response = self
-            .get_json(&url, credential, AdminHeader::Anthropic)
+            .get_json(&url, credential, AuthHeader::Anthropic)
             .await?;
         let details = parse_anthropic_limits(&response, workspace)?;
         Ok(ProviderObservation {
@@ -1122,17 +1225,27 @@ impl StatusService {
         &self,
         url: &str,
         credential: &SecretCredential,
-        header_kind: AdminHeader,
+        header_kind: AuthHeader,
     ) -> Result<Value, ProviderFailure> {
         let mut request = self
             .client
             .get(url)
             .timeout(Duration::from_secs(self.config.defaults.timeout_seconds));
         request = match header_kind {
-            AdminHeader::Bearer => request.bearer_auth(&credential.value),
-            AdminHeader::Anthropic => request
+            AuthHeader::Bearer => request.bearer_auth(&credential.value),
+            AuthHeader::Anthropic => request
                 .header("x-api-key", &credential.value)
                 .header("anthropic-version", "2023-06-01"),
+            AuthHeader::ClaudeOauth => request
+                .bearer_auth(&credential.value)
+                .header("anthropic-beta", "oauth-2025-04-20"),
+            AuthHeader::ChatGpt { account_id } => {
+                request = request.bearer_auth(&credential.value);
+                match account_id {
+                    Some(account_id) => request.header("chatgpt-account-id", account_id),
+                    None => request,
+                }
+            }
         };
         let response = request.send().await.map_err(|error| {
             if error.is_timeout() {
@@ -1211,10 +1324,11 @@ where
     (results, unfinished)
 }
 
-#[derive(Clone, Copy)]
-enum AdminHeader {
+enum AuthHeader {
     Bearer,
     Anthropic,
+    ClaudeOauth,
+    ChatGpt { account_id: Option<String> },
 }
 
 struct ProviderObservation {
@@ -1232,18 +1346,19 @@ impl ProviderObservation {
         }
     }
 
-    fn configured_only(source: Option<&str>) -> Self {
-        let mut details = vec![detail(
-            "Quota",
-            "configured credential; provider publishes no standalone quota endpoint",
-        )];
-        if let Some(source) = source {
-            details.push(detail("Source", source));
-        }
-        Self {
+    fn configured_only(source: Option<&str>, reason: &str) -> Self {
+        let mut observation = Self {
             state: StatusModuleState::Warn,
             primary: Some("configured".to_owned()),
-            details,
+            details: vec![detail("Quota", reason)],
+        };
+        observation.push_source(source);
+        observation
+    }
+
+    fn push_source(&mut self, source: Option<&str>) {
+        if let Some(source) = source {
+            self.details.push(detail("Source", source));
         }
     }
 
@@ -1455,6 +1570,285 @@ fn detail(label: &str, value: &str) -> StatusDetail {
         label: label.to_owned(),
         value: value.to_owned(),
     }
+}
+
+const CONFIGURED_ONLY_NO_ENDPOINT: &str =
+    "configured credential; provider publishes no standalone quota endpoint";
+const CONFIGURED_ONLY_NEEDS_OAUTH: &str =
+    "API key configured; usage windows are only published for OAuth (subscription) credentials";
+const USAGE_WARN_PERCENT: u64 = 90;
+
+/// One provider rate-limit window, normalized across providers so every
+/// module renders the same way: worst percent as the pill primary, one
+/// popover row per window.
+struct UsageWindow {
+    label: String,
+    percent: u64,
+    resets_in: Option<u64>,
+    used_of: Option<(u64, u64)>,
+}
+
+fn observation_from_windows(
+    windows: Vec<UsageWindow>,
+    extra: Vec<StatusDetail>,
+) -> Result<ProviderObservation, ProviderFailure> {
+    let max_percent = windows
+        .iter()
+        .map(|window| window.percent)
+        .max()
+        .ok_or_else(ProviderFailure::invalid_response)?;
+    let mut details = Vec::new();
+    for window in &windows {
+        let mut value = format!("{}% used", window.percent);
+        if let Some((used, total)) = window.used_of {
+            value.push_str(&format!(" ({used}/{total})"));
+        }
+        if let Some(resets_in) = window.resets_in {
+            value.push_str(&format!(" · resets in {}", format_duration(resets_in)));
+        }
+        details.push(detail(&window.label, &value));
+    }
+    details.extend(extra);
+    Ok(ProviderObservation {
+        state: if max_percent >= USAGE_WARN_PERCENT {
+            StatusModuleState::Warn
+        } else {
+            StatusModuleState::Ok
+        },
+        primary: Some(format!("{max_percent}%")),
+        details,
+    })
+}
+
+fn percent_value(value: Option<&Value>) -> Option<u64> {
+    let percent = value?.as_f64()?;
+    if !percent.is_finite() || percent < 0.0 {
+        return None;
+    }
+    Some(percent.round().min(999.0) as u64)
+}
+
+fn format_duration(seconds: u64) -> String {
+    let minutes = seconds / 60;
+    let (days, hours, mins) = (minutes / 1440, (minutes % 1440) / 60, minutes % 60);
+    if days > 0 {
+        if hours > 0 {
+            format!("{days}d {hours}h")
+        } else {
+            format!("{days}d")
+        }
+    } else if hours > 0 {
+        if mins > 0 {
+            format!("{hours}h {mins}m")
+        } else {
+            format!("{hours}h")
+        }
+    } else {
+        format!("{}m", mins.max(1))
+    }
+}
+
+fn format_window(seconds: u64) -> String {
+    match seconds {
+        604_800 => "Weekly".to_owned(),
+        86_400 => "Daily".to_owned(),
+        18_000 => "5-hour".to_owned(),
+        _ if seconds.is_multiple_of(86_400) => format!("{}-day", seconds / 86_400),
+        _ if seconds.is_multiple_of(3_600) => format!("{}-hour", seconds / 3_600),
+        _ => format!("{}-minute", (seconds / 60).max(1)),
+    }
+}
+
+fn parse_rfc3339_seconds(value: &str) -> Option<i64> {
+    time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+        .ok()
+        .map(|timestamp| timestamp.unix_timestamp())
+}
+
+fn looks_like_jwt(value: &str) -> bool {
+    value.starts_with("eyJ") && value.split('.').count() == 3
+}
+
+/// The Codex usage endpoint routes by ChatGPT account. When auth.json does not
+/// carry the account id, recover it from the OAuth JWT's claim payload (the
+/// same claim the Codex CLI reads); the token never leaves the process.
+fn chatgpt_account_id_from_jwt(token: &str) -> Option<String> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let value: Value = serde_json::from_slice(&bytes).ok()?;
+    non_empty_string(
+        value
+            .get("https://api.openai.com/auth")?
+            .get("chatgpt_account_id"),
+    )
+}
+
+fn parse_claude_usage(
+    value: &Value,
+    now_seconds: u64,
+) -> Result<ProviderObservation, ProviderFailure> {
+    let mut windows = Vec::new();
+    let push = |windows: &mut Vec<UsageWindow>,
+                label: String,
+                percent: Option<u64>,
+                resets_at: Option<&Value>| {
+        let Some(percent) = percent else { return };
+        let resets_in = resets_at
+            .and_then(Value::as_str)
+            .and_then(parse_rfc3339_seconds)
+            .and_then(|reset| u64::try_from(reset).ok())
+            .and_then(|reset| reset.checked_sub(now_seconds));
+        windows.push(UsageWindow {
+            label,
+            percent,
+            resets_in,
+            used_of: None,
+        });
+    };
+    if let Some(limits) = value.get("limits").and_then(Value::as_array) {
+        for entry in limits.iter().take(MAX_DETAIL_ROWS) {
+            let label = match entry.get("kind").and_then(Value::as_str) {
+                Some("session") => "5-hour".to_owned(),
+                Some("weekly_all") => "Weekly".to_owned(),
+                Some("weekly_scoped") => {
+                    let model = entry
+                        .pointer("/scope/model/display_name")
+                        .and_then(Value::as_str);
+                    match model {
+                        Some(model) => format!("Weekly ({model})"),
+                        None => "Weekly (scoped)".to_owned(),
+                    }
+                }
+                Some(other) => other.to_owned(),
+                None => continue,
+            };
+            push(
+                &mut windows,
+                label,
+                percent_value(entry.get("percent")),
+                entry.get("resets_at"),
+            );
+        }
+    }
+    if windows.is_empty() {
+        for (key, label) in [("five_hour", "5-hour"), ("seven_day", "Weekly")] {
+            let Some(entry) = value.get(key) else {
+                continue;
+            };
+            push(
+                &mut windows,
+                label.to_owned(),
+                percent_value(entry.get("utilization")),
+                entry.get("resets_at"),
+            );
+        }
+    }
+    observation_from_windows(windows, Vec::new())
+}
+
+fn codex_window(window: &Value, name: Option<&str>) -> Option<UsageWindow> {
+    let percent = percent_value(window.get("used_percent"))?;
+    let label = match name {
+        Some(name) => name.to_owned(),
+        None => window
+            .get("limit_window_seconds")
+            .and_then(Value::as_u64)
+            .map(format_window)
+            .unwrap_or_else(|| "Usage".to_owned()),
+    };
+    Some(UsageWindow {
+        label,
+        percent,
+        resets_in: window.get("reset_after_seconds").and_then(Value::as_u64),
+        used_of: None,
+    })
+}
+
+fn parse_codex_usage(value: &Value) -> Result<ProviderObservation, ProviderFailure> {
+    let rate_limit = value
+        .get("rate_limit")
+        .ok_or_else(ProviderFailure::invalid_response)?;
+    let mut windows = Vec::new();
+    for key in ["primary_window", "secondary_window"] {
+        if let Some(window) = rate_limit.get(key)
+            && let Some(window) = codex_window(window, None)
+        {
+            windows.push(window);
+        }
+    }
+    if let Some(extras) = value
+        .get("additional_rate_limits")
+        .and_then(Value::as_array)
+    {
+        for entry in extras.iter().take(MAX_DETAIL_ROWS) {
+            let name = entry.get("limit_name").and_then(Value::as_str);
+            if let Some(window) = entry.pointer("/rate_limit/primary_window")
+                && let Some(window) = codex_window(window, name)
+            {
+                windows.push(window);
+            }
+        }
+    }
+    let mut extra = Vec::new();
+    if let Some(plan) = non_empty_string(value.get("plan_type")) {
+        extra.push(detail("Plan", &plan));
+    }
+    observation_from_windows(windows, extra)
+}
+
+fn parse_zai_quota(value: &Value, now_ms: u64) -> Result<ProviderObservation, ProviderFailure> {
+    let data = value
+        .get("data")
+        .ok_or_else(ProviderFailure::invalid_response)?;
+    let limits = data
+        .get("limits")
+        .and_then(Value::as_array)
+        .ok_or_else(ProviderFailure::invalid_response)?;
+    let mut windows = Vec::new();
+    for entry in limits.iter().take(MAX_DETAIL_ROWS) {
+        let Some(percent) = percent_value(entry.get("percentage")) else {
+            continue;
+        };
+        // The quota API describes windows as unit (3=hour, 5=day, 6=week)
+        // times a count; normalize to seconds for shared labeling.
+        let unit_seconds = match entry.get("unit").and_then(Value::as_u64) {
+            Some(3) => Some(3_600),
+            Some(5) => Some(86_400),
+            Some(6) => Some(604_800),
+            _ => None,
+        };
+        let window_text = unit_seconds
+            .map(|unit| {
+                format_window(entry.get("number").and_then(Value::as_u64).unwrap_or(1) * unit)
+            })
+            .unwrap_or_else(|| "window".to_owned());
+        let label = match entry.get("type").and_then(Value::as_str) {
+            Some("TIME_LIMIT") => format!("Tools ({window_text})"),
+            _ => window_text,
+        };
+        let used_of = entry
+            .get("currentValue")
+            .and_then(Value::as_u64)
+            .zip(entry.get("usage").and_then(Value::as_u64));
+        let resets_in = entry
+            .get("nextResetTime")
+            .and_then(Value::as_u64)
+            .and_then(|reset_ms| reset_ms.checked_sub(now_ms))
+            .map(|delta_ms| delta_ms / 1000);
+        windows.push(UsageWindow {
+            label,
+            percent,
+            resets_in,
+            used_of,
+        });
+    }
+    let mut extra = Vec::new();
+    if let Some(level) = non_empty_string(data.get("level")) {
+        extra.push(detail("Plan", &level));
+    }
+    observation_from_windows(windows, extra)
 }
 
 fn parse_openai_limits(value: &Value) -> Result<Vec<StatusDetail>, ProviderFailure> {
@@ -1911,12 +2305,43 @@ mod tests {
         fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
     }
 
+    /// Endpoints that refuse connections immediately, so no unit test ever
+    /// reaches a real provider even when a discovered credential looks live.
+    fn unroutable_endpoints() -> ProviderEndpoints {
+        ProviderEndpoints {
+            claude_usage: "http://127.0.0.1:9/claude".to_owned(),
+            codex_usage: "http://127.0.0.1:9/codex".to_owned(),
+            zai_quota: "http://127.0.0.1:9/zai".to_owned(),
+        }
+    }
+
+    async fn serve_json(body: serde_json::Value) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let body = serde_json::to_string(&body).unwrap();
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buffer = [0_u8; 8192];
+                let _ = stream.read(&mut buffer).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        format!("http://{address}")
+    }
+
     fn auto_service(home: &Path, extra: &[(&str, &str)]) -> StatusService {
         let mut environment = vec![("HOME".to_owned(), home.display().to_string())];
         for (name, value) in extra {
             environment.push(((*name).to_owned(), (*value).to_owned()));
         }
         StatusService::auto_with_environment(environment)
+            .with_test_endpoints(unroutable_endpoints())
     }
 
     #[tokio::test]
@@ -1972,7 +2397,27 @@ mod tests {
             &home.path().join(".pi/agent/auth.json"),
             serde_json::json!({ "zai": { "type": "api_key", "key": "zai-secret" } }),
         );
-        let payload = auto_service(home.path(), &[]).snapshot().await;
+        let zai_quota = serve_json(serde_json::json!({
+            "code": 200,
+            "data": {
+                "limits": [
+                    { "type": "TOKENS_LIMIT", "unit": 3, "number": 5, "percentage": 1,
+                      "nextResetTime": unix_millis() + 7_200_000 },
+                    { "type": "TIME_LIMIT", "unit": 5, "number": 1, "usage": 1000,
+                      "currentValue": 167, "percentage": 16,
+                      "nextResetTime": unix_millis() + 3_600_000 },
+                ],
+                "level": "pro",
+            },
+        }))
+        .await;
+        let payload = auto_service(home.path(), &[])
+            .with_test_endpoints(ProviderEndpoints {
+                zai_quota,
+                ..unroutable_endpoints()
+            })
+            .snapshot()
+            .await;
         assert_eq!(
             payload
                 .modules
@@ -1988,12 +2433,22 @@ mod tests {
                 .iter()
                 .any(|detail| detail.value == "~/.codex/auth.json")
         );
+        let zai = &payload.modules[1];
+        assert_eq!(zai.state, StatusModuleState::Ok);
+        assert_eq!(zai.primary.as_deref(), Some("16%"));
         assert!(
-            payload.modules[1]
-                .details
+            zai.details
+                .iter()
+                .any(|detail| detail.label == "Tools (Daily)"
+                    && detail.value.starts_with("16% used (167/1000) · resets in"))
+        );
+        assert!(
+            zai.details
                 .iter()
                 .any(|detail| detail.value == "~/.pi/agent/auth.json")
         );
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(!json.contains("zai-secret"));
     }
 
     #[tokio::test]
@@ -2073,5 +2528,141 @@ mod tests {
             restored.display.show_on_mobile,
             "persisted show_on_mobile must override the runtime default"
         );
+    }
+
+    fn detail_value<'a>(observation: &'a ProviderObservation, label: &str) -> &'a str {
+        observation
+            .details
+            .iter()
+            .find(|entry| entry.label == label)
+            .unwrap_or_else(|| panic!("missing detail row {label}"))
+            .value
+            .as_str()
+    }
+
+    #[test]
+    fn claude_usage_prefers_limit_windows_and_reports_worst_percent() {
+        let now = parse_rfc3339_seconds("2026-08-13T22:00:00+00:00").unwrap() as u64;
+        let fixture = serde_json::json!({
+            "five_hour": { "utilization": 17.0, "resets_at": "2026-08-14T01:00:00+00:00" },
+            "seven_day": { "utilization": 14.0, "resets_at": "2026-08-19T23:59:59+00:00" },
+            "limits": [
+                { "kind": "session", "percent": 17, "severity": "normal",
+                  "resets_at": "2026-08-14T01:00:00+00:00" },
+                { "kind": "weekly_all", "percent": 14,
+                  "resets_at": "2026-08-19T23:59:59+00:00" },
+                { "kind": "weekly_scoped", "percent": 22,
+                  "resets_at": "2026-08-20T00:00:00+00:00",
+                  "scope": { "model": { "display_name": "Fable" } } },
+            ],
+        });
+        let observation = parse_claude_usage(&fixture, now).unwrap();
+        assert_eq!(observation.state, StatusModuleState::Ok);
+        assert_eq!(observation.primary.as_deref(), Some("22%"));
+        assert_eq!(
+            detail_value(&observation, "5-hour"),
+            "17% used · resets in 3h"
+        );
+        assert_eq!(
+            detail_value(&observation, "Weekly (Fable)"),
+            "22% used · resets in 6d 2h"
+        );
+    }
+
+    #[test]
+    fn claude_usage_falls_back_to_window_objects_and_warns_when_high() {
+        let now = parse_rfc3339_seconds("2026-08-13T22:00:00+00:00").unwrap() as u64;
+        let fixture = serde_json::json!({
+            "five_hour": { "utilization": 92.0, "resets_at": "2026-08-14T01:30:00+00:00" },
+            "seven_day": { "utilization": 14.0, "resets_at": null },
+        });
+        let observation = parse_claude_usage(&fixture, now).unwrap();
+        assert_eq!(observation.state, StatusModuleState::Warn);
+        assert_eq!(observation.primary.as_deref(), Some("92%"));
+        assert_eq!(
+            detail_value(&observation, "5-hour"),
+            "92% used · resets in 3h 30m"
+        );
+        assert_eq!(detail_value(&observation, "Weekly"), "14% used");
+        assert!(parse_claude_usage(&serde_json::json!({}), now).is_err());
+    }
+
+    #[test]
+    fn codex_usage_labels_windows_and_named_limits() {
+        let fixture = serde_json::json!({
+            "plan_type": "pro",
+            "rate_limit": {
+                "allowed": true,
+                "primary_window": {
+                    "used_percent": 40, "limit_window_seconds": 604_800,
+                    "reset_after_seconds": 534_676, "reset_at": 1_787_196_618_u64,
+                },
+                "secondary_window": null,
+            },
+            "additional_rate_limits": [
+                { "limit_name": "GPT-5.3-Codex-Spark",
+                  "rate_limit": { "primary_window": {
+                      "used_percent": 0, "limit_window_seconds": 604_800,
+                      "reset_after_seconds": 604_800 } } },
+            ],
+        });
+        let observation = parse_codex_usage(&fixture).unwrap();
+        assert_eq!(observation.state, StatusModuleState::Ok);
+        assert_eq!(observation.primary.as_deref(), Some("40%"));
+        assert_eq!(
+            detail_value(&observation, "Weekly"),
+            "40% used · resets in 6d 4h"
+        );
+        assert_eq!(
+            detail_value(&observation, "GPT-5.3-Codex-Spark"),
+            "0% used · resets in 7d"
+        );
+        assert_eq!(detail_value(&observation, "Plan"), "pro");
+    }
+
+    #[test]
+    fn codex_auth_file_captures_the_chatgpt_account_id() {
+        let home = tempfile::tempdir().unwrap();
+        write_json(
+            &home.path().join(".codex/auth.json"),
+            serde_json::json!({
+                "tokens": { "access_token": "eyJx.eyJy.z", "account_id": "acct-777" }
+            }),
+        );
+        let discovery = DiscoveryContext::from_environment(BTreeMap::from([(
+            "HOME".to_owned(),
+            home.path().display().to_string(),
+        )]));
+        let resolved = discovery.resolve("codex", unix_millis()).unwrap();
+        assert_eq!(resolved.account_id.as_deref(), Some("acct-777"));
+        assert_eq!(resolved.source.as_deref(), Some("~/.codex/auth.json"));
+    }
+
+    #[test]
+    fn chatgpt_account_id_is_recovered_from_the_oauth_jwt() {
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "https://api.openai.com/auth": { "chatgpt_account_id": "acct-123" }
+            }))
+            .unwrap(),
+        );
+        let token = format!("eyJhbGciOiJIUzI1NiJ9.{payload}.signature");
+        assert!(looks_like_jwt(&token));
+        assert_eq!(
+            chatgpt_account_id_from_jwt(&token).as_deref(),
+            Some("acct-123")
+        );
+        assert!(!looks_like_jwt("sk-proj-plain-api-key"));
+    }
+
+    #[test]
+    fn window_and_duration_formatting_is_compact() {
+        assert_eq!(format_window(604_800), "Weekly");
+        assert_eq!(format_window(86_400), "Daily");
+        assert_eq!(format_window(18_000), "5-hour");
+        assert_eq!(format_window(7_200), "2-hour");
+        assert_eq!(format_duration(534_676), "6d 4h");
+        assert_eq!(format_duration(200), "3m");
+        assert_eq!(format_duration(30), "1m");
     }
 }
