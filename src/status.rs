@@ -1,7 +1,8 @@
 use std::{
     collections::{BTreeMap, HashSet},
-    env, fs,
-    path::Path,
+    env, fs, io,
+    io::Write,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -25,6 +26,8 @@ const STATUS_REFRESH_CONCURRENCY: usize = 8;
 const STATUS_REFRESH_DEADLINE_SECONDS: u64 = 60;
 const STATUS_MIN_RETRY_SECONDS: u64 = 5;
 const STATUS_MAX_RETRY_SECONDS: u64 = 300;
+const SETTINGS_FILE: &str = "status-settings.json";
+const SETTINGS_SCHEMA_VERSION: u32 = 1;
 
 /// Versioned, non-secret status-line configuration loaded at startup.
 #[derive(Clone, Debug, Deserialize)]
@@ -286,8 +289,333 @@ pub struct StatusError {
     pub retryable: bool,
 }
 
+/// Browser-facing display settings for the status modules feature. These are
+/// editable from the settings screen and persist in the data directory.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct StatusSettings {
+    pub enabled: bool,
+    pub show_on_mobile: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpdateStatusSettings {
+    pub enabled: Option<bool>,
+    pub show_on_mobile: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredStatusSettings {
+    schema_version: u32,
+    #[serde(default = "default_settings_enabled")]
+    enabled: bool,
+    #[serde(default)]
+    show_on_mobile: bool,
+}
+
+fn default_settings_enabled() -> bool {
+    true
+}
+
+impl Default for StoredStatusSettings {
+    fn default() -> Self {
+        Self {
+            schema_version: SETTINGS_SCHEMA_VERSION,
+            enabled: true,
+            show_on_mobile: false,
+        }
+    }
+}
+
+struct StatusSettingsStore {
+    path: Option<PathBuf>,
+    state: parking_lot::RwLock<StoredStatusSettings>,
+}
+
+impl StatusSettingsStore {
+    fn in_memory() -> Self {
+        Self {
+            path: None,
+            state: parking_lot::RwLock::new(StoredStatusSettings::default()),
+        }
+    }
+
+    fn load(data_directory: &Path) -> Self {
+        let path = data_directory.join(SETTINGS_FILE);
+        let state = match fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice::<StoredStatusSettings>(&bytes) {
+                Ok(stored) if stored.schema_version == SETTINGS_SCHEMA_VERSION => stored,
+                Ok(stored) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        schema_version = stored.schema_version,
+                        "ignoring status settings with an unsupported schema"
+                    );
+                    StoredStatusSettings::default()
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        path = %path.display(),
+                        "ignoring invalid status settings"
+                    );
+                    StoredStatusSettings::default()
+                }
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                StoredStatusSettings::default()
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    path = %path.display(),
+                    "unable to load status settings"
+                );
+                StoredStatusSettings::default()
+            }
+        };
+        Self {
+            path: Some(path),
+            state: parking_lot::RwLock::new(state),
+        }
+    }
+
+    fn snapshot(&self) -> StoredStatusSettings {
+        self.state.read().clone()
+    }
+
+    fn update(&self, input: &UpdateStatusSettings) -> io::Result<StoredStatusSettings> {
+        let mut state = self.state.read().clone();
+        if let Some(enabled) = input.enabled {
+            state.enabled = enabled;
+        }
+        if let Some(show_on_mobile) = input.show_on_mobile {
+            state.show_on_mobile = show_on_mobile;
+        }
+        self.persist(&state)?;
+        *self.state.write() = state.clone();
+        Ok(state)
+    }
+
+    fn persist(&self, state: &StoredStatusSettings) -> io::Result<()> {
+        let Some(path) = self.path.as_deref() else {
+            return Ok(());
+        };
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::other("status settings path has no parent"))?;
+        fs::create_dir_all(parent)?;
+
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        serde_json::to_writer_pretty(&mut temporary, state).map_err(io::Error::other)?;
+        temporary.write_all(b"\n")?;
+        temporary.as_file().sync_all()?;
+        temporary.persist(path).map_err(|error| error.error)?;
+        sync_directory(parent)
+    }
+}
+
+#[cfg(unix)]
+fn sync_directory(directory: &Path) -> io::Result<()> {
+    fs::File::open(directory)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_directory: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 struct SecretCredential {
     value: String,
+}
+
+/// A credential resolved for one refresh, along with a non-secret description
+/// of where it came from (an environment variable or a local agent auth file).
+struct ResolvedCredential {
+    secret: Arc<SecretCredential>,
+    source: Option<String>,
+}
+
+/// Non-secret pointers to the local agent credential stores that auto-discovery
+/// reads. Files are re-read on every module refresh so re-logins and rotated
+/// OAuth tokens are picked up without a server restart.
+struct DiscoveryContext {
+    environment: BTreeMap<String, String>,
+    home: Option<PathBuf>,
+    codex_home: Option<PathBuf>,
+    omp_root: Option<PathBuf>,
+}
+
+impl DiscoveryContext {
+    fn from_environment(environment: BTreeMap<String, String>) -> Self {
+        let home = environment
+            .get("HOME")
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from);
+        let codex_home = environment
+            .get("CODEX_HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .or_else(|| home.as_ref().map(|home| home.join(".codex")));
+        // Oh My Pi keeps its root at $HOME/$PI_CONFIG_DIR, defaulting to ~/.omp.
+        let omp_root = home.as_ref().map(|home| {
+            let config_dir = environment
+                .get("PI_CONFIG_DIR")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(".omp"));
+            home.join(config_dir)
+        });
+        Self {
+            environment,
+            home,
+            codex_home,
+            omp_root,
+        }
+    }
+
+    fn resolve(&self, provider: &str, now_ms: u64) -> Option<ResolvedCredential> {
+        let environment_names: &[&str] = match provider {
+            "codex" | "openai" => NORMAL_CODEX_CREDENTIALS,
+            "anthropic" | "claude" => NORMAL_ANTHROPIC_CREDENTIALS,
+            "zai" => &["ZAI_API_KEY"],
+            _ => return None,
+        };
+        for name in environment_names {
+            if let Some(value) = self
+                .environment
+                .get(*name)
+                .filter(|value| !value.trim().is_empty())
+            {
+                return Some(resolved_credential(
+                    value,
+                    format!("{name} environment variable"),
+                ));
+            }
+        }
+        match provider {
+            "anthropic" | "claude" => self
+                .claude_credentials_file(now_ms)
+                .or_else(|| self.agent_store_credential("anthropic", now_ms)),
+            "codex" | "openai" => self
+                .codex_auth_file()
+                .or_else(|| self.agent_store_credential("openai-codex", now_ms)),
+            "zai" => self.agent_store_credential("zai", now_ms),
+            _ => None,
+        }
+    }
+
+    fn claude_credentials_file(&self, now_ms: u64) -> Option<ResolvedCredential> {
+        let path = self
+            .home
+            .as_ref()?
+            .join(".claude")
+            .join(".credentials.json");
+        let value = read_json_file(&path)?;
+        let oauth = value.get("claudeAiOauth")?;
+        let token = non_empty_string(oauth.get("accessToken"))?;
+        if expired(oauth.get("expiresAt"), now_ms) {
+            return None;
+        }
+        Some(resolved_credential(&token, self.display_path(&path)))
+    }
+
+    fn codex_auth_file(&self) -> Option<ResolvedCredential> {
+        let path = self.codex_home.as_ref()?.join("auth.json");
+        let value = read_json_file(&path)?;
+        if let Some(key) = non_empty_string(value.get("OPENAI_API_KEY")) {
+            return Some(resolved_credential(&key, self.display_path(&path)));
+        }
+        let token = non_empty_string(
+            value
+                .get("tokens")
+                .and_then(|tokens| tokens.get("access_token")),
+        )?;
+        Some(resolved_credential(&token, self.display_path(&path)))
+    }
+
+    /// pi and Oh My Pi share the auth-store format: `~/.pi/agent/auth.json` and
+    /// `<omp root>/agent/auth.json` map provider names to api-key or oauth
+    /// entries.
+    fn agent_store_credential(&self, entry_name: &str, now_ms: u64) -> Option<ResolvedCredential> {
+        let mut stores = Vec::new();
+        if let Some(home) = self.home.as_ref() {
+            stores.push(home.join(".pi").join("agent").join("auth.json"));
+        }
+        if let Some(root) = self.omp_root.as_ref() {
+            stores.push(root.join("agent").join("auth.json"));
+        }
+        for path in stores {
+            let Some(value) = read_json_file(&path) else {
+                continue;
+            };
+            let Some(entry) = value.get(entry_name) else {
+                continue;
+            };
+            if let Some(secret) = agent_store_entry_secret(entry, now_ms) {
+                return Some(resolved_credential(&secret, self.display_path(&path)));
+            }
+        }
+        None
+    }
+
+    fn display_path(&self, path: &Path) -> String {
+        if let Some(home) = self.home.as_ref()
+            && let Ok(relative) = path.strip_prefix(home)
+        {
+            return format!("~/{}", relative.display());
+        }
+        path.display().to_string()
+    }
+}
+
+fn resolved_credential(secret: &str, source: String) -> ResolvedCredential {
+    ResolvedCredential {
+        secret: Arc::new(SecretCredential {
+            value: secret.to_owned(),
+        }),
+        source: Some(source),
+    }
+}
+
+fn read_json_file(path: &Path) -> Option<Value> {
+    let bytes = fs::read(path).ok()?;
+    if bytes.len() > MAX_RESPONSE_BYTES {
+        return None;
+    }
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn non_empty_string(value: Option<&Value>) -> Option<String> {
+    value?
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn expired(value: Option<&Value>, now_ms: u64) -> bool {
+    value
+        .and_then(Value::as_f64)
+        .is_some_and(|expires| expires > 0.0 && expires <= now_ms as f64)
+}
+
+fn agent_store_entry_secret(entry: &Value, now_ms: u64) -> Option<String> {
+    if let Some(key) = non_empty_string(entry.get("key")) {
+        return Some(key);
+    }
+    if expired(entry.get("expires"), now_ms) {
+        return None;
+    }
+    non_empty_string(entry.get("access"))
+}
+
+enum ModuleCredential {
+    /// Captured from the process environment at startup (TOML-configured mode).
+    Static(Option<Arc<SecretCredential>>),
+    /// Re-resolved from the environment and local agent auth files per refresh.
+    Discovered,
 }
 
 struct RuntimeModule {
@@ -297,7 +625,7 @@ struct RuntimeModule {
     admin: bool,
     project_id: Option<String>,
     workspace_id: Option<String>,
-    credential: Option<Arc<SecretCredential>>,
+    credential: ModuleCredential,
 }
 
 struct RuntimeConfig {
@@ -305,6 +633,9 @@ struct RuntimeConfig {
     show_on_mobile: bool,
     defaults: StatusDefaults,
     modules: Vec<RuntimeModule>,
+    /// Auto-configured mode hides modules without a discovered credential.
+    auto: bool,
+    discovery: Option<DiscoveryContext>,
 }
 
 struct CachedPayload {
@@ -324,6 +655,7 @@ struct CacheState {
 #[derive(Clone)]
 pub struct StatusService {
     config: Arc<RuntimeConfig>,
+    settings: Arc<StatusSettingsStore>,
     cache: Arc<Mutex<CacheState>>,
     refresh_lock: Arc<Mutex<()>>,
     client: Client,
@@ -333,12 +665,68 @@ pub struct StatusService {
 }
 
 impl StatusService {
+    /// Build the runtime service. An explicit TOML configuration wins;
+    /// otherwise, when `auto` is allowed, modules are auto-configured from the
+    /// local agent credential stores (~/.claude, ~/.codex, ~/.pi, ~/.omp).
+    /// Display settings persist in the data directory in every mode.
+    pub fn new(
+        config_path: Option<&Path>,
+        data_directory: &Path,
+        auto: bool,
+    ) -> Result<Self, StatusConfigError> {
+        let mut service = match (config_path, auto) {
+            (Some(path), _) => Self::from_path(Some(path))?,
+            (None, true) => Self::auto(),
+            (None, false) => Self::disabled(),
+        };
+        service.settings = Arc::new(StatusSettingsStore::load(data_directory));
+        Ok(service)
+    }
+
     pub fn disabled() -> Self {
         Self::from_runtime(RuntimeConfig {
             enabled: false,
             show_on_mobile: false,
             defaults: StatusDefaults::default(),
             modules: Vec::new(),
+            auto: false,
+            discovery: None,
+        })
+    }
+
+    fn auto() -> Self {
+        Self::auto_with_environment(env::vars())
+    }
+
+    fn auto_with_environment<I, K, V>(environment: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        let environment = environment
+            .into_iter()
+            .map(|(name, value)| (name.into(), value.into()))
+            .collect::<BTreeMap<_, _>>();
+        let modules = [("claude", "Claude"), ("codex", "Codex"), ("zai", "Z.ai")]
+            .into_iter()
+            .map(|(provider, label)| RuntimeModule {
+                id: provider.to_owned(),
+                label: label.to_owned(),
+                provider: provider.to_owned(),
+                admin: false,
+                project_id: None,
+                workspace_id: None,
+                credential: ModuleCredential::Discovered,
+            })
+            .collect();
+        Self::from_runtime(RuntimeConfig {
+            enabled: true,
+            show_on_mobile: false,
+            defaults: StatusDefaults::default(),
+            modules,
+            auto: true,
+            discovery: Some(DiscoveryContext::from_environment(environment)),
         })
     }
 
@@ -386,7 +774,7 @@ impl StatusService {
                 admin: module.admin,
                 project_id: module.project_id.clone(),
                 workspace_id: module.workspace_id.clone(),
-                credential: resolve_credential(module, &environment),
+                credential: ModuleCredential::Static(resolve_credential(module, &environment)),
             })
             .collect();
         Ok(Self::from_runtime(RuntimeConfig {
@@ -394,6 +782,8 @@ impl StatusService {
             show_on_mobile: config.show_on_mobile,
             defaults: config.defaults,
             modules,
+            auto: false,
+            discovery: None,
         }))
     }
 
@@ -406,6 +796,7 @@ impl StatusService {
             .expect("fixed status HTTP client configuration must be valid");
         Self {
             config: Arc::new(config),
+            settings: Arc::new(StatusSettingsStore::in_memory()),
             cache: Arc::new(Mutex::new(CacheState {
                 current: None,
                 retry_attempts: vec![0; module_count],
@@ -429,9 +820,40 @@ impl StatusService {
         self
     }
 
+    /// The current settings-screen configuration for the feature.
+    pub fn settings(&self) -> StatusSettings {
+        let stored = self.settings.snapshot();
+        StatusSettings {
+            enabled: stored.enabled,
+            show_on_mobile: stored.show_on_mobile,
+        }
+    }
+
+    pub fn update_settings(&self, input: UpdateStatusSettings) -> io::Result<StatusSettings> {
+        let stored = self.settings.update(&input)?;
+        Ok(StatusSettings {
+            enabled: stored.enabled,
+            show_on_mobile: stored.show_on_mobile,
+        })
+    }
+
+    /// Shape a cached or fresh payload for the browser: auto-configured mode
+    /// hides modules without a discovered credential, and the persisted display
+    /// settings override the mobile visibility default.
+    fn presentable(&self, mut payload: StatusPayload) -> StatusPayload {
+        if self.config.auto {
+            payload
+                .modules
+                .retain(|module| module.state != StatusModuleState::Unconfigured);
+        }
+        payload.display.show_on_mobile =
+            self.config.show_on_mobile || self.settings.snapshot().show_on_mobile;
+        payload
+    }
+
     pub async fn snapshot(&self) -> StatusPayload {
         let observed_at = unix_seconds();
-        if !self.config.enabled {
+        if !self.config.enabled || !self.settings.snapshot().enabled {
             return self.empty_payload(observed_at);
         }
         {
@@ -439,7 +861,7 @@ impl StatusService {
             if let Some(current) = cache.current.as_ref()
                 && observed_at < current.expires_at
             {
-                return current.payload.clone();
+                return self.presentable(current.payload.clone());
             }
         }
 
@@ -450,7 +872,7 @@ impl StatusService {
             if let Some(current) = cache.current.as_ref()
                 && refresh_started_at < current.expires_at
             {
-                return current.payload.clone();
+                return self.presentable(current.payload.clone());
             }
         }
 
@@ -584,7 +1006,8 @@ impl StatusService {
             expires_at,
         });
         cache.retry_attempts = retry_attempts;
-        payload
+        drop(cache);
+        self.presentable(payload)
     }
 
     fn empty_payload(&self, generated_at: u64) -> StatusPayload {
@@ -622,18 +1045,29 @@ impl StatusService {
         ) {
             return Err(ProviderFailure::unsupported_provider());
         }
-        let Some(credential) = runtime.credential.as_ref() else {
+        let resolved = match &runtime.credential {
+            ModuleCredential::Static(Some(secret)) => Some(ResolvedCredential {
+                secret: Arc::clone(secret),
+                source: None,
+            }),
+            ModuleCredential::Static(None) => None,
+            ModuleCredential::Discovered => self
+                .config
+                .discovery
+                .as_ref()
+                .and_then(|discovery| discovery.resolve(&runtime.provider, unix_millis())),
+        };
+        let Some(resolved) = resolved else {
             return Ok(ProviderObservation::unconfigured());
         };
         match runtime.provider.as_str() {
-            "openai" if runtime.admin => self.openai_admin_limits(runtime, credential).await,
+            "openai" if runtime.admin => self.openai_admin_limits(runtime, &resolved.secret).await,
             "anthropic" | "claude" if runtime.admin => {
-                self.anthropic_admin_limits(runtime, credential).await
+                self.anthropic_admin_limits(runtime, &resolved.secret).await
             }
-            "codex" | "openai" | "anthropic" | "claude" | "zai" => {
-                Ok(ProviderObservation::configured_only())
-            }
-            _ => Err(ProviderFailure::unsupported_provider()),
+            _ => Ok(ProviderObservation::configured_only(
+                resolved.source.as_deref(),
+            )),
         }
     }
 
@@ -798,14 +1232,18 @@ impl ProviderObservation {
         }
     }
 
-    fn configured_only() -> Self {
+    fn configured_only(source: Option<&str>) -> Self {
+        let mut details = vec![detail(
+            "Quota",
+            "configured credential; provider publishes no standalone quota endpoint",
+        )];
+        if let Some(source) = source {
+            details.push(detail("Source", source));
+        }
         Self {
             state: StatusModuleState::Warn,
             primary: Some("configured".to_owned()),
-            details: vec![detail(
-                "Quota",
-                "configured credential; provider publishes no standalone quota endpoint",
-            )],
+            details,
         }
     }
 
@@ -1119,6 +1557,13 @@ fn unix_seconds() -> u64 {
         .as_secs()
 }
 
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_millis() as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1133,6 +1578,13 @@ mod tests {
             admin: false,
             project_id: None,
             workspace_id: None,
+        }
+    }
+
+    fn static_credential(module: &RuntimeModule) -> Option<&Arc<SecretCredential>> {
+        match &module.credential {
+            ModuleCredential::Static(credential) => credential.as_ref(),
+            ModuleCredential::Discovered => None,
         }
     }
 
@@ -1215,9 +1667,7 @@ mod tests {
             StatusService::from_config_with_environment(config(vec![module("codex")]), environment)
                 .unwrap();
         assert_eq!(
-            service.config.modules[0]
-                .credential
-                .as_ref()
+            static_credential(&service.config.modules[0])
                 .expect("credential should resolve")
                 .value,
             "first-secret"
@@ -1240,9 +1690,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            admin_service.config.modules[0]
-                .credential
-                .as_ref()
+            static_credential(&admin_service.config.modules[0])
                 .expect("admin credential should resolve")
                 .value,
             "admin-secret"
@@ -1369,7 +1817,7 @@ mod tests {
                 admin: false,
                 project_id: None,
                 workspace_id: None,
-                credential: None,
+                credential: ModuleCredential::Static(None),
             },
             Some(&previous),
             300,
@@ -1455,6 +1903,175 @@ mod tests {
         assert!(
             cache.current.as_ref().expect("cached payload").expires_at > first.generated_at,
             "published cache must expire after, not during, the refresh"
+        );
+    }
+
+    fn write_json(path: &Path, value: serde_json::Value) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+
+    fn auto_service(home: &Path, extra: &[(&str, &str)]) -> StatusService {
+        let mut environment = vec![("HOME".to_owned(), home.display().to_string())];
+        for (name, value) in extra {
+            environment.push(((*name).to_owned(), (*value).to_owned()));
+        }
+        StatusService::auto_with_environment(environment)
+    }
+
+    #[tokio::test]
+    async fn auto_mode_discovers_claude_and_hides_missing_providers() {
+        let home = tempfile::tempdir().unwrap();
+        write_json(
+            &home.path().join(".claude/.credentials.json"),
+            serde_json::json!({
+                "claudeAiOauth": {
+                    "accessToken": "claude-oauth-secret",
+                    "expiresAt": (unix_millis() + 3_600_000),
+                }
+            }),
+        );
+        let payload = auto_service(home.path(), &[]).snapshot().await;
+        assert!(payload.enabled);
+        assert_eq!(
+            payload
+                .modules
+                .iter()
+                .map(|module| module.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["claude"],
+            "providers without credentials must stay hidden"
+        );
+        let module = &payload.modules[0];
+        assert_eq!(module.state, StatusModuleState::Warn);
+        assert_eq!(module.primary.as_deref(), Some("configured"));
+        assert!(module.details.iter().any(
+            |detail| detail.label == "Source" && detail.value == "~/.claude/.credentials.json"
+        ));
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(!json.contains("claude-oauth-secret"));
+    }
+
+    #[tokio::test]
+    async fn auto_mode_skips_expired_tokens_and_reads_agent_stores() {
+        let home = tempfile::tempdir().unwrap();
+        write_json(
+            &home.path().join(".claude/.credentials.json"),
+            serde_json::json!({
+                "claudeAiOauth": { "accessToken": "stale-secret", "expiresAt": 1_000 }
+            }),
+        );
+        write_json(
+            &home.path().join(".codex/auth.json"),
+            serde_json::json!({
+                "OPENAI_API_KEY": null,
+                "tokens": { "access_token": "codex-oauth-secret" }
+            }),
+        );
+        write_json(
+            &home.path().join(".pi/agent/auth.json"),
+            serde_json::json!({ "zai": { "type": "api_key", "key": "zai-secret" } }),
+        );
+        let payload = auto_service(home.path(), &[]).snapshot().await;
+        assert_eq!(
+            payload
+                .modules
+                .iter()
+                .map(|module| module.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["codex", "zai"],
+            "expired claude oauth token must not count as configured"
+        );
+        assert!(
+            payload.modules[0]
+                .details
+                .iter()
+                .any(|detail| detail.value == "~/.codex/auth.json")
+        );
+        assert!(
+            payload.modules[1]
+                .details
+                .iter()
+                .any(|detail| detail.value == "~/.pi/agent/auth.json")
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_mode_prefers_environment_and_reads_omp_store() {
+        let home = tempfile::tempdir().unwrap();
+        write_json(
+            &home.path().join(".omp/agent/auth.json"),
+            serde_json::json!({
+                "zai": { "key": "omp-zai-secret" },
+                "openai-codex": { "access": "omp-codex-secret", "expires": 0 }
+            }),
+        );
+        let payload = auto_service(home.path(), &[("ANTHROPIC_API_KEY", "environment-secret")])
+            .snapshot()
+            .await;
+        assert_eq!(
+            payload
+                .modules
+                .iter()
+                .map(|module| module.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["claude", "codex", "zai"]
+        );
+        assert!(
+            payload.modules[0]
+                .details
+                .iter()
+                .any(|detail| detail.value == "ANTHROPIC_API_KEY environment variable")
+        );
+        assert!(
+            payload.modules[1]
+                .details
+                .iter()
+                .any(|detail| detail.value == "~/.omp/agent/auth.json")
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_default_on_persist_and_gate_the_snapshot() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        write_json(
+            &home.path().join(".pi/agent/auth.json"),
+            serde_json::json!({ "zai": { "key": "zai-secret" } }),
+        );
+        let mut service = auto_service(home.path(), &[]);
+        service.settings = Arc::new(StatusSettingsStore::load(data_dir.path()));
+        assert!(service.settings().enabled, "settings must default to on");
+        assert!(!service.settings().show_on_mobile);
+        assert!(service.snapshot().await.enabled);
+
+        let updated = service
+            .update_settings(UpdateStatusSettings {
+                enabled: Some(false),
+                show_on_mobile: Some(true),
+            })
+            .unwrap();
+        assert!(!updated.enabled);
+        let disabled = service.snapshot().await;
+        assert!(!disabled.enabled);
+        assert!(disabled.modules.is_empty());
+
+        // A fresh instance reloads the persisted settings from disk.
+        let reloaded = StatusService::new(None, data_dir.path(), false).unwrap();
+        assert!(!reloaded.settings().enabled);
+        assert!(reloaded.settings().show_on_mobile);
+
+        service
+            .update_settings(UpdateStatusSettings {
+                enabled: Some(true),
+                show_on_mobile: None,
+            })
+            .unwrap();
+        let restored = service.snapshot().await;
+        assert!(restored.enabled);
+        assert!(
+            restored.display.show_on_mobile,
+            "persisted show_on_mobile must override the runtime default"
         );
     }
 }

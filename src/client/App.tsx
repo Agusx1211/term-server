@@ -22,6 +22,7 @@ import type {
   FileEntry,
   FileTarget,
   PushoverMode,
+  UpdateStatusModulesSettings,
   ReleaseInfo,
   TerminalInfo,
   UpdateActivityView,
@@ -181,6 +182,10 @@ const defaultConfig: ClientConfig = {
     appKey: "",
     mode: "off",
     enabled: false,
+  },
+  statusModules: {
+    enabled: true,
+    showOnMobile: false,
   },
   build: {
     version: "unknown",
@@ -1343,6 +1348,16 @@ export function App() {
     }
   };
 
+  const updateStatusModulesConfig = async (changes: UpdateStatusModulesSettings) => {
+    try {
+      const statusModules = await api.updateStatusModulesConfig(changes);
+      setConfig((current) => ({ ...current, statusModules }));
+      showNotice("Status bar settings updated");
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : "Unable to update status bar settings");
+    }
+  };
+
   const maybeSendPushover = (terminal: TerminalInfo, agent: AgentInfo) => {
     const pushover = configRef.current.pushover;
     if (!pushover.enabled) return;
@@ -1966,6 +1981,7 @@ export function App() {
                 frontendRecordingEvents={frontendRecordingEvents}
                 recordingBusy={recordingBusy}
                 pushover={config.pushover}
+                statusModules={config.statusModules}
                 onTheme={setTheme}
                 onPiChange={(titlesEnabled, summariesEnabled, model) => (
                   void updatePiConfig(titlesEnabled, summariesEnabled, model)
@@ -1992,6 +2008,7 @@ export function App() {
                 onRecordingDownload={() => void downloadRecording()}
                 onRecordingClear={() => void clearRecording()}
                 onPushoverChange={(changes) => void updatePushoverConfig(changes)}
+                onStatusModulesChange={(changes) => void updateStatusModulesConfig(changes)}
                 onPasswordChanged={() => showNotice("Password changed; other sessions were signed out")}
                 onLogout={() => void logout()}
               />
@@ -2018,7 +2035,10 @@ export function App() {
             </span>
           )}
         </span>
-        <StatusModules onMobileVisibilityChange={setStatusModulesMobileVisible} />
+        <StatusModules
+          enabled={config.statusModules.enabled}
+          onMobileVisibilityChange={setStatusModulesMobileVisible}
+        />
         <span class="statusbar-group statusbar-right">
           <span
             class="statusbar-item statusbar-build"

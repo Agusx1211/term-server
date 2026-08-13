@@ -98,9 +98,20 @@ export interface ClientConfig {
   agentIntegrations: AgentIntegrationsConfig;
   artifactSkill: ArtifactSkillConfig;
   pushover: PushoverConfig;
+  statusModules: StatusModulesSettings;
   build: BuildInfo;
   broker: SessionBrokerInfo | null;
   updates: UpdateConfig;
+}
+
+export interface StatusModulesSettings {
+  enabled: boolean;
+  showOnMobile: boolean;
+}
+
+export interface UpdateStatusModulesSettings {
+  enabled?: boolean;
+  showOnMobile?: boolean;
 }
 export type StatusModuleState = "ok" | "warn" | "error" | "unconfigured";
 

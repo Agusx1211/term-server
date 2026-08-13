@@ -53,7 +53,7 @@ use crate::{
     },
     files::{self, FileError},
     pushover::{PushoverConfig, PushoverNotification, PushoverService, UpdatePushoverConfig},
-    status::{StatusPayload, StatusService},
+    status::{StatusPayload, StatusService, StatusSettings, UpdateStatusSettings},
     terminal::{CreateTerminal, RenameTerminal, TerminalError, TerminalInfo},
     update::{UpdateConfig, UpdateError, UpdateService, UpdateStatus},
     workspace::{
@@ -274,6 +274,7 @@ struct ClientConfig {
     agent_integrations: AgentIntegrationsConfig,
     artifact_skill: ArtifactSkillConfig,
     pushover: PushoverConfig,
+    status_modules: StatusSettings,
     build: build::BuildInfo,
     broker: Option<SessionBrokerInfo>,
     updates: UpdateConfig,
@@ -636,6 +637,7 @@ async fn config(
         agent_integrations,
         artifact_skill: state.artifact_skill.status(),
         pushover: state.pushover.client_config(),
+        status_modules: state.status_modules.settings(),
         build: build::info(),
         broker,
         updates: state.updates.config(),
@@ -808,6 +810,33 @@ async fn update_pi_config(
         .await
         .map(Json)
         .map_err(Into::into)
+}
+
+async fn status_modules_config(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> Result<Json<StatusSettings>, ApiError> {
+    require_auth(&jar, &state)?;
+    Ok(Json(state.status_modules.settings()))
+}
+
+async fn update_status_modules_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+    Json(body): Json<UpdateStatusSettings>,
+) -> Result<Json<StatusSettings>, ApiError> {
+    require_origin(&headers, &uri, &state)?;
+    require_auth(&jar, &state)?;
+    let settings = state
+        .status_modules
+        .update_settings(body)
+        .map_err(|error| {
+            tracing::error!(%error, "unable to persist status module settings");
+            ApiError::Internal
+        })?;
+    Ok(Json(settings))
 }
 
 async fn pushover_config(
@@ -1436,6 +1465,10 @@ pub fn build_router(state: AppState, client_directory: Option<PathBuf>) -> Route
         .route("/password", patch(change_password))
         .route("/config", get(config))
         .route("/status-modules", get(status_modules))
+        .route(
+            "/config/status-modules",
+            get(status_modules_config).patch(update_status_modules_config),
+        )
         .route("/config/pi", patch(update_pi_config))
         .route(
             "/config/pushover",
@@ -1676,6 +1709,75 @@ mod tests {
         assert_eq!(json["display"]["showOnMobile"], false);
         assert_eq!(json["modules"], serde_json::json!([]));
         assert!(json["generatedAt"].is_number());
+    }
+
+    #[tokio::test]
+    async fn status_modules_settings_default_on_and_round_trip() {
+        let (app, cookie) = authenticated_app().await;
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config/status-modules")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let get = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config/status-modules")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get.status(), StatusCode::OK);
+        let body = to_bytes(get.into_body(), 16 * 1024).await.unwrap();
+        let settings: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(settings["enabled"], true);
+        assert_eq!(settings["showOnMobile"], false);
+
+        let patch = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/config/status-modules")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(Body::from(r#"{"enabled":false,"showOnMobile":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(patch.status(), StatusCode::OK);
+        let body = to_bytes(patch.into_body(), 16 * 1024).await.unwrap();
+        let settings: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(settings["enabled"], false);
+        assert_eq!(settings["showOnMobile"], true);
+
+        let config = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(config.status(), StatusCode::OK);
+        let body = to_bytes(config.into_body(), 1024 * 1024).await.unwrap();
+        let config: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(config["statusModules"]["enabled"], false);
+        assert_eq!(config["statusModules"]["showOnMobile"], true);
     }
 
     #[test]

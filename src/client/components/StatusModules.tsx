@@ -16,6 +16,7 @@ import {
 } from "../lib/status-modules";
 
 interface StatusModulesProps {
+  enabled: boolean;
   onMobileVisibilityChange: (visible: boolean) => void;
 }
 
@@ -32,7 +33,7 @@ const EMPTY_MODULES: StatusModule[] = [];
 
 const MAX_STATUS_RETRY_ATTEMPT = 8;
 
-export function StatusModules({ onMobileVisibilityChange }: StatusModulesProps) {
+export function StatusModules({ enabled, onMobileVisibilityChange }: StatusModulesProps) {
   const [response, setResponse] = useState<StatusModulesResponse | null>(null);
   const responseRef = useRef<StatusModulesResponse | null>(null);
   responseRef.current = response;
@@ -98,6 +99,12 @@ export function StatusModules({ onMobileVisibilityChange }: StatusModulesProps) 
   };
 
   useEffect(() => {
+    if (!enabled) {
+      responseRef.current = null;
+      setResponse(null);
+      onMobileVisibilityChange(false);
+      return;
+    }
     let disposed = false;
     let inFlight = false;
     let refreshTimer: number | undefined;
@@ -187,7 +194,7 @@ export function StatusModules({ onMobileVisibilityChange }: StatusModulesProps) 
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       onMobileVisibilityChange(false);
     };
-  }, [onMobileVisibilityChange]);
+  }, [enabled, onMobileVisibilityChange]);
 
   const modules = response?.enabled ? response.modules : EMPTY_MODULES;
 
