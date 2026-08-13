@@ -69,6 +69,8 @@ export interface E2EXtermSnapshot {
   readonly cursorX: number;
   readonly cursorY: number;
   readonly viewportY: number;
+  readonly baseY: number;
+  readonly bufferLength: number;
   readonly text: string;
   readonly selectionText: string;
 }
@@ -132,6 +134,8 @@ export interface E2ETerminalSnapshot {
   readonly cursorX: number;
   readonly cursorY: number;
   readonly viewportY: number;
+  readonly baseY: number;
+  readonly bufferLength: number;
   readonly text: string;
   readonly selectionText: string;
   readonly mounted: boolean;
@@ -372,6 +376,8 @@ interface MutableSnapshot {
   cursorX: number;
   cursorY: number;
   viewportY: number;
+  baseY: number;
+  bufferLength: number;
   text: string;
   selectionText: string;
   mounted: boolean;
@@ -497,6 +503,8 @@ function blankSnapshot(registration: E2ETerminalRegistration): MutableSnapshot {
     cursorX: 0,
     cursorY: 0,
     viewportY: 0,
+    baseY: 0,
+    bufferLength: 0,
     text: "",
     selectionText: "",
   };
@@ -557,6 +565,8 @@ function blankSnapshot(registration: E2ETerminalRegistration): MutableSnapshot {
     cursorX: xterm.cursorX,
     cursorY: xterm.cursorY,
     viewportY: xterm.viewportY,
+    baseY: xterm.baseY,
+    bufferLength: xterm.bufferLength,
     text: xterm.text,
     selectionText: xterm.selectionText,
     mounted: lifecycle.mounted,
@@ -730,6 +740,8 @@ function setPatch(entry: InternalEntry, patch: Partial<E2ETerminalSnapshot>): vo
     cursorX: entry.snapshot.cursorX,
     cursorY: entry.snapshot.cursorY,
     viewportY: entry.snapshot.viewportY,
+    baseY: entry.snapshot.baseY,
+    bufferLength: entry.snapshot.bufferLength,
     text: entry.snapshot.text,
     selectionText: entry.snapshot.selectionText,
   };
@@ -1257,7 +1269,7 @@ function makeHandle(entry: InternalEntry): E2ETerminalDiagnosticsHandle {
       const value = terminal as {
         cols?: number;
         rows?: number;
-        buffer?: { active?: { type?: "normal" | "alternate"; cursorX?: number; cursorY?: number; viewportY?: number; length?: number; getLine?: (index: number) => { isWrapped?: boolean; translateToString(trimRight?: boolean): string } | undefined } };
+        buffer?: { active?: { type?: "normal" | "alternate"; cursorX?: number; cursorY?: number; viewportY?: number; baseY?: number; length?: number; getLine?: (index: number) => { isWrapped?: boolean; translateToString(trimRight?: boolean): string } | undefined } };
         getSelection?: () => string;
       };
       const active = value.buffer?.active;
@@ -1270,6 +1282,8 @@ function makeHandle(entry: InternalEntry): E2ETerminalDiagnosticsHandle {
         cursorX: active.cursorX ?? 0,
         cursorY: active.cursorY ?? 0,
         viewportY: active.viewportY ?? 0,
+        baseY: active.baseY ?? 0,
+        bufferLength: active.length ?? 0,
         text,
         selectionText: value.getSelection?.() ?? "",
       });
