@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.14.0 - 2026-08-13
+
+The bottom status bar now shows provider limit modules by default, configured automatically from
+the machine's local agent credentials, with a new settings card to control the feature.
+
+### Added
+
+- Provider status modules auto-configure when no `--status-config` TOML is supplied. On every
+  refresh the server resolves each provider's credential first from the usual environment
+  variables and then from the local agent credential stores: `~/.claude/.credentials.json`,
+  `$CODEX_HOME/auth.json` (default `~/.codex/auth.json`), `~/.pi/agent/auth.json`, and
+  `~/.omp/agent/auth.json` (the Oh My Pi root follows `PI_CONFIG_DIR`). Expired OAuth tokens are
+  skipped, providers without a discovered credential stay hidden, and re-logins are picked up on
+  the next refresh without a server restart. Each module popover names its non-secret credential
+  source; credential values are never accepted from the browser, serialized, or logged.
+- A new **Settings → Status bar limits** card controls the feature: "Show limits in the status
+  bar" (on by default) and "Also show on mobile". Both persist server-side in
+  `status-settings.json` inside the data directory and are exposed through the authenticated
+  `GET`/`PATCH /api/config/status-modules` endpoint.
+- A new `--no-status-auto` flag (`TERM_SERVER_NO_STATUS_AUTO`) disables credential
+  auto-discovery entirely. An explicit `--status-config` file continues to replace
+  auto-configuration, unchanged.
+
+### Upgrade notes
+
+- Deployments without `TERM_SERVER_STATUS_CONFIG` now show status modules for providers whose
+  credentials are found on the server. Turn the bar off under **Settings → Status bar limits**,
+  or set `TERM_SERVER_NO_STATUS_AUTO=true` to restore the previous silent default.
+- There are no breaking changes, data migrations, or session broker protocol changes. The
+  isolated E2E harness disables auto-discovery so tests stay hermetic.
+- The release is safe for automatic installation over `0.13.5`.
+
 ## 0.13.5 - 2026-08-13
 
 omp agents no longer show as idle while they are still working.
