@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.13.4 - 2026-08-13
+
+Completes the 0.13.3 scrollback work: terminals no longer strand the user above the bottom of the
+buffer during live sessions, and reconnect snapshots no longer corrupt reflowed history.
+
+### Fixed
+
+- A scroll issued while the terminal's scrollbar range was stale was clamped and silently
+  discarded, parking the viewport short of the bottom with follow-tail disengaged until the page
+  was refreshed. The range now re-synchronizes when a backgrounded tab returns to the foreground
+  and when a hidden pane becomes active again, explicit re-synchronizations are no longer silently
+  ignored while an agent TUI holds a synchronized-output frame open, and the **Latest** button
+  verifies it actually reached the bottom and retries once — which is what re-arms follow-tail
+  after a clamped scroll.
+- The canonical reconnect snapshot — served on the first reconnect after a grid change, or after
+  enough output accumulated while no browser was attached — no longer merges soft-wrapped
+  scrollback rows with their continuations when the grid is resized. The merge lost content,
+  shortened the buffer, restored the cursor too high, and bled text attributes across rows; a
+  refresh only healed it once a fresh browser checkpoint replaced the canonical model, which is
+  why refreshing sometimes fixed the cut and sometimes did not.
+
+### Upgrade notes
+
+- There are no breaking changes, data migrations, or configuration changes. Reload open terminal
+  pages after updating. The canonical snapshot fix applies to session brokers started by this
+  version; existing brokers keep running and benefit from the client-side fixes immediately.
+- The release is safe for automatic installation over `0.13.3`.
+
 ## 0.13.3 - 2026-08-13
 
 Large terminals no longer lose or hide the bottom of their scrollback after a browser refresh or a
