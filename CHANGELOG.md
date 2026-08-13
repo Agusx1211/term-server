@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.13.6 - 2026-08-13
+
+Provider usage limits now appear in the status bar out of the box.
+
+### Added
+
+- The provider status modules in the bottom bar auto-configure when no `--status-config` is given:
+  the server builds `claude`, `codex`, and `zai` modules and resolves their credentials on every
+  refresh, first from the usual environment variables and then from the local agent stores
+  (`~/.claude/.credentials.json`, `$CODEX_HOME/auth.json`, `~/.pi/agent/auth.json`, and
+  `~/.omp/agent/auth.json`, following `PI_CONFIG_DIR` for the omp root). Expired OAuth tokens are
+  skipped, providers without a credential stay hidden, and a re-login shows up on the next refresh
+  without restarting the server. Each module popover names the non-secret source it used;
+  credential values are never sent to the browser. An explicit status TOML still replaces
+  auto-configuration, and `--no-status-auto` (`TERM_SERVER_NO_STATUS_AUTO=true`) disables
+  discovery entirely.
+- A "Status bar limits" card in settings with "Show limits in the status bar" (on by default) and
+  "Also show on mobile" toggles, persisted in `status-settings.json` in the data directory and
+  editable through the authenticated `GET`/`PATCH /api/config/status-modules` endpoint.
+
+### Upgrade notes
+
+- There are no breaking changes, data migrations, or configuration changes. Reload open pages
+  after updating to see the status bar; the modules appear once the main server process picks up
+  the update. Deployments that must not read local agent credential stores should set
+  `--no-status-auto`.
+- The release is safe for automatic installation over `0.13.5`.
+
 ## 0.13.5 - 2026-08-13
 
 omp agents no longer show as idle while they are still working.
