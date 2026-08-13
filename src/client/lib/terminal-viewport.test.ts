@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createSettledTask,
   nextTerminalViewportReport,
+  resyncTerminalScrollArea,
   terminalViewportForServerSize,
   terminalViewportSize,
 } from "./terminal-viewport";
@@ -85,5 +86,36 @@ describe("settled terminal viewport reporting", () => {
     task.cancel();
     vi.runAllTimers();
     expect(report).not.toHaveBeenCalled();
+  });
+});
+
+describe("xterm scroll area re-sync", () => {
+  const fakeTerminal = (viewport: Record<string, unknown>) => ({
+    buffer: { active: { viewportY: 42 } },
+    _core: { viewport },
+  });
+
+  it("re-syncs the private viewport and re-anchors the scrollbar", () => {
+    const sync = vi.fn();
+    const scrollToLine = vi.fn();
+    const terminal = fakeTerminal({ _sync: sync, scrollToLine });
+
+    expect(resyncTerminalScrollArea(terminal)).toBe(true);
+    expect(sync).toHaveBeenCalledTimes(1);
+    expect(scrollToLine).toHaveBeenCalledWith(42, true);
+  });
+
+  it("falls back to queueSync when _sync is unavailable", () => {
+    const queueSync = vi.fn();
+    const terminal = fakeTerminal({ queueSync });
+
+    expect(resyncTerminalScrollArea(terminal)).toBe(true);
+    expect(queueSync).toHaveBeenCalledTimes(1);
+  });
+
+  it("does nothing when the internals are unreachable", () => {
+    expect(resyncTerminalScrollArea(undefined)).toBe(false);
+    expect(resyncTerminalScrollArea({})).toBe(false);
+    expect(resyncTerminalScrollArea({ _core: { viewport: {} } })).toBe(false);
   });
 });

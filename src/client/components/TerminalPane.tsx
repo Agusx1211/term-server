@@ -102,10 +102,12 @@ import {
   tuiCompatibilityOptions,
 } from "../lib/terminal-compatibility";
 import { loadTerminalNerdFont, TERMINAL_FONT_FAMILY } from "../lib/terminal-font";
+import { resizeTerminalPreservingTail } from "../lib/terminal-resize";
 import { PanoptesUnicode17Addon } from "../lib/terminal-unicode";
 import {
   createSettledTask,
   nextTerminalViewportReport,
+  resyncTerminalScrollArea,
   terminalViewportForServerSize,
   terminalViewportSize,
   type TerminalViewportSize,
@@ -366,6 +368,7 @@ export function TerminalPane({
       if (disposed) return;
       term.clearTextureAtlas();
       term.refresh(0, term.rows - 1);
+      resyncScrollArea();
       diagnosticsHandle?.record("font-load", { result: "settled" });
       reportTerminalViewport.current?.();
     });
@@ -493,6 +496,21 @@ export function TerminalPane({
         captureScreenshot();
       }
     };
+    // xterm only recomputes its scrollbar geometry on buffer scroll/resize
+    // events, so a renderer swap or a replay parsed while the renderer was
+    // paused leaves the scroll range stale and the bottom of a large
+    // scrollback unreachable. Re-sync immediately and once more after the
+    // next render, when a paused renderer has measured real cell metrics.
+    let scrollAreaRenderResync: { dispose(): void } | undefined;
+    const resyncScrollArea = (): void => {
+      resyncTerminalScrollArea(term);
+      scrollAreaRenderResync?.dispose();
+      scrollAreaRenderResync = term.onRender(() => {
+        scrollAreaRenderResync?.dispose();
+        scrollAreaRenderResync = undefined;
+        resyncTerminalScrollArea(term);
+      });
+    };
     const fallbackFromWebgl = (): void => {
       if (disposed || webglContextLost) return;
       // Mark the transition before disposing. xterm's addon cleanup removes
@@ -510,6 +528,7 @@ export function TerminalPane({
       diagnosticsHandle?.rendererContextLost();
       recordRenderer();
       term.refresh(0, term.rows - 1);
+      resyncScrollArea();
       reportedViewport = "";
       reportTerminalViewport.current?.();
     };
@@ -547,6 +566,7 @@ export function TerminalPane({
           rendererKind = "webgl";
           webglLoaded = true;
           diagnosticsHandle?.rendererLoaded("webgl");
+          resyncScrollArea();
           reportTerminalViewport.current?.();
           recordRenderer();
         } catch {
@@ -733,6 +753,11 @@ export function TerminalPane({
     });
     const scrollDisposable = term.onScroll((position) => {
       setScrolledBack(position < term.buffer.active.baseY);
+      diagnosticsHandle?.update({
+        viewportY: position,
+        baseY: term.buffer.active.baseY,
+        bufferLength: term.buffer.active.length,
+      });
     });
     term.attachCustomKeyEventHandler((event) => handleTerminalClipboardShortcut(
       event,
@@ -1136,7 +1161,12 @@ export function TerminalPane({
                 epoch: message.epoch,
               });
               terminalEpoch = message.epoch;
-              term.resize(message.cols, message.rows);
+              resizeTerminalPreservingTail(term, message.cols, message.rows);
+              // A reflow changes the buffer length and the line a scrolled-back
+              // pane's scrollTop maps to. xterm's queued resize sync updates the
+              // range but never repositions, so re-anchor the scrollbar to the
+              // buffer explicitly.
+              resyncScrollArea();
               responder = message.responder;
               if (!acceptingInput) term.options.disableStdin = !responder;
               setTerminalSize({ focused: message.focused, controller: message.controller });
@@ -1231,6 +1261,10 @@ export function TerminalPane({
                 sequence: stream.committed ?? message.sequence,
                 epoch: terminalEpoch,
               });
+              // A replay parsed while the renderer was paused (hidden pane,
+              // occluded tab) leaves xterm's scroll geometry at its pre-replay
+              // range; without a re-sync the new bottom is unreachable.
+              resyncScrollArea();
               reportViewport();
               if (activeState.current && visibleState.current) term.focus();
               captureRenderState(true);
@@ -1357,6 +1391,7 @@ export function TerminalPane({
         // A cached pane is display:none, so the renderer has drawn nothing while
         // it was away however much output it parsed. Repaint from the buffer.
         term.refresh(0, term.rows - 1);
+        resyncScrollArea();
         if (hasSynced && activeState.current) term.focus();
       });
     };
@@ -1414,6 +1449,8 @@ export function TerminalPane({
       unregisterContextLossControl = undefined;
       writeCheckpoint();
       disposed = true;
+      scrollAreaRenderResync?.dispose();
+      scrollAreaRenderResync = undefined;
       streamGeneration += 1;
       clearReconnectTimer();
       clearCheckpointTimer();
