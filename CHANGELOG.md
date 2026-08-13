@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.13.3 - 2026-08-13
+
+Large terminals no longer lose or hide the bottom of their scrollback after a browser refresh or a
+window resize.
+
+### Fixed
+
+- Shrinking a terminal's rows no longer deletes the buffer lines below a mid-screen cursor. Agent
+  TUIs park their cursor above real content, so a browser refresh (which replays the snapshot at
+  the pre-font-settle grid and then shrinks to the real one) or any window resize could cut a large
+  scrollback short of its real bottom — and the damaged buffer was then checkpointed back to the
+  server as the authoritative snapshot, making the loss permanent. Destructive shrinks now move
+  those rows into scrollback instead.
+- The terminal scrollbar's range is re-synchronized after renderer swaps (WebGL load or
+  context-loss fallback), font settling, snapshot replays, server resizes, and cached panes
+  returning to the screen. A stale range could end short of the buffer's bottom, leaving the last
+  lines unreachable until new output arrived.
+
+### Upgrade notes
+
+- There are no breaking changes, data migrations, configuration changes, or session broker protocol
+  changes. The fix is entirely in the browser client; reload open terminal pages after updating.
+- Scrollback tails already lost to previously stored damaged checkpoints are not recovered, but
+  affected terminals heal as soon as their application repaints or produces new output.
+- The release is safe for automatic installation over `0.13.2`.
+
 ## 0.13.2 - 2026-08-11
 
 ### Fixed
