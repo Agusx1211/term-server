@@ -224,6 +224,7 @@ export function TerminalPane({
   const exited = useRef(terminal.status === "exited");
   const reconnectTimer = useRef<number>();
   const reportTerminalViewport = useRef<() => void>();
+  const repaintAndResyncScrollArea = useRef<() => void>();
   const setTerminalVisibility = useRef<(visible: boolean) => void>();
   const terminalState = useRef(terminal);
   const openFile = useRef(onOpenFile);
@@ -501,15 +502,28 @@ export function TerminalPane({
     // paused leaves the scroll range stale and the bottom of a large
     // scrollback unreachable. Re-sync immediately and once more after the
     // next render, when a paused renderer has measured real cell metrics.
+    // The public onRender skips redraw-only frames, so prefer the internal
+    // render service's event, which fires for every render.
+    const onAnyRender = (listener: () => void): { dispose(): void } => {
+      const renderService = (term as unknown as {
+        _core?: { _renderService?: { onRender?: (l: () => void) => { dispose(): void } } };
+      })._core?._renderService;
+      return renderService?.onRender?.(listener) ?? term.onRender(listener);
+    };
     let scrollAreaRenderResync: { dispose(): void } | undefined;
     const resyncScrollArea = (): void => {
       resyncTerminalScrollArea(term);
       scrollAreaRenderResync?.dispose();
-      scrollAreaRenderResync = term.onRender(() => {
+      scrollAreaRenderResync = onAnyRender(() => {
         scrollAreaRenderResync?.dispose();
         scrollAreaRenderResync = undefined;
         resyncTerminalScrollArea(term);
       });
+    };
+    repaintAndResyncScrollArea.current = () => {
+      if (disposed) return;
+      term.refresh(0, term.rows - 1);
+      resyncScrollArea();
     };
     const fallbackFromWebgl = (): void => {
       if (disposed || webglContextLost) return;
@@ -1475,6 +1489,7 @@ export function TerminalPane({
       diagnosticsHandle.dispose();
       if (diagnostics.current === diagnosticsHandle) diagnostics.current = undefined;
       reportTerminalViewport.current = undefined;
+      repaintAndResyncScrollArea.current = undefined;
       setTerminalVisibility.current = undefined;
       term.dispose();
       xterm.current = undefined;
@@ -1495,9 +1510,26 @@ export function TerminalPane({
       term.blur();
       return;
     }
+    // On narrow layouts an inactive pane is display:none while still marked
+    // visible, so its renderer was paused and the scroll range froze while
+    // output kept arriving. Coming back to the pane must repaint and re-sync
+    // the same way a cached pane's visibility restore does.
+    repaintAndResyncScrollArea.current?.();
     const frame = requestAnimationFrame(() => term.focus());
     return () => cancelAnimationFrame(frame);
   }, [active, visible]);
+
+  useEffect(() => {
+    // A backgrounded tab stops animation frames while agent output keeps
+    // growing the buffer, so the scroll range is stale the moment the user
+    // returns — exactly when they scroll. Re-sync on every return to
+    // foreground; nothing else in the pane observes document visibility.
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") repaintAndResyncScrollArea.current?.();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", onVisibilityChange);
+  }, []);
 
   useEffect(() => {
     const term = xterm.current;
@@ -1890,8 +1922,24 @@ export function TerminalPane({
           class="terminal-scroll-latest"
           onPointerDown={keepTerminalFocused}
           onClick={() => {
-            xterm.current?.scrollToBottom();
-            xterm.current?.focus();
+            const term = xterm.current;
+            if (!term) return;
+            // A scroll issued against a stale range is clamped and silently
+            // discarded, so re-sync first and verify the bottom was actually
+            // reached; retry once after the next render if it was not. The
+            // retry is what re-arms xterm's follow-tail after a clamp.
+            resyncTerminalScrollArea(term);
+            term.scrollToBottom();
+            if (term.buffer.active.viewportY !== term.buffer.active.baseY) {
+              const retry = term.onRender(() => {
+                retry.dispose();
+                const current = xterm.current;
+                if (!current) return;
+                resyncTerminalScrollArea(current);
+                current.scrollToBottom();
+              });
+            }
+            term.focus();
           }}
         >
           <ChevronDown size={14} /> Latest

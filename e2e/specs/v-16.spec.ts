@@ -218,3 +218,83 @@ test.describe("hidpi", () => {
     expect(down.xterm.viewportY).toBe(down.xterm.baseY);
   });
 });
+
+test("V-16 Hidden-pane synchronized output keeps the bottom reachable @p1 @pr @nightly @scrollback @renderer", async ({
+  page,
+  baseURL,
+  server,
+}, testInfo) => {
+  const tag = `D${testInfo.workerIndex}${testInfo.repeatEachIndex}${testInfo.retry}`;
+  const { pane, terminalId } = await setupLargeTerminal(page, baseURL, server.fixturePath, tag);
+
+  // Queue a synchronized-output frame plus a large burst behind a hold. The
+  // executor releases it later, while this pane is display:none with a paused
+  // renderer: every byte parses, but xterm defers all scroll-range syncs
+  // behind the open DECSET 2026 frame and no render ever flushes them.
+  await pane.sendInput(`HOLD ${tag}`, true);
+  await server.waitForTranscript(terminalId, (entry) => entry.event === "hold", { timeoutMs: WAIT_TIMEOUT_MS });
+  await pane.sendInput(`SYNC_BEGIN ${tag}`, true);
+  await pane.sendInput(`BURST ${tag}2 200000 80`, true);
+  const hiddenMarker = `V16-HIDDEN-${tag}`;
+  await pane.sendInput(`PRINT ${tag}-HIDDEN ${hiddenMarker}`, true);
+
+  const second = await createFixtureTerminal(page, `v16-${tag}-other`, server.fixturePath);
+  const workbench = new WorkbenchPage(page);
+  const secondPane = await workbench.openTerminal({ id: second.id, name: second.name });
+  await secondPane.expectVisible();
+  await secondPane.waitForSynchronized({ timeout: WAIT_TIMEOUT_MS });
+  await page.evaluate(async ({ id, timeout }) => {
+    const api = (window as E2EWindow).__TERM_SERVER_E2E__;
+    if (!api) throw new Error("term-server E2E diagnostics are unavailable");
+    await api.waitForTerminal(id, (snapshot) => !snapshot.visible, { timeout });
+  }, { id: terminalId, timeout: WAIT_TIMEOUT_MS });
+  const beforeRelease = await snapshotOf(page, terminalId);
+
+  // Release the held burst from a second client so the hidden pane receives
+  // it without ever being shown.
+  const releasePage = await page.context().newPage();
+  try {
+    await releasePage.goto(baseURL);
+    const releaseWorkbench = new WorkbenchPage(releasePage);
+    await releaseWorkbench.expectVisible();
+    const releasePane = await releaseWorkbench.openTerminal({ id: terminalId, name: "" });
+    await releasePane.expectVisible();
+    await releasePane.waitForSynchronized({ timeout: WAIT_TIMEOUT_MS });
+    await releasePane.sendInput(`RELEASE ${tag}`, true);
+    await server.waitForTranscript(
+      terminalId,
+      (entry) => entry.event === "print" && entry.id === `${tag}-HIDDEN`,
+      { timeoutMs: WAIT_TIMEOUT_MS },
+    );
+  } finally {
+    await releasePage.close();
+  }
+
+  // Wait until the hidden pane has parsed the burst into its buffer.
+  await page.evaluate(async ({ id, floor, timeout }) => {
+    const api = (window as E2EWindow).__TERM_SERVER_E2E__;
+    if (!api) throw new Error("term-server E2E diagnostics are unavailable");
+    await api.waitForTerminal(id, (snapshot) => (
+      snapshot.xterm.bufferLength > floor
+      && snapshot.pendingParserWrites === 0
+      && snapshot.pendingParserBytes === 0
+    ), { timeout });
+  }, { id: terminalId, floor: beforeRelease.xterm.bufferLength + 2000, timeout: WAIT_TIMEOUT_MS });
+
+  // Return to the pane and immediately try to reach the bottom, the way a
+  // user flicks the wheel the moment they come back. Without the re-sync on
+  // visibility restore bypassing the still-open synchronized-output frame,
+  // the scroll range is frozen thousands of lines short and the request is
+  // clamped and discarded.
+  const restored = await workbench.openTerminal({ id: terminalId, name: "" });
+  await restored.expectVisible();
+  const box = await restored.xtermHost.boundingBox();
+  if (!box) throw new Error("terminal host has no bounding box");
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  for (let tick = 0; tick < 30; tick += 1) {
+    await page.mouse.wheel(0, 4_000);
+  }
+  await page.waitForTimeout(150);
+  const after = await snapshotOf(page, terminalId);
+  expect(after.xterm.viewportY).toBe(after.xterm.baseY);
+});
