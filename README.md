@@ -202,7 +202,8 @@ Run `term-server --help` for generated CLI help. CLI flags take precedence over 
 | `--password-file` | `TERM_SERVER_PASSWORD_FILE` | generated password | Read the password from a secret file |
 | — | `TERM_SERVER_PASSWORD` | — | Password; takes precedence over the file |
 | `--data-dir` | `TERM_SERVER_DATA_DIR` | `$XDG_DATA_HOME/term-server` | Credentials, TLS files, and settings |
-| `--status-config` | `TERM_SERVER_STATUS_CONFIG` | off | Optional version-1 TOML file for authenticated provider status modules |
+| `--status-config` | `TERM_SERVER_STATUS_CONFIG` | auto-configured | Optional version-1 TOML file for authenticated provider status modules |
+| `--no-status-auto` | `TERM_SERVER_NO_STATUS_AUTO` | off | Disable automatic status-module configuration from local agent credentials |
 | `--shell` | `TERM_SERVER_SHELL` | `$SHELL` | Default shell executable |
 | `--allowed-origin` | `TERM_SERVER_ALLOWED_ORIGINS` | same origin | Extra reverse-proxy origins |
 | `--replay-mb` | `TERM_SERVER_REPLAY_MB` | `64` | Canonical reconnect state and recent output per terminal |
@@ -215,14 +216,31 @@ Run `term-server --help` for generated CLI help. CLI flags take precedence over 
 | — | `TERM_SERVER_RELEASE_BASE_URL` | GitHub releases | Alternate HTTPS release base URL |
 | `--log` | `TERM_SERVER_LOG` | `term_server=info,tower_http=info` | Rust tracing filter |
 
-### Optional provider status modules
+### Provider status modules
 
-The provider-neutral status line is disabled when neither `--status-config` nor
-`TERM_SERVER_STATUS_CONFIG` is supplied. The selected file is read at startup; a
-missing, unreadable, malformed, or unsupported-version file fails startup with a
-short secret-free error. As with the other options, an explicit CLI value takes
-precedence over its environment value. Restart term-server after changing the
-path, file, or provider environment.
+The provider-neutral status line is enabled by default. When neither
+`--status-config` nor `TERM_SERVER_STATUS_CONFIG` is supplied, modules for
+`claude`, `codex`, and `zai` are auto-configured: on every refresh the server
+resolves a credential first from the usual environment variables and then from
+the local agent credential stores — `~/.claude/.credentials.json`,
+`$CODEX_HOME/auth.json` (default `~/.codex/auth.json`), `~/.pi/agent/auth.json`,
+and `~/.omp/agent/auth.json` (the Oh My Pi root follows `PI_CONFIG_DIR`).
+Expired OAuth tokens are skipped, providers without a discovered credential stay
+hidden, and re-logins are picked up without a restart. Each module's detail
+popover names its non-secret credential source. Pass `--no-status-auto` (or
+`TERM_SERVER_NO_STATUS_AUTO=true`) to turn auto-configuration off entirely.
+
+The settings screen has a "Status bar limits" card whose toggles persist in
+`status-settings.json` inside the data directory: "Show limits in the status
+bar" (on by default) gates the whole feature in every mode, and "Also show on
+mobile" overrides the mobile default. They are also editable through the
+authenticated `GET`/`PATCH /api/config/status-modules` endpoint.
+
+An explicit TOML file replaces auto-configuration. The selected file is read at
+startup; a missing, unreadable, malformed, or unsupported-version file fails
+startup with a short secret-free error. As with the other options, an explicit
+CLI value takes precedence over its environment value. Restart term-server
+after changing the path, file, or provider environment.
 
 The version-1 file is non-secret TOML. Its complete schema is:
 
@@ -368,11 +386,13 @@ When enabled, only the compact horizontally scrollable status-module row is
 shown, with all 32px of controls reserved above the bottom safe-area inset;
 the normal connection/host/build items remain desktop-only.
 
-Status credentials are read from term-server's startup environment. On Unix, the
-same-user session broker and terminal children intentionally inherit these
-variables, so commands run by that user may observe them. They are not accepted
-from the browser, written to this configuration, serialized in
-`/api/status-modules`, or logged; browser/API/log isolation remains intact.
+TOML-configured status credentials are read from term-server's startup
+environment; auto-configured modules additionally re-read the local agent
+credential files on each refresh. On Unix, the same-user session broker and
+terminal children intentionally inherit the environment variables, so commands
+run by that user may observe them. Credentials are not accepted from the
+browser, written to this configuration, serialized in `/api/status-modules`, or
+logged; browser/API/log isolation remains intact.
 
 For an unattended deployment, provide the password through the environment or a protected file:
 

@@ -6,6 +6,7 @@ import {
   BellRing,
   Download,
   Eye,
+  Gauge,
   LayoutDashboard,
   LoaderCircle,
   LogOut,
@@ -14,6 +15,7 @@ import {
   PackageOpen,
   Settings,
   Shield,
+  Smartphone,
   Sparkles,
   SplitSquareHorizontal,
   Square,
@@ -35,8 +37,10 @@ import type {
   PushoverConfig,
   PushoverMode,
   SessionBrokerInfo,
+  StatusModulesSettings,
   UpdateConfig,
   UpdateStatus,
+  UpdateStatusModulesSettings,
 } from "../../shared/types";
 import type {
   NotificationDuration,
@@ -97,6 +101,7 @@ interface SettingsWorkspaceProps {
   frontendRecordingEvents: number;
   recordingBusy: boolean;
   pushover: PushoverConfig;
+  statusModules: StatusModulesSettings;
   onTheme: (theme: ThemeName) => void;
   onPiChange: (titlesEnabled: boolean, summariesEnabled: boolean, model: string) => void;
   onAgentIntegration: (
@@ -123,6 +128,7 @@ interface SettingsWorkspaceProps {
   onRecordingDownload: () => void;
   onRecordingClear: () => void;
   onPushoverChange: (changes: { userKey?: string; appKey?: string; mode?: PushoverMode }) => void;
+  onStatusModulesChange: (changes: UpdateStatusModulesSettings) => void;
   onPasswordChanged: () => void;
   onLogout: () => void;
 }
@@ -227,6 +233,7 @@ export function SettingsWorkspace({
   frontendRecordingEvents,
   recordingBusy,
   pushover,
+  statusModules,
   onTheme,
   onPiChange,
   onAgentIntegration,
@@ -247,6 +254,7 @@ export function SettingsWorkspace({
   onRecordingDownload,
   onRecordingClear,
   onPushoverChange,
+  onStatusModulesChange,
   onPasswordChanged,
   onLogout,
 }: SettingsWorkspaceProps) {
@@ -500,6 +508,35 @@ export function SettingsWorkspace({
                 </button>
               )}
             </fieldset>
+          </section>
+
+          <section class="settings-card">
+            <header><Gauge size={16} /><h2>Status bar limits</h2></header>
+            <p>Show AI provider limit modules in the bottom status bar.</p>
+            <label class={`settings-toggle ${statusModules.enabled ? "active" : ""}`}>
+              <Gauge size={14} />
+              <span>Show limits in the status bar</span>
+              <input
+                type="checkbox"
+                checked={statusModules.enabled}
+                onChange={(event) => onStatusModulesChange({ enabled: event.currentTarget.checked })}
+              />
+            </label>
+            <p class="settings-hint">
+              Provider credentials are detected automatically on the server from ~/.claude, ~/.codex,
+              ~/.pi, and ~/.omp; environment variables take precedence. Providers without credentials
+              stay hidden.
+            </p>
+            <label class={`settings-toggle ${statusModules.showOnMobile ? "active" : ""}`}>
+              <Smartphone size={14} />
+              <span>Also show on mobile</span>
+              <input
+                type="checkbox"
+                checked={statusModules.showOnMobile}
+                onChange={(event) => onStatusModulesChange({ showOnMobile: event.currentTarget.checked })}
+              />
+            </label>
+            <p class="settings-hint">Small screens hide the limit modules unless this is on.</p>
           </section>
 
           <section class="settings-card settings-card-wide">

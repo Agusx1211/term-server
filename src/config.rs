@@ -87,8 +87,14 @@ pub struct Cli {
     #[arg(long, env = "TERM_SERVER_DATA_DIR", default_value_os_t = default_data_dir())]
     pub data_dir: PathBuf,
     /// Optional versioned TOML configuration for authenticated provider status modules.
+    /// Without it, status modules auto-configure from local agent credentials.
     #[arg(long = "status-config", env = "TERM_SERVER_STATUS_CONFIG")]
     pub status_config: Option<PathBuf>,
+
+    /// Disable automatic status-module configuration from local agent
+    /// credential stores (~/.claude, ~/.codex, ~/.pi, ~/.omp).
+    #[arg(long, env = "TERM_SERVER_NO_STATUS_AUTO", action = ArgAction::SetTrue)]
+    pub no_status_auto: bool,
 
     /// Default shell executable used for new terminals.
     #[arg(long, env = "TERM_SERVER_SHELL")]
