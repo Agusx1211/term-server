@@ -830,15 +830,24 @@ impl TerminalSignals {
             .strip_prefix("0;")
             .or_else(|| normalized.strip_prefix("2;"))
         {
-            let first = title.trim_start().chars().next();
-            if first.is_some_and(is_braille_spinner) {
+            // omp prefixes its titles with a "π" marker; the state glyph is
+            // the token after it (busy spinner while running, ">" at the
+            // prompt). Strip the marker so the glyph checks below see it.
+            let trimmed = title.trim_start();
+            let omp_title = trimmed.strip_prefix('π').map(str::trim_start);
+            let glyphs = omp_title.unwrap_or(trimmed);
+            let first = glyphs.chars().next();
+            if first.is_some_and(is_busy_spinner) {
                 self.active_title_seen = true;
                 Some(ReportedAgentState::Working)
             } else if title.contains("action required") {
                 // Codex writes this when it needs an approval or an answer.
                 self.active_title_seen = false;
                 Some(ReportedAgentState::Blocked)
-            } else if first == Some('✳') || title_contains_word(title, "ready") {
+            } else if first == Some('✳')
+                || title_contains_word(title, "ready")
+                || (omp_title.is_some() && first == Some('>'))
+            {
                 self.active_title_seen = false;
                 Some(ReportedAgentState::Idle)
             } else if std::mem::take(&mut self.active_title_seen) {
@@ -905,6 +914,12 @@ fn sanitize_osc_payload(payload: &str) -> String {
 
 fn is_braille_spinner(character: char) -> bool {
     ('\u{2800}'..='\u{28ff}').contains(&character)
+}
+
+/// Spinner glyphs agents animate in their titles while running. omp cycles
+/// through braille frames plus "⸼"-style dotted frames.
+fn is_busy_spinner(character: char) -> bool {
+    is_braille_spinner(character) || matches!(character, '⸼' | '⸽' | '⸱' | '⸳')
 }
 
 fn osc_end(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
@@ -1004,6 +1019,7 @@ struct StatusFallback<'a> {
     reported_state: Option<(ReportedAgentState, u64)>,
     now: u64,
     input_submitted_at: u64,
+    resumed_after_completion: bool,
     active_samples: u8,
     quiet_samples: u8,
 }
@@ -1016,48 +1032,34 @@ fn resolve_agent_status(
     if let Some(native) = native_status {
         return native;
     }
-    let StatusFallback {
-        agent_kind,
-        current_status,
-        reported_state,
-        now,
-        input_submitted_at,
-        active_samples,
-        quiet_samples,
-    } = fallback;
     match screen_detection_outcome(detection) {
-        DetectionOutcome::Keep => current_status,
+        DetectionOutcome::Keep => fallback.current_status,
         DetectionOutcome::Status(status) => status,
-        DetectionOutcome::Undecided => select_agent_status(
-            agent_kind,
-            current_status,
-            reported_state,
-            now,
-            input_submitted_at,
-            active_samples,
-            quiet_samples,
-        ),
+        DetectionOutcome::Undecided => select_agent_status(fallback),
     }
 }
 
-fn select_agent_status(
-    agent_kind: &str,
-    current: AgentStatus,
-    reported: Option<(ReportedAgentState, u64)>,
-    now: u64,
-    input_submitted_at: u64,
-    active_samples: u8,
-    quiet_samples: u8,
-) -> AgentStatus {
-    if input_submitted_at == 0 {
+fn select_agent_status(fallback: StatusFallback) -> AgentStatus {
+    let StatusFallback {
+        agent_kind,
+        current_status: current,
+        reported_state: reported,
+        now,
+        input_submitted_at,
+        resumed_after_completion,
+        active_samples,
+        quiet_samples,
+    } = fallback;
+    // Before the first submission an agent's startup output (banners, boot
+    // spinners) must not read as work. After a completed task the same gate
+    // would be a lie: an autonomous agent resumes without a new prompt (a
+    // background task re-invokes it, a loop continues), and its live spinner
+    // title is the only truthful signal that it is working again. A working
+    // report is trusted only while fresh - spinner frames re-emit the title
+    // continuously, so staleness means the animation stopped.
+    if input_submitted_at == 0 && !resumed_after_completion {
         return AgentStatus::Idle;
     }
-    let (submission_working_millis, quiet_samples_to_idle) = if redraws_signal_activity(agent_kind)
-    {
-        (PI_SUBMISSION_WORKING_MILLIS, PI_QUIET_SAMPLES_TO_IDLE)
-    } else {
-        (SUBMISSION_WORKING_MILLIS, QUIET_SAMPLES_TO_IDLE)
-    };
     match reported {
         Some((ReportedAgentState::Blocked, reported_at)) if reported_at >= input_submitted_at => {
             return AgentStatus::Blocked;
@@ -1072,8 +1074,17 @@ fn select_agent_status(
         }
         _ => {}
     }
+    if input_submitted_at == 0 {
+        return AgentStatus::Idle;
+    }
+    let (submission_working_millis, quiet_samples_to_idle) = if redraws_signal_activity(agent_kind)
+    {
+        (PI_SUBMISSION_WORKING_MILLIS, PI_QUIET_SAMPLES_TO_IDLE)
+    } else {
+        (SUBMISSION_WORKING_MILLIS, QUIET_SAMPLES_TO_IDLE)
+    };
 
-    if input_submitted_at > 0 && now.saturating_sub(input_submitted_at) <= submission_working_millis
+    if now.saturating_sub(input_submitted_at) <= submission_working_millis
         || active_samples >= ACTIVE_SAMPLES_TO_WORKING
         || current == AgentStatus::Working && quiet_samples < quiet_samples_to_idle
     {
@@ -2094,10 +2105,20 @@ impl TerminalSession {
                         reported_state,
                         now,
                         input_submitted_at: activity.input_submitted_at,
+                        resumed_after_completion: info
+                            .agent
+                            .as_ref()
+                            .is_some_and(|current| current.completed_at.is_some()),
                         active_samples: activity.active_samples,
                         quiet_samples: activity.quiet_samples,
                     },
                 );
+                if next_status == AgentStatus::Working && activity.input_submitted_at == 0 {
+                    // Work resumed without a prompt (an autonomous agent was
+                    // re-invoked). Record the resumption as the submission so
+                    // the eventual return to idle registers as a completion.
+                    activity.input_submitted_at = now;
+                }
                 if let Some(current) = info.agent.as_mut()
                     && current.status != next_status
                 {
@@ -4802,15 +4823,16 @@ mod tests {
     #[test]
     fn ignores_agent_startup_activity_until_a_task_is_submitted() {
         assert_eq!(
-            select_agent_status(
-                "codex",
-                AgentStatus::Idle,
-                Some((ReportedAgentState::Working, 1_000)),
-                1_000,
-                0,
-                3,
-                0,
-            ),
+            select_agent_status(StatusFallback {
+                agent_kind: "codex",
+                current_status: AgentStatus::Idle,
+                reported_state: Some((ReportedAgentState::Working, 1_000)),
+                now: 1_000,
+                input_submitted_at: 0,
+                resumed_after_completion: false,
+                active_samples: 3,
+                quiet_samples: 0,
+            }),
             AgentStatus::Idle
         );
     }
@@ -4854,47 +4876,94 @@ mod tests {
     #[test]
     fn debounces_fallback_activity_and_invalidates_stale_idle_signals() {
         assert_eq!(
-            select_agent_status("codex", AgentStatus::Idle, None, 20_000, 1_000, 1, 0),
+            select_agent_status(StatusFallback {
+                agent_kind: "codex",
+                current_status: AgentStatus::Idle,
+                reported_state: None,
+                now: 20_000,
+                input_submitted_at: 1_000,
+                resumed_after_completion: false,
+                active_samples: 1,
+                quiet_samples: 0,
+            }),
             AgentStatus::Idle
         );
         assert_eq!(
-            select_agent_status("codex", AgentStatus::Idle, None, 20_000, 1_000, 2, 0),
+            select_agent_status(StatusFallback {
+                agent_kind: "codex",
+                current_status: AgentStatus::Idle,
+                reported_state: None,
+                now: 20_000,
+                input_submitted_at: 1_000,
+                resumed_after_completion: false,
+                active_samples: 2,
+                quiet_samples: 0,
+            }),
             AgentStatus::Idle
         );
         assert_eq!(
-            select_agent_status("codex", AgentStatus::Idle, None, 20_000, 1_000, 3, 0),
+            select_agent_status(StatusFallback {
+                agent_kind: "codex",
+                current_status: AgentStatus::Idle,
+                reported_state: None,
+                now: 20_000,
+                input_submitted_at: 1_000,
+                resumed_after_completion: false,
+                active_samples: 3,
+                quiet_samples: 0,
+            }),
             AgentStatus::Working
         );
         assert_eq!(
-            select_agent_status("codex", AgentStatus::Working, None, 20_000, 1_000, 0, 4),
+            select_agent_status(StatusFallback {
+                agent_kind: "codex",
+                current_status: AgentStatus::Working,
+                reported_state: None,
+                now: 20_000,
+                input_submitted_at: 1_000,
+                resumed_after_completion: false,
+                active_samples: 0,
+                quiet_samples: 4,
+            }),
             AgentStatus::Working
         );
         assert_eq!(
-            select_agent_status("codex", AgentStatus::Working, None, 20_000, 1_000, 0, 5),
+            select_agent_status(StatusFallback {
+                agent_kind: "codex",
+                current_status: AgentStatus::Working,
+                reported_state: None,
+                now: 20_000,
+                input_submitted_at: 1_000,
+                resumed_after_completion: false,
+                active_samples: 0,
+                quiet_samples: 5,
+            }),
             AgentStatus::Idle
         );
         assert_eq!(
-            select_agent_status(
-                "codex",
-                AgentStatus::Idle,
-                Some((ReportedAgentState::Idle, 900)),
-                1_050,
-                1_000,
-                0,
-                0,
-            ),
+            select_agent_status(StatusFallback {
+                agent_kind: "codex",
+                current_status: AgentStatus::Idle,
+                reported_state: Some((ReportedAgentState::Idle, 900)),
+                now: 1_050,
+                input_submitted_at: 1_000,
+                resumed_after_completion: false,
+                active_samples: 0,
+                quiet_samples: 0,
+            }),
             AgentStatus::Working
         );
         assert_eq!(
-            select_agent_status(
-                "codex",
-                AgentStatus::Working,
-                Some((ReportedAgentState::Idle, 1_010)),
-                1_050,
-                1_000,
-                2,
-                0,
-            ),
+            select_agent_status(StatusFallback {
+                agent_kind: "codex",
+                current_status: AgentStatus::Working,
+                reported_state: Some((ReportedAgentState::Idle, 1_010)),
+                now: 1_050,
+                input_submitted_at: 1_000,
+                resumed_after_completion: false,
+                active_samples: 2,
+                quiet_samples: 0,
+            }),
             AgentStatus::Idle
         );
     }
@@ -4902,11 +4971,29 @@ mod tests {
     #[test]
     fn settles_pi_after_two_quiet_samples() {
         assert_eq!(
-            select_agent_status("pi", AgentStatus::Working, None, 5_000, 1_000, 0, 1),
+            select_agent_status(StatusFallback {
+                agent_kind: "pi",
+                current_status: AgentStatus::Working,
+                reported_state: None,
+                now: 5_000,
+                input_submitted_at: 1_000,
+                resumed_after_completion: false,
+                active_samples: 0,
+                quiet_samples: 1,
+            }),
             AgentStatus::Working
         );
         assert_eq!(
-            select_agent_status("pi", AgentStatus::Working, None, 5_000, 1_000, 0, 2),
+            select_agent_status(StatusFallback {
+                agent_kind: "pi",
+                current_status: AgentStatus::Working,
+                reported_state: None,
+                now: 5_000,
+                input_submitted_at: 1_000,
+                resumed_after_completion: false,
+                active_samples: 0,
+                quiet_samples: 2,
+            }),
             AgentStatus::Idle
         );
     }
@@ -5141,6 +5228,7 @@ mod tests {
                     reported_state: None,
                     now: 5_000,
                     input_submitted_at: 1_000,
+                    resumed_after_completion: false,
                     active_samples: 0,
                     quiet_samples: 5,
                 },
@@ -5160,6 +5248,7 @@ mod tests {
                     reported_state: None,
                     now: 5_000,
                     input_submitted_at: 1_000,
+                    resumed_after_completion: false,
                     active_samples: 3,
                     quiet_samples: 0,
                 },
@@ -5181,6 +5270,7 @@ mod tests {
                     reported_state: None,
                     now: 5_000,
                     input_submitted_at: 1_000,
+                    resumed_after_completion: false,
                     active_samples: 0,
                     quiet_samples: 0,
                 },
@@ -5205,6 +5295,7 @@ mod tests {
                     reported_state: None,
                     now: 5_000,
                     input_submitted_at: 1_000,
+                    resumed_after_completion: false,
                     active_samples: 0,
                     quiet_samples: 0,
                 },
@@ -5224,6 +5315,7 @@ mod tests {
                     reported_state: None,
                     now: 5_000,
                     input_submitted_at: 1_000,
+                    resumed_after_completion: false,
                     active_samples: 0,
                     quiet_samples: 2,
                 },
@@ -5257,28 +5349,30 @@ mod tests {
     #[test]
     fn reported_blocked_state_wins_over_activity_heuristics() {
         assert_eq!(
-            select_agent_status(
-                "codex",
-                AgentStatus::Working,
-                Some((ReportedAgentState::Blocked, 2_000)),
-                20_000,
-                1_000,
-                5,
-                0,
-            ),
+            select_agent_status(StatusFallback {
+                agent_kind: "codex",
+                current_status: AgentStatus::Working,
+                reported_state: Some((ReportedAgentState::Blocked, 2_000)),
+                now: 20_000,
+                input_submitted_at: 1_000,
+                resumed_after_completion: false,
+                active_samples: 5,
+                quiet_samples: 0,
+            }),
             AgentStatus::Blocked
         );
         // A blocked report from before the current submission is stale.
         assert_eq!(
-            select_agent_status(
-                "codex",
-                AgentStatus::Working,
-                Some((ReportedAgentState::Blocked, 500)),
-                20_000,
-                1_000,
-                5,
-                0,
-            ),
+            select_agent_status(StatusFallback {
+                agent_kind: "codex",
+                current_status: AgentStatus::Working,
+                reported_state: Some((ReportedAgentState::Blocked, 500)),
+                now: 20_000,
+                input_submitted_at: 1_000,
+                resumed_after_completion: false,
+                active_samples: 5,
+                quiet_samples: 0,
+            }),
             AgentStatus::Working
         );
     }
@@ -5344,6 +5438,72 @@ mod tests {
         assert_eq!(
             manager.get(info.id).unwrap().info().agent.unwrap().status,
             AgentStatus::Working
+        );
+    }
+
+    #[test]
+    fn omp_title_glyphs_report_state() {
+        let mut signals = TerminalSignals::default();
+        signals.observe("\x1b]0;π ⠙ Implement task\x07".as_bytes(), 100);
+        assert_eq!(
+            signals.agent_state,
+            Some((ReportedAgentState::Working, 100))
+        );
+
+        signals.observe("\x1b]0;π > Implement task\x07".as_bytes(), 200);
+        assert_eq!(signals.agent_state, Some((ReportedAgentState::Idle, 200)));
+
+        signals.observe("\x1b]0;π ⸼ Implement task\x07".as_bytes(), 300);
+        assert_eq!(
+            signals.agent_state,
+            Some((ReportedAgentState::Working, 300))
+        );
+    }
+
+    #[test]
+    fn resumed_agent_trusts_a_fresh_spinner_title_without_a_new_prompt() {
+        // After a completed task the agent resumes on its own; the live
+        // spinner title outranks the submission gate.
+        assert_eq!(
+            select_agent_status(StatusFallback {
+                agent_kind: "omp",
+                current_status: AgentStatus::Idle,
+                reported_state: Some((ReportedAgentState::Working, 10_400)),
+                now: 10_500,
+                input_submitted_at: 0,
+                resumed_after_completion: true,
+                active_samples: 0,
+                quiet_samples: 0,
+            }),
+            AgentStatus::Working
+        );
+        // A stale working report means the spinner stopped animating.
+        assert_eq!(
+            select_agent_status(StatusFallback {
+                agent_kind: "omp",
+                current_status: AgentStatus::Idle,
+                reported_state: Some((ReportedAgentState::Working, 1_000)),
+                now: 10_500,
+                input_submitted_at: 0,
+                resumed_after_completion: true,
+                active_samples: 0,
+                quiet_samples: 0,
+            }),
+            AgentStatus::Idle
+        );
+        // Before any completed task the startup gate still applies.
+        assert_eq!(
+            select_agent_status(StatusFallback {
+                agent_kind: "omp",
+                current_status: AgentStatus::Idle,
+                reported_state: Some((ReportedAgentState::Working, 10_400)),
+                now: 10_500,
+                input_submitted_at: 0,
+                resumed_after_completion: false,
+                active_samples: 0,
+                quiet_samples: 0,
+            }),
+            AgentStatus::Idle
         );
     }
 }
