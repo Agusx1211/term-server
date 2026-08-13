@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.13.7 - 2026-08-13
+
+The status bar now shows real usage percentages for Claude, Codex, and z.ai.
+
+### Changed
+
+- The provider status modules fetch live quota data instead of showing a generic
+  "configured credential" placeholder:
+  - **Claude**: subscription usage windows from `api.anthropic.com/api/oauth/usage`
+    when the discovered credential is an OAuth access token (Claude Code / claude.ai
+    login).
+  - **Codex**: rate-limit windows, named model limits, and plan tier from
+    `chatgpt.com/backend-api/wham/usage` when the credential is a ChatGPT OAuth
+    token. The required account id is read from `auth.json` (`tokens.account_id`)
+    or recovered from the token itself.
+  - **z.ai**: token and tool quotas from `api.z.ai/api/monitor/usage/quota/limit`.
+- Pills are more compact: they show a single worst-window percentage (for example
+  `Claude 22%`) and turn yellow at 90% utilization. The popover lists every window
+  with its reset countdown (`Weekly (Fable) — 22% used · resets in 6d 2h`), the plan
+  tier, and the credential source.
+- Plain API keys, which have no usage endpoint, keep the configured-only fallback
+  with a clearer explanation.
+
+### Upgrade notes
+
+- There are no breaking changes, data migrations, or configuration changes. The
+  quota fetchers run in the main server process, so they appear after a full
+  service restart (not just a broker rollover) plus a page reload.
+- The release is safe for automatic installation over `0.13.6`.
+
 ## 0.13.6 - 2026-08-13
 
 Provider usage limits now appear in the status bar out of the box.
