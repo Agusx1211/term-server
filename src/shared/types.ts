@@ -394,6 +394,12 @@ export type ClientTerminalMessage =
       data: string;
       final: boolean;
     }
+  // Announces a binary checkpoint upload: exactly `size` raw bytes follow as
+  // ordered binary frames of at most TERMINAL_CHECKPOINT_CHUNK_BYTES each,
+  // every frame prefixed with a kind byte (2) and a big-endian u64 sequence.
+  // Only valid after the server advertised `binaryCheckpoint` in `ready` —
+  // an older broker reads client binary frames as terminal input.
+  | { type: "checkpointBinary"; sequence: number; epoch: number; size: number }
   | { type: "ping" };
 
 export type ServerTerminalMessage =
@@ -409,6 +415,10 @@ export type ServerTerminalMessage =
       flowControl?: boolean;
       viewportRelease?: boolean;
       checkpointBytes?: number;
+      // Marks a server that assembles `checkpointBinary` uploads. Absent on
+      // older brokers, which read client binary frames as terminal input, so
+      // a browser must keep base64 JSON checkpoints until it has seen this.
+      binaryCheckpoint?: boolean;
     }
   | { type: "exit"; exitCode: number }
   | {

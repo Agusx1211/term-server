@@ -167,7 +167,7 @@ async function waitForCheckpoint(
   }, { id: terminalId, after: afterEventId, sequence, timeout: WAIT_TIMEOUT_MS });
 }
 
-async function waitForCheckpointFrame(
+async function waitForCheckpointAnnouncement(
   faultController: NetworkFaultController,
   terminalId: string,
   generation: number,
@@ -179,27 +179,31 @@ async function waitForCheckpointFrame(
     && event.terminalId === terminalId
     && event.generation === generation
     && event.direction === "browser-to-server"
-    && event.frame?.jsonType === "checkpoint"
+    && event.frame?.jsonType === "checkpointBinary"
     && event.frame.sequence === sequence
     && event.frame.occurrence > afterOccurrence
   ), { timeoutMs: WAIT_TIMEOUT_MS });
 }
 
-function checkpointFrames(
+/**
+ * The live browser uploads checkpoints as a `checkpointBinary` announcement
+ * followed by binary body frames whose nine-byte header carries kind byte 2
+ * and the announced sequence, which the proxy already decodes as `binaryKind`
+ * and `sequence`.
+ */
+function binaryCheckpointBodyFrames(
   events: readonly NetworkFaultEvent[],
   terminalId: string,
   generation: number,
   sequence: number,
-  afterOccurrence: number,
 ): readonly NetworkFaultEvent[] {
   return events.filter((event) => (
     event.type === "frame"
     && event.terminalId === terminalId
     && event.generation === generation
     && event.direction === "browser-to-server"
-    && event.frame?.jsonType === "checkpoint"
+    && event.frame?.binaryKind === 2
     && event.frame.sequence === sequence
-    && event.frame.occurrence > afterOccurrence
   ));
 }
 
@@ -279,14 +283,14 @@ test("K-01 Idle checkpoint @nightly @p1 @checkpoint @checkpoint-idle", async ({
   // checkpoint under test is measured from the subsequent PRINT commit.
   const readyCheckpoint = await waitForCheckpoint(page, created.id, readyFloor, readySequence);
   const readyGeneration = readyCheckpoint.snapshot.socketGeneration;
-  const readyFrame = await waitForCheckpointFrame(
+  const readyFrame = await waitForCheckpointAnnouncement(
     faultController,
     created.id,
     readyGeneration,
     readySequence,
     0,
   );
-  const readyOccurrence = requiredNumber(readyFrame.frame?.occurrence, "READY checkpoint frame occurrence");
+  const readyOccurrence = requiredNumber(readyFrame.frame?.occurrence, "READY checkpoint announcement occurrence");
   expect(readyCheckpoint.data.result).toBe("sent");
   expect(readyCheckpoint.data.sequence).toBe(readySequence);
 
@@ -358,7 +362,7 @@ test("K-01 Idle checkpoint @nightly @p1 @checkpoint @checkpoint-idle", async ({
     && event.data.sequence === printSequence
   ));
   expect(checkpointEventsForPrint).toHaveLength(1);
-  const uploadedFrame = await waitForCheckpointFrame(
+  const uploadedFrame = await waitForCheckpointAnnouncement(
     faultController,
     created.id,
     checkpoint.snapshot.socketGeneration,
@@ -366,15 +370,28 @@ test("K-01 Idle checkpoint @nightly @p1 @checkpoint @checkpoint-idle", async ({
     targetFrameOccurrenceFloor,
   );
   expect(uploadedFrame.frame?.bytes).toBeGreaterThan(0);
-  const uploadedFrames = checkpointFrames(
+  // The PRINT announcement must be the very next checkpoint upload after the
+  // READY one — no other checkpoint upload happened in between.
+  expect(uploadedFrame.frame?.occurrence).toBe(targetFrameOccurrenceFloor + 1);
+  await faultController.waitFor((event) => (
+    event.type === "frame"
+    && event.terminalId === created.id
+    && event.direction === "browser-to-server"
+    && event.frame?.binaryKind === 2
+    && binaryCheckpointBodyFrames(
+      faultController.events,
+      created.id,
+      checkpoint.snapshot.socketGeneration,
+      printSequence,
+    ).length >= checkpointChunks
+  ), { timeoutMs: WAIT_TIMEOUT_MS });
+  const uploadedFrames = binaryCheckpointBodyFrames(
     faultController.events,
     created.id,
     checkpoint.snapshot.socketGeneration,
     printSequence,
-    targetFrameOccurrenceFloor,
   );
   expect(uploadedFrames).toHaveLength(checkpointChunks);
-  expect(uploadedFrames.map((event) => event.frame?.occurrence)).toEqual([targetFrameOccurrenceFloor + 1]);
 
   await expectTerminalInteractive(page, created.id, { timeout: WAIT_TIMEOUT_MS });
   await pane.sendInput(`ECHO_INPUT ${echoId}`, true);

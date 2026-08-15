@@ -115,7 +115,13 @@ async function expectNoEvent(
   }
 }
 
-function checkpointFrames(
+/**
+ * The live browser uploads checkpoints as one `checkpointBinary` announcement
+ * followed by binary body frames whose nine-byte header carries kind byte 2
+ * and the announced sequence, which the proxy already decodes as `binaryKind`
+ * and `sequence`. Only the body frames are chunks.
+ */
+function binaryCheckpointBodyFrames(
   controller: NetworkFaultController,
   terminalId: string,
   generation: number,
@@ -125,39 +131,59 @@ function checkpointFrames(
       && event.terminalId === terminalId
       && event.generation === generation
       && event.direction === "browser-to-server"
-      && event.frame?.jsonType === "checkpoint")
+      && event.frame?.binaryKind === 2)
     .map((event) => event.frame)
     .filter((frame): frame is NonNullable<typeof frame> => frame !== undefined);
 }
 
-async function waitForCheckpointFrame(
+function checkpointAnnouncements(
   controller: NetworkFaultController,
   terminalId: string,
   generation: number,
-  minimumOccurrence: number,
+): readonly NonNullable<NetworkFaultController["events"][number]["frame"]>[] {
+  return controller.events
+    .filter((event) => event.type === "frame"
+      && event.terminalId === terminalId
+      && event.generation === generation
+      && event.direction === "browser-to-server"
+      && event.frame?.jsonType === "checkpointBinary")
+    .map((event) => event.frame)
+    .filter((frame): frame is NonNullable<typeof frame> => frame !== undefined);
+}
+
+async function waitForCheckpointUpload(
+  controller: NetworkFaultController,
+  terminalId: string,
+  generation: number,
+  minimumAnnouncementOccurrence: number,
+  minimumBodyFrames: number,
 ): Promise<void> {
   await controller.waitFor((event) => event.type === "frame"
     && event.terminalId === terminalId
     && event.direction === "browser-to-server"
-    && event.frame?.jsonType === "checkpoint"
-    && (event.generation !== generation || (event.frame.occurrence >= minimumOccurrence)), {
+    && (event.frame?.jsonType === "checkpointBinary" || event.frame?.binaryKind === 2)
+    && (event.generation !== generation || (
+      checkpointAnnouncements(controller, terminalId, generation).some((frame) => frame.occurrence >= minimumAnnouncementOccurrence)
+      && binaryCheckpointBodyFrames(controller, terminalId, generation).length >= minimumBodyFrames
+    )), {
     timeoutMs: WAIT_TIMEOUT_MS,
   });
 }
 
-async function expectNoCheckpointFrame(
+async function expectNoCheckpointUpload(
   controller: NetworkFaultController,
   terminalId: string,
   generation: number,
-  afterOccurrence: number,
+  afterAnnouncementOccurrence: number,
   durationMs: number,
 ): Promise<void> {
   try {
     await controller.waitFor((event) => event.type === "frame"
       && event.terminalId === terminalId
       && event.direction === "browser-to-server"
-      && event.frame?.jsonType === "checkpoint"
-      && (event.generation !== generation || (event.frame.occurrence > afterOccurrence)), {
+      && (event.frame?.jsonType === "checkpointBinary" || event.frame?.binaryKind === 2)
+      && (event.generation !== generation
+        || (event.frame?.jsonType === "checkpointBinary" && event.frame.occurrence > afterAnnouncementOccurrence)), {
       timeoutMs: durationMs,
     });
   } catch (error) {
@@ -226,8 +252,8 @@ test("K-03 No redundant checkpoint @p1 @checkpoint @dedupe @nightly", async ({ p
   });
   const beforeOutputEvents = await terminalEvents(page, terminalId);
   const beforeOutputEventId = beforeOutputEvents.at(-1)?.id ?? -1;
-  const beforeCheckpointFrames = checkpointFrames(faultController, terminalId, initial.socketGeneration);
-  const beforeCheckpointOccurrence = beforeCheckpointFrames.reduce(
+  const beforeCheckpointFrames = binaryCheckpointBodyFrames(faultController, terminalId, initial.socketGeneration);
+  const beforeAnnouncementOccurrence = checkpointAnnouncements(faultController, terminalId, initial.socketGeneration).reduce(
     (maximum, frame) => Math.max(maximum, frame.occurrence),
     0,
   );
@@ -286,13 +312,14 @@ test("K-03 No redundant checkpoint @p1 @checkpoint @dedupe @nightly", async ({ p
   expect(checkpointEpoch).toBe(checkpointEvent.snapshot.gridEpoch);
   expect(checkpointEvent.snapshot.receivedSequence).toBe(checkpointSequence);
 
-  await waitForCheckpointFrame(
+  await waitForCheckpointUpload(
     faultController,
     terminalId,
     initial.socketGeneration,
-    beforeCheckpointOccurrence + checkpoint.chunks,
+    beforeAnnouncementOccurrence + 1,
+    beforeCheckpointFrames.length + checkpoint.chunks,
   );
-  const uploadedCheckpointFrames = checkpointFrames(faultController, terminalId, initial.socketGeneration);
+  const uploadedCheckpointFrames = binaryCheckpointBodyFrames(faultController, terminalId, initial.socketGeneration);
   expect(uploadedCheckpointFrames.length - beforeCheckpointFrames.length).toBe(checkpoint.chunks);
   const stableBeforeObservation = await pane.snapshot();
   if (!stableBeforeObservation) throw new Error(`No diagnostics snapshot for terminal ${terminalId}`);
@@ -303,18 +330,18 @@ test("K-03 No redundant checkpoint @p1 @checkpoint @dedupe @nightly", async ({ p
   expect(stableBeforeObservation.receivedSequence).toBe(checkpointSequence);
   expect(stableBeforeObservation.gridEpoch).toBe(checkpointEpoch);
   expect(stableBeforeObservation.checkpoint).toEqual(checkpointSnapshot);
-  const stableOccurrence = uploadedCheckpointFrames.reduce(
+  const stableAnnouncementOccurrence = checkpointAnnouncements(faultController, terminalId, initial.socketGeneration).reduce(
     (maximum, frame) => Math.max(maximum, frame.occurrence),
-    beforeCheckpointOccurrence,
+    beforeAnnouncementOccurrence,
   );
 
   await Promise.all([
     expectNoEvent(page, terminalId, checkpointEvent.id, "checkpoint", NO_EVENT_WINDOW_MS),
-    expectNoCheckpointFrame(
+    expectNoCheckpointUpload(
       faultController,
       terminalId,
       initial.socketGeneration,
-      stableOccurrence,
+      stableAnnouncementOccurrence,
       NO_EVENT_WINDOW_MS,
     ),
   ]);
@@ -338,7 +365,7 @@ test("K-03 No redundant checkpoint @p1 @checkpoint @dedupe @nightly", async ({ p
   expect(afterObservation.gridEpoch).toBe(stableBeforeObservation.gridEpoch);
   expect(afterObservation.xterm.text).toBe(stableBeforeObservation.xterm.text);
   expect(afterObservation.checkpoint).toEqual(checkpointSnapshot);
-  expect(checkpointFrames(faultController, terminalId, initial.socketGeneration)).toHaveLength(uploadedCheckpointFrames.length);
+  expect(binaryCheckpointBodyFrames(faultController, terminalId, initial.socketGeneration)).toHaveLength(uploadedCheckpointFrames.length);
   expect(afterObservation.checkpointSequence).toBe(checkpointSequence);
   expect(afterObservation.checkpointEpoch).toBe(checkpointEpoch);
   expect(afterObservation.checkpointSize).toBe(checkpoint.size);

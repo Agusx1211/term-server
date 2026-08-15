@@ -213,6 +213,10 @@ async function waitForSnapshotSyncAfter(
   }, { id: terminalId, after: afterEventId, timeout: WAIT_TIMEOUT_MS });
 }
 
+// Binary checkpoint chunk frames carry kind byte 2 and the upload sequence in
+// their nine-byte header; the proxy decodes them as binaryKind and sequence.
+// The JSON `checkpointBinary` announcement that precedes them is deliberately
+// excluded: these helpers count chunk frames against the diagnostics count.
 function checkpointFramesSince(
   events: readonly NetworkFaultEvent[],
   terminalId: string,
@@ -224,7 +228,7 @@ function checkpointFramesSince(
     && event.terminalId === terminalId
     && event.generation === generation
     && event.direction === "browser-to-server"
-    && event.frame?.jsonType === "checkpoint"
+    && event.frame?.binaryKind === 2
     && (event.frame.occurrence ?? 0) > occurrenceFloor
   ));
 }
@@ -249,13 +253,23 @@ async function runWithDroppedCheckpoint(
   const beforeEvents = await terminalEvents(page, terminalId);
   const afterEventId = beforeEvents.at(-1)?.id ?? 0;
   const occurrenceFloor = latestCheckpointOccurrence(faultController.events, terminalId, generation);
-  const matcher = {
+  // A binary upload is an announcement plus headered chunk frames; both must
+  // be dropped together, or the server would read the surviving frames as an
+  // unannounced upload or as terminal input.
+  const announcementMatcher = {
     terminalId,
     generation,
     direction: "browser-to-server" as const,
-    jsonType: "checkpoint",
+    jsonType: "checkpointBinary",
   };
-  const dropRule = faultController.drop(matcher);
+  const chunkMatcher = {
+    terminalId,
+    generation,
+    direction: "browser-to-server" as const,
+    binaryKind: 2,
+  };
+  const announcementDropRule = faultController.drop(announcementMatcher);
+  const chunkDropRule = faultController.drop(chunkMatcher);
   try {
     const checkpointPromise = waitForCheckpointAfter(page, terminalId, afterEventId, generation);
     await action();
@@ -278,7 +292,7 @@ async function runWithDroppedCheckpoint(
       && event.terminalId === terminalId
       && event.generation === generation
       && event.direction === "browser-to-server"
-      && event.frame?.jsonType === "checkpoint"
+      && event.frame?.binaryKind === 2
       && checkpointFramesSince(faultController.events, terminalId, generation, occurrenceFloor).length >= chunks
     ), { timeoutMs: WAIT_TIMEOUT_MS });
     const uploadedFrames = checkpointFramesSince(
@@ -298,8 +312,10 @@ async function runWithDroppedCheckpoint(
     expect(droppedEvents.length).toBeGreaterThan(0);
     return { event: checkpoint, frames: uploadedFrames };
   } finally {
-    faultController.restore(matcher);
-    dropRule.dispose();
+    faultController.restore(announcementMatcher);
+    faultController.restore(chunkMatcher);
+    announcementDropRule.dispose();
+    chunkDropRule.dispose();
   }
 }
 
@@ -1105,7 +1121,7 @@ test("K-13 Canonical fallback without browser checkpoint @nightly @p1 @checkpoin
       event.type === "frame"
       && event.terminalId === created.id
       && event.direction === "browser-to-server"
-      && event.frame?.jsonType === "checkpoint"
+      && event.frame?.binaryKind === 2
     ));
     const expectedDroppedFrames = droppedCheckpoints.reduce((total, checkpoint) => total + checkpoint.frames.length, 0);
     expect(networkCheckpointFrames.length).toBe(expectedDroppedFrames);

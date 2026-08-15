@@ -38,6 +38,11 @@ const TERMINAL_INPUT_RETRY_INTERVAL: Duration = Duration::from_millis(5);
 const TERMINAL_CHECKPOINT_CHUNK_BYTES: usize = 32 * 1024;
 const TERMINAL_CHECKPOINT_CHUNK_BASE64_BYTES: usize =
     TERMINAL_CHECKPOINT_CHUNK_BYTES.div_ceil(3) * 4;
+/// Binary checkpoint chunks mirror the server-to-browser frame header: one
+/// kind byte and a big-endian u64 sequence, so a raw chunk stays attributable
+/// to its announced upload.
+const TERMINAL_CHECKPOINT_FRAME_KIND: u8 = 2;
+const TERMINAL_CHECKPOINT_FRAME_HEADER_BYTES: usize = 9;
 const TERMINAL_CLIENT_LEASE: Duration = Duration::from_secs(90);
 const TERMINAL_LEASE_CHECK_INTERVAL: Duration = Duration::from_secs(15);
 /// A pty master returns at most one 4 KiB chunk per read, so a full-screen TUI
@@ -404,6 +409,17 @@ enum TerminalClientMessage {
         #[serde(rename = "final")]
         final_chunk: bool,
     },
+    /// Announces a binary checkpoint upload: exactly `size` bytes of raw xterm
+    /// serialization follow as ordered binary frames, each within the chunk
+    /// limit. Clients send this only after `ready` advertised
+    /// `binaryCheckpoint`, because every other server reads client binary
+    /// frames as terminal input.
+    #[serde(rename = "checkpointBinary")]
+    CheckpointBinary {
+        sequence: u64,
+        epoch: u64,
+        size: usize,
+    },
     Ping,
 }
 
@@ -431,6 +447,12 @@ enum TerminalServerMessage<'a> {
         /// terminal belongs to an older broker generation.
         #[serde(rename = "checkpointBytes")]
         checkpoint_bytes: usize,
+        /// Advertises that this server assembles `checkpointBinary` uploads.
+        /// Carries the same caveat as `flowControl`, with higher stakes: an
+        /// older broker reads client binary frames as terminal input, so a
+        /// browser must keep base64 JSON checkpoints until it has seen this.
+        #[serde(rename = "binaryCheckpoint")]
+        binary_checkpoint: bool,
     },
     Exit {
         #[serde(rename = "exitCode")]
@@ -467,6 +489,24 @@ struct PendingCheckpoint {
     sequence: u64,
     epoch: u64,
     bytes: Vec<u8>,
+}
+
+/// A binary checkpoint upload announced by `checkpointBinary`: the client owes
+/// exactly `expected` bytes of raw serialization as ordered binary frames.
+#[derive(Debug)]
+struct PendingBinaryCheckpoint {
+    sequence: u64,
+    epoch: u64,
+    expected: usize,
+    bytes: Vec<u8>,
+}
+
+/// Per-socket checkpoint assembly. A client uses one path per connection, but
+/// both stay valid so older browsers keep their base64 JSON chunks.
+#[derive(Default)]
+struct CheckpointAssembly {
+    chunked: Option<PendingCheckpoint>,
+    binary: Option<PendingBinaryCheckpoint>,
 }
 
 impl Drop for Attachment {
@@ -529,6 +569,7 @@ pub(crate) async fn serve_terminal_socket(
         flow_control: true,
         viewport_release: true,
         checkpoint_bytes: terminal.checkpoint_maximum_bytes(),
+        binary_checkpoint: true,
     })
     .expect("serializable terminal");
     if send_socket_message(&mut socket, Message::Text(ready.into()))
@@ -550,7 +591,7 @@ pub(crate) async fn serve_terminal_socket(
     // reorders the size, exit, or lag notices that follow it.
     let mut deferred: Option<Result<TerminalEvent, tokio::sync::broadcast::error::RecvError>> =
         None;
-    let mut checkpoint: Option<PendingCheckpoint> = None;
+    let mut checkpoint = CheckpointAssembly::default();
     let client = TerminalClientContext {
         terminal: &terminal,
         client_id,
@@ -733,7 +774,7 @@ async fn handle_client_message(
     message: Message,
     sender: &mut SplitSink<WebSocket, Message>,
     client: TerminalClientContext<'_>,
-    checkpoint: &mut Option<PendingCheckpoint>,
+    checkpoint: &mut CheckpointAssembly,
 ) -> Result<(), ()> {
     let TerminalClientContext {
         terminal,
@@ -809,7 +850,7 @@ async fn handle_client_message(
                 data,
                 final_chunk,
             }) => match append_checkpoint(
-                checkpoint,
+                &mut checkpoint.chunked,
                 terminal,
                 sequence,
                 epoch,
@@ -829,6 +870,27 @@ async fn handle_client_message(
                     send_or_stop!(Message::Text(error.into()));
                 }
             },
+            Ok(TerminalClientMessage::CheckpointBinary {
+                sequence,
+                epoch,
+                size,
+            }) => {
+                if let Err(message) = start_binary_checkpoint(
+                    checkpoint,
+                    terminal.checkpoint_maximum_bytes(),
+                    sequence,
+                    epoch,
+                    size,
+                ) {
+                    // The announced frames are already in flight; without an
+                    // assembly to absorb them they would be fed to the pty as
+                    // input, so the connection cannot continue.
+                    let error = serde_json::to_string(&TerminalServerMessage::Error { message })
+                        .expect("serializable error");
+                    send_or_stop!(Message::Text(error.into()));
+                    return Err(());
+                }
+            }
             _ => {
                 let error = serde_json::to_string(&TerminalServerMessage::Error {
                     message: "invalid terminal message",
@@ -844,6 +906,30 @@ async fn handle_client_message(
             .expect("serializable error");
             send_or_stop!(Message::Text(error.into()));
         }
+        Message::Binary(data) if checkpoint.binary.is_some() => {
+            match append_binary_checkpoint(&mut checkpoint.binary, &data) {
+                Ok(Some(completed)) => {
+                    let stored = terminal.store_browser_checkpoint(
+                        completed.sequence,
+                        completed.epoch,
+                        Bytes::from(completed.bytes),
+                    );
+                    if stored && let Some(recorder) = recorder {
+                        recorder.note(&terminal_id, "xterm checkpoint stored");
+                    }
+                }
+                Ok(None) => {}
+                Err(message) => {
+                    // The client broke the announced framing, so the number of
+                    // frames still in flight is unknowable; letting them fall
+                    // through would feed them to the pty as input.
+                    let error = serde_json::to_string(&TerminalServerMessage::Error { message })
+                        .expect("serializable error");
+                    send_or_stop!(Message::Text(error.into()));
+                    return Err(());
+                }
+            }
+        }
         Message::Binary(data) if !data.is_empty() => {
             if let Some(recorder) = recorder {
                 recorder.input(&terminal_id, &data);
@@ -858,6 +944,69 @@ async fn handle_client_message(
         _ => {}
     }
     Ok(())
+}
+
+/// Opens a binary checkpoint assembly for the announced byte count. Rejecting
+/// here means the connection must close: the announced frames are already
+/// ordered behind the announcement and nothing else may consume them.
+fn start_binary_checkpoint(
+    assembly: &mut CheckpointAssembly,
+    maximum: usize,
+    sequence: u64,
+    epoch: u64,
+    size: usize,
+) -> Result<(), &'static str> {
+    // A new announcement supersedes any half-finished base64 assembly.
+    assembly.chunked = None;
+    if assembly.binary.take().is_some() {
+        return Err("terminal checkpoint announced during another upload");
+    }
+    if size == 0 || size > maximum {
+        return Err("terminal checkpoint exceeds the replay limit");
+    }
+    assembly.binary = Some(PendingBinaryCheckpoint {
+        sequence,
+        epoch,
+        expected: size,
+        bytes: Vec::with_capacity(size),
+    });
+    Ok(())
+}
+
+/// Appends one raw frame of an announced binary checkpoint. Returns the
+/// completed assembly once exactly the announced bytes have arrived.
+fn append_binary_checkpoint(
+    pending: &mut Option<PendingBinaryCheckpoint>,
+    data: &[u8],
+) -> Result<Option<PendingBinaryCheckpoint>, &'static str> {
+    let Some(current) = pending.as_mut() else {
+        return Err("terminal checkpoint is missing its announcement");
+    };
+    if data.len() <= TERMINAL_CHECKPOINT_FRAME_HEADER_BYTES
+        || data.len() > TERMINAL_CHECKPOINT_FRAME_HEADER_BYTES + TERMINAL_CHECKPOINT_CHUNK_BYTES
+    {
+        *pending = None;
+        return Err("terminal checkpoint chunk exceeds the message limit");
+    }
+    let sequence_bytes: [u8; 8] = data[1..TERMINAL_CHECKPOINT_FRAME_HEADER_BYTES]
+        .try_into()
+        .expect("frame header holds an eight-byte sequence");
+    if data[0] != TERMINAL_CHECKPOINT_FRAME_KIND
+        || u64::from_be_bytes(sequence_bytes) != current.sequence
+    {
+        *pending = None;
+        return Err("terminal checkpoint chunk header does not match its announcement");
+    }
+    let payload = &data[TERMINAL_CHECKPOINT_FRAME_HEADER_BYTES..];
+    if current.bytes.len().saturating_add(payload.len()) > current.expected {
+        *pending = None;
+        return Err("terminal checkpoint chunks exceed the announced size");
+    }
+    current.bytes.extend_from_slice(payload);
+    if current.bytes.len() < current.expected {
+        return Ok(None);
+    }
+    Ok(pending.take())
 }
 
 fn start_checkpoint(
@@ -1241,6 +1390,103 @@ mod tests {
         );
         assert!(merged.bytes.len() >= TERMINAL_OUTPUT_COALESCE_BYTES);
         assert!(merged.bytes.len() < TERMINAL_OUTPUT_COALESCE_BYTES + 4095);
+    }
+
+    fn chunk_frame(sequence: u64, payload: &[u8]) -> Vec<u8> {
+        let mut frame = vec![TERMINAL_CHECKPOINT_FRAME_KIND];
+        frame.extend_from_slice(&sequence.to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    #[test]
+    fn binary_checkpoint_assembles_exactly_the_announced_bytes() {
+        let mut assembly = CheckpointAssembly::default();
+        start_binary_checkpoint(&mut assembly, 1024, 9, 2, 5).expect("announcement accepted");
+
+        assert!(
+            append_binary_checkpoint(&mut assembly.binary, &chunk_frame(9, b"he"))
+                .expect("first frame accepted")
+                .is_none(),
+            "an incomplete assembly must not complete early"
+        );
+        let completed = append_binary_checkpoint(&mut assembly.binary, &chunk_frame(9, b"llo"))
+            .expect("final frame accepted")
+            .expect("announced size reached");
+
+        assert_eq!(completed.sequence, 9);
+        assert_eq!(completed.epoch, 2);
+        assert_eq!(completed.bytes, b"hello");
+        assert!(
+            assembly.binary.is_none(),
+            "a completed assembly must free the slot so later binary frames are input again"
+        );
+    }
+
+    #[test]
+    fn binary_checkpoint_rejects_invalid_announcements_and_overflow() {
+        let mut assembly = CheckpointAssembly::default();
+        assert_eq!(
+            start_binary_checkpoint(&mut assembly, 4, 1, 1, 5).unwrap_err(),
+            "terminal checkpoint exceeds the replay limit"
+        );
+        assert_eq!(
+            start_binary_checkpoint(&mut assembly, 4, 1, 1, 0).unwrap_err(),
+            "terminal checkpoint exceeds the replay limit"
+        );
+
+        start_binary_checkpoint(&mut assembly, 8, 1, 1, 4).expect("valid announcement accepted");
+        assert_eq!(
+            append_binary_checkpoint(&mut assembly.binary, &chunk_frame(1, b"hello")).unwrap_err(),
+            "terminal checkpoint chunks exceed the announced size"
+        );
+        assert!(assembly.binary.is_none());
+
+        start_binary_checkpoint(
+            &mut assembly,
+            usize::MAX,
+            1,
+            1,
+            TERMINAL_CHECKPOINT_CHUNK_BYTES * 2,
+        )
+        .expect("valid announcement accepted");
+        let oversized = chunk_frame(1, &vec![0u8; TERMINAL_CHECKPOINT_CHUNK_BYTES + 1]);
+        assert_eq!(
+            append_binary_checkpoint(&mut assembly.binary, &oversized).unwrap_err(),
+            "terminal checkpoint chunk exceeds the message limit"
+        );
+        assert!(assembly.binary.is_none());
+
+        start_binary_checkpoint(&mut assembly, 8, 5, 1, 4).expect("valid announcement accepted");
+        assert_eq!(
+            append_binary_checkpoint(&mut assembly.binary, &chunk_frame(6, b"hi")).unwrap_err(),
+            "terminal checkpoint chunk header does not match its announcement"
+        );
+        assert!(assembly.binary.is_none());
+    }
+
+    #[test]
+    fn binary_checkpoint_announcement_supersedes_chunked_and_rejects_reentry() {
+        let mut assembly = CheckpointAssembly {
+            chunked: Some(PendingCheckpoint {
+                sequence: 1,
+                epoch: 1,
+                bytes: vec![1],
+            }),
+            binary: None,
+        };
+
+        start_binary_checkpoint(&mut assembly, 1024, 2, 2, 2).expect("announcement accepted");
+        assert!(
+            assembly.chunked.is_none(),
+            "a binary announcement must drop a half-finished base64 assembly"
+        );
+
+        assert_eq!(
+            start_binary_checkpoint(&mut assembly, 1024, 3, 3, 2).unwrap_err(),
+            "terminal checkpoint announced during another upload"
+        );
+        assert!(assembly.binary.is_none());
     }
 
     #[test]

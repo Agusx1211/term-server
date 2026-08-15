@@ -21,6 +21,7 @@ use axum_extra::extract::{
     cookie::{Cookie, SameSite},
 };
 use axum_server::Handle;
+use base64::Engine as _;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -1320,6 +1321,7 @@ async fn proxy_terminal_socket(
     recorder.connect(&terminal_id);
     let (mut browser_sender, mut browser_receiver) = socket.split();
     let (mut broker_sender, mut broker_receiver) = broker.split();
+    let mut checkpoint_recording = BrowserCheckpointRecording::default();
     loop {
         tokio::select! {
             message = broker_receiver.next() => {
@@ -1346,11 +1348,11 @@ async fn proxy_terminal_socket(
                 let Some(Ok(message)) = message else { break; };
                 let outgoing = match message {
                     Message::Text(text) => {
-                        record_browser_message(recorder, &terminal_id, &text);
+                        record_browser_message(recorder, &terminal_id, &text, &mut checkpoint_recording);
                         BrokerMessage::Text(text.to_string().into())
                     }
                     Message::Binary(bytes) => {
-                        recorder.input(&terminal_id, &bytes);
+                        record_browser_binary(recorder, &terminal_id, &bytes, &mut checkpoint_recording);
                         BrokerMessage::Binary(bytes.to_vec().into())
                     }
                     Message::Close(_) => BrokerMessage::Close(None),
@@ -1374,9 +1376,41 @@ fn record_broker_control(recorder: &DebugRecordingManager, terminal_id: &Uuid, t
     }
 }
 
+/// Tracks an announced binary checkpoint upload so the proxy can record its
+/// chunk frames as checkpoint content instead of terminal input.
 #[cfg(unix)]
-fn record_browser_message(recorder: &DebugRecordingManager, terminal_id: &Uuid, text: &str) {
+#[derive(Default)]
+struct BrowserCheckpointRecording {
+    sequence: u64,
+    epoch: u64,
+    offset: usize,
+    remaining: usize,
+}
+
+#[cfg(unix)]
+fn record_browser_message(
+    recorder: &DebugRecordingManager,
+    terminal_id: &Uuid,
+    text: &str,
+    checkpoint: &mut BrowserCheckpointRecording,
+) {
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+        if value.get("type").and_then(serde_json::Value::as_str) == Some("checkpointBinary") {
+            checkpoint.sequence = value
+                .get("sequence")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            checkpoint.epoch = value
+                .get("epoch")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            checkpoint.offset = 0;
+            checkpoint.remaining = value
+                .get("size")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|size| usize::try_from(size).ok())
+                .unwrap_or(0);
+        }
         recorder.control(
             terminal_id,
             serde_json::json!({
@@ -1385,6 +1419,43 @@ fn record_browser_message(recorder: &DebugRecordingManager, terminal_id: &Uuid, 
             }),
         );
     }
+}
+
+/// Binary checkpoint chunks travel on the same frame type as raw terminal
+/// input; the announcement tracked above is what tells them apart, exactly as
+/// it does for the broker's assembly.
+#[cfg(unix)]
+fn record_browser_binary(
+    recorder: &DebugRecordingManager,
+    terminal_id: &Uuid,
+    bytes: &[u8],
+    checkpoint: &mut BrowserCheckpointRecording,
+) {
+    if checkpoint.remaining > 0 && bytes.len() > 9 && bytes[0] == 2 {
+        let sequence = u64::from_be_bytes(bytes[1..9].try_into().expect("frame sequence"));
+        if sequence == checkpoint.sequence {
+            let payload = &bytes[9..];
+            let consumed = payload.len().min(checkpoint.remaining);
+            recorder.control(
+                terminal_id,
+                serde_json::json!({
+                    "type": "client",
+                    "message": {
+                        "type": "checkpointBinaryChunk",
+                        "sequence": checkpoint.sequence,
+                        "epoch": checkpoint.epoch,
+                        "offset": checkpoint.offset,
+                        "data": base64::engine::general_purpose::STANDARD.encode(payload),
+                        "final": consumed == checkpoint.remaining,
+                    },
+                }),
+            );
+            checkpoint.offset += consumed;
+            checkpoint.remaining -= consumed;
+            return;
+        }
+    }
+    recorder.input(terminal_id, bytes);
 }
 
 #[cfg(unix)]

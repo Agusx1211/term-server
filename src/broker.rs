@@ -1491,6 +1491,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn binary_xterm_checkpoints_are_used_for_snapshot_recovery() {
+        let (_directory, server, client) = start_test_broker(1024 * 1024).await;
+        let terminal = client
+            .create(CreateTerminal {
+                path: Some("xterm-checkpoint-binary".to_owned()),
+                cwd: Some(PathBuf::from("/tmp")),
+                shell: Some("/bin/sh".to_owned()),
+                clone_from: None,
+            })
+            .await
+            .unwrap();
+        let viewport = TerminalViewport::new(80, 24, 800, 480);
+        let mut first = client
+            .terminal_socket(terminal.id, Some(viewport), None, false)
+            .await
+            .unwrap();
+        let ready = wait_for_control(&mut first, "ready").await;
+        assert_eq!(ready["binaryCheckpoint"], true);
+        let size = wait_for_control(&mut first, "size").await;
+        let epoch = size["epoch"].as_u64().unwrap();
+        let (initial_sync, _) = collect_sync(&mut first).await;
+        let sequence = initial_sync["sequence"].as_u64().unwrap();
+
+        let first_part = b"binary-xterm-";
+        let second_part = b"snapshot";
+        first
+            .send(TungsteniteMessage::Text(
+                serde_json::json!({
+                    "type": "checkpointBinary",
+                    "sequence": sequence,
+                    "epoch": epoch,
+                    "size": first_part.len() + second_part.len(),
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        for part in [first_part.as_slice(), second_part.as_slice()] {
+            let mut frame = vec![2u8];
+            frame.extend_from_slice(&sequence.to_be_bytes());
+            frame.extend_from_slice(part);
+            first
+                .send(TungsteniteMessage::Binary(frame.into()))
+                .await
+                .unwrap();
+        }
+        // WebSocket ordering makes the pong proof that the assembly completed.
+        first
+            .send(TungsteniteMessage::Text(r#"{"type":"ping"}"#.into()))
+            .await
+            .unwrap();
+        wait_for_control(&mut first, "pong").await;
+
+        // Once the announced bytes are consumed, binary frames must reach the
+        // pty as terminal input again.
+        first
+            .send(TungsteniteMessage::Binary(
+                b"printf '%s' input-after-binary-checkpoint\n"
+                    .to_vec()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        wait_for_output(&mut first, "input-after-binary-checkpoint").await;
+        first.close(None).await.unwrap();
+        wait_for_client_count(&client, terminal.id, 0).await;
+
+        let mut recovered = client
+            .terminal_socket(terminal.id, Some(viewport), None, false)
+            .await
+            .unwrap();
+        wait_for_control(&mut recovered, "ready").await;
+        let recovered_size = wait_for_control(&mut recovered, "size").await;
+        assert_eq!(recovered_size["epoch"], epoch);
+        let (sync, snapshot) = collect_sync(&mut recovered).await;
+        assert_eq!(sync["mode"], "snapshot");
+        assert!(snapshot.starts_with(b"binary-xterm-snapshot"));
+        assert!(
+            String::from_utf8_lossy(&snapshot).contains("input-after-binary-checkpoint"),
+            "raw output after the checkpoint must extend the snapshot"
+        );
+
+        client.remove(terminal.id).await.unwrap();
+        client.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("broker shutdown timeout")
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn reconnect_cannot_resume_across_a_resize_it_missed() {
         let (_directory, server, client) = start_test_broker(1024 * 1024).await;
         let terminal = client

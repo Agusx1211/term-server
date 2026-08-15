@@ -124,6 +124,26 @@ function checkpointFrames(
   ));
 }
 
+/**
+ * The live browser uploads checkpoints as a `checkpointBinary` announcement
+ * followed by binary frames whose nine-byte header carries kind byte 2 and
+ * the announced sequence, which the proxy already decodes as `binaryKind`
+ * and `sequence`.
+ */
+function binaryCheckpointBodyFrames(
+  events: readonly NetworkFaultEvent[],
+  terminalId: string,
+  sequence: number,
+): readonly NetworkFaultEvent[] {
+  return events.filter((event) => (
+    event.type === "frame"
+    && event.terminalId === terminalId
+    && event.direction === "browser-to-server"
+    && event.frame?.binaryKind === 2
+    && event.frame.sequence === sequence
+  ));
+}
+
 async function readTerminal(page: Page, terminalId: string): Promise<TerminalApiInfo> {
   return page.evaluate(async (id) => {
     const response = await fetch("/api/terminals", { cache: "no-store" });
@@ -610,11 +630,19 @@ test("K-14 Corrupt and oversized checkpoint @p1 @checkpoint @protocol-failure @b
     (event) => event.type === "frame"
       && event.terminalId === terminalId
       && event.direction === "browser-to-server"
-      && event.frame?.jsonType === "checkpoint"
+      && event.frame?.jsonType === "checkpointBinary"
       && event.frame.sequence === baselineSequence,
     { timeoutMs: WAIT_TIMEOUT_MS },
   );
-  const baselineProxyFrames = checkpointFrames(faultController.events, terminalId, baselineSequence, 0);
+  await faultController.waitFor(
+    (event) => event.type === "frame"
+      && event.terminalId === terminalId
+      && event.direction === "browser-to-server"
+      && event.frame?.binaryKind === 2
+      && binaryCheckpointBodyFrames(faultController.events, terminalId, baselineSequence).length >= baseline.checkpointChunks,
+    { timeoutMs: WAIT_TIMEOUT_MS },
+  );
+  const baselineProxyFrames = binaryCheckpointBodyFrames(faultController.events, terminalId, baselineSequence);
   expect(baselineProxyFrames.length).toBeGreaterThanOrEqual(baseline.checkpointChunks);
   expect(baselineProxyFrames.every((event) => (event.frame?.bytes ?? 0) < 64 * 1024)).toBe(true);
 

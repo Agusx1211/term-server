@@ -122,6 +122,11 @@ function checkpointRecord(event: DiagnosticEvent, firstOccurrence: number): Chec
   };
 }
 
+// Binary checkpoint chunk frames carry kind byte 2 in their nine-byte header;
+// the proxy decodes it as binaryKind and keeps a per-connection occurrence
+// counter for that key, so chunk arithmetic works exactly as it did for the
+// legacy JSON chunks. The `checkpointBinary` announcement is not a chunk and
+// is deliberately excluded.
 function checkpointFrames(
   events: readonly NetworkFaultEvent[],
   terminalId: string,
@@ -132,7 +137,7 @@ function checkpointFrames(
       && event.terminalId === terminalId
       && event.generation === generation
       && event.direction === "browser-to-server"
-      && event.frame?.jsonType === "checkpoint"
+      && event.frame?.binaryKind === 2
   ));
 }
 
@@ -199,7 +204,7 @@ async function waitForCheckpointFrames(
         && event.terminalId === terminalId
         && event.generation === generation
         && event.direction === "browser-to-server"
-        && event.frame?.jsonType === "checkpoint"
+        && event.frame?.binaryKind === 2
         && event.frame.occurrence === occurrence,
       { timeoutMs: WAIT_TIMEOUT_MS },
     );
@@ -498,7 +503,7 @@ async function runBoundary(
       terminalId,
       generation: session.generation,
       direction: "browser-to-server",
-      jsonType: "checkpoint",
+      binaryKind: 2,
       occurrence: targetOccurrence,
     });
     const eventsBeforeBurst = await terminalEvents(session.page, terminalId);

@@ -360,7 +360,16 @@ async function readPerformanceMetrics(page: Page): Promise<PerformanceMetrics> {
   }, PERFORMANCE_KEY);
 }
 
-function checkpointFrames(
+/**
+ * The live browser uploads checkpoints as a `checkpointBinary` announcement
+ * followed by binary frames whose nine-byte header carries kind byte 2 and
+ * the announced sequence, which the proxy already decodes as `binaryKind`
+ * and `sequence`. The announcement is not a chunk, so only the binary body
+ * frames are counted against the diagnostics chunk count. Occurrence floors
+ * are keyed per frame kind by the proxy, so they must also be computed over
+ * kind-2 binary frames.
+ */
+function binaryCheckpointBodyFrames(
   events: readonly NetworkFaultEvent[],
   terminalId: string,
   generation: number,
@@ -372,13 +381,13 @@ function checkpointFrames(
     && event.terminalId === terminalId
     && event.generation === generation
     && event.direction === "browser-to-server"
-    && event.frame?.jsonType === "checkpoint"
+    && event.frame?.binaryKind === 2
     && event.frame.sequence === sequence
     && event.frame.occurrence > minimumOccurrence
   ));
 }
 
-async function waitForCheckpointFrame(
+async function waitForCheckpointBodyFrame(
   controller: NetworkFaultController,
   terminalId: string,
   generation: number,
@@ -390,7 +399,7 @@ async function waitForCheckpointFrame(
     && event.terminalId === terminalId
     && event.generation === generation
     && event.direction === "browser-to-server"
-    && event.frame?.jsonType === "checkpoint"
+    && event.frame?.binaryKind === 2
     && event.frame.sequence === sequence
     && event.frame.occurrence > minimumOccurrence
   ), { timeoutMs: WAIT_TIMEOUT_MS });
@@ -487,7 +496,7 @@ async function runTier(
       && event.terminalId === terminal.id
       && event.generation === initial.socketGeneration
       && event.direction === "browser-to-server"
-      && event.frame?.jsonType === "checkpoint"
+      && event.frame?.binaryKind === 2
     ))
     .reduce((maximum, event) => Math.max(maximum, event.frame?.occurrence ?? 0), 0);
   const performanceStart = await resetPerformanceMetrics(page);
@@ -559,7 +568,7 @@ async function runTier(
   expect(echoPayload.payload_base64).toBe(Buffer.from(echoText, "utf8").toString("base64"));
   expect(interactionLatencyMs).toBeLessThanOrEqual(INTERACTION_LATENCY_BUDGET_MS);
 
-  const checkpointFrame = await waitForCheckpointFrame(
+  const checkpointFrame = await waitForCheckpointBodyFrame(
     faultController,
     terminal.id,
     checkpoint.snapshot.socketGeneration,
@@ -567,7 +576,7 @@ async function runTier(
     frameFloor,
   );
   expect(checkpointFrame.frame?.bytes).toBeGreaterThan(0);
-  const uploadedFrames = checkpointFrames(
+  const uploadedFrames = binaryCheckpointBodyFrames(
     faultController.events,
     terminal.id,
     checkpoint.snapshot.socketGeneration,
@@ -578,6 +587,15 @@ async function runTier(
   expect(uploadedFrames.map((event) => event.frame?.sequence)).toEqual(
     Array.from({ length: checkpointChunks }, () => checkpointSequence),
   );
+  const proxiedAnnouncements = faultController.events.filter((event) => (
+    event.type === "frame"
+    && event.terminalId === terminal.id
+    && event.generation === checkpoint.snapshot.socketGeneration
+    && event.direction === "browser-to-server"
+    && event.frame?.jsonType === "checkpointBinary"
+    && event.frame.sequence === checkpointSequence
+  ));
+  expect(proxiedAnnouncements).toHaveLength(1);
 
   const longTasks = performance.longTasks.filter((entry) => (
     entry.startTime >= performanceStart.startTime && entry.startTime <= performance.endTime
