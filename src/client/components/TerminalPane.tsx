@@ -152,6 +152,11 @@ interface TerminalPaneProps {
   onDeleteArtifact: (artifact: ArtifactEntry) => Promise<void>;
 }
 const TERMINAL_PROTOCOL_MISMATCH_MESSAGE = "terminal client is out of date; reload the page";
+// How long a foreground pane may hold outstanding writes with no parse
+// progress before its xterm write pump is considered dead and the stream is
+// rebuilt. Generous: a healthy parser settles each frame within milliseconds,
+// and a burst still reports progress per frame.
+const TERMINAL_PARSER_STALL_MS = 30_000;
 
 const searchOptions = (theme: ThemeName, incremental = false): ISearchOptions => ({
   incremental,
@@ -794,6 +799,13 @@ export function TerminalPane({
     // and abandon its stream. More than one write can be in flight, so the
     // parsing flag counts them instead of tracking a single write.
     let unparsedWrites = 0;
+    // When the newest outstanding write last made progress. An exception inside
+    // xterm's chunked write loop kills its pump silently: every queued callback
+    // stops firing, the pane freezes at its current bottom, and — because
+    // acknowledgements only follow parsed bytes — the server's flow control
+    // eventually parks the pty against a debt this pane will never pay. The
+    // watchdog below turns that permanent wedge into one forced resync.
+    let lastParseProgressAt = Date.now();
     const updateStreamDiagnostics = (): void => {
       diagnosticsHandle?.parserState(unparsedWrites, backlog.pendingBytes);
       diagnosticsHandle?.renderBacklog({
@@ -909,10 +921,12 @@ export function TerminalPane({
         recordDebugEvent(terminal.id, { type: "write", data: encodeBytesBase64(data) });
       }
       unparsedWrites += 1;
+      if (unparsedWrites === 1) lastParseProgressAt = Date.now();
       parsingOutput = true;
       updateStreamDiagnostics();
       try {
         term.write(data, () => {
+          lastParseProgressAt = Date.now();
           if (!isCurrentSocket(generation, owner)) {
             resolve();
             return;
@@ -958,6 +972,7 @@ export function TerminalPane({
       messageQueue = Promise.resolve();
       pendingWrites = Promise.resolve();
       unparsedWrites = 0;
+      lastParseProgressAt = Date.now();
       parsingOutput = false;
       backlog.reset();
       suspendSocket = undefined;
@@ -1413,6 +1428,37 @@ export function TerminalPane({
     const keepaliveTimer = window.setInterval(() => {
       const current = socket.current;
       if (current?.readyState !== WebSocket.OPEN) return;
+      if (
+        !document.hidden
+        && visibleState.current
+        && unparsedWrites > 0
+        && Date.now() - lastParseProgressAt > TERMINAL_PARSER_STALL_MS
+      ) {
+        // xterm's write pump died (an exception in its chunked parse loop stops
+        // every queued callback, silently). The pane would otherwise freeze at
+        // its current bottom forever: pongs keep the keepalive satisfied, and
+        // the normal close-handler recovery waits on the wedged message queue,
+        // so it would never reconnect. Rebuild the stream directly — connect()
+        // resets the queues, and stream.restart() forces a full snapshot since
+        // writes were lost mid-queue. Only foreground panes qualify: a hidden
+        // or backgrounded tab parses slowly by design (timer throttling), and
+        // closing its held stream would trade deep scrollback for a shallow
+        // snapshot for no reason.
+        recordDebugEvent(terminal.id, {
+          type: "notice",
+          message: "terminal parser stalled; resynchronizing",
+        });
+        diagnosticsHandle?.record("parser-stall", { unparsedWrites });
+        closeTerminalSocket(current, "parser-stall");
+        socket.current = undefined;
+        stream.restart();
+        backlog.reset();
+        recoveringOutput = true;
+        reportStreamIssue({ kind: "recovering" });
+        setConnection("recovering");
+        connect();
+        return;
+      }
       if (Date.now() - lastServerMessage > 45_000) {
         closeTerminalSocket(current, "timeout");
         return;

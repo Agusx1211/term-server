@@ -81,6 +81,16 @@ const FLOW_CONTROL_LOW_WATERMARK_BYTES: u64 = 5_000;
 /// already false. It exists because a missed notification would wedge an agent
 /// silently, which is far worse than one predicate check every few seconds.
 const FLOW_CONTROL_WAIT_BACKSTOP: Duration = Duration::from_secs(5);
+/// Longest a parked read loop waits without any acknowledgement progress before
+/// the outstanding debt is written off and the pty resumes. A browser whose
+/// parser has wedged (or that a background tab has throttled to a crawl) stops
+/// acknowledging while its socket stays healthy; without a deadline that single
+/// client freezes the terminal for every other client and blocks the agent on
+/// its next write, indefinitely. A slow-but-alive browser is unaffected: any
+/// acknowledgement arriving during the pause restarts the clock, and a browser
+/// that genuinely cannot keep up falls behind and recovers through its own
+/// snapshot resynchronization path.
+const FLOW_CONTROL_PAUSE_DEADLINE: Duration = Duration::from_secs(10);
 const DEFAULT_VIEWPORT_SIZE: TerminalViewport = TerminalViewport {
     cols: 100,
     rows: 30,
@@ -1505,6 +1515,32 @@ struct FlowControl {
     resumed: Condvar,
 }
 
+/// See [`TerminalSession::flow_wait_until_resumed`]. Standalone so tests can
+/// drive the wait with a short deadline.
+fn flow_wait_until_resumed(flow: &FlowControl, deadline: Duration) {
+    let mut state = flow.state.lock();
+    let mut expires = std::time::Instant::now() + deadline;
+    let mut last_unacknowledged = state.unacknowledged;
+    while state.blocked() {
+        let remaining = expires.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            // No acknowledgement progress across the whole deadline: the
+            // attached browsers are wedged, not slow. Write the debt off rather
+            // than keep the agent blocked on a client that will never pay it.
+            state.clear();
+            break;
+        }
+        flow.resumed
+            .wait_for(&mut state, remaining.min(FLOW_CONTROL_WAIT_BACKSTOP));
+        if state.unacknowledged < last_unacknowledged {
+            // Acknowledgements are flowing, just not enough to resume yet:
+            // an alive browser keeps its full deadline.
+            expires = std::time::Instant::now() + deadline;
+            last_unacknowledged = state.unacknowledged;
+        }
+    }
+}
+
 pub struct TerminalSession {
     info: RwLock<TerminalInfo>,
     master: Mutex<Box<dyn MasterPty + Send>>,
@@ -1677,14 +1713,12 @@ impl TerminalSession {
 
     /// Blocks the pty read loop while output stands unacknowledged above the
     /// high watermark, so the master's buffer fills and the writing process
-    /// blocks. This is the only backpressure that reaches a TUI.
+    /// blocks. This is the only backpressure that reaches a TUI. The pause is
+    /// bounded: browsers that stop acknowledging entirely have their debt
+    /// written off after `FLOW_CONTROL_PAUSE_DEADLINE` so a wedged client can
+    /// never freeze the terminal for the agent or the other clients.
     fn flow_wait_until_resumed(&self) {
-        let mut state = self.flow.state.lock();
-        while state.blocked() {
-            self.flow
-                .resumed
-                .wait_for(&mut state, FLOW_CONTROL_WAIT_BACKSTOP);
-        }
+        flow_wait_until_resumed(&self.flow, FLOW_CONTROL_PAUSE_DEADLINE);
     }
 
     /// Permanently opens the gate. A parked read loop must not outlive the
@@ -3813,6 +3847,67 @@ mod tests {
         // acknowledge must not be allowed to block the process producing it.
         assert!(!state.blocked());
         assert_eq!(state.unacknowledged, 0);
+    }
+
+    #[test]
+    fn flow_pause_deadline_writes_off_the_debt_of_a_wedged_browser() {
+        let flow = FlowControl::default();
+        {
+            let mut state = flow.state.lock();
+            state.clients = 1;
+            state.published(FLOW_CONTROL_HIGH_WATERMARK_BYTES + 1);
+            assert!(state.blocked());
+        }
+        let started = Instant::now();
+        flow_wait_until_resumed(&flow, Duration::from_millis(50));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a wedged browser must not park the read loop past the deadline"
+        );
+        let state = flow.state.lock();
+        assert!(!state.blocked());
+        assert_eq!(state.unacknowledged, 0, "the stale debt is written off");
+    }
+
+    #[test]
+    fn flow_pause_deadline_extends_while_acknowledgements_make_progress() {
+        let flow = std::sync::Arc::new(FlowControl::default());
+        {
+            let mut state = flow.state.lock();
+            state.clients = 1;
+            state.published(120_000);
+            assert!(state.blocked());
+        }
+        // An alive browser trickles acknowledgements from another thread. Each
+        // one restarts the deadline, so the debt must drain fully through
+        // acknowledgements (12 of them) even though draining takes far longer
+        // than the initial deadline. A write-off would end the pause early and
+        // the browser would get nowhere near 12.
+        let acker = {
+            let flow = std::sync::Arc::clone(&flow);
+            std::thread::spawn(move || {
+                let mut acks = 0_u32;
+                loop {
+                    std::thread::sleep(Duration::from_millis(25));
+                    let mut state = flow.state.lock();
+                    if !state.blocked() {
+                        break;
+                    }
+                    acks += 1;
+                    if state.acknowledged(10_000) {
+                        flow.resumed.notify_all();
+                    }
+                }
+                acks
+            })
+        };
+        flow_wait_until_resumed(&flow, Duration::from_millis(250));
+        let acks = acker.join().unwrap();
+        assert!(
+            acks >= 12,
+            "the pause must end through acknowledgements, not the write-off (saw {acks})"
+        );
+        assert_eq!(flow.state.lock().unacknowledged, 0);
     }
 
     #[test]

@@ -176,6 +176,7 @@ export type E2ETerminalEventType =
   | "exit"
   | "output-received"
   | "parser-commit"
+  | "parser-stall"
   | "checkpoint"
   | "renderer-load"
   | "renderer-context-loss"
@@ -822,6 +823,7 @@ const EVENT_TYPES: Record<E2ETerminalEventType, true> = {
   exit: true,
   "output-received": true,
   "parser-commit": true,
+  "parser-stall": true,
   checkpoint: true,
   "renderer-load": true,
   "renderer-context-loss": true,
