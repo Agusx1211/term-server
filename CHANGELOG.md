@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.13.8 - 2026-08-15
+
+Fixes the terminal freeze behind "can't scroll to the bottom" and agents that
+looked idle while working.
+
+### Fixed
+
+- A browser pane whose xterm parser wedged (or that a background tab throttled)
+  stopped acknowledging output while its socket stayed healthy. The broker's
+  flow control — one counter per pty with a 100KB high watermark and an
+  unbounded wait — then parked the pty read loop: every other client saw the
+  terminal frozen short of its real tail, and the agent blocked on its next
+  write, which is why working agents were reported idle. Reconnecting cleared
+  the debt, so each reload advanced roughly 100KB — the "I have to reload many
+  times for it to get to the end" behavior. A parked read loop now writes off
+  the outstanding debt after 10 seconds without acknowledgement progress; any
+  acknowledgement during the pause restarts the clock, so slow-but-alive
+  browsers keep full backpressure and catch up through their normal
+  resynchronization path.
+- The client now detects a dead xterm write pump (outstanding writes with no
+  parse progress for 30 seconds on a visible pane) and rebuilds the stream with
+  a full resync instead of freezing at its current bottom forever. The previous
+  recovery path could never run for this failure because it waited on the same
+  wedged message queue. Hidden and backgrounded panes are exempt: their parsers
+  are throttled by design and their held streams preserve deep scrollback.
+
+### Upgrade notes
+
+- No breaking changes, data migrations, or configuration changes. The broker
+  fix applies to terminals created on new broker generations; terminals created
+  before the update keep their old broker (and the old behavior) until a full
+  service restart. Reload open pages to pick up the client watchdog.
+- The release is safe for automatic installation over `0.13.7`.
+
 ## 0.13.7 - 2026-08-13
 
 The status bar now shows real usage percentages for Claude, Codex, and z.ai.
