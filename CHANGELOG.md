@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.13.9 - 2026-08-15
+
+Terminal panes can no longer get stuck when their socket closes mid-recovery.
+
+### Fixed
+
+- The 0.13.8 parser watchdog covered a wedged xterm write pump on an open
+  socket, but every close-recovery path still waited for the stream to go
+  quiescent — the exact wait a wedged pump leaves hanging forever. When such a
+  pane's socket closed, the close handler never ran its cleanup: no reconnect
+  was scheduled and the pane froze at its current bottom while still looking
+  connected (confirmed from a heap dump of a fully-updated tab: stream synced,
+  nothing queued in the browser's websocket internals, terminal alive on the
+  server). The quiescence wait is now bounded at 3 seconds, after which
+  recovery proceeds and the follow-up resynchronization supersedes anything
+  still queued.
+- The keepalive watchdog additionally rebuilds the stream when it finds a
+  closing or closed socket still registered after two ticks, as a backstop for
+  any recovery path that misses the close event entirely.
+
+### Upgrade notes
+
+- No breaking changes, data migrations, or configuration changes. This is a
+  client-only fix: reload open pages to pick it up. Terminals living on
+  pre-0.13.8 draining brokers can still park their pty on the old unbounded
+  flow-control wait; a reconnect (which this release makes reliable) clears
+  the debt and resumes them, and the exposure disappears entirely once those
+  terminals close or the service fully restarts.
+- The release is safe for automatic installation over `0.13.8`.
+
 ## 0.13.8 - 2026-08-15
 
 Fixes the terminal freeze behind "can't scroll to the bottom" and agents that
