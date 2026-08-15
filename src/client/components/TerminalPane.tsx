@@ -651,6 +651,22 @@ export function TerminalPane({
         return pendingWrites;
       });
     };
+    // Quiescence is a courtesy, not a requirement. A wedged xterm write pump
+    // leaves `pendingWrites` permanently unsettled, and every recovery path
+    // that waited on it unconditionally hung forever: a closed socket was
+    // never cleaned up or reconnected, leaving a frozen pane that still looked
+    // connected. After the deadline the caller proceeds; whatever was still
+    // queued is superseded by the resynchronization that follows.
+    const settledStreamWithDeadline = (
+      generation = messageQueueGeneration,
+      deadlineMs = 3_000,
+    ): Promise<void> =>
+      Promise.race([
+        settledStream(generation).then(() => undefined),
+        new Promise<void>((resolve) => {
+          window.setTimeout(resolve, deadlineMs);
+        }),
+      ]);
     let lastServerMessage = Date.now();
     let hasSynced = false;
     let recoveringOutput = false;
@@ -1336,8 +1352,10 @@ export function TerminalPane({
         recordDebugEvent(terminal.id, { type: "disconnect", cause: "close" });
         // A server exit is sent immediately before the socket closes. Let all
         // messages already delivered by this socket run before invalidating it;
-        // otherwise the close callback races the queue and drops the exit.
-        void settledStream(generation).then(() => {
+        // otherwise the close callback races the queue and drops the exit. The
+        // wait is bounded: recovery must run even when a wedged write pump
+        // keeps the queue from ever settling.
+        void settledStreamWithDeadline(generation).then(() => {
           if (!isCurrentSocket(generation, next) || exited.current) return;
           acceptingInput = false;
           term.options.disableStdin = true;
@@ -1412,7 +1430,7 @@ export function TerminalPane({
       }
       clearReconnectTimer();
       const generation = streamGeneration;
-      void settledStream(generation).then(() => {
+      void settledStreamWithDeadline(generation).then(() => {
         if (!isCurrentGeneration(generation) || exited.current || !visibleState.current) return;
         const current = socket.current;
         if (!current || current.readyState === WebSocket.CLOSED) connect();
@@ -1425,9 +1443,40 @@ export function TerminalPane({
       });
     };
 
+    let deadSocketTicks = 0;
     const keepaliveTimer = window.setInterval(() => {
       const current = socket.current;
-      if (current?.readyState !== WebSocket.OPEN) return;
+      if (!current) {
+        deadSocketTicks = 0;
+        return;
+      }
+      if (
+        current.readyState === WebSocket.CLOSING
+        || current.readyState === WebSocket.CLOSED
+      ) {
+        // The socket closed but the close handler's cleanup never ran, so no
+        // reconnect was ever scheduled — the pane would sit frozen while still
+        // looking connected. The bounded quiescence wait makes this rare, but
+        // any path that misses it lands here. Two ticks of grace, then rebuild.
+        deadSocketTicks += 1;
+        if (deadSocketTicks < 2) return;
+        deadSocketTicks = 0;
+        recordDebugEvent(terminal.id, {
+          type: "notice",
+          message: "terminal socket closed without recovery; resynchronizing",
+        });
+        diagnosticsHandle?.record("socket-dead", { unparsedWrites });
+        socket.current = undefined;
+        stream.restart();
+        backlog.reset();
+        recoveringOutput = true;
+        reportStreamIssue({ kind: "recovering" });
+        setConnection("recovering");
+        if (visibleState.current) connect();
+        return;
+      }
+      deadSocketTicks = 0;
+      if (current.readyState !== WebSocket.OPEN) return;
       if (
         !document.hidden
         && visibleState.current
