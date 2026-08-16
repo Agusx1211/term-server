@@ -100,6 +100,7 @@ import {
   type TerminalCheckpointSerializeBudget,
 } from "../lib/terminal-checkpoint";
 import { throttleTerminalScrollbarHide } from "../lib/terminal-scrollbar-hide-throttle";
+import { unthrottleTerminalWritePump } from "../lib/terminal-write-pump";
 import {
   terminalKittyKeyboardState,
   tuiCompatibilityOptions,
@@ -374,6 +375,15 @@ export function TerminalPane({
     );
     term.open(host);
     throttleTerminalScrollbarHide(term);
+    // A remounting pane replays a multi-megabyte snapshot through xterm's
+    // write pump, which paces parsing one ~12ms slice per `setTimeout(0)`
+    // tick. A page whose timers are throttled (occluded window, embedded
+    // webview, recently backgrounded tab — some while still reporting
+    // `visibilityState === "visible"`) then takes close to a minute to
+    // scroll the pane to its real bottom. Route the zero-delay scheduling
+    // through a MessagePort so the pump keeps its pace wherever the page is
+    // actually being viewed.
+    unthrottleTerminalWritePump(term);
     void loadTerminalNerdFont().then(() => {
       if (disposed) return;
       term.clearTextureAtlas();
