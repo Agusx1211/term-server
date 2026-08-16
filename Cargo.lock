@@ -2105,7 +2105,7 @@ dependencies = [
 
 [[package]]
 name = "term-server"
-version = "0.13.9"
+version = "0.13.10"
 dependencies = [
  "argon2",
  "axum",

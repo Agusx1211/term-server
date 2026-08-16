@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.13.10 - 2026-08-16
+
+Sustained terminal output no longer stutters: recovery checkpoints stay off
+the hot path and upload as binary.
+
+### Changed
+
+- Recovery checkpoints forced while output is still streaming serialize a
+  1,000-line scrollback slice instead of the full 10,000-line depth. The full
+  pass walked the buffer cell by cell for 100-350ms on the main thread every
+  five seconds - exactly when the parser and renderer were busiest - and
+  surfaced as periodic hitches, delayed input, and dropped frames (diagnosed
+  from a 17-minute performance trace of a real session). The idle checkpoint
+  that follows a burst restores full depth within 750ms, and a rolling
+  bytes-per-line estimate seeds each serialization so oversized passes are no
+  longer serialized twice.
+- Checkpoint uploads travel as one JSON announcement followed by raw binary
+  frames - each carrying a nine-byte kind-and-sequence header - instead of
+  base64 chunks inside JSON, removing the encode cost and a third of the
+  upload size. The server advertises support in its ready message and still
+  accepts the legacy format from older browsers.
+- The checkpoint scheduler keeps a single armed timer against a moving
+  deadline instead of resetting a timeout on every parsed chunk, and xterm's
+  overlay scrollbar hide timer - re-armed once per scrolled line during
+  output - is throttled to roughly ten timer operations per second with the
+  fade behaviour within 100ms of stock. Together these remove around 700
+  timer calls per second during bursts.
+- Server debug recordings store binary checkpoint chunks as checkpoint
+  content; the recording proxy would otherwise have logged them as terminal
+  input.
+
+### Upgrade notes
+
+- No breaking changes, data migrations, or configuration changes. The wire
+  format is negotiated per connection: older browsers keep base64 JSON
+  checkpoints against the new server, and new browsers keep the legacy format
+  toward brokers from older generations, because such a broker reads
+  unexpected client binary frames as terminal input. Binary uploads begin for
+  terminals on new broker generations; reload open pages to pick up the
+  client-side improvements.
+- The release is safe for automatic installation over `0.13.9`.
+
 ## 0.13.9 - 2026-08-15
 
 Terminal panes can no longer get stuck when their socket closes mid-recovery.
