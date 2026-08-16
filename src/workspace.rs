@@ -19,7 +19,9 @@ use crate::{
         TerminalError, TerminalEvent, TerminalInfo, TerminalManager, TerminalSession,
         TerminalSizeState, TerminalViewport, terminate_descendant_process,
     },
-    terminal_state::{SequencedOutput, SyncMode, TerminalResume, TerminalSync},
+    terminal_state::{
+        SequencedOutput, SyncMode, TERMINAL_OUTPUT_FRAME_BYTES, TerminalResume, TerminalSync,
+    },
 };
 
 /// Bumped to 3 for flow control. A browser on the old protocol never
@@ -29,7 +31,6 @@ use crate::{
 pub(crate) const TERMINAL_STREAM_PROTOCOL: u8 = 3;
 
 const TERMINAL_FRAME_HEADER_BYTES: usize = 9;
-const TERMINAL_FRAME_PAYLOAD_BYTES: usize = 60 * 1024;
 const TERMINAL_FRAME_SNAPSHOT: u8 = 0;
 const TERMINAL_FRAME_OUTPUT: u8 = 1;
 const TERMINAL_SEND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -45,11 +46,6 @@ const TERMINAL_CHECKPOINT_FRAME_KIND: u8 = 2;
 const TERMINAL_CHECKPOINT_FRAME_HEADER_BYTES: usize = 9;
 const TERMINAL_CLIENT_LEASE: Duration = Duration::from_secs(90);
 const TERMINAL_LEASE_CHECK_INTERVAL: Duration = Duration::from_secs(15);
-/// A pty master returns at most one 4 KiB chunk per read, so a full-screen TUI
-/// redraw reaches this loop as hundreds of tiny events. Merging whatever is
-/// already queued into one frame keeps a burst to a few dozen websocket
-/// messages, which the browser can hand to its parser in far fewer turns.
-const TERMINAL_OUTPUT_COALESCE_BYTES: usize = 60 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -706,9 +702,9 @@ pub(crate) async fn serve_terminal_socket(
     }
 }
 
-/// Merges the output events already queued behind `output` into a single frame.
-/// Stops at the coalescing budget, at a gap, or at the first non-output event,
-/// which is handed back through `deferred` so the caller processes it next.
+/// Merges whole output events already queued behind `output` into one frame.
+/// Stops before the payload cap, at a gap, or at a non-output event. Keeping
+/// event boundaries intact also keeps checkpoint sequences parser-verifiable.
 fn coalesce_terminal_output(
     output: SequencedOutput,
     events: &mut tokio::sync::broadcast::Receiver<TerminalEvent>,
@@ -718,7 +714,7 @@ fn coalesce_terminal_output(
 
     let mut merged: Option<Vec<u8>> = None;
     let mut end = output.end_sequence();
-    while end - output.sequence < TERMINAL_OUTPUT_COALESCE_BYTES as u64 {
+    while end - output.sequence < TERMINAL_OUTPUT_FRAME_BYTES as u64 {
         match events.try_recv() {
             Ok(TerminalEvent::Output(next)) => {
                 if next.end_sequence() <= end {
@@ -726,6 +722,11 @@ fn coalesce_terminal_output(
                 }
                 if next.sequence > end {
                     // A gap, which only the caller's snapshot recovery can close.
+                    deferred.replace(Ok(TerminalEvent::Output(next)));
+                    break;
+                }
+                let additional_bytes = next.end_sequence() - end;
+                if end - output.sequence + additional_bytes > TERMINAL_OUTPUT_FRAME_BYTES as u64 {
                     deferred.replace(Ok(TerminalEvent::Output(next)));
                     break;
                 }
@@ -1223,7 +1224,7 @@ async fn send_terminal_bytes(
             _ => {}
         }
     }
-    for chunk in bytes.chunks(TERMINAL_FRAME_PAYLOAD_BYTES) {
+    for chunk in bytes.chunks(TERMINAL_OUTPUT_FRAME_BYTES) {
         let mut frame = Vec::with_capacity(TERMINAL_FRAME_HEADER_BYTES + chunk.len());
         frame.push(kind);
         frame.extend_from_slice(&sequence.to_be_bytes());
@@ -1381,15 +1382,15 @@ mod tests {
                 })
             })
             .collect();
-        let (merged, _) = drain(
+        let (merged, remaining) = drain(
             SequencedOutput {
                 sequence: 0,
                 bytes: Bytes::from_static(chunk),
             },
             events,
         );
-        assert!(merged.bytes.len() >= TERMINAL_OUTPUT_COALESCE_BYTES);
-        assert!(merged.bytes.len() < TERMINAL_OUTPUT_COALESCE_BYTES + 4095);
+        assert_eq!(merged.bytes.len(), 15 * 4095);
+        assert_eq!(remaining, 25);
     }
 
     fn chunk_frame(sequence: u64, payload: &[u8]) -> Vec<u8> {

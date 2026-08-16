@@ -22,6 +22,10 @@ const CELL_BYTES: usize = std::mem::size_of::<vt100::Cell>();
 const MAX_PENDING_SEQUENCE_BYTES: usize = 64 * 1024;
 const MAX_TRACKED_SGR_BYTES: usize = 64 * 1024;
 const KITTY_KEYBOARD_STACK_LIMIT: usize = 16;
+/// Maximum payload in one terminal output WebSocket frame. PTY reads and
+/// output coalescing share this cap so every normal frame ends at a canonical
+/// publish boundary whose parser safety is known.
+pub(crate) const TERMINAL_OUTPUT_FRAME_BYTES: usize = 60 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SequencedOutput {
@@ -73,6 +77,7 @@ pub struct TerminalOutputState {
     state_bytes: usize,
     checkpoint_bytes: usize,
     browser_checkpoint: Option<BrowserCheckpoint>,
+    safe_browser_checkpoint_sequences: VecDeque<u64>,
     terminal: CanonicalTerminal,
     exit_code: Option<u32>,
 }
@@ -96,6 +101,7 @@ impl TerminalOutputState {
             checkpoint_bytes: (maximum_bytes / CHECKPOINT_BUDGET_DIVISOR)
                 .clamp(MIN_CHECKPOINT_BYTES, MAX_CHECKPOINT_BYTES),
             browser_checkpoint: None,
+            safe_browser_checkpoint_sequences: VecDeque::from([0]),
             terminal: CanonicalTerminal::new(rows, cols, scrollback_capacity(state_bytes, cols)),
             exit_code: None,
         }
@@ -109,11 +115,26 @@ impl TerminalOutputState {
         self.sequence = output.end_sequence();
         self.terminal.process(&output.bytes);
         self.delta.push(output.clone());
+        let earliest = self.delta.earliest_sequence(self.sequence);
+        while self
+            .safe_browser_checkpoint_sequences
+            .front()
+            .is_some_and(|sequence| *sequence < earliest)
+        {
+            self.safe_browser_checkpoint_sequences.pop_front();
+        }
+        if self.terminal.can_store_browser_checkpoint()
+            && self.safe_browser_checkpoint_sequences.back() != Some(&self.sequence)
+        {
+            self.safe_browser_checkpoint_sequences
+                .push_back(self.sequence);
+        }
         output
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16, pixel_width: u16, pixel_height: u16) {
-        if self.terminal.parser.screen().size() != (rows, cols) {
+        let grid_changed = self.terminal.parser.screen().size() != (rows, cols);
+        if grid_changed {
             self.grid_epoch = self.grid_epoch.saturating_add(1);
             // Output sequences do not advance for a grid resize. A checkpoint
             // from the previous grid therefore cannot be paired safely with
@@ -128,6 +149,13 @@ impl TerminalOutputState {
             pixel_width,
             pixel_height,
         );
+        if grid_changed {
+            self.safe_browser_checkpoint_sequences.clear();
+            if self.terminal.can_store_browser_checkpoint() {
+                self.safe_browser_checkpoint_sequences
+                    .push_back(self.sequence);
+            }
+        }
     }
 
     pub fn grid_epoch(&self) -> u64 {
@@ -138,12 +166,17 @@ impl TerminalOutputState {
         self.checkpoint_bytes
     }
 
-    /// Retains a browser-produced xterm serialization when it describes this
-    /// exact grid and its sequence is still bridgeable by the delta ring.
+    /// Retains a browser-produced xterm serialization only when it describes
+    /// this exact grid, ends between control/UTF-8 sequences, and is still
+    /// bridgeable by the delta ring.
     pub fn store_browser_checkpoint(&mut self, sequence: u64, epoch: u64, bytes: Bytes) -> bool {
         if bytes.is_empty()
             || bytes.len() > self.checkpoint_bytes
             || epoch != self.grid_epoch
+            || self
+                .safe_browser_checkpoint_sequences
+                .binary_search(&sequence)
+                .is_err()
             || self.delta.outputs_since(sequence, self.sequence).is_none()
             || self
                 .browser_checkpoint
@@ -292,14 +325,17 @@ impl DeltaBuffer {
         }
     }
 
+    fn earliest_sequence(&self, current_sequence: u64) -> u64 {
+        self.chunks
+            .front()
+            .map_or(current_sequence, |chunk| chunk.sequence)
+    }
+
     fn outputs_since(&self, sequence: u64, current_sequence: u64) -> Option<Vec<SequencedOutput>> {
         if sequence > current_sequence {
             return None;
         }
-        let earliest = self
-            .chunks
-            .front()
-            .map_or(current_sequence, |chunk| chunk.sequence);
+        let earliest = self.earliest_sequence(current_sequence);
         if sequence < earliest {
             return None;
         }
@@ -421,6 +457,15 @@ impl CanonicalTerminal {
             start = index + 1;
         }
         self.process_parser_bytes(&bytes[start..], parser_sequence);
+    }
+
+    fn can_store_browser_checkpoint(&self) -> bool {
+        self.sequence == EscapeSequence::Ground
+            && self.pending.is_empty()
+            && self.utf8_expected == 0
+            && self.utf8_pending.is_empty()
+            && self.parser_utf8_expected == 0
+            && self.parser_utf8_pending.is_empty()
     }
 
     /// panoptes-vt100 0.16.2 underflows its one-row wrap source row before
@@ -1995,6 +2040,65 @@ mod tests {
         assert_eq!(
             sync.snapshot.unwrap().as_ref(),
             b"official-xterm-snapshot-new-output"
+        );
+    }
+
+    #[test]
+    fn browser_checkpoint_inside_escape_sequence_is_rejected() {
+        let mut state = TerminalOutputState::new(1024 * 1024, 4, 20);
+        state.publish(Bytes::from_static(b"shell history\r\n"));
+        state.publish(Bytes::from_static(b"\x1b"));
+        let unsafe_sequence = state.sequence;
+
+        assert!(!state.store_browser_checkpoint(
+            unsafe_sequence,
+            state.grid_epoch(),
+            Bytes::from_static(b"serialized-before-sequence-completed"),
+        ));
+
+        state.publish(Bytes::from_static(b"[?1049h\x1b[2J\x1b[Hlive screen"));
+        let snapshot = state.sync(None).snapshot.unwrap();
+        let mut reconstructed = vt100::Parser::new(4, 20, 20);
+        reconstructed.process(&snapshot);
+
+        assert!(reconstructed.screen().alternate_screen());
+        assert_screen_eq(reconstructed.screen(), state.terminal.parser.screen());
+    }
+
+    #[test]
+    fn browser_checkpoint_inside_utf8_scalar_is_rejected() {
+        let mut state = TerminalOutputState::new(1024 * 1024, 4, 20);
+        state.publish(Bytes::from_static(&[0xf0, 0x9f]));
+        let unsafe_sequence = state.sequence;
+        assert!(!state.store_browser_checkpoint(
+            unsafe_sequence,
+            state.grid_epoch(),
+            Bytes::from_static(b"serialized-mid-scalar"),
+        ));
+
+        state.publish(Bytes::from_static(&[0x90, 0x8d]));
+        assert!(state.store_browser_checkpoint(
+            state.sequence,
+            state.grid_epoch(),
+            Bytes::from_static(b"serialized-after-scalar"),
+        ));
+    }
+
+    #[test]
+    fn earlier_safe_checkpoint_remains_bridgeable_during_partial_sequence() {
+        let mut state = TerminalOutputState::new(1024 * 1024, 4, 20);
+        state.publish(Bytes::from_static(b"safe boundary"));
+        let safe_sequence = state.sequence;
+        state.publish(Bytes::from_static(b"\x1b"));
+
+        assert!(state.store_browser_checkpoint(
+            safe_sequence,
+            state.grid_epoch(),
+            Bytes::from_static(b"serialized-at-safe-boundary"),
+        ));
+        assert_eq!(
+            state.sync(None).snapshot.unwrap().as_ref(),
+            b"serialized-at-safe-boundary\x1b"
         );
     }
 
