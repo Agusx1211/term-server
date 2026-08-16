@@ -554,7 +554,14 @@ async function runRawCheckpoint(
   }, { id: terminalId, sequence, epoch, timeout: WAIT_TIMEOUT_MS });
 }
 
-function checkpointFramesSince(
+/**
+ * Matches the legacy JSON `{type:"checkpoint"}` frames that runRawCheckpoint
+ * deliberately sends over its own raw websocket (the server still accepts the
+ * old format). The live browser pane now uploads checkpoints as a
+ * `checkpointBinary` announcement plus binary frames, so it can never
+ * contribute matches here.
+ */
+function legacyCheckpointFramesSince(
   events: readonly NetworkFaultEvent[],
   terminalId: string,
   floor: number,
@@ -784,7 +791,7 @@ test("E-07 Oversized messages and resource bounds @nightly @resource-bounds @e",
     expect(checkpointOutcome.oversizedPongs).toBeGreaterThanOrEqual(1);
     expect(checkpointOutcome.errors.filter((error) => error.phase === "exact")).toEqual([]);
     expect(checkpointOutcome.errors.some((error) => error.phase === "oversized" && /replay limit|message limit/i.test(error.message))).toBe(true);
-    const checkpointFrames = checkpointFramesSince(faultController.events, created.id, checkpointFrameFloor);
+    const checkpointFrames = legacyCheckpointFramesSince(faultController.events, created.id, checkpointFrameFloor);
     expect(checkpointFrames.length).toBe(checkpointOutcome.exactChunks + checkpointOutcome.oversizedChunks);
     expect(checkpointFrames.every((event) => (event.bytes ?? 0) <= 64 * 1024)).toBe(true);
     const checkpointRecordingStatus = await recordingControl(page, "stop");

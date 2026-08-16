@@ -453,8 +453,13 @@ test("K-08 Checkpoint plus retained delta @p1 @nightly @checkpoint @delta @recov
   await pane.sendInput(`PRINT ${preId} ${preText}`, true);
   await server.waitForTranscript(terminalId, (entry) => entry.event === "print" && entry.id === preId && entry.text === preText, { timeoutMs: WAIT_TIMEOUT_MS });
   const preSnapshot = await waitForSettledMarker(page, terminalId, preMarker);
+  // The live browser uploads a checkpoint as one `checkpointBinary` JSON
+  // announcement followed by binary body frames whose nine-byte header carries
+  // kind byte 2 and the announced sequence, which the proxy decodes as
+  // `binaryKind` and `sequence`. Track the body-frame occurrence high-water
+  // mark so earlier uploads on this socket are not counted below.
   const checkpointFrameBaseline = faultController.events.reduce((maximum, event) => (
-    frameMatches(event, terminalId, preSnapshot.socketGeneration, "browser-to-server", undefined, "checkpoint")
+    frameMatches(event, terminalId, preSnapshot.socketGeneration, "browser-to-server", 2)
       ? Math.max(maximum, event.frame?.occurrence ?? 0)
       : maximum
   ), 0);
@@ -486,18 +491,23 @@ test("K-08 Checkpoint plus retained delta @p1 @nightly @checkpoint @delta @recov
   expect(checkpointEvent.snapshot.checkpointEpoch).toBe(checkpointEpoch);
   if (checkpointChunks === undefined || checkpointChunks <= 0) throw new Error("checkpoint did not report a positive chunk count");
 
-  const checkpointFrames: NetworkFaultEvent[] = [];
+  await faultController.waitFor((event) => (
+    frameMatches(event, terminalId, preSnapshot.socketGeneration, "browser-to-server", undefined, "checkpointBinary")
+    && event.frame?.sequence === checkpointSequence
+  ), { timeoutMs: WAIT_TIMEOUT_MS });
+  const checkpointBodyFrames: NetworkFaultEvent[] = [];
   let checkpointFrameOccurrence = checkpointFrameBaseline;
   for (let chunk = 0; chunk < checkpointChunks; chunk += 1) {
     const frame = await faultController.waitFor((event) => (
-      frameMatches(event, terminalId, preSnapshot.socketGeneration, "browser-to-server", undefined, "checkpoint")
+      frameMatches(event, terminalId, preSnapshot.socketGeneration, "browser-to-server", 2)
+      && event.frame?.sequence === checkpointSequence
       && (event.frame?.occurrence ?? 0) > checkpointFrameOccurrence
     ), { timeoutMs: WAIT_TIMEOUT_MS });
-    checkpointFrames.push(frame);
+    checkpointBodyFrames.push(frame);
     checkpointFrameOccurrence = frame.frame?.occurrence ?? checkpointFrameOccurrence;
   }
-  expect(checkpointFrames).toHaveLength(checkpointChunks);
-  expect(checkpointFrames.every((event) => event.frame?.jsonType === "checkpoint")).toBe(true);
+  expect(checkpointBodyFrames).toHaveLength(checkpointChunks);
+  expect(checkpointBodyFrames.every((event) => event.frame?.binaryKind === 2)).toBe(true);
 
   const pausedRule = faultController.pause("server-to-browser", {
     terminalId,

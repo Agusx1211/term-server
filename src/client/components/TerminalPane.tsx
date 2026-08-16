@@ -94,9 +94,12 @@ import {
 import {
   TERMINAL_CHECKPOINT_IDLE_MS,
   TERMINAL_CHECKPOINT_MAX_INTERVAL_MS,
+  TERMINAL_CHECKPOINT_STREAMING_SCROLLBACK_LINES,
   sendTerminalCheckpoint,
   serializeTerminalCheckpoint,
+  type TerminalCheckpointSerializeBudget,
 } from "../lib/terminal-checkpoint";
+import { throttleTerminalScrollbarHide } from "../lib/terminal-scrollbar-hide-throttle";
 import {
   terminalKittyKeyboardState,
   tuiCompatibilityOptions,
@@ -370,6 +373,7 @@ export function TerminalPane({
       }),
     );
     term.open(host);
+    throttleTerminalScrollbarHide(term);
     void loadTerminalNerdFont().then(() => {
       if (disposed) return;
       term.clearTextureAtlas();
@@ -680,10 +684,14 @@ export function TerminalPane({
     let suspendSocket: (() => void) | undefined;
     let terminalEpoch: number | undefined;
     let checkpointMaximumBytes = 0;
+    let checkpointBinary = false;
     let checkpointTimer: number | undefined;
     let checkpointWindowStartedAt = 0;
+    let checkpointDueAt = 0;
+    let lastCheckpointSignalAt = 0;
     let lastCheckpointSequence: number | undefined;
     let lastCheckpointEpoch: number | undefined;
+    const checkpointBudget: TerminalCheckpointSerializeBudget = {};
     const reportStreamIssue = (issue?: TerminalStreamIssue) => {
       const key = issue ? `${issue.kind}:${issue.pendingBytes ?? 0}` : "";
       if (key === reportedIssue) return;
@@ -857,18 +865,31 @@ export function TerminalPane({
       ) return;
       if (current.bufferedAmount > 1024 * 1024) {
         checkpointWindowStartedAt = Date.now();
-        checkpointTimer = window.setTimeout(writeCheckpoint, TERMINAL_CHECKPOINT_IDLE_MS);
+        checkpointDueAt = checkpointWindowStartedAt + TERMINAL_CHECKPOINT_IDLE_MS;
+        armCheckpointTimer(TERMINAL_CHECKPOINT_IDLE_MS);
         return;
       }
       if (sequence === lastCheckpointSequence && terminalEpoch === lastCheckpointEpoch) {
         checkpointWindowStartedAt = 0;
         return;
       }
+      // A checkpoint forced mid-burst by the maximum interval serializes a
+      // shallow scrollback slice: the full depth walks the buffer cell by cell
+      // for hundreds of milliseconds, and this fires exactly when the parser
+      // and renderer are busiest. The idle checkpoint that follows the burst
+      // restores full depth within TERMINAL_CHECKPOINT_IDLE_MS.
+      const streaming = Date.now() - lastCheckpointSignalAt < TERMINAL_CHECKPOINT_IDLE_MS;
       const serializationStartedAt = performance.now();
       const bytes = serializeTerminalCheckpoint(
         serialize,
         term,
         checkpointMaximumBytes,
+        {
+          maximumScrollbackLines: streaming
+            ? TERMINAL_CHECKPOINT_STREAMING_SCROLLBACK_LINES
+            : undefined,
+          budget: checkpointBudget,
+        },
       );
       const serializationDurationMs = performance.now() - serializationStartedAt;
       if (!bytes) {
@@ -886,7 +907,9 @@ export function TerminalPane({
       }
       try {
         const uploadStartedAt = performance.now();
-        const chunks = sendTerminalCheckpoint(current, sequence, terminalEpoch, bytes);
+        const chunks = sendTerminalCheckpoint(current, sequence, terminalEpoch, bytes, {
+          binary: checkpointBinary,
+        });
         diagnosticsHandle?.checkpointState({
           sequence,
           epoch: terminalEpoch,
@@ -912,16 +935,32 @@ export function TerminalPane({
       lastCheckpointSequence = sequence;
       lastCheckpointEpoch = terminalEpoch;
     };
+    const armCheckpointTimer = (delayMs: number) => {
+      checkpointTimer = window.setTimeout(fireCheckpointTimer, delayMs);
+    };
+    const fireCheckpointTimer = () => {
+      checkpointTimer = undefined;
+      // The deadline usually moved while the timer slept — every parsed chunk
+      // pushes it forward. Sleeping out the difference here costs one timer
+      // per idle period, where re-arming per chunk cost two timer calls per
+      // parsed websocket frame.
+      const remaining = checkpointDueAt - Date.now();
+      if (remaining > 0) {
+        armCheckpointTimer(remaining);
+        return;
+      }
+      writeCheckpoint();
+    };
     const scheduleCheckpoint = () => {
       if (checkpointMaximumBytes <= 0 || terminalEpoch === undefined || !acceptingInput) return;
       const now = Date.now();
+      lastCheckpointSignalAt = now;
       if (!checkpointWindowStartedAt) checkpointWindowStartedAt = now;
-      const dueAt = Math.min(
+      checkpointDueAt = Math.min(
         now + TERMINAL_CHECKPOINT_IDLE_MS,
         checkpointWindowStartedAt + TERMINAL_CHECKPOINT_MAX_INTERVAL_MS,
       );
-      clearCheckpointTimer();
-      checkpointTimer = window.setTimeout(writeCheckpoint, Math.max(0, dueAt - now));
+      if (checkpointTimer === undefined) armCheckpointTimer(Math.max(0, checkpointDueAt - now));
     };
     const writeTerminal = (
       data: Uint8Array,
@@ -1027,6 +1066,11 @@ export function TerminalPane({
       }
       const next = new WebSocket(url);
       const socketGeneration = diagnosticsHandle?.socketCreated(next, url.toString()) ?? 0;
+      // A reconnect can land on an older broker generation than the last
+      // socket. Binary checkpoints must stay off until THIS connection's ready
+      // message re-advertises them, because an older broker would feed the
+      // frames to the pty as input.
+      checkpointBinary = false;
       // The server tracks what it is owed per connection, so acknowledgements
       // belong to the socket the bytes arrived on and start over on reconnect.
       const outputAck = new TerminalOutputAck();
@@ -1189,6 +1233,7 @@ export function TerminalPane({
                 && checkpointBytes > 0
                 ? checkpointBytes
                 : 0;
+              checkpointBinary = message.binaryCheckpoint === true;
               onUpdate(message.terminal);
               diagnosticsHandle?.flowState({
                 controlled: flowControlled,

@@ -288,12 +288,12 @@ test("@p1 @checkpoint @checkpoint-max @streaming @nightly K-02 Continuous-output
   expect(firstInterval).toBeGreaterThanOrEqual(CHECKPOINT_MAX_INTERVAL_MS - CHECKPOINT_INTERVAL_TOLERANCE_MS);
   expect(firstInterval).toBeLessThanOrEqual(CHECKPOINT_MAX_INTERVAL_MS + CHECKPOINT_INTERVAL_TOLERANCE_MS);
 
-  const checkpointFramePromise = faultController.waitFor((event) => (
+  const checkpointAnnouncementPromise = faultController.waitFor((event) => (
     event.type === "frame"
     && event.terminalId === created.id
     && event.generation === initialGeneration
     && event.direction === "browser-to-server"
-    && event.frame?.jsonType === "checkpoint"
+    && event.frame?.jsonType === "checkpointBinary"
     && event.at >= firstCommit.timestamp
   ), { timeoutMs: EVENT_TIMEOUT_MS });
   const secondMax = await waitForEventAfter(page, created.id, firstMax.id, "checkpoint", firstMaxSequence + 1);
@@ -303,8 +303,8 @@ test("@p1 @checkpoint @checkpoint-max @streaming @nightly K-02 Continuous-output
   const secondInterval = secondMax.timestamp - firstMax.timestamp;
   expect(secondInterval).toBeGreaterThanOrEqual(CHECKPOINT_MAX_INTERVAL_MS - CHECKPOINT_INTERVAL_TOLERANCE_MS);
   expect(secondInterval).toBeLessThanOrEqual(CHECKPOINT_MAX_INTERVAL_MS + CHECKPOINT_INTERVAL_TOLERANCE_MS);
-  const firstCheckpointFrame = await checkpointFramePromise;
-  expect(firstCheckpointFrame.frame?.jsonType).toBe("checkpoint");
+  const firstCheckpointAnnouncement = await checkpointAnnouncementPromise;
+  expect(firstCheckpointAnnouncement.frame?.jsonType).toBe("checkpointBinary");
 
   const checkpointEvents = (await terminalEvents(page, created.id)).filter((event) => event.type === "checkpoint");
   expect(checkpointEvents.filter((event) => event.data.result === "sent").length).toBeGreaterThanOrEqual(3);
@@ -387,16 +387,18 @@ test("@p1 @checkpoint @checkpoint-max @streaming @nightly K-02 Continuous-output
   expect(transcript.filter((entry) => entry.event === "echo_input" && entry.id === echoId && entry.phase === "payload")).toHaveLength(1);
   expect(transcript.filter((entry) => entry.event === "error")).toHaveLength(0);
 
-  const checkpointFrames = faultController.events.filter((event) => (
+  // Checkpoint uploads are one `checkpointBinary` announcement followed by
+  // binary body frames (kind byte 2); only the body frames are chunks.
+  const checkpointBodyFrames = faultController.events.filter((event) => (
     event.type === "frame"
     && event.terminalId === created.id
     && event.generation === initialGeneration
     && event.direction === "browser-to-server"
-    && event.frame?.jsonType === "checkpoint"
+    && event.frame?.binaryKind === 2
   ));
   const firstChunks = eventNumber(firstMax, "chunks") ?? 0;
   const secondChunks = eventNumber(secondMax, "chunks") ?? 0;
-  expect(checkpointFrames.length).toBeGreaterThanOrEqual(firstChunks + secondChunks);
+  expect(checkpointBodyFrames.length).toBeGreaterThanOrEqual(firstChunks + secondChunks);
   expect(faultController.events.filter((event) => event.type === "malformed-frame" || event.type === "socket-error")).toHaveLength(0);
 
   const events = await terminalEvents(page, created.id);

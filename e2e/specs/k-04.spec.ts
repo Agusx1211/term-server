@@ -159,11 +159,18 @@ async function waitForHiddenOutput(
   }, { id: terminalId, minimum: minimumSequence, timeout: WAIT_TIMEOUT_MS });
 }
 
-function checkpointFrames(
+/**
+ * The live browser uploads a checkpoint as one `checkpointBinary` JSON
+ * announcement followed by binary body frames whose nine-byte header carries
+ * kind byte 2 and the announced sequence, which the proxy decodes as
+ * `binaryKind` and `sequence`.
+ */
+function checkpointAnnouncementFrames(
   events: readonly NetworkFaultEvent[],
   terminalId: string,
   generation: number,
   baseline: ReadonlySet<NetworkFaultEvent>,
+  sequence: number,
 ): NetworkFaultEvent[] {
   return events.filter((event) => (
     !baseline.has(event)
@@ -171,7 +178,26 @@ function checkpointFrames(
     && event.terminalId === terminalId
     && event.generation === generation
     && event.direction === "browser-to-server"
-    && event.frame?.jsonType === "checkpoint"
+    && event.frame?.jsonType === "checkpointBinary"
+    && event.frame.sequence === sequence
+  ));
+}
+
+function binaryCheckpointBodyFrames(
+  events: readonly NetworkFaultEvent[],
+  terminalId: string,
+  generation: number,
+  baseline: ReadonlySet<NetworkFaultEvent>,
+  sequence: number,
+): NetworkFaultEvent[] {
+  return events.filter((event) => (
+    !baseline.has(event)
+    && event.type === "frame"
+    && event.terminalId === terminalId
+    && event.generation === generation
+    && event.direction === "browser-to-server"
+    && event.frame?.binaryKind === 2
+    && event.frame.sequence === sequence
   ));
 }
 
@@ -438,8 +464,15 @@ test("@p1 @checkpoint @cache @nightly K-04 Hidden cached checkpoint policy", asy
     expect(checkpointEvents).toHaveLength(1);
     expect(checkpointEvents.every((event) => event.data.result === "sent")).toBe(true);
     expect(checkpointEvents.every((event) => event.snapshot.lifecycle.cached && !event.snapshot.lifecycle.visible)).toBe(true);
-    const frames = checkpointFrames(faultController.events, terminalId, initialSocketGeneration, baselineNetworkEvents);
     if (checkpointChunks === undefined) throw new Error("checkpoint event omitted serialized chunk count");
+    if (checkpointSequence === undefined) throw new Error("checkpoint event omitted its upload sequence");
+    await faultController.waitFor((event) => (
+      event.type === "frame"
+      && binaryCheckpointBodyFrames(faultController.events, terminalId, initialSocketGeneration, baselineNetworkEvents, checkpointSequence).length >= checkpointChunks
+    ), { timeoutMs: WAIT_TIMEOUT_MS });
+    const announcements = checkpointAnnouncementFrames(faultController.events, terminalId, initialSocketGeneration, baselineNetworkEvents, checkpointSequence);
+    expect(announcements).toHaveLength(1);
+    const frames = binaryCheckpointBodyFrames(faultController.events, terminalId, initialSocketGeneration, baselineNetworkEvents, checkpointSequence);
     expect(frames).toHaveLength(checkpointChunks);
     expect(frames.every((event) => (event.frame?.bytes ?? 0) > 0 && (event.frame?.bytes ?? 0) <= MAX_CHECKPOINT_FRAME_BYTES)).toBe(true);
     expect(frames.reduce((total, event) => total + (event.frame?.bytes ?? 0), 0)).toBeLessThanOrEqual((checkpointChunks ?? 0) * MAX_CHECKPOINT_FRAME_BYTES);

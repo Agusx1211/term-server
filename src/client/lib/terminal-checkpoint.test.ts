@@ -3,6 +3,8 @@ import { Terminal } from "@xterm/headless";
 import { describe, expect, it, vi } from "vitest";
 import {
   TERMINAL_CHECKPOINT_CHUNK_BYTES,
+  TERMINAL_CHECKPOINT_FRAME_HEADER_BYTES,
+  TERMINAL_CHECKPOINT_FRAME_KIND,
   sendTerminalCheckpoint,
   serializeTerminalCheckpoint,
 } from "./terminal-checkpoint";
@@ -180,6 +182,94 @@ describe("terminal xterm checkpoints", () => {
 
     terminal.dispose();
     restored.dispose();
+  });
+
+  it("caps scrollback depth for streaming checkpoints but keeps the live screen", async () => {
+    const terminal = new Terminal({
+      cols: 40,
+      rows: 5,
+      scrollback: 1_000,
+      allowProposedApi: true,
+    });
+    const serializer = new SerializeAddon();
+    terminal.loadAddon(serializer);
+    await write(terminal, Array.from({ length: 300 }, (_, line) => `line-${line}\r\n`).join(""));
+
+    const checkpoint = serializeTerminalCheckpoint(serializer, terminal, 1024 * 1024, {
+      maximumScrollbackLines: 50,
+    });
+    const text = new TextDecoder().decode(checkpoint);
+    expect(text).toContain("line-299");
+    expect(text).toContain("line-260");
+    expect(text).not.toContain("line-200\r");
+
+    terminal.dispose();
+  });
+
+  it("seeds the first serialization pass from the previous checkpoint's density", async () => {
+    const terminal = new Terminal({
+      cols: 80,
+      rows: 24,
+      scrollback: 5_000,
+      allowProposedApi: true,
+    });
+    const serializer = new SerializeAddon();
+    terminal.loadAddon(serializer);
+    const filler = "x".repeat(50);
+    for (let batch = 0; batch < 20; batch += 1) {
+      await write(terminal, Array.from(
+        { length: 100 },
+        (_, line) => `line-${batch * 100 + line} ${filler}\r\n`,
+      ).join(""));
+    }
+
+    const budget: { lineBytesEstimate?: number } = {};
+    const spy = vi.spyOn(serializer, "serialize");
+    const first = serializeTerminalCheckpoint(serializer, terminal, 16 * 1024, { budget });
+    expect(first).toBeDefined();
+    expect(spy.mock.calls.length).toBeGreaterThan(1);
+    expect(spy.mock.calls[0]?.[0]?.scrollback).toBeGreaterThan(1_000);
+    expect(budget.lineBytesEstimate).toBeGreaterThan(0);
+
+    spy.mockClear();
+    const second = serializeTerminalCheckpoint(serializer, terminal, 16 * 1024, { budget });
+    expect(second).toBeDefined();
+    expect(second!.byteLength).toBeLessThanOrEqual(16 * 1024);
+    expect(spy.mock.calls[0]?.[0]?.scrollback).toBeLessThan(600);
+
+    terminal.dispose();
+  });
+
+  it("sends binary checkpoints as one announcement plus headered ordered frames", () => {
+    const length = TERMINAL_CHECKPOINT_CHUNK_BYTES * 2 + 17;
+    const bytes = Uint8Array.from({ length }, (_, index) => index % 251);
+    const send = vi.fn();
+
+    const chunks = sendTerminalCheckpoint({ send }, 123, 7, bytes, { binary: true });
+
+    expect(chunks).toBe(3);
+    const [announcement, ...frames] = send.mock.calls.map(([message]) => message);
+    expect(JSON.parse(announcement as string)).toEqual({
+      type: "checkpointBinary",
+      sequence: 123,
+      epoch: 7,
+      size: length,
+    });
+    expect(frames).toHaveLength(3);
+    const restored = new Uint8Array(length);
+    let offset = 0;
+    for (const frame of frames as Uint8Array[]) {
+      expect(frame).toBeInstanceOf(Uint8Array);
+      expect(frame[0]).toBe(TERMINAL_CHECKPOINT_FRAME_KIND);
+      expect(new DataView(frame.buffer).getBigUint64(1)).toBe(123n);
+      const payload = frame.subarray(TERMINAL_CHECKPOINT_FRAME_HEADER_BYTES);
+      expect(payload.byteLength).toBeGreaterThan(0);
+      expect(payload.byteLength).toBeLessThanOrEqual(TERMINAL_CHECKPOINT_CHUNK_BYTES);
+      restored.set(payload, offset);
+      offset += payload.byteLength;
+    }
+    expect(offset).toBe(length);
+    expect(restored).toEqual(bytes);
   });
 
   it("chunks checkpoints at exact boundaries with ordered offsets below the websocket limit", () => {

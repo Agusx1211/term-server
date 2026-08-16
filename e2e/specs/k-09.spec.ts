@@ -188,6 +188,11 @@ async function waitForSnapshotSync(page: Page, terminalId: string): Promise<E2ET
   }, { id: terminalId, timeout: WAIT_TIMEOUT_MS });
 }
 
+// Binary checkpoint chunk frames carry kind byte 2 and the upload sequence in
+// their nine-byte header; the proxy decodes them as binaryKind and sequence.
+// The JSON `checkpointBinary` announcement that precedes them is not a chunk
+// and is deliberately excluded, so this count stays comparable to the
+// diagnostics chunk count.
 function checkpointFrameCount(
   events: readonly NetworkFaultEvent[],
   terminalId: string,
@@ -198,7 +203,7 @@ function checkpointFrameCount(
     && event.terminalId === terminalId
     && event.generation === generation
     && event.direction === "browser-to-server"
-    && event.frame?.jsonType === "checkpoint"
+    && event.frame?.binaryKind === 2
   )).length;
 }
 
@@ -379,7 +384,7 @@ test("K-09 Normal and alternate buffer checkpoint @p1 @nightly @checkpoint @alte
     && event.terminalId === terminalId
     && event.generation === initialProxyGeneration
     && event.direction === "browser-to-server"
-    && event.frame?.jsonType === "checkpoint"
+    && event.frame?.binaryKind === 2
     && checkpointFrameCount(faultController.events, terminalId, initialProxyGeneration)
       >= checkpointFramesBefore + checkpointData.chunks!
   ), { timeoutMs: WAIT_TIMEOUT_MS });
