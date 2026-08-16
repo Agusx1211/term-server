@@ -205,6 +205,12 @@ async function waitForCheckpointSent(
   }, { id: terminalId, after: afterEventId, minimum: minimumSequence, timeout: WAIT_TIMEOUT_MS });
 }
 
+// Binary checkpoint chunk frames carry kind byte 2 and the upload sequence in
+// their nine-byte header; the proxy decodes them as binaryKind and sequence
+// and keeps a per-connection occurrence counter for that key, so chunk
+// arithmetic works exactly as it did for the legacy JSON chunks. The JSON
+// `checkpointBinary` announcement that precedes them is not a chunk and is
+// deliberately excluded.
 function checkpointFrames(
   controller: NetworkFaultController,
   terminalId: string,
@@ -216,7 +222,7 @@ function checkpointFrames(
     && event.terminalId === terminalId
     && event.generation === generation
     && event.direction === "browser-to-server"
-    && event.frame?.jsonType === "checkpoint"
+    && event.frame?.binaryKind === 2
     && (event.frame.occurrence ?? 0) > afterOccurrence
   ));
 }
@@ -232,7 +238,7 @@ async function waitForCheckpointFrames(
     && event.terminalId === terminalId
     && event.generation === generation
     && event.direction === "browser-to-server"
-    && event.frame?.jsonType === "checkpoint"
+    && event.frame?.binaryKind === 2
     && (event.frame.occurrence ?? 0) >= minimumOccurrence
   ), { timeoutMs: WAIT_TIMEOUT_MS });
 }
@@ -432,6 +438,8 @@ function cursorCellDifference(
   return total === 0 ? 1 : changed / total;
 }
 
+// Highest per-connection occurrence of binary checkpoint chunk frames, used
+// as a floor so only chunks of the upload under test are counted.
 function checkpointFrameOccurrence(
   controller: NetworkFaultController,
   terminalId: string,
@@ -443,7 +451,7 @@ function checkpointFrameOccurrence(
       && event.terminalId === terminalId
       && event.generation === generation
       && event.direction === "browser-to-server"
-      && event.frame?.jsonType === "checkpoint"
+      && event.frame?.binaryKind === 2
     ) {
       return Math.max(maximum, event.frame.occurrence ?? 0);
     }

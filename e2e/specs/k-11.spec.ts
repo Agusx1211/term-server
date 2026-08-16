@@ -146,8 +146,11 @@ function checkpointFromRecording(event: DebugRecordingEvent): CheckpointMessage 
     readonly data?: unknown;
     readonly final?: unknown;
   };
+  // The proxy records legacy JSON chunks verbatim as "checkpoint" and
+  // reconstructs binary chunk frames as "checkpointBinaryChunk"; both carry
+  // the same fields.
   if (
-    message.type !== "checkpoint"
+    (message.type !== "checkpoint" && message.type !== "checkpointBinaryChunk")
     || typeof message.sequence !== "number"
     || typeof message.epoch !== "number"
     || typeof message.offset !== "number"
@@ -738,10 +741,15 @@ test("K-11 Unicode checkpoint @p1 @nightly @checkpoint @unicode", async ({ page,
     const networkEvents: readonly NetworkFaultEvent[] = faultController.events.filter((event) => event.terminalId === created.id);
     expect(networkEvents.filter((event) => event.type === "connection-open")).toHaveLength(2);
     expect(networkEvents.filter((event) => event.type === "connection-terminated" && event.generation === previousGeneration)).toHaveLength(1);
+    // Binary checkpoint chunk frames carry kind byte 2 and the upload
+    // sequence in their nine-byte header; the proxy decodes them as
+    // binaryKind and sequence. The JSON `checkpointBinary` announcement is
+    // not a chunk and is deliberately excluded from this count.
     const checkpointFrames = networkEvents.filter((event) => (
       event.type === "frame"
       && event.direction === "browser-to-server"
-      && event.frame?.jsonType === "checkpoint"
+      && event.frame?.binaryKind === 2
+      && event.frame.sequence === checkpointSequence
     ));
     expect(checkpointFrames.length).toBeGreaterThanOrEqual(checkpointChunks);
 

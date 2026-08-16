@@ -8,9 +8,19 @@ import {
 } from "./terminal-compatibility.js";
 
 export const TERMINAL_CHECKPOINT_CHUNK_BYTES = 32 * 1024;
+// Binary chunk frames mirror the server-to-browser frame header: one kind
+// byte and a big-endian u64 sequence. The header lets both the server and
+// protocol tooling attribute a raw chunk to its announced upload instead of
+// telling it apart from binary input by position alone.
+export const TERMINAL_CHECKPOINT_FRAME_KIND = 2;
+export const TERMINAL_CHECKPOINT_FRAME_HEADER_BYTES = 9;
 export const TERMINAL_CHECKPOINT_IDLE_MS = 750;
 export const TERMINAL_CHECKPOINT_MAX_INTERVAL_MS = 5_000;
+export const TERMINAL_CHECKPOINT_STREAMING_SCROLLBACK_LINES = 1_000;
 const MAX_CHECKPOINT_SCROLLBACK_LINES = 10_000;
+// Below this depth the fixed screen cost dominates the measurement, so the
+// bytes-per-line estimate would be too noisy to seed or record.
+const ESTIMATE_MINIMUM_SCROLLBACK_LINES = 64;
 const KITTY_KEYBOARD_STACK_LIMIT = 16;
 
 const encoder = new TextEncoder();
@@ -23,6 +33,26 @@ interface CheckpointTerminal {
 }
 
 /**
+ * Rolling density measurement carried between checkpoints of one terminal.
+ * The serializer updates it in place and uses it to size the next first pass.
+ */
+export interface TerminalCheckpointSerializeBudget {
+  lineBytesEstimate?: number;
+}
+
+export interface TerminalCheckpointSerializeOptions {
+  /**
+   * Caps how much scrollback the checkpoint carries. Forced checkpoints taken
+   * while output is still streaming pass a small cap here: serialization walks
+   * the buffer cell by cell on the main thread, and a full-depth pass blocks
+   * input and frames for hundreds of milliseconds exactly when the terminal
+   * is busiest. The next idle checkpoint restores full depth.
+   */
+  maximumScrollbackLines?: number;
+  budget?: TerminalCheckpointSerializeBudget;
+}
+
+/**
  * Serializes the browser's real xterm model, trimming only old scrollback until
  * it fits the broker-advertised bound. The live screen, modes, cursor, normal
  * buffer, and alternate buffer are always included by the serialize addon.
@@ -31,12 +61,29 @@ export function serializeTerminalCheckpoint(
   serializer: Pick<SerializeAddon, "serialize">,
   terminal: CheckpointTerminal,
   maximumBytes: number,
-): Uint8Array | undefined {
+  options?: TerminalCheckpointSerializeOptions,
+): Uint8Array<ArrayBuffer> | undefined {
   if (!Number.isSafeInteger(maximumBytes) || maximumBytes <= 0) return undefined;
-  let scrollback = Math.min(
+  const maximumLines = Math.min(
     MAX_CHECKPOINT_SCROLLBACK_LINES,
+    Math.max(0, Math.floor(options?.maximumScrollbackLines ?? MAX_CHECKPOINT_SCROLLBACK_LINES)),
+  );
+  let scrollback = Math.min(
+    maximumLines,
     Math.max(0, Math.floor(terminal.buffer.normal.baseY)),
   );
+
+  // Seed from the previous checkpoint's density so the first pass usually
+  // fits, instead of serializing the full depth just to measure it. The
+  // estimate includes the fixed screen cost, so it errs toward fewer lines;
+  // the overflow loop below still corrects any overshoot.
+  const estimate = options?.budget?.lineBytesEstimate;
+  if (estimate !== undefined && estimate > 0 && scrollback > ESTIMATE_MINIMUM_SCROLLBACK_LINES) {
+    scrollback = Math.min(
+      scrollback,
+      Math.max(ESTIMATE_MINIMUM_SCROLLBACK_LINES, Math.floor(maximumBytes / estimate)),
+    );
+  }
 
   for (;;) {
     const serialized = restorePrivateTerminalState(
@@ -44,6 +91,9 @@ export function serializeTerminalCheckpoint(
       terminal,
     );
     const bytes = encoder.encode(serialized);
+    if (options?.budget && scrollback >= ESTIMATE_MINIMUM_SCROLLBACK_LINES) {
+      options.budget.lineBytesEstimate = bytes.byteLength / scrollback;
+    }
     if (bytes.byteLength <= maximumBytes) return bytes.byteLength ? bytes : undefined;
     if (scrollback === 0) return undefined;
 
@@ -137,14 +187,49 @@ export interface TerminalCheckpointSendHooks {
   onChunk?: (offset: number, bytes: number, final: boolean) => void;
 }
 
-/** Sends an exact checkpoint as ordered sub-64-KiB JSON messages. */
+export interface TerminalCheckpointSendOptions {
+  /**
+   * Sends the checkpoint as raw binary frames behind a JSON announcement,
+   * skipping the base64 and JSON encoding of the legacy path. Only safe once
+   * the server advertised `binaryCheckpoint` in its ready message: an older
+   * broker reads client binary frames as terminal input.
+   */
+  binary?: boolean;
+  hooks?: TerminalCheckpointSendHooks;
+}
+
+/**
+ * Sends an exact checkpoint as ordered sub-64-KiB messages: base64 JSON
+ * chunks by default, or raw binary frames when the server supports them.
+ */
 export function sendTerminalCheckpoint(
   socket: Pick<WebSocket, "send">,
   sequence: number,
   epoch: number,
-  bytes: Uint8Array,
-  hooks?: TerminalCheckpointSendHooks,
+  bytes: Uint8Array<ArrayBuffer>,
+  options?: TerminalCheckpointSendOptions,
 ): number {
+  const hooks = options?.hooks;
+  if (options?.binary && bytes.byteLength > 0) {
+    socket.send(JSON.stringify({
+      type: "checkpointBinary",
+      sequence,
+      epoch,
+      size: bytes.byteLength,
+    } satisfies ClientTerminalMessage));
+    let chunks = 0;
+    for (let offset = 0; offset < bytes.byteLength; offset += TERMINAL_CHECKPOINT_CHUNK_BYTES) {
+      const end = Math.min(bytes.byteLength, offset + TERMINAL_CHECKPOINT_CHUNK_BYTES);
+      const frame = new Uint8Array(TERMINAL_CHECKPOINT_FRAME_HEADER_BYTES + end - offset);
+      frame[0] = TERMINAL_CHECKPOINT_FRAME_KIND;
+      new DataView(frame.buffer).setBigUint64(1, BigInt(sequence));
+      frame.set(bytes.subarray(offset, end), TERMINAL_CHECKPOINT_FRAME_HEADER_BYTES);
+      socket.send(frame);
+      chunks += 1;
+      hooks?.onChunk?.(offset, end - offset, end === bytes.byteLength);
+    }
+    return chunks;
+  }
   let chunks = 0;
   for (let offset = 0; offset < bytes.byteLength; offset += TERMINAL_CHECKPOINT_CHUNK_BYTES) {
     const end = Math.min(bytes.byteLength, offset + TERMINAL_CHECKPOINT_CHUNK_BYTES);

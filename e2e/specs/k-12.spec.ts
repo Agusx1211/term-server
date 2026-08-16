@@ -257,7 +257,14 @@ async function waitForSocketClose(page: Page, terminalId: string, generation: nu
   }, { id: terminalId, expectedGeneration: generation, timeout: WAIT_TIMEOUT_MS });
 }
 
-function checkpointFrames(
+/**
+ * The live browser uploads checkpoints as a `checkpointBinary` announcement
+ * followed by binary frames whose nine-byte header carries kind byte 2 and
+ * the announced sequence, which the proxy already decodes as `binaryKind`
+ * and `sequence`. The announcement is not a chunk, so only the binary body
+ * frames are counted against the diagnostics chunk count.
+ */
+function binaryCheckpointBodyFrames(
   events: readonly NetworkFaultEvent[],
   terminalId: string,
   generation: number,
@@ -268,12 +275,12 @@ function checkpointFrames(
     && event.terminalId === terminalId
     && event.generation === generation
     && event.direction === "browser-to-server"
-    && event.frame?.jsonType === "checkpoint"
+    && event.frame?.binaryKind === 2
     && event.frame.sequence === sequence
   ));
 }
 
-async function waitForCheckpointFrames(
+async function waitForCheckpointBodyFrames(
   faultController: NetworkFaultController,
   terminalId: string,
   generation: number,
@@ -282,7 +289,7 @@ async function waitForCheckpointFrames(
 ): Promise<void> {
   await faultController.waitFor((event) => (
     event.terminalId === terminalId
-    && checkpointFrames(faultController.events, terminalId, generation, sequence).length >= chunks
+    && binaryCheckpointBodyFrames(faultController.events, terminalId, generation, sequence).length >= chunks
   ), { timeoutMs: WAIT_TIMEOUT_MS });
 }
 
@@ -445,14 +452,14 @@ test("K-12 Checkpoint size trimming @nightly @p1 @checkpoint @trim", async ({
     expect(checkpoint.snapshot.checkpointResult).toBe("sent");
     expect(checkpoint.snapshot.pendingParserWrites).toBe(0);
     expect(checkpoint.snapshot.renderBacklogBytes).toBe(0);
-    await waitForCheckpointFrames(
+    await waitForCheckpointBodyFrames(
       faultController,
       created.id,
       checkpoint.snapshot.socketGeneration,
       checkpointSequence,
       checkpointChunks,
     );
-    const uploadedFrames = checkpointFrames(
+    const uploadedFrames = binaryCheckpointBodyFrames(
       faultController.events,
       created.id,
       checkpoint.snapshot.socketGeneration,
@@ -460,6 +467,15 @@ test("K-12 Checkpoint size trimming @nightly @p1 @checkpoint @trim", async ({
     );
     expect(uploadedFrames).toHaveLength(checkpointChunks);
     expect(uploadedFrames.every((event) => (event.frame?.bytes ?? 0) > 0)).toBe(true);
+    const proxiedAnnouncements = faultController.events.filter((event) => (
+      event.type === "frame"
+      && event.terminalId === created.id
+      && event.generation === checkpoint.snapshot.socketGeneration
+      && event.direction === "browser-to-server"
+      && event.frame?.jsonType === "checkpointBinary"
+      && event.frame.sequence === checkpointSequence
+    ));
+    expect(proxiedAnnouncements).toHaveLength(1);
 
     const originalEvents = await terminalEvents(page, created.id);
     await assertMonotonicSequences(originalEvents);

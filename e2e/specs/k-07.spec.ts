@@ -260,23 +260,36 @@ test("K-07 Resize invalidates checkpoint @nightly @p1 @checkpoint @epoch @resize
     ));
     expect(baselineCheckpointEvents).toHaveLength(1);
     const checkpointFrameCount = checkpointSnapshot.checkpointChunks;
+    // The live browser uploads a checkpoint as one `checkpointBinary` JSON
+    // announcement followed by binary body frames whose nine-byte header
+    // carries kind byte 2 and the announced sequence, which the proxy decodes
+    // as `binaryKind` and `sequence`.
+    const binaryCheckpointBodyFrames = () => faultController.events.filter((event) => (
+      event.type === "frame"
+      && event.terminalId === terminalId
+      && event.direction === "browser-to-server"
+      && event.generation === checkpointSnapshot.socketGeneration
+      && event.frame?.binaryKind === 2
+      && event.frame.sequence === checkpointSequence
+    ));
     await faultController.waitFor((event) => (
       event.type === "frame"
       && event.terminalId === terminalId
       && event.direction === "browser-to-server"
       && event.generation === checkpointSnapshot.socketGeneration
-      && event.frame?.jsonType === "checkpoint"
-      && (event.frame.occurrence ?? 0) >= checkpointFrameCount
+      && event.frame?.jsonType === "checkpointBinary"
+      && event.frame.sequence === checkpointSequence
     ), { timeoutMs: WAIT_TIMEOUT_MS });
-    const checkpointFrames = faultController.events.filter((event) => (
+    await faultController.waitFor((event) => (
       event.type === "frame"
       && event.terminalId === terminalId
       && event.direction === "browser-to-server"
-      && event.generation === checkpointSnapshot.socketGeneration
-      && event.frame?.jsonType === "checkpoint"
-    ));
-    expect(checkpointFrames.length).toBeGreaterThanOrEqual(checkpointFrameCount);
-    expect(checkpointFrames.at(-1)?.frame?.occurrence).toBeGreaterThanOrEqual(checkpointFrameCount);
+      && event.frame?.binaryKind === 2
+      && binaryCheckpointBodyFrames().length >= checkpointFrameCount
+    ), { timeoutMs: WAIT_TIMEOUT_MS });
+    const checkpointBodyFrames = binaryCheckpointBodyFrames();
+    expect(checkpointBodyFrames.length).toBeGreaterThanOrEqual(checkpointFrameCount);
+    expect(checkpointBodyFrames.at(-1)?.frame?.occurrence).toBeGreaterThanOrEqual(checkpointFrameCount);
     const initialTranscript = await server.readTranscript<TranscriptEntry>(terminalId);
     const initialWriteCount = initialTranscript.filter((entry) => entry.event === "write").length;
     const initialWinchCount = initialTranscript.filter((entry) => entry.event === "sigwinch" && entry.source === "signal").length;

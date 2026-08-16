@@ -269,87 +269,94 @@ function socketMatches(frame: WireFrame, terminalId: string): boolean {
   return frame.url.includes(`/api/terminals/${terminalId}/socket`);
 }
 
-function checkpointMessage(frame: WireFrame, terminalId: string): CheckpointWireMessage | undefined {
-  if (frame.direction !== "sent" || !socketMatches(frame, terminalId) || frame.json?.type !== "checkpoint") return undefined;
-  const sequence = numberField(frame.json, "sequence");
-  const epoch = numberField(frame.json, "epoch");
-  const offset = numberField(frame.json, "offset");
-  const data = frame.json.data;
-  const final = frame.json.final;
-  if (sequence === undefined || epoch === undefined || offset === undefined || typeof data !== "string" || typeof final !== "boolean") return undefined;
-  return { sequence, epoch, offset, data, final };
-}
-
-type CheckpointWireMessage = {
+type CheckpointAnnouncement = {
   readonly sequence: number;
   readonly epoch: number;
-  readonly offset: number;
-  readonly data: string;
-  readonly final: boolean;
+  readonly size: number;
 };
 
-function checkpointFrames(
+function checkpointAnnouncement(frame: WireFrame, terminalId: string): CheckpointAnnouncement | undefined {
+  if (frame.direction !== "sent" || !socketMatches(frame, terminalId) || frame.json?.type !== "checkpointBinary") return undefined;
+  const sequence = numberField(frame.json, "sequence");
+  const epoch = numberField(frame.json, "epoch");
+  const size = numberField(frame.json, "size");
+  if (sequence === undefined || epoch === undefined || size === undefined) return undefined;
+  return { sequence, epoch, size };
+}
+
+// Binary checkpoint chunks carry a nine-byte header: kind byte 2 and the
+// announced sequence as a big-endian u64, mirroring server-to-browser frames.
+const CHECKPOINT_FRAME_KIND = 2;
+const CHECKPOINT_FRAME_HEADER_BYTES = 9;
+
+function checkpointChunkPayload(frame: WireFrame, terminalId: string, sequence: number): Buffer | undefined {
+  if (frame.direction !== "sent" || !socketMatches(frame, terminalId)) return undefined;
+  if (typeof frame.payload === "string" || frame.payload.length <= CHECKPOINT_FRAME_HEADER_BYTES) return undefined;
+  if (frame.payload[0] !== CHECKPOINT_FRAME_KIND) return undefined;
+  if (frame.payload.readBigUInt64BE(1) !== BigInt(sequence)) return undefined;
+  return frame.payload.subarray(CHECKPOINT_FRAME_HEADER_BYTES);
+}
+
+function checkpointChunksAfter(
   capture: WireCapture,
   terminalId: string,
   sequence: number,
-  epoch: number,
-): Array<{ readonly frame: WireFrame; readonly message: CheckpointWireMessage }> {
-  return capture.frames.flatMap((frame) => {
-    const message = checkpointMessage(frame, terminalId);
-    return message?.sequence === sequence && message.epoch === epoch ? [{ frame, message }] : [];
-  });
+  announcementIndex: number,
+  expected: number,
+): Buffer[] {
+  const chunks: Buffer[] = [];
+  for (const frame of capture.frames.slice(announcementIndex + 1)) {
+    const payload = checkpointChunkPayload(frame, terminalId, sequence);
+    if (!payload) continue;
+    chunks.push(payload);
+    if (chunks.length === expected) break;
+  }
+  return chunks;
 }
 
-async function waitForCheckpointFrames(
+async function waitForCheckpointUpload(
   capture: WireCapture,
   terminalId: string,
   sequence: number,
   epoch: number,
   expected: number,
-): Promise<Array<{ readonly frame: WireFrame; readonly message: CheckpointWireMessage }>> {
-  await capture.waitFor((frame) => {
-    const message = checkpointMessage(frame, terminalId);
-    if (message?.sequence !== sequence || message.epoch !== epoch) return false;
-    return checkpointFrames(capture, terminalId, sequence, epoch).length >= expected;
+): Promise<{ readonly announcement: CheckpointAnnouncement; readonly announcementIndex: number; readonly chunks: Buffer[] }> {
+  const frame = await capture.waitFor((candidate) => {
+    const announcement = checkpointAnnouncement(candidate, terminalId);
+    return announcement?.sequence === sequence && announcement.epoch === epoch;
   });
-  const frames = checkpointFrames(capture, terminalId, sequence, epoch);
-  if (frames.length !== expected) throw new Error(`terminal ${terminalId} sent ${frames.length} checkpoint chunks for sequence ${sequence}; expected ${expected}`);
-  return frames;
+  const announcement = checkpointAnnouncement(frame, terminalId);
+  if (!announcement) throw new Error("checkpoint announcement frame lost its payload");
+  const announcementIndex = capture.frames.indexOf(frame);
+  await capture.waitFor(() => checkpointChunksAfter(capture, terminalId, sequence, announcementIndex, expected).length >= expected);
+  const chunks = checkpointChunksAfter(capture, terminalId, sequence, announcementIndex, expected);
+  if (chunks.length !== expected) throw new Error(`terminal ${terminalId} sent ${chunks.length} checkpoint chunks for sequence ${sequence}; expected ${expected}`);
+  return { announcement, announcementIndex, chunks };
 }
 
-function frameText(frame: WireFrame): string | undefined {
-  return typeof frame.payload === "string" ? frame.payload : undefined;
+function legacyCheckpointFrameCount(capture: WireCapture, terminalId: string): number {
+  return capture.frames.filter((frame) => (
+    frame.direction === "sent" && socketMatches(frame, terminalId) && frame.json?.type === "checkpoint"
+  )).length;
 }
 
 function latestCompleteCheckpointBytes(capture: WireCapture, terminalId: string, endExclusive = capture.frames.length): Buffer {
-  let sequence: number | undefined;
-  let epoch: number | undefined;
-  let nextOffset = 0;
-  let chunks: Buffer[] = [];
-  let latest: Buffer | undefined;
-  for (const frame of capture.frames.slice(0, endExclusive)) {
-    const message = checkpointMessage(frame, terminalId);
-    if (!message) continue;
-    if (message.offset === 0) {
-      sequence = message.sequence;
-      epoch = message.epoch;
-      nextOffset = 0;
-      chunks = [];
+  const frames = capture.frames.slice(0, endExclusive);
+  for (let index = frames.length - 1; index >= 0; index -= 1) {
+    const announcement = checkpointAnnouncement(frames[index]!, terminalId);
+    if (!announcement) continue;
+    const chunks: Buffer[] = [];
+    let received = 0;
+    for (const frame of frames.slice(index + 1)) {
+      const payload = checkpointChunkPayload(frame, terminalId, announcement.sequence);
+      if (!payload) continue;
+      chunks.push(payload);
+      received += payload.length;
+      if (received >= announcement.size) break;
     }
-    if (message.sequence !== sequence || message.epoch !== epoch || message.offset !== nextOffset) continue;
-    const bytes = Buffer.from(message.data, "base64");
-    chunks.push(bytes);
-    nextOffset += bytes.length;
-    if (message.final) {
-      latest = Buffer.concat(chunks);
-      sequence = undefined;
-      epoch = undefined;
-      nextOffset = 0;
-      chunks = [];
-    }
+    if (received === announcement.size) return Buffer.concat(chunks);
   }
-  if (!latest) throw new Error(`terminal ${terminalId} did not send a complete checkpoint`);
-  return latest;
+  throw new Error(`terminal ${terminalId} did not send a complete checkpoint`);
 }
 async function probeSnapshot(
   page: Page,
@@ -718,33 +725,22 @@ test("K-05 Checkpoint chunk boundaries @nightly @p1 @checkpoint @chunks @protoco
           testInfo,
           artifactName: `k-05-${key.toLowerCase()}-output-crop`,
         });
-        const chunks = await waitForCheckpointFrames(capture, terminalId, checkpointSequence, checkpointEpoch, expectedChunkCount);
-        const proxiedChunks = faultController.events.filter((event) => (
+        const upload = await waitForCheckpointUpload(capture, terminalId, checkpointSequence, checkpointEpoch, expectedChunkCount);
+        expect(upload.announcement.size).toBe(checkpointSize);
+        expect(legacyCheckpointFrameCount(capture, terminalId)).toBe(0);
+        const proxiedAnnouncements = faultController.events.filter((event) => (
           event.type === "frame"
           && event.terminalId === terminalId
           && event.direction === "browser-to-server"
-          && event.frame?.jsonType === "checkpoint"
+          && event.frame?.jsonType === "checkpointBinary"
           && event.frame?.sequence === checkpointSequence
         ));
-        expect(proxiedChunks).toHaveLength(expectedChunkCount);
-        for (const event of proxiedChunks) {
-          expect(event.bytes).toBeLessThanOrEqual(SOCKET_MESSAGE_LIMIT_BYTES);
+        expect(proxiedAnnouncements).toHaveLength(1);
+        for (const [chunkIndex, chunk] of upload.chunks.entries()) {
+          expect(chunk.length).toBe(chunkIndex < upload.chunks.length - 1 ? CHECKPOINT_CHUNK_BYTES : checkpointSize - chunkIndex * CHECKPOINT_CHUNK_BYTES);
+          expect(chunk.length).toBeLessThan(SOCKET_MESSAGE_LIMIT_BYTES);
         }
-        const decoded: Buffer[] = [];
-        for (const [chunkIndex, chunk] of chunks.entries()) {
-          const decodedChunk = Buffer.from(chunk.message.data, "base64");
-          decoded.push(decodedChunk);
-          expect(chunk.message.sequence).toBe(checkpointSequence);
-          expect(chunk.message.epoch).toBe(checkpointEpoch);
-          expect(chunk.message.offset).toBe(chunkIndex * CHECKPOINT_CHUNK_BYTES);
-          expect(decodedChunk.length).toBe(chunkIndex < chunks.length - 1 ? CHECKPOINT_CHUNK_BYTES : checkpointSize - chunkIndex * CHECKPOINT_CHUNK_BYTES);
-          expect(chunk.message.data.length).toBe(Math.ceil(decodedChunk.length / 3) * 4);
-          expect(chunk.message.final).toBe(chunkIndex === chunks.length - 1);
-          const raw = frameText(chunk.frame);
-          if (raw === undefined) throw new Error("checkpoint frame payload was not text JSON");
-          expect(Buffer.byteLength(raw, "utf8")).toBeLessThan(SOCKET_MESSAGE_LIMIT_BYTES);
-        }
-        const serializedBytes = Buffer.concat(decoded);
+        const serializedBytes = Buffer.concat(upload.chunks);
         expect(serializedBytes.length).toBe(checkpointSize);
         const pingFloor = capture.frames.length;
         const pingFrame = await capture.waitFor((frame) => (
