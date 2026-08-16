@@ -425,7 +425,13 @@ test("@p1 @pr @nightly @render @interaction @recovery R-08 Selection and search 
     await peerWorkbench.expectVisible();
     const peerPane = await peerWorkbench.openTerminal({ id: terminalId, name });
     await peerPane.expectVisible();
-    const peerInitial = await peerPane.waitForSynchronized({ timeout: WAIT_TIMEOUT_MS });
+    await peerPane.waitForSynchronized({ timeout: WAIT_TIMEOUT_MS });
+    const peerInitial = await expectTerminalConverged(
+      peerPage,
+      terminalId,
+      { cols: resized.cols, rows: resized.rows },
+      { timeout: WAIT_TIMEOUT_MS },
+    );
     expect(peerInitial.socketState).toBe("connected");
     expect(peerInitial.acceptingInput).toBe(true);
     expect(peerInitial.cols).toBe(resized.cols);
