@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.13.12 - 2026-08-16
+
+Terminal snapshot recovery no longer restores the wrong screen or leaves a
+pane stuck on old history after switching back to a dropped terminal.
+
+### Fixed
+
+- Browser checkpoints are accepted only at output positions where the
+  server's canonical VT parser has completed every escape and UTF-8 sequence.
+  A checkpoint could previously land between bytes of a control sequence;
+  recovery then restored that partial state and replayed only the suffix. An
+  alternate-screen terminal could consequently reopen in the normal buffer,
+  presenting old history while its current bottom was unreachable.
+- PTY reads and WebSocket output coalescing now share a 60 KiB frame boundary,
+  so checkpoint sequences correspond to complete server parser publishes.
+  Grid-changing resizes also invalidate prior checkpoint positions.
+- A deterministic browser regression checkpoints inside an alternate-screen
+  escape sequence, forces the real backlog disconnect and snapshot resync,
+  then verifies screen mode, bottom content, input, parser, socket, and
+  sequence invariants.
+
+### Upgrade notes
+
+- No breaking changes, data migrations, configuration changes, or wire
+  protocol changes. The release is safe for automatic installation over
+  `0.13.11`.
+- Existing terminals remain on the broker generation that created them. To
+  apply this server-side fix to terminals open during the upgrade, close and
+  recreate those terminals. Alternatively, **Settings > Updates > Restart all
+  session brokers** closes every open terminal; terminals created afterward
+  use `0.13.12`.
+
 ## 0.13.11 - 2026-08-16
 
 Focusing a tab no longer parks the terminal at a middle point of its history
