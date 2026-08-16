@@ -24,7 +24,10 @@ use crate::{
     ai::{PiRequest, PiService, PiTaskKind},
     artifacts,
     build::BuildIdentity,
-    terminal_state::{SequencedOutput, TerminalOutputState, TerminalResume, TerminalSync},
+    terminal_state::{
+        SequencedOutput, TERMINAL_OUTPUT_FRAME_BYTES, TerminalOutputState, TerminalResume,
+        TerminalSync,
+    },
 };
 
 // Neighboring buckets jump across the hue wheel and keep similar luminance across themes.
@@ -2796,7 +2799,7 @@ fn read_output_chunks<R: Read + ?Sized>(
     mut before_read: impl FnMut(),
     mut publish: impl FnMut(Bytes),
 ) {
-    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; TERMINAL_OUTPUT_FRAME_BYTES];
     loop {
         before_read();
         match reader.read(&mut buffer) {
@@ -3772,6 +3775,16 @@ mod tests {
         // the read instead would hand over a chunk the browser has no room for.
         assert_eq!(gates, 3);
         assert_eq!(output, b"first second");
+    }
+
+    #[test]
+    fn terminal_output_reader_keeps_publishes_within_a_frame() {
+        let mut reader = io::Cursor::new(vec![b'x'; TERMINAL_OUTPUT_FRAME_BYTES.saturating_add(1)]);
+        let mut chunk_sizes = Vec::new();
+
+        read_output_chunks(&mut reader, || {}, |bytes| chunk_sizes.push(bytes.len()));
+
+        assert_eq!(chunk_sizes, [TERMINAL_OUTPUT_FRAME_BYTES, 1]);
     }
 
     fn attached_flow() -> FlowControlState {

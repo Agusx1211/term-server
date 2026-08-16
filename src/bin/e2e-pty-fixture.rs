@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use uuid::Uuid;
 const TRANSCRIPT_VERSION: u64 = 1;
@@ -31,6 +31,7 @@ const MAX_GENERATED_BYTES: usize = 64 * 1024 * 1024;
 const MAX_LINE_WIDTH: usize = 64 * 1024;
 const MAX_INPUT_LINE_BYTES: usize = 256 * 1024;
 const MAX_QUERY_ESCAPE_BYTES: usize = 4 * 1024;
+const MAX_ESCAPE_DELAY_MS: u64 = 60_000;
 
 fn main() {
     let output = Arc::new(SharedOutput::new());
@@ -458,6 +459,12 @@ enum CommandKind {
         sequence: Vec<u8>,
         split: usize,
     },
+    EscapeDelay {
+        id: String,
+        sequence: Vec<u8>,
+        split: usize,
+        delay_ms: u64,
+    },
     Query(String),
     Bytes {
         id: String,
@@ -547,6 +554,7 @@ impl CommandKind {
             Self::Erase { .. } => "ERASE",
             Self::Utf8Split { .. } => "UTF8_SPLIT",
             Self::EscapeSplit { .. } => "ESCAPE_SPLIT",
+            Self::EscapeDelay { .. } => "ESCAPE_DELAY",
             Self::Query(_) => "QUERY",
             Self::Bytes { .. } => "BYTES",
             Self::QueryBytes { .. } => "QUERY_BYTES",
@@ -1023,6 +1031,38 @@ fn execute(
             output.write_chunk(&sequence[split..]);
             output.marker("ESCAPE_SPLIT", &[id]);
         }
+        CommandKind::EscapeDelay {
+            id,
+            sequence,
+            split,
+            delay_ms,
+        } => {
+            output.write_chunk(&sequence[..split]);
+            output.record(
+                "escape_delay",
+                json!({
+                    "id": id.clone(),
+                    "phase": "prefix",
+                    "split": split,
+                    "bytes": sequence.len(),
+                    "delay_ms": delay_ms,
+                    "sequence_base64": base64::engine::general_purpose::STANDARD.encode(&sequence),
+                }),
+            );
+            thread::sleep(Duration::from_millis(delay_ms));
+            output.write_chunk(&sequence[split..]);
+            output.record(
+                "escape_delay",
+                json!({
+                    "id": id.clone(),
+                    "phase": "complete",
+                    "split": split,
+                    "bytes": sequence.len(),
+                    "delay_ms": delay_ms,
+                }),
+            );
+            output.marker("ESCAPE_DELAY", &[id]);
+        }
         CommandKind::Query(id) => {
             if query.begin(id.clone()) {
                 let requests: [(&str, &[u8]); QUERY_COUNT] = [
@@ -1171,6 +1211,7 @@ fn parse_command(raw: &[u8]) -> Command {
         "ERASE" => parse_erase(rest),
         "UTF8_SPLIT" => parse_utf8_split(rest),
         "ESCAPE_SPLIT" => parse_escape_split(rest),
+        "ESCAPE_DELAY" => parse_escape_delay(rest),
         "QUERY" => one_id(rest).map(CommandKind::Query),
         "BYTES" => parse_bytes(rest),
         "QUERY_BYTES" => parse_query_bytes(rest),
@@ -1503,26 +1544,45 @@ fn parse_utf8_split(rest: &str) -> Result<CommandKind, String> {
     })
 }
 fn parse_escape_split(rest: &str) -> Result<CommandKind, String> {
-    let (prefix, split) = split_last_token(rest, "expected-id-sequence-split-byte")?;
+    let (id, sequence, split) = parse_escape_split_fields(rest, "expected-id-sequence-split-byte")?;
+    Ok(CommandKind::EscapeSplit {
+        id,
+        sequence,
+        split,
+    })
+}
+fn parse_escape_delay(rest: &str) -> Result<CommandKind, String> {
+    let reason = "expected-id-sequence-split-byte-delay-ms";
+    let (prefix, delay_ms) = split_last_token(rest, reason)?;
+    let delay_ms = parse_u64(delay_ms, "delay-ms")?;
+    if delay_ms == 0 || delay_ms > MAX_ESCAPE_DELAY_MS {
+        return Err("delay-ms-must-be-between-one-and-60000".to_owned());
+    }
+    let (id, sequence, split) = parse_escape_split_fields(prefix, reason)?;
+    Ok(CommandKind::EscapeDelay {
+        id,
+        sequence,
+        split,
+        delay_ms,
+    })
+}
+fn parse_escape_split_fields(rest: &str, reason: &str) -> Result<(String, Vec<u8>, usize), String> {
+    let (prefix, split) = split_last_token(rest, reason)?;
     let mut parts = prefix.splitn(2, |c: char| c.is_ascii_whitespace());
     let id = parts
         .next()
         .filter(|v| !v.is_empty())
-        .ok_or_else(|| "expected-id-sequence-split-byte".to_owned())?;
+        .ok_or_else(|| reason.to_owned())?;
     let sequence = parts
         .next()
-        .ok_or_else(|| "expected-id-sequence-split-byte".to_owned())?
+        .ok_or_else(|| reason.to_owned())?
         .trim_start_matches(|c: char| c.is_ascii_whitespace());
     let sequence = decode_escape_sequence(sequence)?;
     let split = parse_usize(split, "split-byte")?;
     if split == 0 || split >= sequence.len() {
         return Err("split-byte-must-be-inside-sequence".to_owned());
     }
-    Ok(CommandKind::EscapeSplit {
-        id: id.to_owned(),
-        sequence,
-        split,
-    })
+    Ok((id.to_owned(), sequence, split))
 }
 fn parse_echo(rest: &str) -> Result<CommandKind, String> {
     let mut parts = rest.splitn(2, |c: char| c.is_ascii_whitespace());
