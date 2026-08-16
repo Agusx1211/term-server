@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.13.11 - 2026-08-16
+
+Focusing a tab no longer parks the terminal at a middle point of its history
+while it slowly replays a snapshot. Terminal parsing is now paced by an event
+loop task rather than a DOM timer, so a throttled page can no longer starve
+the write pump.
+
+### Fixed
+
+- A pane that wasn't cached-mounted replays its full checkpoint snapshot on
+  focus, and xterm paced that replay one ~12ms slice per `setTimeout(0)` tick.
+  A page whose timers were throttled - a backgrounded tab, an occluded
+  window, an embedded webview, or a headless session, several of which still
+  report `document.visibilityState` as `"visible"` - only woke that timer a
+  few times per second, so a large snapshot took close to a minute to reach
+  its real bottom while the viewport followed the parse frontier (measured at
+  ~50s for a ~580KB replay under a ~4-5/s timer throttle). A reload looked
+  like the cure only because a freshly-loaded page isn't throttled yet.
+- The write pump's zero-delay scheduling is now routed through a MessagePort
+  instead of `setTimeout(0)`. Port messages are ordinary event-loop tasks, so
+  they keep firing at full speed in exactly the states that throttle DOM
+  timers; the same replay completes in seconds regardless of the throttle.
+  Pacing on a genuinely hidden page is unchanged, and the change degrades to
+  upstream behaviour if xterm's internals move.
+
+### Upgrade notes
+
+- No breaking changes, data migrations, or configuration changes. The release
+  is safe for automatic installation over `0.13.10`.
+
 ## 0.13.10 - 2026-08-16
 
 Sustained terminal output no longer stutters: recovery checkpoints stay off
