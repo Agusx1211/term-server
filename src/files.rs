@@ -14,6 +14,9 @@ use thiserror::Error;
 
 pub const MAX_EDIT_BYTES: u64 = 2 * 1024 * 1024;
 pub const MAX_REQUEST_BYTES: usize = 6 * 1024 * 1024;
+/// Ceiling for a single multipart file-upload request body. Generous so large
+/// files can be dropped without a round-trip through copyparty.
+pub const MAX_UPLOAD_BYTES: usize = 8 * 1024 * 1024 * 1024;
 const MAX_DIRECTORY_ENTRIES: usize = 1_000;
 const DEFAULT_SEARCH_RESULTS: usize = 100;
 const MAX_SEARCH_RESULTS: usize = 250;
@@ -32,6 +35,8 @@ pub enum FileError {
     NotAFile,
     #[error("path is not a directory")]
     NotADirectory,
+    #[error("file name is unsafe")]
+    UnsafeFileName,
     #[error("file exceeds the supported size limit")]
     TooLarge,
     #[error("file is binary or is not valid UTF-8")]
@@ -99,6 +104,15 @@ pub struct FileAsset {
     pub path: PathBuf,
     pub name: String,
     pub mime: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadedFile {
+    pub path: String,
+    pub name: String,
+    pub size: u64,
+    pub sha256: String,
 }
 
 fn home_directory() -> Result<PathBuf, FileError> {
@@ -394,6 +408,123 @@ pub fn save_document(
     read_document(path.to_string_lossy().as_ref(), None)
 }
 
+/// Resolves an upload destination directory (optionally relative to `cwd`),
+/// creating it (and any missing parents) on demand.
+pub fn resolve_upload_directory(raw: &str, cwd: Option<&str>) -> Result<PathBuf, FileError> {
+    let path = decode_input_path(raw)?;
+    let path = if path.is_absolute() {
+        path
+    } else {
+        let base = cwd
+            .map(decode_input_path)
+            .transpose()?
+            .unwrap_or(home_directory()?);
+        base.join(path)
+    };
+    if !path.is_dir() {
+        fs::create_dir_all(&path)?;
+    }
+    if !path.is_dir() {
+        return Err(FileError::NotADirectory);
+    }
+    Ok(path)
+}
+
+/// Rejects file names that would escape the upload directory (path separators,
+/// `.`/`..`, empty) or that are not valid UTF-8. Defense in depth: the returned
+/// name is also reduced to its basename.
+fn safe_file_name(raw: &str) -> Result<String, FileError> {
+    if raw.contains('/') || raw.contains('\\') || raw == "." || raw == ".." {
+        return Err(FileError::UnsafeFileName);
+    }
+    let name = Path::new(raw)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(FileError::InvalidEncoding)?;
+    if name.is_empty() || name == "." || name == ".." || name.contains('\0') {
+        return Err(FileError::UnsafeFileName);
+    }
+    Ok(name.to_owned())
+}
+
+/// Finds a non-colliding sibling path for `target`, appending ` (N)` before the
+/// extension when the name is already taken, so an upload never silently
+/// overwrites an existing file.
+fn unique_path(target: &Path) -> PathBuf {
+    if !target.exists() {
+        return target.to_owned();
+    }
+    let stem = target
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("file");
+    let extension = target.extension().and_then(|ext| ext.to_str());
+    let mut counter = 1;
+    loop {
+        let candidate = match extension {
+            Some(extension) => target.with_file_name(format!("{stem} ({counter}).{extension}")),
+            None => target.with_file_name(format!("{stem} ({counter})")),
+        };
+        if !candidate.exists() {
+            return candidate;
+        }
+        counter += 1;
+    }
+}
+
+/// An in-flight upload: bytes are streamed into a temporary file in the target
+/// directory, SHA-256 hashed as they arrive, then atomically persisted. The
+/// temporary file is cleaned up automatically if the upload never finishes.
+pub struct PendingUpload {
+    temporary: NamedTempFile,
+    hasher: Sha256,
+    target: PathBuf,
+    name: String,
+    written: u64,
+}
+
+impl PendingUpload {
+    pub fn start(directory: &Path, raw_name: &str) -> Result<Self, FileError> {
+        let name = safe_file_name(raw_name)?;
+        let target = unique_path(&directory.join(&name));
+        let stored_name = target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&name)
+            .to_owned();
+        let temporary = NamedTempFile::new_in(directory)?;
+        Ok(Self {
+            temporary,
+            hasher: Sha256::new(),
+            target,
+            name: stored_name,
+            written: 0,
+        })
+    }
+
+    pub fn write(&mut self, bytes: &[u8]) -> Result<(), FileError> {
+        self.temporary.write_all(bytes)?;
+        self.hasher.update(bytes);
+        self.written += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// Flushes and atomically renames the temporary file into place.
+    pub fn finish(self) -> Result<UploadedFile, FileError> {
+        self.temporary.as_file().sync_all()?;
+        let digest = format!("{:x}", self.hasher.finalize());
+        self.temporary
+            .persist(&self.target)
+            .map_err(|error| FileError::Io(error.error))?;
+        Ok(UploadedFile {
+            path: self.target.to_string_lossy().into_owned(),
+            name: self.name,
+            size: self.written,
+            sha256: digest,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,5 +598,78 @@ mod tests {
             preview_asset(path.to_str().unwrap(), None).unwrap().mime,
             "application/pdf"
         );
+    }
+
+    #[test]
+    fn resolves_and_creates_upload_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("a/b/c");
+        let resolved = resolve_upload_directory(nested.to_str().unwrap(), None).unwrap();
+        assert_eq!(resolved, nested.canonicalize().unwrap());
+        assert!(nested.is_dir());
+    }
+
+    #[test]
+    fn upload_writes_atomically_and_reports_a_hash() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut pending = PendingUpload::start(directory.path(), "hello.txt").unwrap();
+        pending.write(b"hello ").unwrap();
+        pending.write(b"world").unwrap();
+        let uploaded = pending.finish().unwrap();
+
+        let target = directory.path().join("hello.txt");
+        assert_eq!(fs::read(&target).unwrap(), b"hello world");
+        assert_eq!(uploaded.size, 11);
+        assert_eq!(uploaded.sha256, version(b"hello world"));
+        assert_eq!(uploaded.path, target.to_string_lossy());
+    }
+
+    #[test]
+    fn upload_never_overwrites_an_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("note.txt"), "original").unwrap();
+
+        let mut first = PendingUpload::start(directory.path(), "note.txt").unwrap();
+        first.write(b"new").unwrap();
+        let first_result = first.finish().unwrap();
+        assert!(first_result.path.ends_with("note (1).txt"));
+
+        let mut second = PendingUpload::start(directory.path(), "note.txt").unwrap();
+        second.write(b"newer").unwrap();
+        let second_result = second.finish().unwrap();
+        assert!(second_result.path.ends_with("note (2).txt"));
+
+        assert_eq!(
+            fs::read(directory.path().join("note.txt")).unwrap(),
+            b"original"
+        );
+        assert_eq!(
+            fs::read(directory.path().join("note (1).txt")).unwrap(),
+            b"new"
+        );
+        assert_eq!(
+            fs::read(directory.path().join("note (2).txt")).unwrap(),
+            b"newer"
+        );
+    }
+
+    #[test]
+    fn upload_rejects_unsafe_file_names() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            PendingUpload::start(directory.path(), "../escape.txt"),
+            Err(FileError::UnsafeFileName)
+        ));
+        assert!(matches!(
+            PendingUpload::start(directory.path(), "a/b/c.txt"),
+            Err(FileError::UnsafeFileName)
+        ));
+        assert!(matches!(
+            PendingUpload::start(directory.path(), ".."),
+            Err(FileError::UnsafeFileName)
+        ));
+        // Nothing escapes the upload directory.
+        assert!(!directory.path().join("escape.txt").exists());
+        assert!(!directory.path().join("c.txt").exists());
     }
 }

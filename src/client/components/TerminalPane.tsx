@@ -23,6 +23,7 @@ import {
   TerminalSquare,
   TriangleAlert,
   Trash2,
+  Upload,
   WifiOff,
   X,
   ZoomIn,
@@ -154,6 +155,17 @@ interface TerminalPaneProps {
   onOpenFile: (target: FileTarget) => void;
   onOpenArtifact: (artifact: ArtifactEntry) => void;
   onDeleteArtifact: (artifact: ArtifactEntry) => Promise<void>;
+  onUploadFiles: (files: File[]) => void;
+  /** A request from the app to inject text (e.g. an uploaded file path) into
+   * this terminal, matched by terminal id. */
+  pasteRequest?: PasteRequest | null;
+  onPasteHandled?: (id: string) => void;
+}
+
+export interface PasteRequest {
+  id: string;
+  text: string;
+  nonce: number;
 }
 const TERMINAL_PROTOCOL_MISMATCH_MESSAGE = "terminal client is out of date; reload the page";
 // How long a foreground pane may hold outstanding writes with no parse
@@ -222,14 +234,19 @@ export function TerminalPane({
   onOpenFile,
   onOpenArtifact,
   onDeleteArtifact,
+  onUploadFiles,
+  pasteRequest,
+  onPasteHandled,
 }: TerminalPaneProps) {
   const container = useRef<HTMLDivElement>(null);
   const pane = useRef<HTMLElement>(null);
   const mobileActions = useRef<HTMLDivElement>(null);
+  const uploadInput = useRef<HTMLInputElement>(null);
   const xterm = useRef<XTerm>();
   const searchAddon = useRef<SearchAddon>();
   const searchInput = useRef<HTMLInputElement>(null);
   const socket = useRef<WebSocket>();
+  const pasteText = useRef<(text: string) => void>(() => {});
   const exited = useRef(terminal.status === "exited");
   const reconnectTimer = useRef<number>();
   const reportTerminalViewport = useRef<() => void>();
@@ -283,6 +300,20 @@ export function TerminalPane({
     handle.record("visibility", { visible });
     handle.record("active", { active });
   }, [active, visible, connection]);
+
+  // Inject externally requested text (e.g. an uploaded file path) into the
+  // terminal once per request, keyed by terminal id so only the addressed pane
+  // reacts. The request nonce (not the object identity, which the app clears
+  // asynchronously, nor the callback identity, which changes every render) is
+  // the trigger, so unrelated re-renders never re-paste.
+  const onPasteHandledRef = useRef(onPasteHandled);
+  onPasteHandledRef.current = onPasteHandled;
+  useEffect(() => {
+    if (pasteRequest && pasteRequest.id === terminal.id) {
+      pasteText.current(pasteRequest.text);
+      onPasteHandledRef.current?.(pasteRequest.id);
+    }
+  }, [pasteRequest?.nonce, terminal.id]);
 
   useEffect(() => {
     const discovered = artifacts.some((artifact) => !knownArtifactIds.current.has(artifact.id));
@@ -633,6 +664,7 @@ export function TerminalPane({
         sendTerminalChunks(current, encodeTerminalText(data));
       }
     };
+    pasteText.current = sendTextInput;
     const sendBinaryInput = (data: string) => {
       if (isDebugRecordingActive()) {
         recordDebugEvent(terminal.id, { type: "input", data: encodeTextBase64(data) });
@@ -1906,7 +1938,28 @@ export function TerminalPane({
           </span>
         )}
         <span class="pane-spacer" />
+        <input
+          ref={uploadInput}
+          type="file"
+          multiple
+          class="pane-upload-input"
+          aria-hidden="true"
+          tabIndex={-1}
+          onChange={(event) => {
+            const files = Array.from(event.currentTarget.files ?? []);
+            if (files.length) onUploadFiles(files);
+            event.currentTarget.value = "";
+          }}
+        />
         <span class="desktop-pane-actions">
+          <button
+            class="pane-action"
+            onClick={() => uploadInput.current?.click()}
+            aria-label="Upload files into this directory"
+            title="Upload files into this directory"
+          >
+            <Upload size={14} />
+          </button>
           <button
             class={`pane-action ${terminalSize.controller ? "active" : ""}`}
             onClick={toggleSizeFocus}
@@ -1958,6 +2011,9 @@ export function TerminalPane({
               </button>
               <button role="menuitem" onClick={() => { setActionsOpen(false); void copy(); }}>
                 <ClipboardCopy size={16} /> Copy selection
+              </button>
+              <button role="menuitem" onClick={() => { setActionsOpen(false); uploadInput.current?.click(); }}>
+                <Upload size={16} /> Upload files
               </button>
               <button role="menuitem" onClick={() => { setActionsOpen(false); void paste(); }}>
                 <ClipboardPaste size={16} /> Paste
