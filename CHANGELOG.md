@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.13.13 - 2026-08-17
+
+Dropped terminals now resume at their live bottom instead of reopening on old
+history and waiting for the server's flow-control watchdog.
+
+### Fixed
+
+- Snapshot reconnects atomically retire flow-control debt for output already
+  incorporated into the snapshot. Output emitted between connection attach and
+  snapshot publication was previously charged against the PTY, but omitted
+  from the subsequent live stream. The browser had no output sequence it could
+  acknowledge to release that debt, so the PTY remained parked and the pane
+  appeared stuck on recovered history.
+- Snapshot creation and output publication now share one synchronization
+  boundary. Observer snapshots remain excluded from client flow accounting,
+  while resume-mode clients continue to acknowledge replayed output normally.
+- A deterministic browser regression exercises the released failure with an
+  alternate-screen terminal, two clients, backpressure, disconnect, resize,
+  delayed snapshot delivery, input, and live-tail convergence.
+
+### Upgrade notes
+
+- No breaking changes, data migrations, configuration changes, or wire
+  protocol changes. The release is safe for automatic installation over
+  `0.13.12`.
+- Existing terminals remain on the broker generation that created them. To
+  apply this server-side fix to terminals open during the upgrade, close and
+  recreate those terminals. Alternatively, **Settings > Updates > Restart all
+  session brokers** closes every open terminal; terminals created afterward
+  use `0.13.13`.
+
 ## 0.13.12 - 2026-08-16
 
 Terminal snapshot recovery no longer restores the wrong screen or leaves a
