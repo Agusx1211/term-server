@@ -639,9 +639,18 @@ mod tests {
         let second_result = second.finish().unwrap();
         assert!(second_result.path.ends_with("note (2).txt"));
 
-        assert_eq!(fs::read(directory.path().join("note.txt")).unwrap(), b"original");
-        assert_eq!(fs::read(directory.path().join("note (1).txt")).unwrap(), b"new");
-        assert_eq!(fs::read(directory.path().join("note (2).txt")).unwrap(), b"newer");
+        assert_eq!(
+            fs::read(directory.path().join("note.txt")).unwrap(),
+            b"original"
+        );
+        assert_eq!(
+            fs::read(directory.path().join("note (1).txt")).unwrap(),
+            b"new"
+        );
+        assert_eq!(
+            fs::read(directory.path().join("note (2).txt")).unwrap(),
+            b"newer"
+        );
     }
 
     #[test]

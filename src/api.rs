@@ -11,7 +11,9 @@ use std::{
 use axum::{
     Json, Router,
     body::Body,
-    extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, Query, Request, State, ws::WebSocketUpgrade},
+    extract::{
+        ConnectInfo, DefaultBodyLimit, Multipart, Path, Query, Request, State, ws::WebSocketUpgrade,
+    },
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header, uri::Authority},
     response::{IntoResponse, Response},
     routing::{any, delete, get, get_service, patch, post},
@@ -1286,14 +1288,13 @@ async fn upload_files(
             continue;
         };
         let directory = directory.clone();
-        let mut pending = tokio::task::spawn_blocking(move || {
-            files::PendingUpload::start(&directory, &name)
-        })
-        .await
-        .map_err(|error| {
-            tracing::error!(%error, "upload start task failed");
-            ApiError::Internal
-        })??;
+        let mut pending =
+            tokio::task::spawn_blocking(move || files::PendingUpload::start(&directory, &name))
+                .await
+                .map_err(|error| {
+                    tracing::error!(%error, "upload start task failed");
+                    ApiError::Internal
+                })??;
         loop {
             let chunk = field.chunk().await.map_err(|error| {
                 tracing::warn!(%error, "upload chunk read failed");
