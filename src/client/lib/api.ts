@@ -20,6 +20,7 @@ import type {
   FileSearchResults,
   FileTarget,
   SaveFileRequest,
+  UploadedFile,
   SessionBrokerInfo,
   StatusModulesResponse,
   StatusModulesSettings,
@@ -153,6 +154,23 @@ export const api = {
   readFile: (target: FileTarget) => request<FileDocument>(`/api/files/content?${fileQuery(target)}`),
   saveFile: (file: SaveFileRequest) =>
     request<FileDocument>("/api/files/content", { method: "PUT", body: JSON.stringify(file) }),
+  // Multipart upload; the browser sets the `multipart/form-data` boundary, so
+  // this bypasses the JSON helper rather than letting it set the content type.
+  uploadFiles: async (target: FileTarget, files: File[]): Promise<UploadedFile[]> => {
+    const form = new FormData();
+    for (const file of files) form.append("files", file, file.name);
+    const response = await fetch(`/api/files/upload?${fileQuery(target)}`, {
+      method: "POST",
+      body: form,
+      cache: "no-store",
+    });
+    if (!response.ok) {
+      const body = (await response.json().catch(() => null)) as { error?: string } | null;
+      throw new ApiError(body?.error ?? `Upload failed (${response.status})`, response.status);
+    }
+    if (response.status === 204) return [];
+    return response.json() as Promise<UploadedFile[]>;
+  },
   previewFileUrl: (target: FileTarget) => `/api/files/raw?${fileQuery(target)}`,
   downloadFileUrl: (target: FileTarget) => `/api/files/download?${fileQuery(target)}`,
   debugRecording: () => request<DebugRecordingStatus>("/api/debug/recording"),

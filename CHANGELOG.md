@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.14.0 - 2026-08-17
+
+Files can now be dropped straight into a terminal session instead of being
+shuttled through a separate file server. Uploads are streamed into a temp
+file, SHA-256 hashed as they arrive, and atomically renamed into place, so a
+failed or interrupted upload never leaves a half-written file behind and a
+drop never overwrites an existing file (a name collision gets a ` (N)`
+suffix).
+
+### Added
+
+- **Drag & drop upload.** Dragging any file over the app splits the screen
+  into a 2×2 quadrant guide (like copyparty) with an emoji per quadrant and a
+  hover highlight. The top row uploads into the active terminal's working
+  directory; the bottom row uploads into `/tmp/temp-server/files`; the left
+  column also pastes the uploaded path into the terminal (shell-quoted when it
+  contains metacharacters); the right column uploads without touching the
+  terminal (toast only). The whole surface is covered — no dead zone.
+- **Upload button.** Each terminal's toolbar (and the mobile action menu) has
+  an upload button that opens a file picker and uploads the chosen files into
+  that terminal's directory.
+- **Upload endpoint.** `POST /api/files/upload` accepts multipart uploads with
+  a generous body limit independent of the JSON request limit, auto-creates
+  the destination directory, and rejects unsafe file names (path separators,
+  `..`).
+
+### Upgrade notes
+
+- No breaking changes, data migrations, or configuration changes. The new
+  upload endpoint is additive; existing file endpoints are unchanged. The
+  release is safe for automatic installation over `0.13.13`.
+- Reload open pages to pick up the client-side drag-and-drop UI.
+
 ## 0.13.13 - 2026-08-17
 
 Dropped terminals now resume at their live bottom instead of reopening on old

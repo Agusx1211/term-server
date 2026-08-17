@@ -1,6 +1,6 @@
 {
   "name": "term-server",
-  "version": "0.13.13",
+  "version": "0.14.0",
   "description": "A fast, secure, Rust-powered web terminal workspace.",
   "type": "module",
   "private": true,

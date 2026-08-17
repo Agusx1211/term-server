@@ -313,6 +313,13 @@ export interface SaveFileRequest extends FileTarget {
   version: string;
 }
 
+export interface UploadedFile {
+  path: string;
+  name: string;
+  size: number;
+  sha256: string;
+}
+
 export interface DebugRecordingStatus {
   active: boolean;
   id: string | null;

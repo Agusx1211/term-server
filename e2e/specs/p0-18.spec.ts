@@ -244,7 +244,12 @@ async function assertSizeRole(
   pane: TerminalPanePage,
   role: "controller" | "focused" | "smallest",
 ): Promise<void> {
-  const sizeButton = pane.root.locator(".desktop-pane-actions").getByRole("button").first();
+  const sizeButton = pane.root
+    .locator(".desktop-pane-actions")
+    .getByRole("button", {
+      name: /Focus this terminal at this device's size|Use this device's size instead|Return to the smallest connected terminal size/,
+      exact: true,
+    });
   const expectedLabel = role === "controller"
     ? "Return to the smallest connected terminal size"
     : role === "focused"
