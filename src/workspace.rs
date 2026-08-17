@@ -46,6 +46,56 @@ const TERMINAL_CHECKPOINT_FRAME_KIND: u8 = 2;
 const TERMINAL_CHECKPOINT_FRAME_HEADER_BYTES: usize = 9;
 const TERMINAL_CLIENT_LEASE: Duration = Duration::from_secs(90);
 const TERMINAL_LEASE_CHECK_INTERVAL: Duration = Duration::from_secs(15);
+#[cfg(feature = "e2e")]
+const E2E_FLOW_BLOCK_WAIT_ENV: &str = "TERM_SERVER_E2E_FLOW_BLOCK_WAIT_MS";
+#[cfg(feature = "e2e")]
+const E2E_CLIENT_DRAIN_WAIT_ENV: &str = "TERM_SERVER_E2E_CLIENT_DRAIN_WAIT_MS";
+#[cfg(feature = "e2e")]
+const E2E_FLOW_BLOCK_BARRIER_IDLE: u8 = 0;
+#[cfg(feature = "e2e")]
+const E2E_FLOW_BLOCK_BARRIER_CLAIMED: u8 = 1;
+#[cfg(feature = "e2e")]
+const E2E_FLOW_BLOCK_BARRIER_COMPLETE: u8 = 2;
+#[cfg(feature = "e2e")]
+static E2E_FLOW_BLOCK_BARRIER_STATE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(E2E_FLOW_BLOCK_BARRIER_IDLE);
+
+#[cfg(feature = "e2e")]
+fn e2e_wait_duration(variable: &str) -> Option<Duration> {
+    std::env::var(variable)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|milliseconds| *milliseconds <= 10_000)
+        .map(Duration::from_millis)
+}
+
+#[cfg(feature = "e2e")]
+async fn e2e_wait_for_flow_blocked(terminal: &TerminalSession, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if terminal.e2e_flow_blocked() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[cfg(feature = "e2e")]
+async fn e2e_wait_for_no_clients(terminal: &TerminalSession, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if terminal.e2e_client_count() == 0 {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -544,21 +594,79 @@ pub(crate) async fn serve_terminal_socket(
             },
         );
     }
+    #[cfg(feature = "e2e")]
+    let e2e_flow_block_timeout = if observer || requested.is_none() {
+        None
+    } else {
+        e2e_wait_duration(E2E_FLOW_BLOCK_WAIT_ENV)
+    };
+    #[cfg(feature = "e2e")]
+    let e2e_flow_block_barrier = e2e_flow_block_timeout.is_some()
+        && E2E_FLOW_BLOCK_BARRIER_STATE
+            .compare_exchange(
+                E2E_FLOW_BLOCK_BARRIER_IDLE,
+                E2E_FLOW_BLOCK_BARRIER_CLAIMED,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok();
+    #[cfg(feature = "e2e")]
+    if e2e_flow_block_timeout.is_some()
+        && !e2e_flow_block_barrier
+        && E2E_FLOW_BLOCK_BARRIER_STATE.load(std::sync::atomic::Ordering::Relaxed)
+            == E2E_FLOW_BLOCK_BARRIER_CLAIMED
+    {
+        return;
+    }
     let _attachment = if observer {
         None
     } else {
+        #[cfg(feature = "e2e")]
+        if e2e_flow_block_barrier
+            && let Some(timeout) = e2e_wait_duration(E2E_CLIENT_DRAIN_WAIT_ENV)
+            && !e2e_wait_for_no_clients(&terminal, timeout).await
+        {
+            E2E_FLOW_BLOCK_BARRIER_STATE.store(
+                E2E_FLOW_BLOCK_BARRIER_IDLE,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            tracing::error!("timed out waiting for the previous E2E terminal client");
+            return;
+        }
         if let Err(error) = terminal.attach(client_id, initial_size) {
             terminal.detach(client_id);
             tracing::debug!(%error, "initial terminal resize failed");
+            #[cfg(feature = "e2e")]
+            if e2e_flow_block_barrier {
+                E2E_FLOW_BLOCK_BARRIER_STATE.store(
+                    E2E_FLOW_BLOCK_BARRIER_IDLE,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
             return;
         }
         // Only real clients gate the pty. A preview pane observes whatever the
         // terminal produces and is never allowed to slow it down.
         terminal.flow_attach();
-        Some(Attachment {
+        let attachment = Attachment {
             terminal: terminal.clone(),
             client_id,
-        })
+        };
+        // Hold a resumed connection at the production race boundary until its
+        // pre-snapshot output has actually parked flow control.
+        #[cfg(feature = "e2e")]
+        if e2e_flow_block_barrier {
+            let timeout = e2e_flow_block_timeout.expect("claimed E2E flow barrier has a timeout");
+            if !e2e_wait_for_flow_blocked(&terminal, timeout).await {
+                E2E_FLOW_BLOCK_BARRIER_STATE.store(
+                    E2E_FLOW_BLOCK_BARRIER_IDLE,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                tracing::error!("timed out waiting for E2E terminal flow debt");
+                return;
+            }
+        }
+        Some(attachment)
     };
     let ready = serde_json::to_string(&TerminalServerMessage::Ready {
         terminal: Box::new(terminal.info()),
@@ -572,14 +680,42 @@ pub(crate) async fn serve_terminal_socket(
         .await
         .is_err()
     {
+        #[cfg(feature = "e2e")]
+        if e2e_flow_block_barrier {
+            E2E_FLOW_BLOCK_BARRIER_STATE.store(
+                E2E_FLOW_BLOCK_BARRIER_IDLE,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         return;
     }
     let (mut sender, mut receiver) = socket.split();
-    let Ok(Some((mut events, mut sent_sequence))) =
-        synchronize_terminal(&mut sender, &terminal, client_id, requested, recorder).await
+    let Ok(Some((mut events, mut sent_sequence))) = synchronize_terminal(
+        &mut sender,
+        &terminal,
+        client_id,
+        requested,
+        !observer,
+        recorder,
+    )
+    .await
     else {
+        #[cfg(feature = "e2e")]
+        if e2e_flow_block_barrier {
+            E2E_FLOW_BLOCK_BARRIER_STATE.store(
+                E2E_FLOW_BLOCK_BARRIER_IDLE,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         return;
     };
+    #[cfg(feature = "e2e")]
+    if e2e_flow_block_barrier {
+        E2E_FLOW_BLOCK_BARRIER_STATE.store(
+            E2E_FLOW_BLOCK_BARRIER_COMPLETE,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
     let mut last_client_message = tokio::time::Instant::now();
     let mut lease_check = tokio::time::interval(TERMINAL_LEASE_CHECK_INTERVAL);
     lease_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -631,8 +767,15 @@ pub(crate) async fn serve_terminal_socket(
                         output_sequence = output.sequence,
                         "terminal stream gap detected; sending current snapshot"
                     );
-                    match synchronize_terminal(&mut sender, &terminal, client_id, None, recorder)
-                        .await
+                    match synchronize_terminal(
+                        &mut sender,
+                        &terminal,
+                        client_id,
+                        None,
+                        !observer,
+                        recorder,
+                    )
+                    .await
                     {
                         Ok(Some((next_events, sequence))) => {
                             events = next_events;
@@ -685,7 +828,15 @@ pub(crate) async fn serve_terminal_socket(
                     sent_sequence,
                     "terminal stream lagged; sending current snapshot"
                 );
-                match synchronize_terminal(&mut sender, &terminal, client_id, None, recorder).await
+                match synchronize_terminal(
+                    &mut sender,
+                    &terminal,
+                    client_id,
+                    None,
+                    !observer,
+                    recorder,
+                )
+                .await
                 {
                     Ok(Some((next_events, sequence))) => {
                         events = next_events;
@@ -1127,10 +1278,11 @@ async fn synchronize_terminal(
     terminal: &TerminalSession,
     client_id: Uuid,
     requested: Option<TerminalResume>,
+    flow_control: bool,
     recorder: Option<&DebugRecordingManager>,
 ) -> Result<Option<(tokio::sync::broadcast::Receiver<TerminalEvent>, u64)>, ()> {
     let terminal_id = terminal.info().id;
-    let (events, sync, size, exit_code) = terminal.subscribe(requested);
+    let (events, sync, size, exit_code) = terminal.subscribe(requested, flow_control);
     send_terminal_control(sender, size_message(size, client_id), terminal_id, recorder).await?;
     let sequence = send_terminal_sync(sender, sync, terminal_id, recorder).await?;
     if let Some(exit_code) = exit_code {
