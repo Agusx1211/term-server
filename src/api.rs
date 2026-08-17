@@ -11,7 +11,7 @@ use std::{
 use axum::{
     Json, Router,
     body::Body,
-    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State, ws::WebSocketUpgrade},
+    extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, Query, Request, State, ws::WebSocketUpgrade},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header, uri::Authority},
     response::{IntoResponse, Response},
     routing::{any, delete, get, get_service, patch, post},
@@ -1255,6 +1255,72 @@ async fn save_file(
     Ok(Json(document))
 }
 
+async fn upload_files(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+    Query(query): Query<FilePathQuery>,
+    mut multipart: Multipart,
+) -> Result<Json<Vec<files::UploadedFile>>, ApiError> {
+    require_origin(&headers, &uri, &state)?;
+    require_auth(&jar, &state)?;
+    let directory = tokio::task::spawn_blocking(move || {
+        files::resolve_upload_directory(&query.path, query.cwd.as_deref())
+    })
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, "upload directory task failed");
+        ApiError::Internal
+    })??;
+
+    let mut uploaded = Vec::new();
+    while let Some(mut field) = multipart.next_field().await.map_err(|error| {
+        tracing::warn!(%error, "multipart field read failed");
+        ApiError::BadRequest("could not read the upload part".to_owned())
+    })? {
+        // Ignore non-file fields (e.g. a stray text part) but keep streaming.
+        let Some(name) = field.file_name().map(str::to_owned) else {
+            // Drain a non-file field so multipart parsing can advance.
+            while let Ok(Some(_)) = field.chunk().await {}
+            continue;
+        };
+        let directory = directory.clone();
+        let mut pending = tokio::task::spawn_blocking(move || {
+            files::PendingUpload::start(&directory, &name)
+        })
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "upload start task failed");
+            ApiError::Internal
+        })??;
+        loop {
+            let chunk = field.chunk().await.map_err(|error| {
+                tracing::warn!(%error, "upload chunk read failed");
+                ApiError::BadRequest("could not read the upload data".to_owned())
+            })?;
+            let Some(chunk) = chunk else { break };
+            pending = tokio::task::spawn_blocking(move || {
+                pending.write(&chunk)?;
+                Ok::<_, FileError>(pending)
+            })
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "upload write task failed");
+                ApiError::Internal
+            })??;
+        }
+        let entry = tokio::task::spawn_blocking(move || pending.finish())
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "upload finalize task failed");
+                ApiError::Internal
+            })??;
+        uploaded.push(entry);
+    }
+    Ok(Json(uploaded))
+}
+
 async fn terminal_socket(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -1590,6 +1656,10 @@ pub fn build_router(state: AppState, client_directory: Option<PathBuf>) -> Route
         .route("/files/content", get(read_file).put(save_file))
         .route("/files/raw", get(preview_file))
         .route("/files/download", get(download_file))
+        .route(
+            "/files/upload",
+            post(upload_files).layer(DefaultBodyLimit::max(files::MAX_UPLOAD_BYTES)),
+        )
         .fallback(api_not_found)
         .layer(SetResponseHeaderLayer::overriding(
             header::CACHE_CONTROL,

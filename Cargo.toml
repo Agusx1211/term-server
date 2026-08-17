@@ -18,7 +18,7 @@ required-features = ["e2e"]
 
 [dependencies]
 argon2 = "0.5.3"
-axum = { version = "0.8.9", features = ["json", "ws"] }
+axum = { version = "0.8.9", features = ["json", "multipart", "ws"] }
 axum-extra = { version = "0.12.6", features = ["cookie"] }
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 base64 = "0.22.1"

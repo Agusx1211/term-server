@@ -992,6 +992,32 @@ body.pane-resizing .layout-divider.horizontal { cursor: row-resize; }
 .pane-drop-zone.active { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--foreground); }
 .pane-drop-zone.active span { opacity: 1; }
 .pane-drop-zone.active.invalid { border-color: var(--danger); background: color-mix(in srgb, var(--danger) 22%, var(--panel)); }
+
+/* File drag & drop upload overlay: four quadrants (2×2) split by a horizontal
+   and vertical midline, each with an emoji guide like copyparty. */
+.file-drop-surface {
+  position: fixed; inset: 0; z-index: 60; pointer-events: none;
+  display: grid; grid-template: 1fr 1fr / 1fr 1fr; gap: 2px;
+  background: var(--border-strong);
+  backdrop-filter: blur(1px);
+}
+.file-drop-zone {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 6px; padding: 12px; text-align: center; color: var(--muted);
+  background: color-mix(in srgb, var(--editor) 82%, transparent);
+  transition: background 120ms ease, color 120ms ease;
+}
+.file-drop-zone.active {
+  color: var(--foreground);
+  background: color-mix(in srgb, var(--accent) 24%, var(--editor));
+}
+.file-drop-emoji { font-size: 30px; line-height: 1; filter: saturate(0.9); }
+.file-drop-zone.active .file-drop-emoji { filter: none; }
+.file-drop-label { font-size: 13px; font-weight: 600; }
+.file-drop-hint { font-size: 10px; color: var(--muted); max-width: 260px; }
+.file-drop-zone.active .file-drop-hint { color: var(--foreground); }
+
+.pane-upload-input { position: fixed; left: -9999px; top: -9999px; width: 1px; height: 1px; opacity: 0; }
 .pane-live-placeholder {
   position: absolute; z-index: 3; overflow: hidden; padding: 1px; background: var(--border); pointer-events: none;
 }

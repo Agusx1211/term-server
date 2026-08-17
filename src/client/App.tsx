@@ -27,6 +27,7 @@ import type {
   TerminalInfo,
   UpdateActivityView,
   UpdateStatus,
+  UploadedFile,
 } from "../shared/types";
 import { api, ApiError } from "./lib/api";
 import { withBrokerSessions } from "./lib/broker-generations";
@@ -145,6 +146,15 @@ import { ResourceTabBar } from "./components/ResourceTabs";
 import type { ResourceTab } from "./lib/resources";
 import type { TerminalStreamIssue } from "./lib/terminal-stream";
 import type { ThemeName } from "./lib/terminal-theme";
+import type { PasteRequest } from "./components/TerminalPane";
+import {
+  FILE_DROP_ZONES,
+  fileDropDestination,
+  fileDropPastes,
+  fileZoneAt,
+  shellQuote,
+  type FileDropZone,
+} from "./lib/file-drop";
 
 const TerminalPane = lazy(() =>
   import("./components/TerminalPane").then((module) => ({ default: module.TerminalPane })),
@@ -326,6 +336,8 @@ export function App() {
   const [activeId, setActiveId] = useState<string>();
   const [draggedId, setDraggedId] = useState<string>();
   const [dropTarget, setDropTarget] = useState<{ id: string; position: DropPosition }>();
+  const [fileDrop, setFileDrop] = useState<FileDropZone>();
+  const [pasteRequest, setPasteRequest] = useState<PasteRequest | null>(null);
   const [theme, setTheme] = useState<ThemeName>(initialTheme);
   const [creating, setCreating] = useState(false);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
@@ -404,6 +416,7 @@ export function App() {
     setAuthenticated(false);
   };
   const editorGridRef = useRef<HTMLElement>(null);
+  const workbenchRef = useRef<HTMLDivElement>(null);
   const layoutRef = useRef(layout);
   layoutRef.current = layout;
   const dividerDragRef = useRef<{
@@ -454,6 +467,76 @@ export function App() {
   const showNotice = (message: string) => {
     setNotice(message);
     window.setTimeout(() => setNotice((current) => (current === message ? "" : current)), 2400);
+  };
+
+  // --- File drop (drag & drop upload) -------------------------------------
+
+  const fileDropZoneFromEvent = (event: DragEvent): FileDropZone | undefined => {
+    const rect = workbenchRef.current?.getBoundingClientRect();
+    if (!rect || rect.width <= 0 || rect.height <= 0) return undefined;
+    return fileZoneAt(rect.width, rect.height, event.clientX - rect.left, event.clientY - rect.top);
+  };
+
+  const onFileDragOver = (event: DragEvent) => {
+    if (!event.dataTransfer?.types.includes("Files")) return;
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+    setFileDrop(fileDropZoneFromEvent(event));
+  };
+
+  const onFileDragLeave = () => {
+    setFileDrop(undefined);
+  };
+
+  const uploadFiles = async (files: File[], target: FileTarget): Promise<UploadedFile[]> => {
+    try {
+      return await api.uploadFiles(target, files);
+    } catch (error) {
+      showNotice(error instanceof ApiError ? error.message : "Upload failed");
+      return [];
+    }
+  };
+
+  const uploadSummary = (result: UploadedFile[], directory: string): string =>
+    result.length === 0
+      ? "Upload failed"
+      : `Uploaded ${result.length} file${result.length === 1 ? "" : "s"} to ${directory}`;
+
+  const onFileDrop = (event: DragEvent) => {
+    const zone = fileDropZoneFromEvent(event);
+    setFileDrop(undefined);
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+    const files = Array.from(event.dataTransfer?.files ?? []);
+    if (files.length === 0 || !zone) return;
+    event.preventDefault();
+    const activeTerminal = activeId ? terminals.find((terminal) => terminal.id === activeId) : undefined;
+    const activeDirectory = activeTerminal?.cwd ?? "~";
+    const directory = fileDropDestination(zone, activeDirectory);
+    const paste = fileDropPastes(zone);
+
+    void uploadFiles(files, { path: directory }).then((result) => {
+      if (!result.length) return;
+      if (paste && activeId) {
+        setPasteRequest({
+          id: activeId,
+          text: result.map((entry) => shellQuote(entry.path)).join(" "),
+          nonce: Date.now(),
+        });
+        showNotice(
+          `Uploaded ${result.length} file${result.length === 1 ? "" : "s"} and pasted ${result.length === 1 ? "its path" : "their paths"}`,
+        );
+      } else {
+        showNotice(uploadSummary(result, directory));
+      }
+    });
+  };
+
+  const uploadToTerminal = (terminalId: string) => (files: File[]) => {
+    const terminal = terminals.find((candidate) => candidate.id === terminalId);
+    const directory = terminal?.cwd ?? "~";
+    void uploadFiles(files, { path: directory }).then((result) => {
+      if (result.length) showNotice(uploadSummary(result, directory));
+    });
   };
 
   const updateTerminalStreamIssue = (id: string, issue?: TerminalStreamIssue) => {
@@ -1674,7 +1757,13 @@ export function App() {
     .join("\n");
 
   return (
-    <div class={`workbench ${statusModulesMobileVisible ? "status-modules-mobile" : ""}`}>
+    <div
+      ref={workbenchRef}
+      class={`workbench ${statusModulesMobileVisible ? "status-modules-mobile" : ""}`}
+      onDragOver={onFileDragOver}
+      onDragLeave={onFileDragLeave}
+      onDrop={onFileDrop}
+    >
       <div class="workbench-main">
         <header class="mobile-toolbar">
           <button
@@ -1819,6 +1908,11 @@ export function App() {
                     onOpenFile={(target) => void openResource(target)}
                     onOpenArtifact={openArtifact}
                     onDeleteArtifact={deleteArtifact}
+                    onUploadFiles={uploadToTerminal(terminal.id)}
+                    pasteRequest={pasteRequest}
+                    onPasteHandled={(id) => {
+                      if (pasteRequest?.id === id) setPasteRequest(null);
+                    }}
                   />
                 </div>
               );
@@ -2053,6 +2147,17 @@ export function App() {
           </span>
         </span>
       </footer>
+      {fileDrop && (
+        <div class="file-drop-surface" aria-hidden="true">
+          {FILE_DROP_ZONES.map(({ zone, emoji, label, hint }) => (
+            <div key={zone} class={`file-drop-zone ${zone} ${fileDrop === zone ? "active" : ""}`}>
+              <span class="file-drop-emoji">{emoji}</span>
+              <span class="file-drop-label">{label}</span>
+              <span class="file-drop-hint">{hint}</span>
+            </div>
+          ))}
+        </div>
+      )}
       {(restartingForUpdate || restartingBroker) && (
         <div class="update-restarting" role="status" aria-live="assertive">
           <LoaderCircle class="spin" size={22} />
