@@ -16,7 +16,9 @@ import {
 const artifactRoot = resolve(process.cwd(), "artifacts", "e2e");
 const retryFailureRoot = join(artifactRoot, "retry-failures");
 
-export type E2EWorkerFixtures = Record<never, never>;
+export type E2EWorkerFixtures = {
+  serverOptions: IsolatedServerOptions;
+};
 
 export type E2ETestFixtures = {
   server: IsolatedServer;
@@ -69,8 +71,11 @@ async function attachServerFailure(testInfo: TestInfo, server: IsolatedServer, f
 }
 
 export const test = base.extend<E2ETestFixtures, E2EWorkerFixtures>({
-  server: async ({}, use, testInfo) => {
+  serverOptions: [{}, { scope: "worker", option: true }],
+
+  server: async ({ serverOptions }, use, testInfo) => {
     const options: IsolatedServerOptions = {
+      ...serverOptions,
       workerIndex: testInfo.workerIndex,
       projectName: testInfo.project.name,
     };

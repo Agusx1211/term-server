@@ -25,8 +25,8 @@ use crate::{
     artifacts,
     build::BuildIdentity,
     terminal_state::{
-        SequencedOutput, TERMINAL_OUTPUT_FRAME_BYTES, TerminalOutputState, TerminalResume,
-        TerminalSync,
+        SequencedOutput, SyncMode, TERMINAL_OUTPUT_FRAME_BYTES, TerminalOutputState,
+        TerminalResume, TerminalSync,
     },
 };
 
@@ -94,6 +94,17 @@ const FLOW_CONTROL_WAIT_BACKSTOP: Duration = Duration::from_secs(5);
 /// that genuinely cannot keep up falls behind and recovers through its own
 /// snapshot resynchronization path.
 const FLOW_CONTROL_PAUSE_DEADLINE: Duration = Duration::from_secs(10);
+#[cfg(feature = "e2e")]
+const E2E_FLOW_CONTROL_PAUSE_DEADLINE_ENV: &str = "TERM_SERVER_E2E_FLOW_CONTROL_PAUSE_DEADLINE_MS";
+
+#[cfg(feature = "e2e")]
+fn e2e_flow_control_pause_deadline() -> Option<Duration> {
+    std::env::var(E2E_FLOW_CONTROL_PAUSE_DEADLINE_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|milliseconds| (1_000..=60_000).contains(milliseconds))
+        .map(Duration::from_millis)
+}
 const DEFAULT_VIEWPORT_SIZE: TerminalViewport = TerminalViewport {
     cols: 100,
     rows: 30,
@@ -1572,22 +1583,39 @@ impl TerminalSession {
     pub fn subscribe(
         &self,
         requested: Option<TerminalResume>,
+        flow_control: bool,
     ) -> (
         broadcast::Receiver<TerminalEvent>,
         TerminalSync,
         TerminalSizeState,
         Option<u32>,
     ) {
-        // Publishing uses the same lock. Subscribing before constructing the
-        // sync plan prevents a gap between the snapshot/delta and live output.
-        // Viewports are locked first, matching resize's lock order, so the
-        // accompanying grid dimensions describe this exact snapshot.
+        // Publishing takes flow before output. A real client holds the same
+        // boundary while constructing its sync plan so output cannot be counted
+        // as live flow debt and simultaneously folded into a snapshot that is
+        // never acknowledged. Observers do not participate in flow control.
+        let mut flow = flow_control.then(|| self.flow.state.lock());
+        // Viewports are locked before output, matching resize's lock order, so
+        // the accompanying grid dimensions describe this exact snapshot.
         let viewports = self.viewports.lock();
         let output = self.output.lock();
         let receiver = self.events.subscribe();
         let sync = output.sync(requested);
         let exit_code = output.exit_code();
-        (receiver, sync, viewports.published, exit_code)
+        let size = viewports.published;
+        let reset_flow = flow.is_some() && sync.mode == SyncMode::Snapshot;
+        if reset_flow {
+            flow.as_mut()
+                .expect("flow lock held for controlled snapshot")
+                .clear();
+        }
+        drop(output);
+        drop(viewports);
+        drop(flow);
+        if reset_flow {
+            self.flow.resumed.notify_all();
+        }
+        (receiver, sync, size, exit_code)
     }
 
     pub fn process_inspector(&self) -> ProcessInspectorSnapshot {
@@ -1686,6 +1714,16 @@ impl TerminalSession {
         self.flow.resumed.notify_all();
     }
 
+    #[cfg(feature = "e2e")]
+    pub(crate) fn e2e_flow_blocked(&self) -> bool {
+        self.flow.state.lock().blocked()
+    }
+
+    #[cfg(feature = "e2e")]
+    pub(crate) fn e2e_client_count(&self) -> usize {
+        self.viewports.lock().sizes.len()
+    }
+
     pub fn flow_detach(&self) {
         let mut state = self.flow.state.lock();
         state.clients = state.clients.saturating_sub(1);
@@ -1721,7 +1759,10 @@ impl TerminalSession {
     /// written off after `FLOW_CONTROL_PAUSE_DEADLINE` so a wedged client can
     /// never freeze the terminal for the agent or the other clients.
     fn flow_wait_until_resumed(&self) {
-        flow_wait_until_resumed(&self.flow, FLOW_CONTROL_PAUSE_DEADLINE);
+        let deadline = FLOW_CONTROL_PAUSE_DEADLINE;
+        #[cfg(feature = "e2e")]
+        let deadline = e2e_flow_control_pause_deadline().unwrap_or(deadline);
+        flow_wait_until_resumed(&self.flow, deadline);
     }
 
     /// Permanently opens the gate. A parked read loop must not outlive the
@@ -1863,14 +1904,18 @@ impl TerminalSession {
         // browser they are fanned out to. This is VS Code's accounting: the debt
         // belongs to the terminal, and any browser's acknowledgement pays it
         // down. The read loop checks the result before its next read.
-        self.flow.state.lock().published(bytes.len() as u64);
-        // Keep the canonical mutation and its event ordered against resize,
-        // which publishes Size while holding this same lock.
+        let mut flow = self.flow.state.lock();
+        flow.published(bytes.len() as u64);
+        // Hold flow through the canonical mutation and event. Snapshot
+        // subscription takes the same order, so bytes are either live output
+        // with matching debt or part of the snapshot that clears that debt.
+        // The output lock also orders this mutation against resize's Size event.
         let mut state = self.output.lock();
         let output = state.publish(bytes);
         let responses = state.drain_responses();
         let _ = self.events.send(TerminalEvent::Output(output));
         drop(state);
+        drop(flow);
         for response in responses {
             if let Err(error) = self.input.enqueue_unobserved(response) {
                 tracing::warn!(%error, "terminal query response could not be queued");
@@ -3669,7 +3714,7 @@ mod tests {
             })
             .unwrap();
         let session = manager.get(info.id).unwrap();
-        let (mut events, _, _, _) = session.subscribe(None);
+        let (mut events, _, _, _) = session.subscribe(None, false);
         session
             .write(
                 concat!(
@@ -3937,6 +3982,63 @@ mod tests {
 
         assert!(!state.blocked());
         assert_eq!(state.unacknowledged, 0);
+    }
+
+    #[test]
+    fn snapshot_subscription_rebases_only_the_acknowledging_clients_flow_debt() {
+        let manager = TerminalManager::new(Some("/bin/cat".to_owned()), 1024 * 1024);
+        let info = manager
+            .create(CreateTerminal {
+                path: Some("snapshot-flow-baseline".to_owned()),
+                cwd: Some(PathBuf::from("/tmp")),
+                shell: Some("/bin/cat".to_owned()),
+                clone_from: None,
+            })
+            .unwrap();
+        let session = manager.get(info.id).unwrap();
+        session.flow_attach();
+
+        {
+            let mut flow = session.flow.state.lock();
+            flow.published(FLOW_CONTROL_HIGH_WATERMARK_BYTES + 1);
+            assert!(flow.blocked());
+        }
+        let (_, snapshot, _, _) = session.subscribe(None, true);
+        assert_eq!(snapshot.mode, crate::terminal_state::SyncMode::Snapshot);
+        assert_eq!(session.flow.state.lock().unacknowledged, 0);
+
+        {
+            let mut flow = session.flow.state.lock();
+            flow.published(FLOW_CONTROL_HIGH_WATERMARK_BYTES + 1);
+        }
+        session.subscribe(None, false);
+        assert_eq!(
+            session.flow.state.lock().unacknowledged,
+            FLOW_CONTROL_HIGH_WATERMARK_BYTES + 1,
+            "an observer snapshot cannot forgive a real client's debt"
+        );
+
+        let (_, baseline, size, _) = session.subscribe(None, true);
+        {
+            let mut flow = session.flow.state.lock();
+            flow.published(FLOW_CONTROL_HIGH_WATERMARK_BYTES + 1);
+        }
+        let (_, resume, _, _) = session.subscribe(
+            Some(TerminalResume {
+                sequence: baseline.sequence,
+                epoch: size.epoch,
+            }),
+            true,
+        );
+        assert_eq!(resume.mode, crate::terminal_state::SyncMode::Resume);
+        assert_eq!(
+            session.flow.state.lock().unacknowledged,
+            FLOW_CONTROL_HIGH_WATERMARK_BYTES + 1,
+            "resumed output is acknowledged normally and must remain counted"
+        );
+
+        session.flow_detach();
+        session.kill();
     }
 
     #[test]

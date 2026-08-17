@@ -37,6 +37,7 @@ export interface IsolatedServerOptions {
   binaryPath?: string;
   clientDirectory?: string;
   fixturePath?: string;
+  environment?: NodeJS.ProcessEnv;
 }
 
 export interface IsolatedServerSnapshot {
@@ -234,6 +235,7 @@ export class IsolatedServer implements IsolatedServerSnapshot {
   readonly binaryPath: string;
   readonly clientDirectory: string;
   readonly fixturePath: string;
+  readonly environment: NodeJS.ProcessEnv;
 
   dataDir = "";
   transcriptDir = "";
@@ -261,6 +263,7 @@ export class IsolatedServer implements IsolatedServerSnapshot {
     this.binaryPath = options.binaryPath ?? process.env.TERM_SERVER_E2E_BINARY ?? join(REPOSITORY_ROOT, "target", "release", "term-server");
     this.clientDirectory = options.clientDirectory ?? process.env.TERM_SERVER_E2E_CLIENT_DIR ?? join(REPOSITORY_ROOT, "dist", "client");
     this.fixturePath = options.fixturePath ?? process.env.TERM_SERVER_E2E_FIXTURE ?? join(REPOSITORY_ROOT, "target", "release", "e2e-pty-fixture");
+    this.environment = { ...options.environment };
   }
 
   get stdout(): string {
@@ -304,6 +307,7 @@ export class IsolatedServer implements IsolatedServerSnapshot {
       await mkdir(temporaryDirectory, { recursive: true, mode: 0o700 });
       const environment: NodeJS.ProcessEnv = {
         ...process.env,
+        ...this.environment,
         TERM_SERVER_PASSWORD: E2E_SERVER_PASSWORD,
         TERM_SERVER_NO_HTTPS: "true",
         TERM_SERVER_DATA_DIR: this.dataDir,
