@@ -1218,6 +1218,31 @@ body.pane-resizing .layout-divider.horizontal { cursor: row-resize; }
   border: 0; background: transparent; color: var(--subtle); cursor: pointer;
 }
 .completion-toast-close:hover { background: color-mix(in srgb, var(--notification-color) 9%, var(--hover)); color: var(--foreground); }
+
+/* In-flight file upload progress (progress bar + cancel). */
+.upload-stack {
+  position: fixed; z-index: 99; bottom: calc(34px + env(safe-area-inset-bottom));
+  left: 50%; transform: translateX(-50%);
+  display: grid; gap: 8px; width: min(420px, calc(100vw - 32px)); pointer-events: none;
+}
+.upload-card {
+  padding: 8px 10px; border: 1px solid var(--border-strong); border-radius: 5px;
+  background: var(--panel); color: var(--foreground); box-shadow: 0 8px 25px var(--shadow);
+  animation: toast-in .15s ease-out; pointer-events: auto;
+}
+.upload-card-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.upload-card-label {
+  min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 11.5px; font-weight: 600;
+}
+.upload-card-percent { flex: none; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.upload-card-cancel {
+  width: 20px; height: 20px; flex: none; display: grid; place-items: center;
+  border: 0; border-radius: 3px; background: transparent; color: var(--subtle); cursor: pointer;
+}
+.upload-card-cancel:hover { background: var(--hover); color: var(--danger); }
+.upload-card-track { height: 5px; border-radius: 3px; background: var(--hover); overflow: hidden; }
+.upload-card-fill { height: 100%; border-radius: 3px; background: var(--accent); transition: width .12s linear; }
 @keyframes toast-in { from { opacity: 0; transform: translateY(5px); } }
 @keyframes spin { to { transform: rotate(360deg); } }
 .spin { animation: spin .75s linear infinite; }
