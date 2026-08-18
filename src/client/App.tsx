@@ -219,6 +219,15 @@ interface CompletionToast {
   color: string;
 }
 
+/** An in-flight file upload shown with a progress bar and a cancel button. */
+interface ActiveUpload {
+  id: string;
+  label: string;
+  sent: number;
+  total: number;
+  abort: () => void;
+}
+
 function deliverCompletionNotification({
   mode,
   toast,
@@ -338,6 +347,8 @@ export function App() {
   const [dropTarget, setDropTarget] = useState<{ id: string; position: DropPosition }>();
   const [fileDrop, setFileDrop] = useState<FileDropZone>();
   const [pasteRequest, setPasteRequest] = useState<PasteRequest | null>(null);
+  const [uploads, setUploads] = useState<ActiveUpload[]>([]);
+  const uploadSequence = useRef(0);
   const [theme, setTheme] = useState<ThemeName>(initialTheme);
   const [creating, setCreating] = useState(false);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
@@ -488,19 +499,55 @@ export function App() {
     setFileDrop(undefined);
   };
 
-  const uploadFiles = async (files: File[], target: FileTarget): Promise<UploadedFile[]> => {
-    try {
-      return await api.uploadFiles(target, files);
-    } catch (error) {
-      showNotice(error instanceof ApiError ? error.message : "Upload failed");
-      return [];
-    }
-  };
-
   const uploadSummary = (result: UploadedFile[], directory: string): string =>
     result.length === 0
       ? "Upload failed"
       : `Uploaded ${result.length} file${result.length === 1 ? "" : "s"} to ${directory}`;
+
+  const cancelUpload = (id: string) => {
+    setUploads((current) => {
+      const upload = current.find((candidate) => candidate.id === id);
+      upload?.abort();
+      return current.filter((candidate) => candidate.id !== id);
+    });
+  };
+
+  // Kicks off a multipart upload, tracking its progress in the `uploads`
+  // stack so the UI can show a progress bar and a cancel button. On success
+  // `onComplete` runs with the uploaded entries; a cancelled upload is silent.
+  const startUpload = (
+    files: File[],
+    target: FileTarget,
+    onComplete: (result: UploadedFile[]) => void,
+  ): void => {
+    uploadSequence.current += 1;
+    const id = `upload-${uploadSequence.current}`;
+    const controller = new AbortController();
+    const label = files.length === 1 ? files[0]?.name ?? "file" : `${files.length} files`;
+    setUploads((current) => [...current, {
+      id,
+      label,
+      sent: 0,
+      total: 0,
+      abort: () => controller.abort(),
+    }]);
+    api.uploadFiles(target, files, (sent, total) => {
+      setUploads((current) => current.map((upload) => (
+        upload.id === id ? { ...upload, sent, total } : upload
+      )));
+    }, controller.signal)
+      .then((result) => {
+        if (result.length) onComplete(result);
+      })
+      .catch((error) => {
+        if (!controller.signal.aborted) {
+          showNotice(error instanceof ApiError ? error.message : "Upload failed");
+        }
+      })
+      .finally(() => {
+        setUploads((current) => current.filter((upload) => upload.id !== id));
+      });
+  };
 
   const onFileDrop = (event: DragEvent) => {
     const zone = fileDropZoneFromEvent(event);
@@ -514,8 +561,7 @@ export function App() {
     const directory = fileDropDestination(zone, activeDirectory);
     const paste = fileDropPastes(zone);
 
-    void uploadFiles(files, { path: directory }).then((result) => {
-      if (!result.length) return;
+    startUpload(files, { path: directory }, (result) => {
       if (paste && activeId) {
         setPasteRequest({
           id: activeId,
@@ -534,8 +580,8 @@ export function App() {
   const uploadToTerminal = (terminalId: string) => (files: File[]) => {
     const terminal = terminals.find((candidate) => candidate.id === terminalId);
     const directory = terminal?.cwd ?? "~";
-    void uploadFiles(files, { path: directory }).then((result) => {
-      if (result.length) showNotice(uploadSummary(result, directory));
+    startUpload(files, { path: directory }, (result) => {
+      showNotice(uploadSummary(result, directory));
     });
   };
 
@@ -2171,6 +2217,34 @@ export function App() {
               ? "Loading the current broker build and reconnecting the server…"
               : "Verified update installed. Terminals are still running while the server reconnects…"}
           </span>
+        </div>
+      )}
+      {uploads.length > 0 && (
+        <div class="upload-stack" role="status" aria-live="polite">
+          {uploads.map((upload) => {
+            const percent = upload.total > 0
+              ? Math.min(100, Math.round((upload.sent / upload.total) * 100))
+              : 0;
+            return (
+              <div key={upload.id} class="upload-card">
+                <div class="upload-card-head">
+                  <span class="upload-card-label" title={`Uploading ${upload.label}`}>Uploading {upload.label}</span>
+                  <span class="upload-card-percent">{percent}%</span>
+                  <button
+                    class="upload-card-cancel"
+                    onClick={() => cancelUpload(upload.id)}
+                    aria-label="Cancel upload"
+                    title="Cancel upload"
+                  >
+                    <X size={13} />
+                  </button>
+                </div>
+                <div class="upload-card-track">
+                  <div class="upload-card-fill" style={{ width: `${percent}%` }} />
+                </div>
+              </div>
+            );
+          })}
         </div>
       )}
       {(completionToasts.length > 0 || notice) && (

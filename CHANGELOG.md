@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.14.1 - 2026-08-18
+
+Large uploads now show a live progress bar and can be cancelled.
+
+### Added
+
+- **Upload progress.** Drag-and-drop uploads (and the toolbar upload button)
+  now run over `XMLHttpRequest`, which exposes upload progress, and each
+  in-flight upload is shown in a progress card at the bottom of the screen
+  with a fill bar and a percentage.
+- **Cancel upload.** Each progress card has a cancel button that aborts the
+  request. The server already discards the temporary file when a connection is
+  aborted, so cancelling never leaves a partial file behind and is silent (no
+  error toast).
+
+### Upgrade notes
+
+- No breaking changes, data migrations, or configuration changes. The upload
+  endpoint is unchanged; only the client transport and UI are new. The release
+  is safe for automatic installation over `0.14.0`.
+- Reload open pages to pick up the client-side progress UI.
+
 ## 0.14.0 - 2026-08-17
 
 Files can now be dropped straight into a terminal session instead of being
