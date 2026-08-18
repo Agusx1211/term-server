@@ -156,20 +156,55 @@ export const api = {
     request<FileDocument>("/api/files/content", { method: "PUT", body: JSON.stringify(file) }),
   // Multipart upload; the browser sets the `multipart/form-data` boundary, so
   // this bypasses the JSON helper rather than letting it set the content type.
-  uploadFiles: async (target: FileTarget, files: File[]): Promise<UploadedFile[]> => {
+  // XMLHttpRequest (not fetch) is used because it exposes upload progress and
+  // reliable abort for the large multipart bodies this endpoint accepts.
+  uploadFiles: (
+    target: FileTarget,
+    files: File[],
+    onProgress?: (sent: number, total: number) => void,
+    signal?: AbortSignal,
+  ): Promise<UploadedFile[]> => {
     const form = new FormData();
     for (const file of files) form.append("files", file, file.name);
-    const response = await fetch(`/api/files/upload?${fileQuery(target)}`, {
-      method: "POST",
-      body: form,
-      cache: "no-store",
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", `/api/files/upload?${fileQuery(target)}`);
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable) onProgress?.(event.loaded, event.total);
+      };
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          if (xhr.status === 204) {
+            resolve([]);
+            return;
+          }
+          try {
+            resolve(JSON.parse(xhr.responseText) as UploadedFile[]);
+          } catch {
+            reject(new ApiError("Upload failed (invalid response)", xhr.status));
+          }
+          return;
+        }
+        let message = `Upload failed (${xhr.status})`;
+        try {
+          const body = JSON.parse(xhr.responseText) as { error?: string } | null;
+          if (body?.error) message = body.error;
+        } catch {
+          // keep the status-based fallback
+        }
+        reject(new ApiError(message, xhr.status));
+      };
+      xhr.onerror = () => reject(new ApiError("Upload failed (network error)", 0));
+      xhr.onabort = () => reject(new ApiError("Upload cancelled", 0));
+      if (signal) {
+        if (signal.aborted) {
+          xhr.abort();
+          return;
+        }
+        signal.addEventListener("abort", () => xhr.abort(), { once: true });
+      }
+      xhr.send(form);
     });
-    if (!response.ok) {
-      const body = (await response.json().catch(() => null)) as { error?: string } | null;
-      throw new ApiError(body?.error ?? `Upload failed (${response.status})`, response.status);
-    }
-    if (response.status === 204) return [];
-    return response.json() as Promise<UploadedFile[]>;
   },
   previewFileUrl: (target: FileTarget) => `/api/files/raw?${fileQuery(target)}`,
   downloadFileUrl: (target: FileTarget) => `/api/files/download?${fileQuery(target)}`,
