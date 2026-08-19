@@ -63,6 +63,7 @@ impl AgentEvent {
             "claude" => "claude",
             "pi" => "pi",
             "omp" => "omp",
+            "hermes" => "hermes",
             _ => return None,
         };
         let name = input
@@ -125,12 +126,12 @@ fn tool_event_kind(tool_name: Option<&str>) -> AgentEventKind {
     let normalized = tool_name.to_ascii_lowercase();
     if matches!(
         normalized.as_str(),
-        "bash" | "exec_command" | "write_stdin" | "shell"
+        "bash" | "exec_command" | "write_stdin" | "shell" | "terminal"
     ) {
         AgentEventKind::RunningCommand
     } else if matches!(
         normalized.as_str(),
-        "apply_patch" | "edit" | "write" | "multiedit" | "notebookedit"
+        "apply_patch" | "edit" | "write" | "write_file" | "patch" | "multiedit" | "notebookedit"
     ) {
         AgentEventKind::EditingFiles
     } else if normalized.contains("search")
@@ -256,5 +257,49 @@ mod tests {
         let mut input = std::io::Cursor::new(oversized);
         assert!(read_hook_event("codex", &mut input).unwrap().is_none());
         assert_eq!(input.position(), input.get_ref().len() as u64);
+    }
+
+    #[test]
+    fn maps_hermes_events_to_shared_activity_kinds() {
+        // The Hermes plugin forwards its lifecycle hooks using the shared
+        // hook_event_name vocabulary, scoped to the "hermes" provider.
+        let cases = [
+            ("agent_start", AgentEventKind::Thinking),
+            ("tool_execution_start", AgentEventKind::UsingTool),
+            ("tool_execution_end", AgentEventKind::Thinking),
+            ("PermissionRequest", AgentEventKind::WaitingForApproval),
+            ("agent_settled", AgentEventKind::Completed),
+            ("session_shutdown", AgentEventKind::Closed),
+        ];
+        for (name, expected) in cases {
+            let event = AgentEvent::from_hook_input(
+                "hermes",
+                &serde_json::json!({ "hook_event_name": name }),
+            )
+            .expect(name);
+            assert_eq!(event.provider, "hermes", "{name}");
+            assert_eq!(event.kind, expected, "{name}");
+        }
+
+        // Hermes tool names flow through to specific activity kinds.
+        let running = AgentEvent::from_hook_input(
+            "hermes",
+            &serde_json::json!({
+                "hook_event_name": "tool_execution_start",
+                "tool_name": "terminal",
+            }),
+        )
+        .unwrap();
+        assert_eq!(running.kind, AgentEventKind::RunningCommand);
+
+        let editing = AgentEvent::from_hook_input(
+            "hermes",
+            &serde_json::json!({
+                "hook_event_name": "tool_execution_start",
+                "tool_name": "write_file",
+            }),
+        )
+        .unwrap();
+        assert_eq!(editing.kind, AgentEventKind::EditingFiles);
     }
 }

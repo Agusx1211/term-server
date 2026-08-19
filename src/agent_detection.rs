@@ -54,6 +54,10 @@ const BUNDLED_MANIFESTS: &[(&str, &str)] = &[
         include_str!("agent_detection/manifests/codex.toml"),
     ),
     ("pi", include_str!("agent_detection/manifests/pi.toml")),
+    (
+        "hermes",
+        include_str!("agent_detection/manifests/hermes.toml"),
+    ),
 ];
 
 /// The terminal snapshot a manifest is evaluated against.

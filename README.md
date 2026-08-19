@@ -54,7 +54,7 @@ On first boot, open `https://127.0.0.1:8090`. term-server prints a random passwo
 - **Files when needed:** searchable explorer, local image and PDF previews, direct downloads, and a lazy-loaded CodeMirror editor with syntax highlighting, atomic saves, and stale-file conflict detection.
 - **Agent-connected artifacts:** multiline handoffs stay attached to the terminal and agent that created them, with inline text, image, and PDF previews plus an optional full editor.
 - **Process visibility and control:** a lightweight Linux `/proc` sampler shows the complete live descendant process tree, foreground job, CPU and memory usage, and lets you send SIGTERM to a selected process. Command lines are secret-aware and redacted; input, output, and exited processes are not retained.
-- **Agent awareness:** Codex, Claude, Pi, and OMP sessions show working, blocked, idle, and closed states. An agent waiting on an approval or a question is marked **Needs you** for as long as it waits, so a stalled agent is visible without opening it. An unseen return to idle gets a distinct bell until you focus that terminal. Alerts can appear in-app, as desktop notifications, in both places, or remain off. In-app cards inherit their terminal color and can be placed in any corner with a configurable dismissal time.
+- **Agent awareness:** Codex, Claude, Pi, OMP, and Hermes sessions show working, blocked, idle, and closed states. An agent waiting on an approval or a question is marked **Needs you** for as long as it waits, so a stalled agent is visible without opening it. An unseen return to idle gets a distinct bell until you focus that terminal. Alerts can appear in-app, as desktop notifications, in both places, or remain off. In-app cards inherit their terminal color and can be placed in any corner with a configurable dismissal time.
 - **Secure defaults:** loopback binding, HTTPS, Argon2 password hashing, signed HTTP-only SameSite cookies, origin enforcement, CSP, HSTS, login throttling, and bounded memory use.
 - **Deployment choices:** one native executable plus static browser assets, with Docker Compose and a systemd user service included.
 
@@ -137,7 +137,7 @@ ln -s "$PWD/skills/term-server-artifacts" \
 
 ### Live agent activity
 
-Term-server continues to infer Codex, Claude Code, Pi, and OMP state from their process trees,
+Term-server continues to infer Codex, Claude Code, Pi, OMP, and Hermes state from their process trees,
 terminal signals, output, and CPU activity. **Settings → Live agent activity** can additionally
 install a small provider-native plugin or extension for more immediate lifecycle updates such as
 thinking, running a command, waiting for approval, and compacting context. These updates appear in
@@ -169,7 +169,7 @@ bundled rules stay in use. `GET /api/terminals/{id}/agent/explain` reports the s
 against, which rule won, and how every rule evaluated, which is the fastest way to diagnose a
 terminal showing the wrong state or to write an override.
 
-The manifest format and the bundled Claude Code, Codex, and Pi rule sets come from
+The manifest format and the bundled Claude Code, Codex, Pi, and Hermes rule sets come from
 [herdr](https://github.com/herdrdev/herdr) and are used under the Apache License 2.0; see
 [`NOTICE`](NOTICE).
 
