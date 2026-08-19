@@ -455,6 +455,80 @@ fn pi_working_literal_is_working() {
 }
 
 // ---------------------------------------------------------------------------
+// Hermes
+// ---------------------------------------------------------------------------
+
+#[test]
+fn hermes_osc_title_markers_map_to_blocked_working_idle() {
+    // Hermes sets its OSC title with a leading marker: `⚠` while waiting on an
+    // approval/sudo/secret/clarify overlay, `⏳` while a turn is running, and
+    // `✓` when idle at the composer. The manifest reads the marker directly.
+    let blocked = classify(
+        "hermes",
+        DetectionInput {
+            screen: "",
+            osc_title: "\u{26a0} fix-bug \u{b7} model \u{b7} /repo",
+            osc_progress: "",
+        },
+    );
+    assert_eq!(blocked.state, DetectedState::Blocked);
+    assert_eq!(matched_rule_id(&blocked), Some("osc_title_blocked"));
+    assert!(blocked.visible_blocker);
+
+    let working = classify(
+        "hermes",
+        DetectionInput {
+            screen: "",
+            osc_title: "\u{23f3} fix-bug \u{b7} model",
+            osc_progress: "",
+        },
+    );
+    assert_eq!(working.state, DetectedState::Working);
+    assert_eq!(matched_rule_id(&working), Some("osc_title_working"));
+    assert!(working.visible_working);
+
+    let idle = classify(
+        "hermes",
+        DetectionInput {
+            screen: "",
+            osc_title: "\u{2713} fix-bug \u{b7} model",
+            osc_progress: "",
+        },
+    );
+    assert_eq!(idle.state, DetectedState::Idle);
+    assert_eq!(matched_rule_id(&idle), Some("osc_title_idle"));
+    assert!(idle.visible_idle);
+}
+
+#[test]
+fn hermes_osc_title_marker_tolerates_a_variation_selector() {
+    // The marker may be followed by a Unicode variation selector before the
+    // separating space (e.g. ⚠️ U+26A0 U+FE0F), which must not defeat the rule.
+    let detection = classify(
+        "hermes",
+        DetectionInput {
+            screen: "",
+            osc_title: "\u{26a0}\u{fe0f} fix-bug",
+            osc_progress: "",
+        },
+    );
+    assert_eq!(detection.state, DetectedState::Blocked);
+    assert_eq!(matched_rule_id(&detection), Some("osc_title_blocked"));
+}
+
+#[test]
+fn hermes_clarification_overlay_is_blocked_from_the_screen() {
+    // Without the window title (a terminal that never saw an OSC title), the
+    // clarification prompt still has to register as blocked.
+    let detection = classify(
+        "hermes",
+        screen("\u{2191}\u{2193} to select\n\n  hermes needs your input\n\n  enter to confirm"),
+    );
+    assert_eq!(detection.state, DetectedState::Blocked);
+    assert_eq!(matched_rule_id(&detection), Some("clarification_prompt"));
+}
+
+// ---------------------------------------------------------------------------
 // Explain
 // ---------------------------------------------------------------------------
 

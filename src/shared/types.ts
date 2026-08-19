@@ -7,7 +7,7 @@ export interface AgentActivity {
 }
 
 export interface AgentInfo {
-  kind: "codex" | "claude" | "pi" | string;
+  kind: "codex" | "claude" | "pi" | "hermes" | string;
   status: AgentStatus;
   statusChangedAt: number;
   startedAt: number;
@@ -207,7 +207,7 @@ export interface UpdatePiConfig {
   model: string;
 }
 
-export type AgentIntegrationProvider = "codex" | "claude" | "pi" | "omp";
+export type AgentIntegrationProvider = "codex" | "claude" | "pi" | "omp" | "hermes";
 export type AgentIntegrationState =
   | "unavailable"
   | "notInstalled"

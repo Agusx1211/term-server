@@ -3368,6 +3368,12 @@ fn agent_kind(process: &ProcessInfo) -> Option<String> {
     if tokens.iter().any(|token| token == "omp") {
         return Some("omp".to_owned());
     }
+    if tokens
+        .iter()
+        .any(|token| token == "hermes" || token == "hermes-agent")
+    {
+        return Some("hermes".to_owned());
+    }
     None
 }
 
@@ -4948,6 +4954,18 @@ mod tests {
         assert_eq!(
             agent_kind(&process("/home/user/.local/bin/omp", &["omp"])).as_deref(),
             Some("omp")
+        );
+        assert_eq!(
+            agent_kind(&process("/home/user/.local/bin/hermes", &["hermes"])).as_deref(),
+            Some("hermes")
+        );
+        assert_eq!(
+            agent_kind(&process(
+                "python",
+                &["python", "/opt/hermes-agent/venv/bin/hermes"]
+            ))
+            .as_deref(),
+            Some("hermes")
         );
     }
 

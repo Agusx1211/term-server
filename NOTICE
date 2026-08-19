@@ -13,6 +13,7 @@ The following files were ported from herdr (https://github.com/herdrdev/herdr):
     src/detect/manifests/claude.toml
     src/detect/manifests/codex.toml
     src/detect/manifests/pi.toml
+    src/detect/manifests/hermes.toml
 
 Copyright the herdr contributors.
 

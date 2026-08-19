@@ -32,6 +32,10 @@ const OMP_PACKAGE: &str = include_str!("../integrations/omp/package.json");
 const OMP_EXTENSION: &str =
     include_str!("../integrations/omp/extensions/term-server-agent-events.ts");
 const OMP_ACTIVITY: &str = include_str!("../integrations/omp/extensions/subagent-activity.ts");
+const HERMES_PLUGIN_YAML: &str = include_str!("../integrations/hermes/plugin.yaml");
+const HERMES_PLUGIN_INIT: &str = include_str!("../integrations/hermes/__init__.py");
+const HERMES_HOME_ENV_VAR: &str = "HERMES_HOME";
+const HERMES_PLUGIN_DIR_NAME: &str = "term-server-agent-events";
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -40,6 +44,7 @@ pub enum AgentIntegrationProvider {
     Claude,
     Pi,
     Omp,
+    Hermes,
 }
 
 impl AgentIntegrationProvider {
@@ -49,6 +54,7 @@ impl AgentIntegrationProvider {
             Self::Claude => "claude",
             Self::Pi => "pi",
             Self::Omp => "omp",
+            Self::Hermes => "hermes",
         }
     }
 
@@ -58,6 +64,7 @@ impl AgentIntegrationProvider {
             Self::Claude => "Claude Code",
             Self::Pi => "Pi",
             Self::Omp => "OMP",
+            Self::Hermes => "Hermes",
         }
     }
 }
@@ -156,14 +163,15 @@ impl AgentIntegrationService {
     }
 
     pub async fn status(&self) -> AgentIntegrationsConfig {
-        let (codex, claude, pi, omp) = tokio::join!(
+        let (codex, claude, pi, omp, hermes) = tokio::join!(
             self.provider_status(AgentIntegrationProvider::Codex),
             self.provider_status(AgentIntegrationProvider::Claude),
             self.provider_status(AgentIntegrationProvider::Pi),
             self.provider_status(AgentIntegrationProvider::Omp),
+            self.provider_status(AgentIntegrationProvider::Hermes),
         );
         AgentIntegrationsConfig {
-            providers: vec![codex, claude, pi, omp],
+            providers: vec![codex, claude, pi, omp, hermes],
             fallbacks_enabled: true,
         }
     }
@@ -203,6 +211,7 @@ impl AgentIntegrationService {
             AgentIntegrationProvider::Claude => self.claude_status(&executable).await,
             AgentIntegrationProvider::Pi => self.pi_status(&executable).await,
             AgentIntegrationProvider::Omp => self.omp_status(&executable).await,
+            AgentIntegrationProvider::Hermes => self.hermes_status().await,
         };
         result.unwrap_or_else(|message| {
             status(
@@ -319,6 +328,25 @@ impl AgentIntegrationService {
             .collect()
             .await;
         Ok(aggregate_omp_status(profile_statuses))
+    }
+
+    async fn hermes_status(&self) -> Result<AgentIntegrationStatus, String> {
+        let plugin_dir = hermes_plugin_dir();
+        let installed = plugin_dir
+            .as_deref()
+            .is_some_and(hermes_plugin_files_present);
+        let assets_current = plugin_dir
+            .as_deref()
+            .is_some_and(hermes_plugin_assets_current);
+        let enabled = hermes_plugin_enabled();
+        Ok(classify_status(
+            AgentIntegrationProvider::Hermes,
+            installed,
+            false,
+            installed,
+            enabled,
+            assets_current,
+        ))
     }
 
     async fn inspect_omp_profile(
@@ -547,6 +575,26 @@ impl AgentIntegrationService {
                     return Err("unable to update one or more OMP profiles".to_owned());
                 }
             }
+            AgentIntegrationProvider::Hermes => {
+                // Hermes discovers plugins from its plugins directory with no
+                // CLI command, so "install" writes the plugin there and adds
+                // it to the config allow-list.
+                let plugin_dir = hermes_plugin_dir().ok_or_else(|| {
+                    "unable to locate the Hermes config directory (set HERMES_HOME or ~/.hermes)"
+                        .to_owned()
+                })?;
+                write_asset(&plugin_dir.join("plugin.yaml"), HERMES_PLUGIN_YAML).await?;
+                write_asset(&plugin_dir.join("__init__.py"), HERMES_PLUGIN_INIT).await?;
+                if let Some(config_path) = hermes_config_path() {
+                    let existing = tokio::fs::read_to_string(&config_path)
+                        .await
+                        .unwrap_or_default();
+                    let updated = ensure_hermes_plugin_enabled(&existing);
+                    if updated != existing {
+                        write_asset(&config_path, &updated).await?;
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -685,6 +733,22 @@ impl AgentIntegrationService {
                     return Err("unable to remove one or more OMP profiles".to_owned());
                 }
             }
+            AgentIntegrationProvider::Hermes => {
+                if let Some(plugin_dir) = hermes_plugin_dir() {
+                    for name in ["plugin.yaml", "__init__.py"] {
+                        let _ = tokio::fs::remove_file(plugin_dir.join(name)).await;
+                    }
+                    let _ = tokio::fs::remove_dir(plugin_dir).await;
+                }
+                if let Some(config_path) = hermes_config_path()
+                    && let Ok(existing) = tokio::fs::read_to_string(&config_path).await
+                {
+                    let updated = remove_hermes_plugin_enabled(&existing);
+                    if updated != existing {
+                        let _ = write_asset(&config_path, &updated).await;
+                    }
+                }
+            }
         }
         let root = self.provider_root(provider);
         if root.is_dir() {
@@ -766,6 +830,10 @@ impl AgentIntegrationService {
                 )
                 .await?;
             }
+            AgentIntegrationProvider::Hermes => {
+                write_asset(&root.join("plugin.yaml"), HERMES_PLUGIN_YAML).await?;
+                write_asset(&root.join("__init__.py"), HERMES_PLUGIN_INIT).await?;
+            }
         }
         Ok(())
     }
@@ -776,6 +844,7 @@ impl AgentIntegrationService {
             AgentIntegrationProvider::Claude => "claude-marketplace",
             AgentIntegrationProvider::Pi => "pi",
             AgentIntegrationProvider::Omp => "omp-marketplace",
+            AgentIntegrationProvider::Hermes => "hermes",
         })
     }
 
@@ -817,6 +886,10 @@ impl AgentIntegrationService {
                     OMP_ACTIVITY,
                 ),
             ],
+            AgentIntegrationProvider::Hermes => &[
+                ("plugin.yaml", HERMES_PLUGIN_YAML),
+                ("__init__.py", HERMES_PLUGIN_INIT),
+            ],
         };
         let assets_current = assets.iter().all(|(path, expected)| {
             std::fs::read_to_string(root.join(path)).is_ok_and(|content| content == *expected)
@@ -835,6 +908,7 @@ impl AgentIntegrationService {
                 &root.join(".omp-plugin/marketplace.json"),
                 &omp_marketplace(),
             ),
+            AgentIntegrationProvider::Hermes => true,
         };
         assets_current && marketplace_current
     }
@@ -920,6 +994,407 @@ fn valid_omp_profile_name(name: &str) -> bool {
         && !name.ends_with('.')
         && !omp_reserved_profile_name(name)
 }
+
+// ---------------------------------------------------------------------------
+// Hermes
+// ---------------------------------------------------------------------------
+
+/// Hermes config root: `$HERMES_HOME`, else `~/.hermes`.
+fn hermes_dir() -> Option<PathBuf> {
+    if let Some(value) = env::var_os(HERMES_HOME_ENV_VAR).filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(value));
+    }
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".hermes"))
+}
+
+fn hermes_plugin_dir() -> Option<PathBuf> {
+    hermes_dir().map(|dir| dir.join("plugins").join(HERMES_PLUGIN_DIR_NAME))
+}
+
+fn hermes_config_path() -> Option<PathBuf> {
+    hermes_dir().map(|dir| dir.join("config.yaml"))
+}
+
+fn hermes_plugin_files_present(dir: &Path) -> bool {
+    dir.join("plugin.yaml").is_file() && dir.join("__init__.py").is_file()
+}
+
+fn hermes_plugin_assets_current(dir: &Path) -> bool {
+    std::fs::read_to_string(dir.join("plugin.yaml"))
+        .is_ok_and(|content| content == HERMES_PLUGIN_YAML)
+        && std::fs::read_to_string(dir.join("__init__.py"))
+            .is_ok_and(|content| content == HERMES_PLUGIN_INIT)
+}
+
+/// Whether `term-server-agent-events` is in the `plugins.enabled` allow-list of
+/// the Hermes `config.yaml`. Mirrors the shapes `update_hermes_enabled_plugin`
+/// edits, so status agrees with what an install/remove would produce.
+fn hermes_plugin_enabled() -> bool {
+    let Some(config_path) = hermes_config_path() else {
+        return false;
+    };
+    let Ok(content) = std::fs::read_to_string(config_path) else {
+        return false;
+    };
+    hermes_enabled_plugins_contain(&content, HERMES_PLUGIN_DIR_NAME)
+}
+
+fn hermes_enabled_plugins_contain(content: &str, name: &str) -> bool {
+    let lines: Vec<String> = content.lines().map(str::to_string).collect();
+    let Some(plugins_index) = top_level_yaml_key_index(&lines, "plugins") else {
+        return false;
+    };
+    let plugins_end =
+        next_top_level_yaml_key_index(&lines, plugins_index + 1).unwrap_or(lines.len());
+
+    let enabled_index = lines[plugins_index + 1..plugins_end]
+        .iter()
+        .position(|line| yaml_key_at_indent(line, 2) == Some("enabled"))
+        .map(|offset| plugins_index + 1 + offset);
+    if let Some(enabled_index) = enabled_index {
+        let line = lines[enabled_index].trim();
+        if line == "enabled: []" || line == "enabled: [] # herdr" {
+            return false;
+        }
+        let list_start = enabled_index + 1;
+        let list_end = lines[list_start..plugins_end]
+            .iter()
+            .position(|line| {
+                yaml_indent(line).is_some_and(|indent| indent <= 2) && yaml_key_name(line).is_some()
+            })
+            .map(|offset| list_start + offset)
+            .unwrap_or(plugins_end);
+        return lines[list_start..list_end]
+            .iter()
+            .any(|line| yaml_list_item_matches(line, name));
+    }
+
+    if let Some(items) = yaml_key_value_at_indent(&lines[plugins_index], 0, "plugins")
+        .and_then(yaml_flow_sequence_items)
+    {
+        return items.iter().any(|item| item == name);
+    }
+
+    let flat_list_start = lines[plugins_index + 1..plugins_end]
+        .iter()
+        .position(|line| yaml_list_item_value_at_indent(line, 2).is_some())
+        .map(|offset| plugins_index + 1 + offset);
+    if let Some(flat_list_start) = flat_list_start {
+        let list_end = lines[flat_list_start..plugins_end]
+            .iter()
+            .position(|line| yaml_indent(line).is_some_and(|indent| indent != 2))
+            .map(|offset| flat_list_start + offset)
+            .unwrap_or(plugins_end);
+        return lines[flat_list_start..list_end]
+            .iter()
+            .any(|line| yaml_list_item_matches_at_indent(line, 2, name));
+    }
+
+    false
+}
+
+fn ensure_hermes_plugin_enabled(content: &str) -> String {
+    update_hermes_enabled_plugin(content, true)
+}
+
+fn remove_hermes_plugin_enabled(content: &str) -> String {
+    update_hermes_enabled_plugin(content, false)
+}
+
+/// Adds or removes `HERMES_PLUGIN_DIR_NAME` from the `plugins.enabled`
+/// allow-list in a Hermes `config.yaml`, preserving unrelated keys and the
+/// existing formatting. Ported from herdr's
+/// `src/integration/config_edit.rs::update_hermes_enabled_plugin`.
+fn update_hermes_enabled_plugin(content: &str, enabled: bool) -> String {
+    let trailing_newline = content.ends_with('\n');
+    let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
+    let Some(plugins_index) = top_level_yaml_key_index(&lines, "plugins") else {
+        if !enabled {
+            return content.to_string();
+        }
+        let mut result = content.trim_end_matches('\n').to_string();
+        if !result.is_empty() {
+            result.push('\n');
+        }
+        result.push_str("plugins:\n  enabled:\n    - term-server-agent-events\n");
+        return result;
+    };
+
+    let plugins_end =
+        next_top_level_yaml_key_index(&lines, plugins_index + 1).unwrap_or(lines.len());
+    let plugins_inline_items = yaml_key_value_at_indent(&lines[plugins_index], 0, "plugins")
+        .and_then(yaml_flow_sequence_items);
+    let enabled_index = lines[plugins_index + 1..plugins_end]
+        .iter()
+        .position(|line| yaml_key_at_indent(line, 2) == Some("enabled"))
+        .map(|offset| plugins_index + 1 + offset);
+    let flat_list_start = lines[plugins_index + 1..plugins_end]
+        .iter()
+        .position(|line| yaml_list_item_value_at_indent(line, 2).is_some())
+        .map(|offset| plugins_index + 1 + offset);
+
+    if let Some(enabled_index) = enabled_index {
+        let line = lines[enabled_index].trim();
+        if line == "enabled: []" || line == "enabled: [] # herdr" {
+            if enabled {
+                lines[enabled_index] = "  enabled:".to_string();
+                lines.insert(
+                    enabled_index + 1,
+                    "    - term-server-agent-events".to_string(),
+                );
+            }
+            return join_yaml_lines(lines, trailing_newline);
+        }
+
+        let list_start = enabled_index + 1;
+        let list_end = lines[list_start..plugins_end]
+            .iter()
+            .position(|line| {
+                yaml_indent(line).is_some_and(|indent| indent <= 2) && yaml_key_name(line).is_some()
+            })
+            .map(|offset| list_start + offset)
+            .unwrap_or(plugins_end);
+        let existing_item_index = lines[list_start..list_end]
+            .iter()
+            .position(|line| yaml_list_item_matches(line, HERMES_PLUGIN_DIR_NAME))
+            .map(|offset| list_start + offset);
+
+        match (enabled, existing_item_index) {
+            (true, Some(_)) | (false, None) => return content.to_string(),
+            (true, None) => lines.insert(list_start, "    - term-server-agent-events".to_string()),
+            (false, Some(index)) => {
+                lines.remove(index);
+            }
+        }
+        return join_yaml_lines(lines, trailing_newline);
+    }
+
+    if let Some(mut items) = plugins_inline_items {
+        let existing_item_index = items.iter().position(|item| item == HERMES_PLUGIN_DIR_NAME);
+
+        match (enabled, existing_item_index) {
+            (true, Some(_)) | (false, None) => return content.to_string(),
+            (true, None) => items.insert(0, HERMES_PLUGIN_DIR_NAME.to_string()),
+            (false, Some(index)) => {
+                items.remove(index);
+            }
+        }
+
+        let replacement = hermes_flat_plugin_lines(&items);
+        lines.splice(plugins_index..plugins_end, replacement);
+        return join_yaml_lines(lines, trailing_newline);
+    }
+
+    if let Some(flat_list_start) = flat_list_start {
+        let existing_item_index = lines[plugins_index + 1..plugins_end]
+            .iter()
+            .position(|line| yaml_list_item_matches_at_indent(line, 2, HERMES_PLUGIN_DIR_NAME))
+            .map(|offset| plugins_index + 1 + offset);
+
+        match (enabled, existing_item_index) {
+            (true, Some(_)) | (false, None) => return content.to_string(),
+            (true, None) => {
+                lines.insert(flat_list_start, "  - term-server-agent-events".to_string())
+            }
+            (false, Some(index)) => {
+                lines.remove(index);
+            }
+        }
+        return join_yaml_lines(lines, trailing_newline);
+    }
+
+    if enabled {
+        lines.insert(plugins_index + 1, "  enabled:".to_string());
+        lines.insert(
+            plugins_index + 2,
+            "    - term-server-agent-events".to_string(),
+        );
+        return join_yaml_lines(lines, trailing_newline);
+    }
+
+    content.to_string()
+}
+
+fn hermes_flat_plugin_lines(items: &[String]) -> Vec<String> {
+    if items.is_empty() {
+        return vec!["plugins: []".to_string()];
+    }
+    let mut lines = vec!["plugins:".to_string()];
+    lines.extend(items.iter().map(|item| format!("  - {item}")));
+    lines
+}
+
+// ---------------------------------------------------------------------------
+// YAML helpers (ported from herdr's src/integration/config_edit.rs)
+// ---------------------------------------------------------------------------
+
+fn top_level_yaml_key_index(lines: &[String], key: &str) -> Option<usize> {
+    lines
+        .iter()
+        .position(|line| yaml_key_at_indent(line, 0) == Some(key))
+}
+
+fn next_top_level_yaml_key_index(lines: &[String], start: usize) -> Option<usize> {
+    lines[start..]
+        .iter()
+        .position(|line| yaml_indent(line) == Some(0) && yaml_key_name(line).is_some())
+        .map(|offset| start + offset)
+}
+
+fn yaml_key_at_indent(line: &str, indent: usize) -> Option<&str> {
+    (yaml_indent(line)? == indent)
+        .then(|| yaml_key_name(line))
+        .flatten()
+}
+
+fn yaml_key_value_at_indent<'a>(line: &'a str, indent: usize, key: &str) -> Option<&'a str> {
+    if yaml_indent(line)? != indent {
+        return None;
+    }
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('-') {
+        return None;
+    }
+    let (line_key, value) = trimmed.split_once(':')?;
+    (line_key.trim() == key).then_some(value.trim())
+}
+
+fn yaml_key_name(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('-') {
+        return None;
+    }
+    let (key, _) = trimmed.split_once(':')?;
+    let key = key.trim();
+    (!key.is_empty()).then_some(key)
+}
+
+fn yaml_indent(line: &str) -> Option<usize> {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+    Some(line.len() - trimmed.len())
+}
+
+fn yaml_list_item_value(line: &str) -> Option<&str> {
+    line.trim().strip_prefix("- ").map(str::trim)
+}
+
+fn yaml_list_item_matches(line: &str, value: &str) -> bool {
+    yaml_list_item_value(line).is_some_and(|item| yaml_scalar_value(item) == value)
+}
+
+fn yaml_list_item_value_at_indent(line: &str, indent: usize) -> Option<&str> {
+    (yaml_indent(line)? == indent)
+        .then(|| yaml_list_item_value(line))
+        .flatten()
+}
+
+fn yaml_list_item_matches_at_indent(line: &str, indent: usize, value: &str) -> bool {
+    yaml_list_item_value_at_indent(line, indent)
+        .is_some_and(|item| yaml_scalar_value(item) == value)
+}
+
+fn yaml_flow_sequence_items(value: &str) -> Option<Vec<String>> {
+    let value = strip_yaml_inline_comment(value).trim();
+    let inner = value.strip_prefix('[')?.strip_suffix(']')?.trim();
+    if inner.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let mut items = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+
+    for ch in inner.chars() {
+        if let Some(quote_char) = quote {
+            current.push(ch);
+            if quote_char == '"' && ch == '\\' && !escaped {
+                escaped = true;
+                continue;
+            }
+            if ch == quote_char && !escaped {
+                quote = None;
+            }
+            escaped = false;
+            continue;
+        }
+
+        match ch {
+            '"' | '\'' => {
+                quote = Some(ch);
+                current.push(ch);
+            }
+            ',' => {
+                items.push(yaml_scalar_value(&current));
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    if quote.is_some() {
+        return None;
+    }
+
+    items.push(yaml_scalar_value(&current));
+    Some(items)
+}
+
+fn yaml_scalar_value(value: &str) -> String {
+    let value = strip_yaml_inline_comment(value).trim();
+    if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        let quoted = (bytes[0] == b'"' && bytes[value.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[value.len() - 1] == b'\'');
+        if quoted {
+            return value[1..value.len() - 1].to_string();
+        }
+    }
+    value.to_string()
+}
+
+fn strip_yaml_inline_comment(value: &str) -> &str {
+    let mut quote = None;
+    let mut escaped = false;
+
+    for (index, ch) in value.char_indices() {
+        if let Some(quote_char) = quote {
+            if quote_char == '"' && ch == '\\' && !escaped {
+                escaped = true;
+                continue;
+            }
+            if ch == quote_char && !escaped {
+                quote = None;
+            }
+            escaped = false;
+            continue;
+        }
+
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '#' if index == 0 || value[..index].ends_with(char::is_whitespace) => {
+                return value[..index].trim_end();
+            }
+            _ => {}
+        }
+    }
+
+    value
+}
+
+fn join_yaml_lines(lines: Vec<String>, trailing_newline: bool) -> String {
+    let mut result = lines.join("\n");
+    if trailing_newline || result.is_empty() {
+        result.push('\n');
+    }
+    result
+}
+
 fn discover_omp_profiles() -> Vec<OmpProfile> {
     let mut names = BTreeSet::from(["default".to_owned()]);
     let config_root = omp_config_root();
@@ -1918,5 +2393,111 @@ mod tests {
         )]);
         assert_eq!(status.state, AgentIntegrationState::NotInstalled);
         assert!(status.message.contains("all OMP profiles"));
+    }
+
+    #[test]
+    fn hermes_config_editing_covers_common_shapes() {
+        // An empty config gains the plugins.enabled allow-list entry.
+        let added = ensure_hermes_plugin_enabled("");
+        assert!(hermes_enabled_plugins_contain(
+            &added,
+            HERMES_PLUGIN_DIR_NAME
+        ));
+        assert_eq!(
+            added,
+            "plugins:\n  enabled:\n    - term-server-agent-events\n"
+        );
+
+        // Unrelated top-level keys are preserved.
+        let base = "theme: dark\nmodel: hermes-4\n";
+        let added = ensure_hermes_plugin_enabled(base);
+        assert!(added.starts_with("theme: dark\nmodel: hermes-4\n"));
+        assert!(hermes_enabled_plugins_contain(
+            &added,
+            HERMES_PLUGIN_DIR_NAME
+        ));
+
+        // An existing enabled list keeps its other entries.
+        let existing = "theme: dark\nplugins:\n  enabled:\n    - some-other-plugin\n";
+        let added = ensure_hermes_plugin_enabled(existing);
+        assert!(hermes_enabled_plugins_contain(
+            &added,
+            HERMES_PLUGIN_DIR_NAME
+        ));
+        assert!(hermes_enabled_plugins_contain(&added, "some-other-plugin"));
+
+        // An explicit empty list expands.
+        let empty_list = "plugins:\n  enabled: []\n";
+        let added = ensure_hermes_plugin_enabled(empty_list);
+        assert!(hermes_enabled_plugins_contain(
+            &added,
+            HERMES_PLUGIN_DIR_NAME
+        ));
+
+        // A flat block list form is handled.
+        let flat = "plugins:\n  - some-other-plugin\n";
+        let added = ensure_hermes_plugin_enabled(flat);
+        assert!(hermes_enabled_plugins_contain(
+            &added,
+            HERMES_PLUGIN_DIR_NAME
+        ));
+        assert!(hermes_enabled_plugins_contain(&added, "some-other-plugin"));
+
+        // An inline flow list form is handled.
+        let inline = "plugins: [some-other-plugin]\n";
+        let added = ensure_hermes_plugin_enabled(inline);
+        assert!(hermes_enabled_plugins_contain(
+            &added,
+            HERMES_PLUGIN_DIR_NAME
+        ));
+        assert!(hermes_enabled_plugins_contain(&added, "some-other-plugin"));
+
+        // Remove leaves unrelated entries and is idempotent when absent.
+        let removed = remove_hermes_plugin_enabled(&added);
+        assert!(!hermes_enabled_plugins_contain(
+            &removed,
+            HERMES_PLUGIN_DIR_NAME
+        ));
+        assert!(hermes_enabled_plugins_contain(
+            &removed,
+            "some-other-plugin"
+        ));
+        assert_eq!(remove_hermes_plugin_enabled(&removed), removed);
+    }
+
+    #[test]
+    fn hermes_plugin_files_and_assets_detect_state() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(!hermes_plugin_files_present(directory.path()));
+        assert!(!hermes_plugin_assets_current(directory.path()));
+
+        std::fs::write(directory.path().join("plugin.yaml"), HERMES_PLUGIN_YAML).unwrap();
+        std::fs::write(directory.path().join("__init__.py"), HERMES_PLUGIN_INIT).unwrap();
+        assert!(hermes_plugin_files_present(directory.path()));
+        assert!(hermes_plugin_assets_current(directory.path()));
+
+        // A stale asset is still present but not current.
+        std::fs::write(directory.path().join("__init__.py"), "stale").unwrap();
+        assert!(hermes_plugin_files_present(directory.path()));
+        assert!(!hermes_plugin_assets_current(directory.path()));
+    }
+
+    #[tokio::test]
+    async fn hermes_prepare_package_stages_current_assets() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = AgentIntegrationService::new(directory.path());
+        service
+            .prepare_package(AgentIntegrationProvider::Hermes)
+            .await
+            .unwrap();
+        assert!(service.assets_current(AgentIntegrationProvider::Hermes));
+        let root = service.provider_root(AgentIntegrationProvider::Hermes);
+        assert!(root.join("plugin.yaml").is_file());
+        assert!(root.join("__init__.py").is_file());
+        assert!(
+            !service
+                .provider_root(AgentIntegrationProvider::Claude)
+                .exists()
+        );
     }
 }

@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.15.0 - 2026-08-19
+
+Hermes Agent (Nous Research) sessions now show their lifecycle state in the
+status pill, matching Codex, Claude, Pi, and OMP.
+
+### Added
+
+- **Hermes Agent status.** A running `hermes` session is recognized from its
+  process tree, and its state is inferred from its window title (markers for
+  blocked, working, and idle) and on-screen approval and clarification prompts,
+  so the status pill shows **Needs you**, **Working**, and **Idle** and the
+  terminal is flagged when Hermes is waiting for input.
+- **Hermes native lifecycle integration.** **Settings → Live agent activity**
+  can install a small Hermes plugin that forwards Hermes's own lifecycle events
+  (working, running a command, editing files, waiting for approval, idle, and
+  session end) to term-server for more immediate status and activity labels.
+- **Activity kinds for Hermes tools.** Hermes's terminal, file-write, and patch
+  tools map to running-a-command and editing-files activity labels.
+
+### Upgrade notes
+
+- No breaking changes, data migrations, or configuration changes. Screen-based
+  Hermes status detection works automatically for detected sessions; the
+  native lifecycle plugin is opt-in from **Settings → Live agent activity**.
+  The release is safe for automatic installation over `0.14.1`.
+- Reload open pages to pick up the client changes.
+
 ## 0.14.1 - 2026-08-18
 
 Large uploads now show a live progress bar and can be cancelled.
