@@ -1281,6 +1281,7 @@ export function App() {
       return next;
     });
     activeIdRef.current = id;
+    setActiveId(id);
     activeResourceRef.current = undefined;
     setActiveResource(undefined);
     setSettingsActive(false);
