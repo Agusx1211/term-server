@@ -173,6 +173,15 @@ test("K-16 Checkpoint inside escape sequence cannot corrupt snapshot recovery @p
     { timeoutMs: WAIT_TIMEOUT_MS },
   );
 
+  // The browser timer is intentionally throttled by the runtime under load.
+  // Force the same production checkpoint callback after the parser boundary so
+  // this protocol test does not depend on wall-clock scheduling.
+  await page.evaluate((id) => {
+    const api = (window as E2EWindow).__TERM_SERVER_E2E__;
+    if (!api) throw new Error("term-server E2E diagnostics are unavailable");
+    api.controls.checkpoint.flush(id);
+  }, terminalId);
+
   const checkpoint = await waitForCheckpoint(page, terminalId, eventFloor, unsafeSequence);
   const checkpointData = checkpoint.data as CheckpointEventData;
   if (typeof checkpointData.chunks !== "number" || checkpointData.chunks < 1) {

@@ -234,6 +234,9 @@ export interface E2EDiagnosticsControls {
     release(): void;
     reset(): void;
   };
+  readonly checkpoint: {
+    flush(terminalId: string): void;
+  };
   readonly renderer: {
     delayWebGL(terminalId: string, delayMs: number): void;
     failWebGL(terminalId: string, options?: { readonly message?: string }): void;
@@ -287,6 +290,7 @@ export interface E2ETerminalDiagnosticsHandle {
   rendererFallback(reason?: string): void;
   rendererContextLost(): void;
   registerContextLossControl(callback: () => void): () => void;
+  registerCheckpointControl(callback: () => void): () => void;
   rendererRendered(): void;
   socketCreated(socket: WebSocket, url: string): number;
   socketProtocolVersion(): number | undefined;
@@ -326,6 +330,7 @@ interface InternalEntry {
   rendererFault: InternalRendererFault;
   protocolVersion?: number;
   contextLossControl?: () => void;
+  checkpointControl?: () => void;
   contextLossCallback?: () => void;
 }
 
@@ -980,6 +985,15 @@ function installApi(): E2ETerminalDiagnosticsApi | undefined {
         releaseFontLoad();
       },
     },
+    checkpoint: {
+      flush(terminalId) {
+        const entry = findEntry(terminalId);
+        if (!entry?.checkpointControl) {
+          throw new Error(`terminal ${terminalId} has no active checkpoint control`);
+        }
+        entry.checkpointControl();
+      },
+    },
     renderer: {
       delayWebGL(terminalId, delayMs) {
         const fault = rendererFaults.get(terminalId) ?? { delayMs: 0, fail: false, message: "WebGL load failed", loseContext: false };
@@ -1215,6 +1229,7 @@ const NOOP_HANDLE: E2ETerminalDiagnosticsHandle = {
   rendererFallback: () => undefined,
   rendererContextLost: () => undefined,
   registerContextLossControl: () => () => undefined,
+  registerCheckpointControl: () => () => undefined,
   rendererRendered: () => undefined,
   socketCreated: () => 0,
   socketProtocolVersion: () => undefined,
@@ -1336,6 +1351,14 @@ function makeHandle(entry: InternalEntry): E2ETerminalDiagnosticsHandle {
       entry.contextLossControl = callback;
       return () => {
         if (entry.contextLossControl === callback) entry.contextLossControl = previous;
+      };
+    },
+    registerCheckpointControl(callback) {
+      if (disposed) return () => undefined;
+      const previous = entry.checkpointControl;
+      entry.checkpointControl = callback;
+      return () => {
+        if (entry.checkpointControl === callback) entry.checkpointControl = previous;
       };
     },
     rendererRendered() {
@@ -1461,6 +1484,7 @@ function makeHandle(entry: InternalEntry): E2ETerminalDiagnosticsHandle {
       if (disposed) return;
       disposed = true;
       entry.contextLossControl = undefined;
+      entry.checkpointControl = undefined;
       entry.snapshot.mounted = false;
       entry.snapshot.visible = false;
       entry.snapshot.cached = true;
