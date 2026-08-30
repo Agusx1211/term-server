@@ -2975,6 +2975,21 @@ impl TerminalManager {
     }
 }
 
+pub(crate) fn is_terminal_descendant(shell_pid: u32, pid: u32, start_ticks: u64) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        ProcessSnapshot::read(&[shell_pid])
+            .descendants(shell_pid)
+            .into_iter()
+            .any(|process| process.pid == pid && process.start_ticks == start_ticks)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (shell_pid, pid, start_ticks);
+        false
+    }
+}
+
 pub(crate) fn terminate_descendant_process(
     shell_pid: u32,
     process_id: &str,

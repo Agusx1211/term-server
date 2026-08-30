@@ -2138,7 +2138,7 @@ dependencies = [
 
 [[package]]
 name = "term-server"
-version = "0.15.2"
+version = "0.16.0"
 dependencies = [
  "argon2",
  "axum",
@@ -2183,6 +2183,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-width",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

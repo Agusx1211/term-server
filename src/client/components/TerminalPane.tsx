@@ -21,6 +21,7 @@ import {
   Radio,
   RefreshCw,
   Search,
+  ShieldCheck,
   TerminalSquare,
   TriangleAlert,
   Trash2,
@@ -130,6 +131,7 @@ import {
   type ThemeName,
 } from "../lib/terminal-theme";
 import { ProcessInspector } from "./ProcessInspector";
+import { AccessPanel } from "./AccessPanel";
 import { ArtifactDrawer } from "./ArtifactDrawer";
 import { WorkingDuration } from "./WorkingDuration";
 import { agentStatusPresentation, type AgentStatusTone } from "../lib/agent-status";
@@ -269,6 +271,8 @@ export function TerminalPane({
   activeState.current = active;
   visibleState.current = visible;
   const [processesOpen, setProcessesOpen] = useState(false);
+  const [accessOpen, setAccessOpen] = useState(false);
+  const [accessPendingCount, setAccessPendingCount] = useState(0);
   const knownArtifactIds = useRef(new Set(artifacts.map((artifact) => artifact.id)));
   const [artifactsOpen, setArtifactsOpen] = useState(artifacts.length > 0);
   const [actionsOpen, setActionsOpen] = useState(false);
@@ -325,6 +329,7 @@ export function TerminalPane({
     for (const artifact of artifacts) knownArtifactIds.current.add(artifact.id);
     if (!discovered) return;
     setProcessesOpen(false);
+    setAccessOpen(false);
     setArtifactsOpen(true);
   }, [artifactSignature]);
 
@@ -1946,6 +1951,7 @@ export function TerminalPane({
             class={`pane-artifacts ${artifactsVisible ? "active" : ""}`}
             onClick={() => {
               setProcessesOpen(false);
+              setAccessOpen(false);
               setArtifactsOpen((current) => !current);
             }}
             aria-label={`${artifactsVisible ? "Close" : "Open"} ${artifacts.length} session ${artifacts.length === 1 ? "artifact" : "artifacts"}`}
@@ -1995,9 +2001,26 @@ export function TerminalPane({
             <Maximize2 size={14} />
           </button>
           <button
+            class={`pane-action pane-access-action ${accessOpen ? "active" : ""} ${accessPendingCount ? "attention" : ""}`}
+            onClick={() => {
+              setArtifactsOpen(false);
+              setProcessesOpen(false);
+              setAccessOpen((current) => !current);
+            }}
+            aria-label={`Open terminal access panel, ${accessPendingCount} ${accessPendingCount === 1 ? "request" : "requests"} waiting`}
+            aria-expanded={accessOpen}
+            title={accessPendingCount
+              ? `${accessPendingCount} access ${accessPendingCount === 1 ? "request" : "requests"} waiting`
+              : "Manage terminal access"}
+          >
+            <ShieldCheck size={14} />
+            {accessPendingCount > 0 && <span>{accessPendingCount}</span>}
+          </button>
+          <button
             class={`pane-action ${processesOpen ? "active" : ""}`}
             onClick={() => {
               setArtifactsOpen(false);
+              setAccessOpen(false);
               setProcessesOpen((current) => !current);
             }}
             aria-label="Inspect terminal processes"
@@ -2046,6 +2069,15 @@ export function TerminalPane({
               <button role="menuitem" onClick={() => {
                 setActionsOpen(false);
                 setArtifactsOpen(false);
+                setProcessesOpen(false);
+                setAccessOpen(true);
+              }}>
+                <ShieldCheck size={16} /> Access{accessPendingCount ? ` requests (${accessPendingCount})` : ""}
+              </button>
+              <button role="menuitem" onClick={() => {
+                setActionsOpen(false);
+                setArtifactsOpen(false);
+                setAccessOpen(false);
                 setProcessesOpen(true);
               }}>
                 <ListTree size={16} /> Inspect processes
@@ -2056,6 +2088,7 @@ export function TerminalPane({
                   onClick={() => {
                     setActionsOpen(false);
                     setProcessesOpen(false);
+                    setAccessOpen(false);
                     setArtifactsOpen(true);
                   }}
                 >
@@ -2237,6 +2270,13 @@ export function TerminalPane({
           <img src={api.previewFileUrl({ path: imagePreview.file.path })} alt={imagePreview.file.name} />
         </div>
       )}
+      <AccessPanel
+        open={accessOpen}
+        terminal={terminal}
+        onClose={() => setAccessOpen(false)}
+        onPendingCountChange={setAccessPendingCount}
+        onNotice={onNotice}
+      />
       {processesOpen && <ProcessInspector terminalId={terminal.id} onClose={() => setProcessesOpen(false)} />}
       {connection === "disconnected" && (
         <div class="pane-banner">

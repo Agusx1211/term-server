@@ -45,6 +45,10 @@ use crate::supervisor::{
     SupervisorService,
 };
 use crate::{
+    access::{
+        AccessDecision, AccessSnapshot, AddSecretGrant, SecretApproval, SecretGrantView,
+        SudoApproval,
+    },
     activity_view::{ActivityView, ActivityViewService},
     agent_integrations::{
         AgentIntegrationAction, AgentIntegrationProvider, AgentIntegrationService,
@@ -472,10 +476,33 @@ fn require_origin(headers: &HeaderMap, uri: &Uri, state: &AppState) -> Result<()
         .and_then(|value| value.to_str().ok())
         .or_else(|| uri.authority().map(|authority| authority.as_str()))
         .ok_or(ApiError::ForbiddenOrigin)?;
-    let scheme = if state.secure { "https" } else { "http" };
+    let scheme = if state.secure || state.secure_cookie {
+        "https"
+    } else {
+        "http"
+    };
     (origin == format!("{scheme}://{authority}"))
         .then_some(())
         .ok_or(ApiError::ForbiddenOrigin)
+}
+
+fn require_sensitive_access(
+    headers: &HeaderMap,
+    uri: &Uri,
+    jar: &CookieJar,
+    state: &AppState,
+) -> Result<(), ApiError> {
+    if !headers.contains_key(header::ORIGIN) {
+        return Err(ApiError::ForbiddenOrigin);
+    }
+    require_origin(headers, uri, state)?;
+    require_auth(jar, state)?;
+    if !state.secure && !state.secure_cookie && !cfg!(feature = "e2e") {
+        return Err(ApiError::UpgradeRequired(
+            "secret and sudo approvals require HTTPS".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -1101,6 +1128,98 @@ async fn terminal_processes(
         .await
         .map(Json)
         .map_err(Into::into)
+}
+
+async fn terminal_access(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    jar: CookieJar,
+) -> Result<Json<AccessSnapshot>, ApiError> {
+    require_auth(&jar, &state)?;
+    state
+        .workspace
+        .access_snapshot(id)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn add_terminal_secret(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+    Json(request): Json<AddSecretGrant>,
+) -> Result<(StatusCode, Json<SecretGrantView>), ApiError> {
+    require_sensitive_access(&headers, &uri, &jar, &state)?;
+    state
+        .workspace
+        .add_secret(id, request)
+        .await
+        .map(|grant| (StatusCode::CREATED, Json(grant)))
+        .map_err(Into::into)
+}
+
+async fn revoke_terminal_secret(
+    State(state): State<AppState>,
+    Path((id, grant_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+) -> Result<StatusCode, ApiError> {
+    require_sensitive_access(&headers, &uri, &jar, &state)?;
+    state.workspace.revoke_secret(id, grant_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn approve_terminal_secret(
+    State(state): State<AppState>,
+    Path((id, request_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+    Json(request): Json<SecretApproval>,
+) -> Result<Json<SecretGrantView>, ApiError> {
+    require_sensitive_access(&headers, &uri, &jar, &state)?;
+    state
+        .workspace
+        .approve_secret(id, request_id, request)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn approve_terminal_sudo(
+    State(state): State<AppState>,
+    Path((id, request_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+    Json(request): Json<SudoApproval>,
+) -> Result<StatusCode, ApiError> {
+    require_sensitive_access(&headers, &uri, &jar, &state)?;
+    state
+        .workspace
+        .approve_sudo(id, request_id, request)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn reject_terminal_access(
+    State(state): State<AppState>,
+    Path((id, request_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+    Json(request): Json<AccessDecision>,
+) -> Result<StatusCode, ApiError> {
+    require_sensitive_access(&headers, &uri, &jar, &state)?;
+    state
+        .workspace
+        .reject_access(id, request_id, request)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Reports what screen detection saw for a terminal and which rule decided its
@@ -1742,6 +1861,27 @@ pub fn build_router(state: AppState, client_directory: Option<PathBuf>) -> Route
             patch(update_terminal_activity_view),
         )
         .route("/terminals/{id}/processes", get(terminal_processes))
+        .route("/terminals/{id}/access", get(terminal_access))
+        .route(
+            "/terminals/{id}/access/secrets",
+            post(add_terminal_secret).layer(DefaultBodyLimit::max(72 * 1024)),
+        )
+        .route(
+            "/terminals/{id}/access/secrets/{grant_id}",
+            delete(revoke_terminal_secret),
+        )
+        .route(
+            "/terminals/{id}/access/requests/{request_id}/secret",
+            post(approve_terminal_secret).layer(DefaultBodyLimit::max(72 * 1024)),
+        )
+        .route(
+            "/terminals/{id}/access/requests/{request_id}/sudo",
+            post(approve_terminal_sudo).layer(DefaultBodyLimit::max(72 * 1024)),
+        )
+        .route(
+            "/terminals/{id}/access/requests/{request_id}/reject",
+            post(reject_terminal_access).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
         .route("/terminals/{id}/agent/explain", get(terminal_agent_explain))
         .route(
             "/terminals/{id}/processes/{process_id}",
@@ -1895,7 +2035,11 @@ mod tests {
     }
 
     async fn authenticated_app() -> (Router, String) {
-        let app = build_router(test_state().await, None);
+        authenticated_app_with_state(test_state().await).await
+    }
+
+    async fn authenticated_app_with_state(state: AppState) -> (Router, String) {
+        let app = build_router(state, None);
         let login = app
             .clone()
             .oneshot(
@@ -1920,6 +2064,29 @@ mod tests {
             .unwrap()
             .to_owned();
         (app, cookie)
+    }
+
+    async fn create_test_terminal(app: &Router, cookie: &str) -> Uuid {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/terminals")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::from(r#"{"cwd":"/tmp","shell":"/bin/sh"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap()
     }
 
     #[tokio::test]
@@ -2092,6 +2259,84 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn access_secret_mutations_require_https() {
+        let (app, cookie) = authenticated_app().await;
+        let terminal = create_test_terminal(&app, &cookie).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/terminals/{terminal}/access/secrets"))
+                    .header(header::HOST, "localhost")
+                    .header(header::ORIGIN, "http://localhost")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::from(r#"{"name":"TOKEN","value":"browser-secret"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn secure_access_mutations_require_origin_and_never_return_secret_values() {
+        let mut state = test_state().await;
+        state.secure = true;
+        let (app, cookie) = authenticated_app_with_state(state).await;
+        let terminal = create_test_terminal(&app, &cookie).await;
+        let missing_origin = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/terminals/{terminal}/access/secrets"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::from(r#"{"name":"TOKEN","value":"browser-secret"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_origin.status(), StatusCode::FORBIDDEN);
+
+        let added = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/terminals/{terminal}/access/secrets"))
+                    .header(header::HOST, "localhost")
+                    .header(header::ORIGIN, "https://localhost")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::from(r#"{"name":"TOKEN","value":"browser-secret"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(added.status(), StatusCode::CREATED);
+        let added_body = to_bytes(added.into_body(), 64 * 1024).await.unwrap();
+        assert!(!String::from_utf8_lossy(&added_body).contains("browser-secret"));
+
+        let snapshot = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/terminals/{terminal}/access"))
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(snapshot.status(), StatusCode::OK);
+        let snapshot_body = to_bytes(snapshot.into_body(), 64 * 1024).await.unwrap();
+        let snapshot_text = String::from_utf8_lossy(&snapshot_body);
+        assert!(snapshot_text.contains("TOKEN"));
+        assert!(!snapshot_text.contains("browser-secret"));
     }
 
     #[tokio::test]

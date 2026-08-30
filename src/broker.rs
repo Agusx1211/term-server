@@ -1,5 +1,6 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
+    convert::Infallible,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -11,14 +12,15 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{Path as AxumPath, Query, State, ws::WebSocketUpgrade},
+    body::Body,
+    extract::{ConnectInfo, Path as AxumPath, Query, State, ws::WebSocketUpgrade},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{any, get, patch, post},
 };
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
-use hyper::{Method, Request};
+use hyper::{Method, Request, body::Incoming};
 use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
@@ -28,8 +30,14 @@ use tokio::{
 };
 use tokio_tungstenite::{WebSocketStream, client_async};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::{
+    access::{
+        AccessDecision, AccessError, AccessManager, AccessSnapshot, AccessSubscription,
+        AddSecretGrant, AgentAccessEvent, AgentRequestContext, AgentSecretExecute, AgentSecretName,
+        AgentSecretRequest, AgentSudoRequest, SecretApproval, SecretGrantView, SudoApproval,
+    },
     agent_events::AgentEvent,
     ai::{PiClientConfig, PiService, UpdatePiSettings},
     build::{self, BuildIdentity},
@@ -41,7 +49,7 @@ use crate::{
     terminal::{
         AgentDetectionExplain, CreateSupervisorTerminal, CreateTerminal, ProcessInspectorSnapshot,
         RenameTerminal, TerminalInfo, TerminalManager, TerminalScreenSnapshot, TerminalViewport,
-        normalize_terminal_path,
+        is_terminal_descendant, normalize_terminal_path,
     },
     terminal_state::TerminalResume,
     workspace::{
@@ -309,6 +317,139 @@ impl BrokerClient {
         .await
     }
 
+    pub async fn access_snapshot(&self, id: Uuid) -> Result<AccessSnapshot, BrokerError> {
+        self.get_json(&format!("/terminals/{id}/access")).await
+    }
+
+    pub async fn add_secret(
+        &self,
+        id: Uuid,
+        request: &AddSecretGrant,
+    ) -> Result<SecretGrantView, BrokerError> {
+        self.send_json(
+            Method::POST,
+            &format!("/terminals/{id}/access/secrets"),
+            Some(request),
+        )
+        .await
+    }
+
+    pub async fn revoke_secret(&self, id: Uuid, grant_id: Uuid) -> Result<(), BrokerError> {
+        self.send_empty::<()>(
+            Method::DELETE,
+            &format!("/terminals/{id}/access/secrets/{grant_id}"),
+            None,
+        )
+        .await
+    }
+
+    pub async fn approve_secret(
+        &self,
+        id: Uuid,
+        request_id: Uuid,
+        request: &SecretApproval,
+    ) -> Result<SecretGrantView, BrokerError> {
+        self.send_json(
+            Method::POST,
+            &format!("/terminals/{id}/access/requests/{request_id}/secret"),
+            Some(request),
+        )
+        .await
+    }
+
+    pub async fn approve_sudo(
+        &self,
+        id: Uuid,
+        request_id: Uuid,
+        request: &SudoApproval,
+    ) -> Result<(), BrokerError> {
+        self.send_empty(
+            Method::POST,
+            &format!("/terminals/{id}/access/requests/{request_id}/sudo"),
+            Some(request),
+        )
+        .await
+    }
+
+    pub async fn reject_access(
+        &self,
+        id: Uuid,
+        request_id: Uuid,
+        request: &AccessDecision,
+    ) -> Result<(), BrokerError> {
+        self.send_empty(
+            Method::POST,
+            &format!("/terminals/{id}/access/requests/{request_id}/reject"),
+            Some(request),
+        )
+        .await
+    }
+
+    pub async fn agent_secret_request(
+        &self,
+        id: Uuid,
+        request: &AgentSecretRequest,
+    ) -> Result<Incoming, BrokerError> {
+        self.request_stream(
+            Method::POST,
+            &format!("/terminals/{id}/access/agent/secret/request"),
+            request,
+        )
+        .await
+    }
+
+    pub async fn agent_sudo_request(
+        &self,
+        id: Uuid,
+        request: &AgentSudoRequest,
+    ) -> Result<Incoming, BrokerError> {
+        self.request_stream(
+            Method::POST,
+            &format!("/terminals/{id}/access/agent/sudo/request"),
+            request,
+        )
+        .await
+    }
+
+    pub async fn agent_secret_execute(
+        &self,
+        id: Uuid,
+        request: &AgentSecretExecute,
+    ) -> Result<Incoming, BrokerError> {
+        self.request_stream(
+            Method::POST,
+            &format!("/terminals/{id}/access/agent/secret/execute"),
+            request,
+        )
+        .await
+    }
+
+    pub async fn agent_secret_list(
+        &self,
+        id: Uuid,
+        request: &AgentRequestContext,
+    ) -> Result<Vec<SecretGrantView>, BrokerError> {
+        self.send_json(
+            Method::POST,
+            &format!("/terminals/{id}/access/agent/secret/list"),
+            Some(request),
+        )
+        .await
+    }
+
+    pub async fn agent_secret_drop(
+        &self,
+        id: Uuid,
+        request: &AgentSecretName,
+    ) -> Result<(), BrokerError> {
+        self.send_empty(
+            Method::POST,
+            &format!("/terminals/{id}/access/agent/secret/drop"),
+            Some(request),
+        )
+        .await
+    }
+
     pub async fn terminal_socket(
         &self,
         id: Uuid,
@@ -392,12 +533,50 @@ impl BrokerClient {
         }
     }
 
+    async fn request_stream<B: Serialize + ?Sized>(
+        &self,
+        method: Method,
+        path: &str,
+        body: &B,
+    ) -> Result<Incoming, BrokerError> {
+        let response = self.request_response(method, path, Some(body)).await?;
+        let status = response.status();
+        if status.is_success() {
+            Ok(response.into_body())
+        } else {
+            let bytes = response
+                .into_body()
+                .collect()
+                .await
+                .map_err(|error| BrokerError::Unavailable(error.to_string()))?
+                .to_bytes();
+            Err(remote_error(status, &bytes))
+        }
+    }
+
     async fn request<B: Serialize + ?Sized>(
         &self,
         method: Method,
         path: &str,
         body: Option<&B>,
     ) -> Result<(StatusCode, Bytes), BrokerError> {
+        let response = self.request_response(method, path, body).await?;
+        let status = response.status();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .map_err(|error| BrokerError::Unavailable(error.to_string()))?
+            .to_bytes();
+        Ok((status, bytes))
+    }
+
+    async fn request_response<B: Serialize + ?Sized>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&B>,
+    ) -> Result<hyper::Response<Incoming>, BrokerError> {
         let stream = UnixStream::connect(self.socket_path.as_ref()).await?;
         let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
             .await
@@ -408,11 +587,12 @@ impl BrokerClient {
             }
         });
 
-        let encoded = body
-            .map(serde_json::to_vec)
-            .transpose()
-            .map_err(|error| BrokerError::Unavailable(error.to_string()))?
-            .unwrap_or_default();
+        let encoded = Zeroizing::new(
+            body.map(serde_json::to_vec)
+                .transpose()
+                .map_err(|error| BrokerError::Unavailable(error.to_string()))?
+                .unwrap_or_default(),
+        );
         let mut builder = Request::builder()
             .method(method)
             .uri(path)
@@ -425,20 +605,12 @@ impl BrokerClient {
             builder = builder.header(BROKER_CONTROL_HEADER, token.as_str());
         }
         let request = builder
-            .body(Full::new(Bytes::from(encoded)))
+            .body(Full::new(Bytes::from_owner(encoded)))
             .map_err(|error| BrokerError::Unavailable(error.to_string()))?;
-        let response = sender
+        sender
             .send_request(request)
             .await
-            .map_err(|error| BrokerError::Unavailable(error.to_string()))?;
-        let status = response.status();
-        let bytes = response
-            .into_body()
-            .collect()
-            .await
-            .map_err(|error| BrokerError::Unavailable(error.to_string()))?
-            .to_bytes();
-        Ok((status, bytes))
+            .map_err(|error| BrokerError::Unavailable(error.to_string()))
     }
 }
 
@@ -736,6 +908,85 @@ impl BrokerPool {
 
     pub async fn agent_explain(&self, id: Uuid) -> Result<AgentDetectionExplain, BrokerError> {
         self.owner(id).await?.client.agent_explain(id).await
+    }
+
+    async fn access_owner(&self, id: Uuid) -> Result<BrokerGeneration, BrokerError> {
+        let generation = self.owner(id).await?;
+        if generation.build.is_current() {
+            Ok(generation)
+        } else {
+            Err(BrokerError::Unavailable(
+                "access control is unavailable from this older session broker; recreate the terminal"
+                    .to_owned(),
+            ))
+        }
+    }
+
+    pub async fn access_snapshot(&self, id: Uuid) -> Result<AccessSnapshot, BrokerError> {
+        self.access_owner(id)
+            .await?
+            .client
+            .access_snapshot(id)
+            .await
+    }
+
+    pub async fn add_secret(
+        &self,
+        id: Uuid,
+        request: &AddSecretGrant,
+    ) -> Result<SecretGrantView, BrokerError> {
+        self.access_owner(id)
+            .await?
+            .client
+            .add_secret(id, request)
+            .await
+    }
+
+    pub async fn revoke_secret(&self, id: Uuid, grant_id: Uuid) -> Result<(), BrokerError> {
+        self.access_owner(id)
+            .await?
+            .client
+            .revoke_secret(id, grant_id)
+            .await
+    }
+
+    pub async fn approve_secret(
+        &self,
+        id: Uuid,
+        request_id: Uuid,
+        request: &SecretApproval,
+    ) -> Result<SecretGrantView, BrokerError> {
+        self.access_owner(id)
+            .await?
+            .client
+            .approve_secret(id, request_id, request)
+            .await
+    }
+
+    pub async fn approve_sudo(
+        &self,
+        id: Uuid,
+        request_id: Uuid,
+        request: &SudoApproval,
+    ) -> Result<(), BrokerError> {
+        self.access_owner(id)
+            .await?
+            .client
+            .approve_sudo(id, request_id, request)
+            .await
+    }
+
+    pub async fn reject_access(
+        &self,
+        id: Uuid,
+        request_id: Uuid,
+        request: &AccessDecision,
+    ) -> Result<(), BrokerError> {
+        self.access_owner(id)
+            .await?
+            .client
+            .reject_access(id, request_id, request)
+            .await
     }
 
     pub async fn screen(
@@ -1089,9 +1340,61 @@ fn load_or_create_broker_control_token(data_directory: &Path) -> Result<String, 
 #[derive(Clone)]
 struct BrokerState {
     terminals: Arc<TerminalManager>,
+    access: AccessManager,
     pi: Arc<PiService>,
     shutdown: Arc<Notify>,
     control_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BrokerPeerCredentials {
+    pid: Option<u32>,
+}
+
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, UnixListener>>
+    for BrokerPeerCredentials
+{
+    fn connect_info(stream: axum::serve::IncomingStream<'_, UnixListener>) -> Self {
+        Self {
+            pid: stream
+                .io()
+                .peer_cred()
+                .ok()
+                .and_then(|credentials| credentials.pid().and_then(|pid| u32::try_from(pid).ok())),
+        }
+    }
+}
+
+fn broker_access_manager() -> AccessManager {
+    #[cfg(feature = "e2e")]
+    let sudo_program = std::env::var_os("TERM_SERVER_E2E_SUDO_PROGRAM")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/usr/bin/sudo"));
+    #[cfg(not(feature = "e2e"))]
+    let sudo_program = PathBuf::from("/usr/bin/sudo");
+    AccessManager::new(sudo_program)
+}
+
+fn start_access_reaper(state: BrokerState) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let active = state
+                        .terminals
+                        .list()
+                        .into_iter()
+                        .filter(|terminal| terminal.pid.is_some())
+                        .map(|terminal| terminal.id)
+                        .collect::<HashSet<_>>();
+                    state.access.clear_inactive_terminals(&active);
+                }
+                _ = state.shutdown.notified() => return,
+            }
+        }
+    });
 }
 
 #[derive(Debug, Error)]
@@ -1102,8 +1405,23 @@ enum BrokerApiError {
     Unauthorized,
     #[error("{0}")]
     BadRequest(String),
+    #[error("{0}")]
+    Conflict(String),
     #[error("internal broker error")]
     Internal,
+}
+
+impl From<AccessError> for BrokerApiError {
+    fn from(error: AccessError) -> Self {
+        match error {
+            AccessError::NotFound => Self::NotFound,
+            AccessError::Stale => Self::Conflict(error.to_string()),
+            AccessError::Conflict(message) => Self::Conflict(message),
+            AccessError::Invalid(message) | AccessError::Unavailable(message) => {
+                Self::BadRequest(message)
+            }
+        }
+    }
 }
 
 impl IntoResponse for BrokerApiError {
@@ -1112,6 +1430,7 @@ impl IntoResponse for BrokerApiError {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (
@@ -1156,9 +1475,11 @@ pub async fn run_session_broker(
     let state = BrokerState {
         terminals,
         pi,
+        access: broker_access_manager(),
         shutdown: shutdown.clone(),
         control_token,
     };
+    start_access_reaper(state.clone());
     let router = Router::new()
         .route("/health", get(broker_health))
         .route("/config", axum::routing::put(configure_broker))
@@ -1171,6 +1492,44 @@ pub async fn run_session_broker(
         .route(
             "/terminals/{id}",
             patch(rename_broker_terminal).delete(remove_broker_terminal),
+        )
+        .route("/terminals/{id}/access", get(broker_access_snapshot))
+        .route("/terminals/{id}/access/secrets", post(broker_add_secret))
+        .route(
+            "/terminals/{id}/access/secrets/{grant_id}",
+            axum::routing::delete(broker_revoke_secret),
+        )
+        .route(
+            "/terminals/{id}/access/requests/{request_id}/secret",
+            post(broker_approve_secret),
+        )
+        .route(
+            "/terminals/{id}/access/requests/{request_id}/sudo",
+            post(broker_approve_sudo),
+        )
+        .route(
+            "/terminals/{id}/access/requests/{request_id}/reject",
+            post(broker_reject_access),
+        )
+        .route(
+            "/terminals/{id}/access/agent/secret/request",
+            post(broker_agent_secret_request),
+        )
+        .route(
+            "/terminals/{id}/access/agent/sudo/request",
+            post(broker_agent_sudo_request),
+        )
+        .route(
+            "/terminals/{id}/access/agent/secret/execute",
+            post(broker_agent_secret_execute),
+        )
+        .route(
+            "/terminals/{id}/access/agent/secret/list",
+            post(broker_agent_secret_list),
+        )
+        .route(
+            "/terminals/{id}/access/agent/secret/drop",
+            post(broker_agent_secret_drop),
         )
         .route("/terminals/{id}/processes", get(broker_terminal_processes))
         .route("/terminals/{id}/agent-explain", get(broker_agent_explain))
@@ -1194,11 +1553,14 @@ pub async fn run_session_broker(
         .with_state(state);
 
     tracing::info!(socket = %path.display(), "terminal session broker is ready");
-    let result = axum::serve(listener, router)
-        .with_graceful_shutdown(async move {
-            shutdown.notified().await;
-        })
-        .await;
+    let result = axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<BrokerPeerCredentials>(),
+    )
+    .with_graceful_shutdown(async move {
+        shutdown.notified().await;
+    })
+    .await;
     let _ = tokio::fs::remove_file(&path).await;
     result.map_err(Into::into)
 }
@@ -1305,11 +1667,214 @@ async fn remove_broker_terminal(
     State(state): State<BrokerState>,
     AxumPath(id): AxumPath<Uuid>,
 ) -> Result<StatusCode, BrokerApiError> {
+    if state.terminals.remove(id) {
+        state.access.clear_terminal(id);
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(BrokerApiError::NotFound)
+    }
+}
+
+async fn broker_access_snapshot(
+    State(state): State<BrokerState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<Uuid>,
+) -> Result<Json<AccessSnapshot>, BrokerApiError> {
+    authorize_broker_history(&state, &headers)?;
+    state.terminals.get(id).ok_or(BrokerApiError::NotFound)?;
+    Ok(Json(state.access.snapshot(id)))
+}
+
+fn require_running_terminal(state: &BrokerState, id: Uuid) -> Result<(), BrokerApiError> {
     state
         .terminals
-        .remove(id)
-        .then_some(StatusCode::NO_CONTENT)
-        .ok_or(BrokerApiError::NotFound)
+        .get(id)
+        .filter(|terminal| terminal.info().pid.is_some())
+        .map(|_| ())
+        .ok_or_else(|| BrokerApiError::BadRequest("terminal is no longer running".to_owned()))
+}
+
+async fn broker_add_secret(
+    State(state): State<BrokerState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(request): Json<AddSecretGrant>,
+) -> Result<(StatusCode, Json<SecretGrantView>), BrokerApiError> {
+    authorize_broker_history(&state, &headers)?;
+    require_running_terminal(&state, id)?;
+    state
+        .access
+        .add_secret(id, request)
+        .map(|grant| (StatusCode::CREATED, Json(grant)))
+        .map_err(Into::into)
+}
+
+async fn broker_revoke_secret(
+    State(state): State<BrokerState>,
+    headers: HeaderMap,
+    AxumPath((id, grant_id)): AxumPath<(Uuid, Uuid)>,
+) -> Result<StatusCode, BrokerApiError> {
+    authorize_broker_history(&state, &headers)?;
+    state
+        .access
+        .revoke_grant(id, grant_id)
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(Into::into)
+}
+
+async fn broker_approve_secret(
+    State(state): State<BrokerState>,
+    headers: HeaderMap,
+    AxumPath((id, request_id)): AxumPath<(Uuid, Uuid)>,
+    Json(request): Json<SecretApproval>,
+) -> Result<Json<SecretGrantView>, BrokerApiError> {
+    authorize_broker_history(&state, &headers)?;
+    require_running_terminal(&state, id)?;
+    state
+        .access
+        .approve_secret(id, request_id, request)
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn broker_approve_sudo(
+    State(state): State<BrokerState>,
+    headers: HeaderMap,
+    AxumPath((id, request_id)): AxumPath<(Uuid, Uuid)>,
+    Json(request): Json<SudoApproval>,
+) -> Result<StatusCode, BrokerApiError> {
+    authorize_broker_history(&state, &headers)?;
+    require_running_terminal(&state, id)?;
+    state
+        .access
+        .approve_sudo(id, request_id, request)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(Into::into)
+}
+
+async fn broker_reject_access(
+    State(state): State<BrokerState>,
+    headers: HeaderMap,
+    AxumPath((id, request_id)): AxumPath<(Uuid, Uuid)>,
+    Json(request): Json<AccessDecision>,
+) -> Result<StatusCode, BrokerApiError> {
+    authorize_broker_history(&state, &headers)?;
+    state
+        .access
+        .reject(id, request_id, request)
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(Into::into)
+}
+
+async fn broker_agent_secret_request(
+    State(state): State<BrokerState>,
+    ConnectInfo(peer): ConnectInfo<BrokerPeerCredentials>,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(request): Json<AgentSecretRequest>,
+) -> Result<Response, BrokerApiError> {
+    authorize_agent_request(&state, &peer, id, &request.context)?;
+    state
+        .access
+        .request_secret(id, request)
+        .map(subscription_response)
+        .map_err(Into::into)
+}
+
+async fn broker_agent_sudo_request(
+    State(state): State<BrokerState>,
+    ConnectInfo(peer): ConnectInfo<BrokerPeerCredentials>,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(request): Json<AgentSudoRequest>,
+) -> Result<Response, BrokerApiError> {
+    authorize_agent_request(&state, &peer, id, &request.context)?;
+    state
+        .access
+        .request_sudo(id, request)
+        .map(subscription_response)
+        .map_err(Into::into)
+}
+
+async fn broker_agent_secret_execute(
+    State(state): State<BrokerState>,
+    ConnectInfo(peer): ConnectInfo<BrokerPeerCredentials>,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(request): Json<AgentSecretExecute>,
+) -> Result<Response, BrokerApiError> {
+    authorize_agent_request(&state, &peer, id, &request.context)?;
+    state
+        .access
+        .execute_secret(id, request)
+        .map(subscription_response)
+        .map_err(Into::into)
+}
+
+async fn broker_agent_secret_list(
+    State(state): State<BrokerState>,
+    ConnectInfo(peer): ConnectInfo<BrokerPeerCredentials>,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(request): Json<AgentRequestContext>,
+) -> Result<Json<Vec<SecretGrantView>>, BrokerApiError> {
+    authorize_agent_request(&state, &peer, id, &request)?;
+    Ok(Json(state.access.list_grants(id)))
+}
+
+async fn broker_agent_secret_drop(
+    State(state): State<BrokerState>,
+    ConnectInfo(peer): ConnectInfo<BrokerPeerCredentials>,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(request): Json<AgentSecretName>,
+) -> Result<StatusCode, BrokerApiError> {
+    authorize_agent_request(&state, &peer, id, &request.context)?;
+    state
+        .access
+        .drop_grant_by_name(id, &request.name)
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(Into::into)
+}
+
+fn authorize_agent_request(
+    state: &BrokerState,
+    peer: &BrokerPeerCredentials,
+    terminal_id: Uuid,
+    request: &AgentRequestContext,
+) -> Result<(), BrokerApiError> {
+    let terminal = state
+        .terminals
+        .get(terminal_id)
+        .ok_or(BrokerApiError::NotFound)?;
+    let shell_pid = terminal
+        .info()
+        .pid
+        .ok_or_else(|| BrokerApiError::BadRequest("terminal is no longer running".to_owned()))?;
+    if peer.pid == Some(request.pid)
+        && request.pid != shell_pid
+        && is_terminal_descendant(shell_pid, request.pid, request.start_ticks)
+    {
+        Ok(())
+    } else {
+        Err(BrokerApiError::Unauthorized)
+    }
+}
+
+fn subscription_response(subscription: AccessSubscription) -> Response {
+    let stream = futures_util::stream::unfold(subscription, |mut subscription| async move {
+        let event = subscription.next().await?;
+        let mut encoded = serde_json::to_vec(&event).unwrap_or_else(|_| {
+            serde_json::to_vec(&AgentAccessEvent::Failed {
+                message: "unable to encode access event".to_owned(),
+            })
+            .unwrap_or_default()
+        });
+        encoded.push(b'\n');
+        Some((Ok::<Bytes, Infallible>(Bytes::from(encoded)), subscription))
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/x-ndjson")
+        .header("cache-control", "no-store")
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 async fn broker_terminal_processes(
@@ -1486,7 +2051,7 @@ async fn shutdown_broker(State(state): State<BrokerState>) -> StatusCode {
     let shutdown = state.shutdown.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        shutdown.notify_one();
+        shutdown.notify_waiters();
     });
     StatusCode::NO_CONTENT
 }

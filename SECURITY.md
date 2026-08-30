@@ -29,6 +29,42 @@ Every terminal still runs as the same operating-system user. A deliberately host
 
 Terminal screens and process output returned to a supervisor agent are untrusted content and can contain prompt-injection text. The embedded skill tells agents to treat that content as data, but model behavior is not an enforcement mechanism. Review destructive requests and keep normal provider approval policies enabled.
 
+## Terminal access control boundary
+
+Secret and sudo requests are bound to a terminal UUID and a live Linux descendant process identity
+(`pid:start_ticks`). Agent lifecycle hooks and screen detection remain advisory and cannot approve a
+request. Browser decisions require authentication, an explicit same-origin header, HTTPS (or the
+configured trusted TLS reverse proxy), and the hash of the immutable request currently displayed.
+
+Secret values are held only in the owning session broker's memory and are zeroized on drop on a
+best-effort basis. API snapshots expose names and bounded use metadata, never values. A secret
+command is started by the broker with an allowlisted environment plus the one approved delivery
+variable, or with the value on standard input when explicitly requested; the agent process never
+receives the value. Exact output occurrences are redacted across stream boundaries, but transformed,
+encoded, hashed, or otherwise derived values cannot be reliably detected. Canceling the requester or
+closing its terminal kills the broker-started process group. This is not a sandbox: a hostile
+same-UID command can deliberately create a new session or process group and escape that cleanup.
+
+Sudo approvals cover one stored argument vector and working directory; no shell is added. The broker
+requires a root-owned executable that is not group- or world-writable, canonicalizes it, and commits
+its content hash and filesystem identity plus the working-directory identity to the request
+fingerprint, then rechecks them immediately before invoking the target through `sudo`. Arguments may
+still name mutable scripts, packages, configuration, or other inputs; the user must review those
+effects.
+
+The browser password field is cleared before the request completes. The broker sends the password
+only to `sudo` standard input, never to command arguments, the command environment, terminal output,
+transcripts, logs, browser storage, or a reusable secret grant, and best-effort zeroes its Rust
+buffers immediately after delivery. Sudo authentication timestamps are removed immediately after
+validation and again after execution. A root command that has already been approved may continue if
+the requesting agent disconnects or its terminal closes.
+
+These controls prevent accidental disclosure through term-server interfaces; they do not create an
+isolation boundary against hostile same-UID code. Such a process may inspect memory, trace another
+process, read the owner-only broker token, or interfere with the local runtime under the operating
+system threat model described above. Use separate Unix users or a sandbox for mutually untrusted
+agents, and do not expose term-server on an untrusted network.
+
 ## Optional provider status modules
 
 The optional status configuration is version-1 non-secret TOML selected with

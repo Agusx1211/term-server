@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.16.0 - 2026-08-30
+
+Secret and sudo approvals now live inside each terminal, with one browser control surface and one bundled agent interface.
+
+### Added
+
+- **Per-terminal Access panel.** Every terminal has a shield action that shows pending secret and sudo requests, active secret grants, use metadata, recent decisions, and an attention count. The same responsive panel works as a right-side inspector on desktop and a full-width surface on mobile.
+- **Proactive secret grants.** A user can add a named secret to a terminal before an agent requests it, review its purpose and use count, and revoke it at any time. Values stay in the owning session broker's memory and are never returned by the browser API or agent protocol.
+- **Integrated agent access client.** The bundled `term-server-access` skill teaches Codex, Claude, Pi, OMP, and Hermes to use `"$TERM_SERVER_EXECUTABLE" access` for request/list/run/drop secret operations and exact local sudo requests. The separate `secret-requests` and `sudo-requests` control TUIs are no longer needed inside term-server sessions.
+- **Reviewed sudo execution.** The Access panel shows the immutable argument vector, working directory, purpose, requester, waiter count, and fingerprint. Approval requires the user's sudo password for that command; wrong passwords leave the request pending for another attempt.
+
+### Security
+
+- Secret and sudo requests are bound to the originating terminal UUID, the connecting Unix peer PID, and a live Linux `pid:start_ticks` descendant identity. Agent lifecycle telemetry cannot create or approve requests.
+- Sensitive browser mutations require an authenticated same-origin request over HTTPS or the configured trusted TLS reverse proxy. Decisions include the current request hash, so a stale panel cannot approve changed work.
+- Secret-bearing commands use a minimal allowlisted environment, bounded output streaming, cross-stream exact-value redaction, zeroized in-process buffers, per-terminal request/grant/execution limits, and process-group cancellation when the requester or terminal goes away.
+- Sudo passwords reject line injection, are delivered only on `sudo` standard input, and are best-effort zeroed immediately after delivery. The broker requires a canonical root-owned executable that is not group- or world-writable, commits its SHA-256 and filesystem identity plus the working-directory identity to the request, and rechecks them immediately before execution.
+
+### Upgrade notes
+
+- No data migration is required. Secret grants are intentionally in-memory and disappear when revoked, when their terminal exits, or when the owning broker stops.
+- Existing terminals attached to an older broker cannot use Access controls. Recreate those terminals, or use **Settings → Restart all session brokers** if closing every open terminal is acceptable.
+- Repair or reinstall **Settings → Live agent activity**, then start a new agent session so its managed integration includes the bundled `term-server-access` skill. After upgrading, standalone `secret-access` and `sudo-access` skills can be removed.
+- Secret entry and sudo approval are unavailable over `--no-https` outside E2E builds. Keep built-in HTTPS enabled or configure a trusted TLS reverse proxy with secure cookies and an allowed origin.
+- Reload open browser pages to pick up the Access panel. The release is safe for automatic installation over `0.15.2`.
+
 ## 0.15.2 - 2026-08-30
 
 Supervisor coordination now has reliable PTY delivery, a pinned workspace identity, and secure retained session history.
