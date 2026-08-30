@@ -14,6 +14,7 @@ use uuid::Uuid;
 use crate::{
     ai::{PiClientConfig, PiService, UpdatePiSettings},
     debug_recording::DebugRecordingManager,
+    history::{AgentTranscriptKind, AgentTranscriptPage, TerminalScrollbackPage},
     terminal::{
         CreateSupervisorTerminal, CreateTerminal, ProcessInspectorSnapshot, ProcessSignalError,
         RenameTerminal, TerminalError, TerminalEvent, TerminalInfo, TerminalManager,
@@ -298,6 +299,51 @@ impl WorkspaceBackend {
         }
     }
 
+    pub async fn scrollback(
+        &self,
+        id: Uuid,
+        from_sequence: Option<u64>,
+        limit_bytes: usize,
+    ) -> Result<TerminalScrollbackPage, WorkspaceError> {
+        match self {
+            Self::Local { terminals, .. } => terminals
+                .get(id)
+                .map(|terminal| terminal.scrollback(from_sequence, limit_bytes))
+                .ok_or_else(|| WorkspaceError::Remote {
+                    status: StatusCode::NOT_FOUND,
+                    message: "terminal not found".to_owned(),
+                }),
+            #[cfg(unix)]
+            Self::Broker(client) => client.scrollback(id, from_sequence, limit_bytes).await,
+        }
+    }
+
+    pub async fn transcript(
+        &self,
+        id: Uuid,
+        from_sequence: Option<u64>,
+        limit: usize,
+        kinds: &[AgentTranscriptKind],
+    ) -> Result<AgentTranscriptPage, WorkspaceError> {
+        match self {
+            Self::Local { terminals, .. } => terminals
+                .get(id)
+                .ok_or_else(|| WorkspaceError::Remote {
+                    status: StatusCode::NOT_FOUND,
+                    message: "terminal not found".to_owned(),
+                })?
+                .transcript(from_sequence, limit, kinds)
+                .ok_or_else(|| WorkspaceError::Remote {
+                    status: StatusCode::BAD_REQUEST,
+                    message:
+                        "terminal has no retained semantic agent transcript; use scrollback instead"
+                            .to_owned(),
+                }),
+            #[cfg(unix)]
+            Self::Broker(client) => client.transcript(id, from_sequence, limit, kinds).await,
+        }
+    }
+
     pub async fn write(&self, id: Uuid, data: String) -> Result<(), WorkspaceError> {
         match self {
             Self::Local { terminals, .. } => terminals
@@ -306,7 +352,8 @@ impl WorkspaceBackend {
                     status: StatusCode::NOT_FOUND,
                     message: "terminal not found".to_owned(),
                 })?
-                .write(data.as_bytes())
+                .write_confirmed(data.as_bytes())
+                .await
                 .map_err(|error| WorkspaceError::Remote {
                     status: StatusCode::BAD_REQUEST,
                     message: error.to_string(),

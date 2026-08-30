@@ -10,12 +10,34 @@ interface TermServerEventBus {
   ): () => void;
 }
 
+interface TermServerSessionManager {
+  getBranch?(): unknown[];
+  getEntries?(): unknown[];
+}
+
 interface TermServerExtensionContext {
   hasUI?: boolean;
+  sessionManager?: TermServerSessionManager;
 }
 
 interface AgentEndEvent {
   isTerminal?: boolean;
+}
+
+interface MessageEndEvent {
+  message?: unknown;
+}
+
+interface ToolExecutionStartEvent {
+  toolCallId?: string;
+  toolName?: string;
+  args?: unknown;
+  intent?: string;
+}
+
+interface ToolExecutionEndEvent extends ToolExecutionStartEvent {
+  result?: unknown;
+  isError?: boolean;
 }
 
 type ExtensionHandler<Event> = (
@@ -26,12 +48,12 @@ type ExtensionHandler<Event> = (
 interface TermServerExtensionApi {
   getSessionName?(): string | undefined | null;
   on(event: "session_start", handler: ExtensionHandler<unknown>): void;
+  on(event: "session_switch", handler: ExtensionHandler<unknown>): void;
+  on(event: "session_tree", handler: ExtensionHandler<unknown>): void;
   on(event: "agent_start", handler: ExtensionHandler<unknown>): void;
-  on(
-    event: "tool_execution_start",
-    handler: ExtensionHandler<{ toolName?: string }>,
-  ): void;
-  on(event: "tool_execution_end", handler: ExtensionHandler<unknown>): void;
+  on(event: "message_end", handler: ExtensionHandler<MessageEndEvent>): void;
+  on(event: "tool_execution_start", handler: ExtensionHandler<ToolExecutionStartEvent>): void;
+  on(event: "tool_execution_end", handler: ExtensionHandler<ToolExecutionEndEvent>): void;
   on(event: "agent_end", handler: ExtensionHandler<AgentEndEvent>): void;
   on(event: "session_before_compact", handler: ExtensionHandler<unknown>): void;
   on(event: "session_compact", handler: ExtensionHandler<unknown>): void;
@@ -44,15 +66,158 @@ interface PendingReport {
   resolve: () => void;
 }
 
+interface TranscriptRecord {
+  kind: "message" | "tool_start" | "tool_result" | "status" | "compaction" | "summary" | "marker";
+  sourceId?: string;
+  timestamp?: number;
+  role?: string;
+  name?: string;
+  text?: string;
+  data?: unknown;
+  truncated?: boolean;
+}
+
 const REPORT_TIMEOUT_MS = 750;
 const MAX_PENDING_REPORTS = 256;
 const HEARTBEAT_INTERVAL_MS = 10_000;
+const MAX_TRANSCRIPT_RECORD_BYTES = 240 * 1024;
+const MAX_TRANSCRIPT_CHUNK_BYTES = 600 * 1024;
 
-// Reports coarse lifecycle activity to the private term-server session broker.
-// omp already generates a conversation title from the first message, so it is
-// forwarded here and term-server reuses it instead of generating its own.
-// Sends no prompts, command arguments, or tool output, and is inactive outside
-// a term-server session.
+function jsonSize(value: unknown): number {
+  try {
+    return Buffer.byteLength(JSON.stringify(value), "utf8");
+  } catch {
+    return Number.POSITIVE_INFINITY;
+  }
+}
+
+function boundedData(value: unknown): { data: unknown; truncated: boolean } {
+  const bytes = jsonSize(value);
+  if (bytes <= MAX_TRANSCRIPT_RECORD_BYTES) return { data: value, truncated: false };
+  return {
+    data: { truncated: true, originalBytes: Number.isFinite(bytes) ? bytes : null },
+    truncated: true,
+  };
+}
+
+function semanticText(value: unknown, depth = 0): string {
+  if (depth > 5 || value === null || value === undefined) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) {
+    return value.map((item) => semanticText(item, depth + 1)).filter(Boolean).join("\n");
+  }
+  if (typeof value !== "object") return "";
+  const object = value as Record<string, unknown>;
+  for (const key of ["text", "content", "message", "summary", "result", "output", "error", "task"]) {
+    const text = semanticText(object[key], depth + 1);
+    if (text) return text;
+  }
+  return "";
+}
+
+function numericTimestamp(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) return Math.floor(value);
+  if (typeof value === "string") {
+    const timestamp = Date.parse(value);
+    if (Number.isFinite(timestamp)) return timestamp;
+  }
+  return undefined;
+}
+
+function messageRecord(message: unknown, sourceId: string): TranscriptRecord | undefined {
+  if (!message || typeof message !== "object") return undefined;
+  const object = message as Record<string, unknown>;
+  const bounded = boundedData(message);
+  const text = semanticText(object.content ?? object.text ?? message);
+  return {
+    kind: "message",
+    sourceId,
+    timestamp: numericTimestamp(object.timestamp),
+    role: typeof object.role === "string" ? object.role : undefined,
+    text: text || undefined,
+    data: bounded.data,
+    truncated: bounded.truncated,
+  };
+}
+
+function snapshotRecord(entry: unknown): TranscriptRecord | undefined {
+  if (!entry || typeof entry !== "object") return undefined;
+  const object = entry as Record<string, unknown>;
+  const type = typeof object.type === "string" ? object.type : "";
+  const sourceId = typeof object.id === "string" ? object.id : undefined;
+  const timestamp = numericTimestamp(object.timestamp);
+  if (type === "message") return messageRecord(object.message, sourceId ?? `message:${timestamp ?? 0}`);
+  if (type === "custom_message") {
+    const bounded = boundedData({
+      customType: object.customType,
+      content: object.content,
+      details: object.details,
+      attribution: object.attribution,
+    });
+    return {
+      kind: "message",
+      sourceId,
+      timestamp,
+      role: "custom",
+      name: typeof object.customType === "string" ? object.customType : undefined,
+      text: semanticText(object.content) || undefined,
+      data: bounded.data,
+      truncated: bounded.truncated,
+    };
+  }
+  if (type === "compaction" || type === "branch_summary") {
+    const bounded = boundedData(object);
+    return {
+      kind: type === "compaction" ? "compaction" : "summary",
+      sourceId,
+      timestamp,
+      text: semanticText(object.summary) || undefined,
+      data: bounded.data,
+      truncated: bounded.truncated,
+    };
+  }
+  if (type === "session_init" && typeof object.task === "string") {
+    return {
+      kind: "message",
+      sourceId,
+      timestamp,
+      role: "user",
+      name: typeof object.agent === "string" ? object.agent : undefined,
+      text: object.task,
+      data: {
+        tools: Array.isArray(object.tools) ? object.tools : [],
+        modelRole: object.modelRole,
+        resolvedModel: object.resolvedModel,
+      },
+    };
+  }
+  if (type === "reset_boundary") {
+    return { kind: "marker", sourceId, timestamp, text: "context reset" };
+  }
+  return undefined;
+}
+
+function transcriptChunks(records: TranscriptRecord[]): TranscriptRecord[][] {
+  const chunks: TranscriptRecord[][] = [];
+  let current: TranscriptRecord[] = [];
+  let currentBytes = 2;
+  for (const record of records) {
+    const bytes = jsonSize(record) + 1;
+    if (current.length > 0 && currentBytes + bytes > MAX_TRANSCRIPT_CHUNK_BYTES) {
+      chunks.push(current);
+      current = [];
+      currentBytes = 2;
+    }
+    current.push(record);
+    currentBytes += bytes;
+  }
+  if (current.length > 0) chunks.push(current);
+  return chunks;
+}
+
+// Reports lifecycle plus a bounded semantic transcript to the private
+// term-server session broker. It is inactive outside a term-server session.
 export default function termServerAgentEvents(pi: TermServerExtensionApi): void {
   const executable = process.env.TERM_SERVER_EXECUTABLE;
   const ready = (): boolean =>
@@ -64,6 +229,7 @@ export default function termServerAgentEvents(pi: TermServerExtensionApi): void 
   let shuttingDown = false;
   let lastTitle = "";
   let lastSequence = Date.now();
+  let semanticSequence = 0;
   let heartbeat: NodeJS.Timeout | undefined;
   let forwarderActive = false;
   const pendingReports: PendingReport[] = [];
@@ -128,15 +294,19 @@ export default function termServerAgentEvents(pi: TermServerExtensionApi): void 
         pumpReports();
       });
   }
-  function send(event: string, toolName?: string, prioritize = false): Promise<void> {
+
+  function send(
+    event: string,
+    details: Record<string, unknown> = {},
+    prioritize = false,
+  ): Promise<void> {
     if (shuttingDown || !rootSession || !ready()) return Promise.resolve();
 
     const payload: Record<string, unknown> = {
+      ...details,
       hook_event_name: event,
       sequence: nextSequence(),
     };
-    if (toolName) payload.tool_name = toolName;
-
     try {
       const title = String(pi.getSessionName?.() ?? "").trim();
       if (title && title !== lastTitle) {
@@ -160,16 +330,31 @@ export default function termServerAgentEvents(pi: TermServerExtensionApi): void 
     return promise;
   }
 
+  async function sendSnapshot(context: TermServerExtensionContext): Promise<void> {
+    const entries = context.sessionManager?.getBranch?.()
+      ?? context.sessionManager?.getEntries?.()
+      ?? [];
+    const records = entries.flatMap((entry) => {
+      const record = snapshotRecord(entry);
+      return record ? [record] : [];
+    });
+    const chunks = transcriptChunks(records);
+    if (chunks.length === 0) {
+      await send("transcript_snapshot", { transcriptReset: true, transcript: [] });
+      return;
+    }
+    await Promise.all(chunks.map((chunk, index) => send("transcript_snapshot", {
+      transcriptReset: index === 0,
+      transcript: chunk,
+    })));
+  }
+
   const tracker = createSubagentActivityTracker((event) => {
     void send(event);
   });
 
-  function isRootContext(context: unknown): context is { hasUI: true } {
-    if (
-      typeof context !== "object"
-      || context === null
-      || !("hasUI" in context)
-    ) return false;
+  function isRootContext(context: unknown): context is TermServerExtensionContext & { hasUI: true } {
+    if (typeof context !== "object" || context === null || !("hasUI" in context)) return false;
     return context.hasUI === true;
   }
 
@@ -202,51 +387,61 @@ export default function termServerAgentEvents(pi: TermServerExtensionApi): void 
   );
 
   pi.on("session_start", (_event: unknown, context: TermServerExtensionContext) => {
-    allowRootSession(context);
+    if (allowRootSession(context)) void sendSnapshot(context);
+  });
+  pi.on("session_switch", (_event: unknown, context: TermServerExtensionContext) => {
+    if (allowRootSession(context)) void sendSnapshot(context);
+  });
+  pi.on("session_tree", (_event: unknown, context: TermServerExtensionContext) => {
+    if (allowRootSession(context)) void sendSnapshot(context);
   });
   pi.on("agent_start", (_event: unknown, context: TermServerExtensionContext) => {
     if (!allowRootSession(context)) return;
     tracker.onParentStart();
   });
-  pi.on(
-    "tool_execution_start",
-    (event: { toolName?: string }, context: TermServerExtensionContext) => {
-      if (!allowRootSession(context)) return;
-      void send("tool_execution_start", event.toolName);
-    },
-  );
-  pi.on("tool_execution_end", (_event: unknown, context: TermServerExtensionContext) => {
-    if (allowRootSession(context)) void send("tool_execution_end");
+  pi.on("message_end", (event: MessageEndEvent, context: TermServerExtensionContext) => {
+    if (!allowRootSession(context)) return;
+    const record = messageRecord(event.message, `live-message:${semanticSequence++}`);
+    if (record) void send("message_end", { transcript: [record] });
   });
-  pi.on(
-    "agent_end",
-    (event: AgentEndEvent, context: TermServerExtensionContext) => {
-      if (!allowRootSession(context)) return;
-      tracker.onParentEnd(event);
-    },
-  );
-  pi.on(
-    "session_before_compact",
-    (_event: unknown, context: TermServerExtensionContext) => {
-      if (allowRootSession(context)) void send("session_before_compact");
-    },
-  );
+  pi.on("tool_execution_start", (event: ToolExecutionStartEvent, context: TermServerExtensionContext) => {
+    if (!allowRootSession(context)) return;
+    void send("tool_execution_start", {
+      toolCallId: event.toolCallId,
+      toolName: event.toolName,
+      args: boundedData(event.args).data,
+      intent: event.intent,
+    });
+  });
+  pi.on("tool_execution_end", (event: ToolExecutionEndEvent, context: TermServerExtensionContext) => {
+    if (!allowRootSession(context)) return;
+    void send("tool_execution_end", {
+      toolCallId: event.toolCallId,
+      toolName: event.toolName,
+      result: boundedData(event.result).data,
+      isError: event.isError,
+    });
+  });
+  pi.on("agent_end", (event: AgentEndEvent, context: TermServerExtensionContext) => {
+    if (!allowRootSession(context)) return;
+    tracker.onParentEnd(event);
+  });
+  pi.on("session_before_compact", (_event: unknown, context: TermServerExtensionContext) => {
+    if (allowRootSession(context)) void send("session_before_compact");
+  });
   pi.on("session_compact", (_event: unknown, context: TermServerExtensionContext) => {
     if (allowRootSession(context)) void send("session_compact");
   });
-  pi.on(
-    "session_shutdown",
-    async (_event: unknown, context: TermServerExtensionContext) => {
-      const shouldReport = allowRootSession(context);
-      stopHeartbeat();
-      const closeReport = shouldReport
-        ? send("session_shutdown", undefined, true)
-        : Promise.resolve();
-      shuttingDown = true;
-      rootSession = false;
-      unsubscribeSubagentLifecycle();
-      tracker.shutdown();
-      await closeReport;
-    },
-  );
+  pi.on("session_shutdown", async (_event: unknown, context: TermServerExtensionContext) => {
+    const shouldReport = allowRootSession(context);
+    stopHeartbeat();
+    const closeReport = shouldReport
+      ? send("session_shutdown", {}, true)
+      : Promise.resolve();
+    shuttingDown = true;
+    rootSession = false;
+    unsubscribeSubagentLifecycle();
+    tracker.shutdown();
+    await closeReport;
+  });
 }

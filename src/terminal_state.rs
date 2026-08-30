@@ -2,6 +2,9 @@ use std::collections::VecDeque;
 
 use bytes::Bytes;
 use unicode_width::UnicodeWidthChar;
+use uuid::Uuid;
+
+use crate::history::{MAX_SCROLLBACK_BYTES, TerminalScrollbackPage, clean_terminal_text};
 
 // Half the budget goes to the delta ring. Resuming from it is what preserves a
 // browser's own scrollback, which is two orders of magnitude deeper than the
@@ -267,6 +270,33 @@ impl TerminalOutputState {
         self.delta.text_tail(maximum_bytes)
     }
 
+    pub fn scrollback_page(
+        &self,
+        terminal_id: Uuid,
+        from_sequence: Option<u64>,
+        limit_bytes: usize,
+    ) -> TerminalScrollbackPage {
+        let latest_sequence = self.sequence;
+        let earliest_sequence = self.delta.earliest_sequence(latest_sequence);
+        let requested_sequence = from_sequence.unwrap_or(earliest_sequence);
+        let start_sequence = requested_sequence.clamp(earliest_sequence, latest_sequence);
+        let (end_sequence, bytes) = self.delta.page_from(
+            start_sequence,
+            latest_sequence,
+            limit_bytes.clamp(1, MAX_SCROLLBACK_BYTES),
+        );
+        TerminalScrollbackPage {
+            terminal_id,
+            earliest_sequence,
+            start_sequence,
+            end_sequence,
+            latest_sequence,
+            truncated: requested_sequence < earliest_sequence,
+            has_more: end_sequence < latest_sequence,
+            text: clean_terminal_text(&bytes),
+        }
+    }
+
     pub fn alternate_screen(&self) -> bool {
         self.terminal.alternate_screen()
     }
@@ -353,6 +383,22 @@ impl DeltaBuffer {
                 .filter_map(|chunk| chunk.slice_from(sequence))
                 .collect(),
         )
+    }
+
+    fn page_from(&self, sequence: u64, latest: u64, maximum_bytes: usize) -> (u64, Vec<u8>) {
+        let mut end_sequence = sequence;
+        let mut bytes = Vec::new();
+        let Some(output) = self.outputs_since(sequence, latest) else {
+            return (end_sequence, bytes);
+        };
+        for chunk in output {
+            if !bytes.is_empty() && bytes.len().saturating_add(chunk.bytes.len()) > maximum_bytes {
+                break;
+            }
+            end_sequence = chunk.end_sequence();
+            bytes.extend_from_slice(&chunk.bytes);
+        }
+        (end_sequence, bytes)
     }
 
     fn text_tail(&self, maximum_bytes: usize) -> String {
@@ -1978,6 +2024,34 @@ mod tests {
         assert_eq!(delta.outputs_since(4, 6).unwrap(), vec![output(4, b"ef")]);
         assert_eq!(delta.outputs_since(6, 6).unwrap(), Vec::new());
         assert!(delta.outputs_since(7, 6).is_none());
+    }
+
+    #[test]
+    fn delta_buffer_pages_on_publish_boundaries() {
+        let mut delta = DeltaBuffer::new(16);
+        delta.push(output(0, b"abc"));
+        delta.push(output(3, b"def"));
+
+        assert_eq!(delta.page_from(0, 6, 3), (3, b"abc".to_vec()));
+        assert_eq!(delta.page_from(3, 6, 3), (6, b"def".to_vec()));
+        assert_eq!(delta.page_from(6, 6, 3), (6, Vec::new()));
+    }
+
+    #[test]
+    fn scrollback_pages_expose_clean_text_and_sequence_cursors() {
+        let terminal_id = Uuid::from_u128(9);
+        let mut state = TerminalOutputState::new(256 * 1024, 4, 20);
+        state.publish(Bytes::from_static(b"first\r\n"));
+        state.publish(Bytes::from_static(b"\x1b[31msecond\x1b[0m\r\n"));
+
+        let first = state.scrollback_page(terminal_id, None, 7);
+        assert_eq!(first.terminal_id, terminal_id);
+        assert_eq!(first.text, "first\n");
+        assert!(first.has_more);
+        let second = state.scrollback_page(terminal_id, Some(first.end_sequence), 64);
+        assert_eq!(second.text, "second\n");
+        assert!(!second.has_more);
+        assert_eq!(second.end_sequence, second.latest_sequence);
     }
 
     #[test]

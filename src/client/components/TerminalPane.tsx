@@ -733,6 +733,7 @@ export function TerminalPane({
     let checkpointMaximumBytes = 0;
     let checkpointBinary = false;
     let checkpointTimer: number | undefined;
+    let unregisterCheckpointControl: (() => void) | undefined;
     let checkpointWindowStartedAt = 0;
     let checkpointDueAt = 0;
     let lastCheckpointSignalAt = 0;
@@ -982,6 +983,7 @@ export function TerminalPane({
       lastCheckpointSequence = sequence;
       lastCheckpointEpoch = terminalEpoch;
     };
+    unregisterCheckpointControl = diagnosticsHandle?.registerCheckpointControl(writeCheckpoint);
     const armCheckpointTimer = (delayMs: number) => {
       checkpointTimer = window.setTimeout(fireCheckpointTimer, delayMs);
     };
@@ -1648,6 +1650,8 @@ export function TerminalPane({
       webglAddon = undefined;
       unregisterContextLossControl?.();
       unregisterContextLossControl = undefined;
+      unregisterCheckpointControl?.();
+      unregisterCheckpointControl = undefined;
       writeCheckpoint();
       disposed = true;
       scrollAreaRenderResync?.dispose();

@@ -1,5 +1,5 @@
 {
-  "description": "Report privacy-bounded Claude Code lifecycle activity to term-server.",
+  "description": "Report Claude Code lifecycle and bounded semantic history to term-server.",
   "hooks": {
     "UserPromptSubmit": [
       {

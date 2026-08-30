@@ -156,7 +156,14 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
 .tree-search:focus-within { border-color: var(--focus); }
 .tree-search input { width: 100%; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--foreground); font-size: 12px; }
 .tree-search button { border: 0; padding: 0; display: grid; background: transparent; color: var(--muted); cursor: pointer; }
-.tree { min-height: 0; overflow: auto; padding: 2px 0 8px; scrollbar-color: var(--border-strong) transparent; }
+.tree { min-height: 0; overflow: auto; padding: 0 0 8px; scrollbar-color: var(--border-strong) transparent; }
+.supervisor-pinned {
+  position: sticky; top: 0; z-index: 3; padding: 2px 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--supervisor) 28%, var(--border));
+  background: var(--sidebar);
+  box-shadow: 0 3px 6px color-mix(in srgb, #000 12%, transparent);
+}
+.workspace-tree { padding-top: 2px; }
 .file-explorer { grid-row: 2 / 4; min-height: 0; display: grid; grid-template-rows: 35px 35px minmax(0, 1fr) auto; }
 .file-location, .file-search {
   min-width: 0; display: flex; align-items: center; gap: 5px; margin: 4px 8px; padding: 0 5px;
@@ -228,6 +235,15 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
 .terminal-kind.supervisor {
   border-color: color-mix(in srgb, var(--supervisor) 52%, var(--border));
   background: color-mix(in srgb, var(--supervisor) 9%, var(--sidebar));
+}
+.terminal-row.supervisor-pinned-row {
+  background: color-mix(in srgb, var(--supervisor) 9%, var(--sidebar));
+}
+.terminal-row.supervisor-pinned-row:hover {
+  background: color-mix(in srgb, var(--supervisor) 13%, var(--hover));
+}
+.terminal-row.supervisor-pinned-row.active {
+  background: color-mix(in srgb, var(--supervisor) 16%, var(--selected));
 }
 .terminal-row.supervisor-context-outside { border-left-color: var(--status-warn); }
 .terminal-row.supervisor-context-outside .terminal-title,

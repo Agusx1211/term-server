@@ -1,6 +1,6 @@
 name: term-server-agent-events
 version: "0.1.0"
-description: Reports Hermes Agent lifecycle activity to term-server.
+description: Reports Hermes Agent lifecycle and retained semantic history to term-server.
 author: term-server
 hooks:
   - pre_llm_call

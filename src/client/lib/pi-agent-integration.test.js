@@ -2,21 +2,10 @@ import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import termServerAgentEvents from "../../../integrations/omp/extensions/term-server-agent-events";
+import termServerAgentEvents from "../../../integrations/pi/extensions/term-server-agent-events";
 
 class FakeExtensionApi {
   handlers = new Map();
-  lifecycleHandlers = new Set();
-  events = {
-    on: (_channel, handler) => {
-      this.lifecycleHandlers.add(handler);
-      return () => this.lifecycleHandlers.delete(handler);
-    },
-  };
-
-  getSessionName() {
-    return "Lifecycle regression";
-  }
 
   on(event, handler) {
     const handlers = this.handlers.get(event) ?? [];
@@ -24,14 +13,14 @@ class FakeExtensionApi {
     this.handlers.set(event, handlers);
   }
 
-  async emit(event, payload, context) {
+  async emit(event, payload, context = {}) {
     for (const handler of this.handlers.get(event) ?? []) {
       await handler(payload, context);
     }
   }
 }
 
-describe("OMP term-server event integration", () => {
+describe("Pi term-server transcript integration", () => {
   let directory = "";
   let capture = "";
   const originalEnvironment = {
@@ -42,7 +31,7 @@ describe("OMP term-server event integration", () => {
   };
 
   beforeEach(() => {
-    directory = mkdtempSync(join(tmpdir(), "term-server-omp-events-"));
+    directory = mkdtempSync(join(tmpdir(), "term-server-pi-events-"));
     capture = join(directory, "events.jsonl");
     const executable = join(directory, "forward-event");
     writeFileSync(executable, "#!/bin/sh\ncat >>\"$HOOK_CAPTURE\"\nprintf '\\n' >>\"$HOOK_CAPTURE\"\n");
@@ -65,56 +54,10 @@ describe("OMP term-server event integration", () => {
     rmSync(directory, { recursive: true, force: true });
   });
 
-  it("does not report lifecycle events from a headless child session", async () => {
-    const api = new FakeExtensionApi();
-    termServerAgentEvents(api);
-    const child = { hasUI: false };
-
-    await api.emit("session_start", {}, child);
-    await api.emit("agent_start", {}, child);
-    await api.emit("agent_end", { isTerminal: true }, child);
-    await api.emit("session_shutdown", {}, child);
-
-    expect(existsSync(capture)).toBe(false);
-  });
-
-  it("orders root reports and ignores a nonterminal agent end", async () => {
-    const api = new FakeExtensionApi();
-    termServerAgentEvents(api);
-    const root = { hasUI: true };
-
-    await api.emit("session_start", {}, root);
-    await api.emit("agent_start", {}, root);
-    await api.emit("agent_end", { isTerminal: false }, root);
-    await api.emit("agent_end", { isTerminal: true }, root);
-    await expect.poll(() => {
-      if (!existsSync(capture)) return 0;
-      return readFileSync(capture, "utf8").trim().split("\n").length;
-    }).toBe(3);
-    await api.emit("session_shutdown", {}, root);
-
-    const reports = readFileSync(capture, "utf8")
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line));
-    expect(reports.map((report) => report.hook_event_name)).toEqual([
-      "transcript_snapshot",
-      "agent_start",
-      "agent_settled",
-      "session_shutdown",
-    ]);
-    expect(reports[0].transcriptReset).toBe(true);
-    expect(reports[0].transcript).toEqual([]);
-    expect(reports[0].sequence).toBeLessThan(reports[1].sequence);
-    expect(reports[1].sequence).toBeLessThan(reports[2].sequence);
-    expect(reports[2].sequence).toBeLessThan(reports[3].sequence);
-  });
-
   it("forwards retained and live semantic messages", async () => {
     const api = new FakeExtensionApi();
     termServerAgentEvents(api);
-    const root = {
-      hasUI: true,
+    const context = {
       sessionManager: {
         getBranch: () => [{
           type: "message",
@@ -125,15 +68,14 @@ describe("OMP term-server event integration", () => {
       },
     };
 
-    await api.emit("session_start", {}, root);
+    await api.emit("session_start", {}, context);
     await api.emit("message_end", {
       message: { role: "assistant", content: [{ type: "text", text: "delivered" }], timestamp: 2 },
-    }, root);
+    }, context);
     await expect.poll(() => {
       if (!existsSync(capture)) return 0;
       return readFileSync(capture, "utf8").trim().split("\n").length;
     }).toBe(2);
-    await api.emit("session_shutdown", {}, root);
 
     const reports = readFileSync(capture, "utf8")
       .trim()
@@ -141,14 +83,12 @@ describe("OMP term-server event integration", () => {
       .map((line) => JSON.parse(line));
     expect(reports[0].hook_event_name).toBe("transcript_snapshot");
     expect(reports[0].transcript[0]).toMatchObject({
-      kind: "message",
       sourceId: "entry-1",
       role: "user",
       text: "inspect delivery",
     });
     expect(reports[1].hook_event_name).toBe("message_end");
     expect(reports[1].transcript[0]).toMatchObject({
-      kind: "message",
       role: "assistant",
       text: "delivered",
     });

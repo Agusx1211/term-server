@@ -12,12 +12,11 @@ use std::{
 use axum::{
     Json, Router,
     extract::{Path as AxumPath, Query, State, ws::WebSocketUpgrade},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{any, get, patch, post},
 };
 use bytes::Bytes;
-use futures_util::SinkExt;
 use http_body_util::{BodyExt, Full};
 use hyper::{Method, Request};
 use hyper_util::rt::TokioIo;
@@ -27,9 +26,7 @@ use tokio::{
     net::{UnixListener, UnixStream},
     sync::{Mutex, Notify, RwLock},
 };
-use tokio_tungstenite::{
-    WebSocketStream, client_async, tungstenite::Message as TungsteniteMessage,
-};
+use tokio_tungstenite::{WebSocketStream, client_async};
 use uuid::Uuid;
 
 use crate::{
@@ -37,6 +34,10 @@ use crate::{
     ai::{PiClientConfig, PiService, UpdatePiSettings},
     build::{self, BuildIdentity},
     config::Cli,
+    history::{
+        AgentTranscriptKind, AgentTranscriptPage, DEFAULT_SCROLLBACK_BYTES,
+        DEFAULT_TRANSCRIPT_RECORDS, TerminalScrollbackPage,
+    },
     terminal::{
         AgentDetectionExplain, CreateSupervisorTerminal, CreateTerminal, ProcessInspectorSnapshot,
         RenameTerminal, TerminalInfo, TerminalManager, TerminalScreenSnapshot, TerminalViewport,
@@ -52,6 +53,9 @@ use crate::{
 const PROTOCOL_VERSION: u32 = 4;
 const SOCKET_NAME: &str = "session-broker.sock";
 const BROKER_DIRECTORY: &str = "session-brokers";
+const BROKER_CONTROL_TOKEN_FILE: &str = "session-broker-control.token";
+const BROKER_CONTROL_TOKEN_ENV: &str = "TERM_SERVER_BROKER_CONTROL_TOKEN";
+const BROKER_CONTROL_HEADER: &str = "x-term-server-broker-control";
 const DRAIN_INTERVAL: Duration = Duration::from_secs(2);
 
 pub type BrokerWebSocket = WebSocketStream<UnixStream>;
@@ -78,6 +82,31 @@ struct TerminalScreenQuery {
     tail_bytes: usize,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalScrollbackQuery {
+    from_sequence: Option<u64>,
+    #[serde(default = "default_scrollback_bytes")]
+    limit_bytes: usize,
+}
+
+fn default_scrollback_bytes() -> usize {
+    DEFAULT_SCROLLBACK_BYTES
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalTranscriptQuery {
+    from_sequence: Option<u64>,
+    #[serde(default = "default_transcript_records")]
+    limit: usize,
+    kinds: Option<String>,
+}
+
+fn default_transcript_records() -> usize {
+    DEFAULT_TRANSCRIPT_RECORDS
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct WriteTerminalInput {
     data: String,
@@ -91,12 +120,21 @@ struct ErrorResponse {
 #[derive(Debug, Clone)]
 pub struct BrokerClient {
     socket_path: Arc<PathBuf>,
+    control_token: Option<Arc<String>>,
 }
 
 impl BrokerClient {
     pub fn new(socket_path: PathBuf) -> Self {
         Self {
             socket_path: Arc::new(socket_path),
+            control_token: None,
+        }
+    }
+
+    fn with_control_token(socket_path: PathBuf, control_token: Arc<String>) -> Self {
+        Self {
+            socket_path: Arc::new(socket_path),
+            control_token: Some(control_token),
         }
     }
 
@@ -105,7 +143,12 @@ impl BrokerClient {
         cli: &Cli,
         executable: &Path,
     ) -> Result<HealthResponse, BrokerError> {
-        spawn_broker(cli, executable, self.socket_path.as_ref())?;
+        spawn_broker(
+            cli,
+            executable,
+            self.socket_path.as_ref(),
+            self.control_token.as_deref().map(String::as_str),
+        )?;
         let mut last_error = None;
         for _ in 0..50 {
             match self.health().await {
@@ -197,6 +240,46 @@ impl BrokerClient {
             .await
     }
 
+    pub async fn scrollback(
+        &self,
+        id: Uuid,
+        from_sequence: Option<u64>,
+        limit_bytes: usize,
+    ) -> Result<TerminalScrollbackPage, BrokerError> {
+        let path = match from_sequence {
+            Some(sequence) => format!(
+                "/terminals/{id}/scrollback?fromSequence={sequence}&limitBytes={limit_bytes}"
+            ),
+            None => format!("/terminals/{id}/scrollback?limitBytes={limit_bytes}"),
+        };
+        self.get_json(&path).await
+    }
+
+    pub async fn transcript(
+        &self,
+        id: Uuid,
+        from_sequence: Option<u64>,
+        limit: usize,
+        kinds: &[AgentTranscriptKind],
+    ) -> Result<AgentTranscriptPage, BrokerError> {
+        let mut query = vec![format!("limit={limit}")];
+        if let Some(sequence) = from_sequence {
+            query.push(format!("fromSequence={sequence}"));
+        }
+        if !kinds.is_empty() {
+            query.push(format!(
+                "kinds={}",
+                kinds
+                    .iter()
+                    .map(|kind| kind.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
+        self.get_json(&format!("/terminals/{id}/transcript?{}", query.join("&")))
+            .await
+    }
+
     pub async fn write(&self, id: Uuid, data: String) -> Result<(), BrokerError> {
         self.send_empty(
             Method::POST,
@@ -204,22 +287,6 @@ impl BrokerClient {
             Some(&WriteTerminalInput { data }),
         )
         .await
-    }
-
-    async fn write_via_socket(&self, id: Uuid, data: String) -> Result<(), BrokerError> {
-        let mut socket = self.terminal_socket(id, None, None, false).await?;
-        socket
-            .send(TungsteniteMessage::Text(
-                serde_json::json!({ "type": "input", "data": data })
-                    .to_string()
-                    .into(),
-            ))
-            .await
-            .map_err(|error| BrokerError::Unavailable(error.to_string()))?;
-        socket
-            .close(None)
-            .await
-            .map_err(|error| BrokerError::Unavailable(error.to_string()))
     }
 
     pub async fn pi_config(&self) -> Result<PiClientConfig, BrokerError> {
@@ -354,6 +421,9 @@ impl BrokerClient {
         if !encoded.is_empty() {
             builder = builder.header("content-type", "application/json");
         }
+        if let Some(token) = self.control_token.as_deref() {
+            builder = builder.header(BROKER_CONTROL_HEADER, token.as_str());
+        }
         let request = builder
             .body(Full::new(Bytes::from(encoded)))
             .map_err(|error| BrokerError::Unavailable(error.to_string()))?;
@@ -398,11 +468,12 @@ impl BrokerPool {
     pub async fn connect_or_start(cli: &Cli, executable: &Path) -> Result<Arc<Self>, BrokerError> {
         tokio::fs::create_dir_all(&cli.data_dir).await?;
         tokio::fs::create_dir_all(cli.data_dir.join(BROKER_DIRECTORY)).await?;
+        let control_token = Arc::new(load_or_create_broker_control_token(&cli.data_dir)?);
         let current_path = current_socket_path(&cli.data_dir);
         let mut compatible = Vec::new();
 
         for path in broker_socket_paths(&cli.data_dir).await? {
-            let client = BrokerClient::new(path);
+            let client = BrokerClient::with_control_token(path, control_token.clone());
             let Ok(health) = client.health().await else {
                 continue;
             };
@@ -438,7 +509,7 @@ impl BrokerPool {
         let mut current = if let Some(index) = current_index {
             compatible.remove(index)
         } else {
-            let client = BrokerClient::new(current_path);
+            let client = BrokerClient::with_control_token(current_path, control_token.clone());
             let health = client.start_and_wait(cli, executable).await?;
             BrokerGeneration {
                 client,
@@ -684,12 +755,74 @@ impl BrokerPool {
         }
     }
 
+    pub async fn scrollback(
+        &self,
+        id: Uuid,
+        from_sequence: Option<u64>,
+        limit_bytes: usize,
+    ) -> Result<TerminalScrollbackPage, BrokerError> {
+        let generation = self.owner(id).await?;
+        if !generation.build.is_current() {
+            return Err(BrokerError::Unavailable(
+                "terminal scrollback is unavailable from this older session broker; restart the session broker or recreate the terminal".to_owned(),
+            ));
+        }
+        match generation
+            .client
+            .scrollback(id, from_sequence, limit_bytes)
+            .await
+        {
+            Ok(page) => Ok(page),
+            Err(error) if error.status() == Some(StatusCode::NOT_FOUND) => {
+                Err(BrokerError::Unavailable(
+                    "terminal scrollback is unavailable from this older session broker; restart the session broker or recreate the terminal".to_owned(),
+                ))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn transcript(
+        &self,
+        id: Uuid,
+        from_sequence: Option<u64>,
+        limit: usize,
+        kinds: &[AgentTranscriptKind],
+    ) -> Result<AgentTranscriptPage, BrokerError> {
+        let generation = self.owner(id).await?;
+        if !generation.build.is_current() {
+            return Err(BrokerError::Unavailable(
+                "agent transcript history is unavailable from this older session broker; restart the session broker or recreate the terminal".to_owned(),
+            ));
+        }
+        match generation
+            .client
+            .transcript(id, from_sequence, limit, kinds)
+            .await
+        {
+            Ok(page) => Ok(page),
+            Err(error) if error.status() == Some(StatusCode::NOT_FOUND) => {
+                Err(BrokerError::Unavailable(
+                    "agent transcript history is unavailable from this older session broker; restart the session broker or recreate the terminal".to_owned(),
+                ))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub async fn write(&self, id: Uuid, data: String) -> Result<(), BrokerError> {
         let generation = self.owner(id).await?;
-        match generation.client.write(id, data.clone()).await {
+        if !generation.build.is_current() {
+            return Err(BrokerError::Unavailable(
+                "terminal input delivery cannot be confirmed by this older session broker; restart the session broker or recreate the terminal".to_owned(),
+            ));
+        }
+        match generation.client.write(id, data).await {
             Ok(()) => Ok(()),
             Err(error) if error.status() == Some(StatusCode::NOT_FOUND) => {
-                generation.client.write_via_socket(id, data).await
+                Err(BrokerError::Unavailable(
+                    "terminal input delivery cannot be confirmed by this older session broker; restart the session broker or recreate the terminal".to_owned(),
+                ))
             }
             Err(error) => Err(error),
         }
@@ -846,7 +979,12 @@ fn remote_error(status: StatusCode, bytes: &[u8]) -> BrokerError {
     BrokerError::Remote { status, message }
 }
 
-fn spawn_broker(cli: &Cli, executable: &Path, socket: &Path) -> Result<(), BrokerError> {
+fn spawn_broker(
+    cli: &Cli,
+    executable: &Path,
+    socket: &Path,
+    control_token: Option<&str>,
+) -> Result<(), BrokerError> {
     let mut command = Command::new(executable);
     command
         .arg("--session-broker")
@@ -860,6 +998,9 @@ fn spawn_broker(cli: &Cli, executable: &Path, socket: &Path) -> Result<(), Broke
         .arg(&cli.log)
         .stdin(Stdio::null())
         .env_remove("TERM_SERVER_SESSION");
+    if let Some(control_token) = control_token {
+        command.env(BROKER_CONTROL_TOKEN_ENV, control_token);
+    }
     if let Some(shell) = &cli.shell {
         command.arg("--shell").arg(shell);
     }
@@ -905,18 +1046,60 @@ async fn broker_socket_paths(data_directory: &Path) -> Result<Vec<PathBuf>, Brok
     paths.dedup();
     Ok(paths)
 }
+fn load_or_create_broker_control_token(data_directory: &Path) -> Result<String, BrokerError> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+    let path = data_directory.join(BROKER_CONTROL_TOKEN_FILE);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o077 != 0 {
+                return Err(BrokerError::Unavailable(
+                    "session broker control token is not a private regular file".to_owned(),
+                ));
+            }
+            let token = std::fs::read_to_string(&path)?.trim().to_owned();
+            if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(BrokerError::Unavailable(
+                    "session broker control token is invalid".to_owned(),
+                ));
+            }
+            Ok(token)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true).mode(0o600);
+            match options.open(&path) {
+                Ok(mut file) => {
+                    file.write_all(token.as_bytes())?;
+                    file.sync_all()?;
+                    Ok(token)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    load_or_create_broker_control_token(data_directory)
+                }
+                Err(error) => Err(error.into()),
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
+}
 
 #[derive(Clone)]
 struct BrokerState {
     terminals: Arc<TerminalManager>,
     pi: Arc<PiService>,
     shutdown: Arc<Notify>,
+    control_token: Option<String>,
 }
 
 #[derive(Debug, Error)]
 enum BrokerApiError {
     #[error("terminal not found")]
     NotFound,
+    #[error("broker control authorization is required")]
+    Unauthorized,
     #[error("{0}")]
     BadRequest(String),
     #[error("internal broker error")]
@@ -926,6 +1109,7 @@ enum BrokerApiError {
 impl IntoResponse for BrokerApiError {
     fn into_response(self) -> Response {
         let status = match self {
+            Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
@@ -943,6 +1127,7 @@ pub async fn run_session_broker(
     socket_path: &Path,
     default_shell: Option<String>,
     replay_bytes: usize,
+    control_token: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     tokio::fs::create_dir_all(data_directory).await?;
     if let Some(parent) = socket_path.parent() {
@@ -972,6 +1157,7 @@ pub async fn run_session_broker(
         terminals,
         pi,
         shutdown: shutdown.clone(),
+        control_token,
     };
     let router = Router::new()
         .route("/health", get(broker_health))
@@ -989,6 +1175,14 @@ pub async fn run_session_broker(
         .route("/terminals/{id}/processes", get(broker_terminal_processes))
         .route("/terminals/{id}/agent-explain", get(broker_agent_explain))
         .route("/terminals/{id}/screen", get(broker_terminal_screen))
+        .route(
+            "/terminals/{id}/scrollback",
+            get(broker_terminal_scrollback),
+        )
+        .route(
+            "/terminals/{id}/transcript",
+            get(broker_terminal_transcript),
+        )
         .route("/terminals/{id}/input", post(broker_terminal_input))
         .route(
             "/terminals/{id}/agent-event",
@@ -1141,6 +1335,85 @@ async fn broker_terminal_screen(
         .ok_or(BrokerApiError::NotFound)
 }
 
+fn authorize_broker_history(
+    state: &BrokerState,
+    headers: &HeaderMap,
+) -> Result<(), BrokerApiError> {
+    let expected = state
+        .control_token
+        .as_deref()
+        .ok_or(BrokerApiError::Unauthorized)?;
+    let actual = headers
+        .get(BROKER_CONTROL_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .ok_or(BrokerApiError::Unauthorized)?;
+    let left = expected.as_bytes();
+    let right = actual.as_bytes();
+    let mut difference = left.len() ^ right.len();
+    for index in 0..left.len().max(right.len()) {
+        difference |= usize::from(
+            left.get(index).copied().unwrap_or_default()
+                ^ right.get(index).copied().unwrap_or_default(),
+        );
+    }
+    if difference == 0 {
+        Ok(())
+    } else {
+        Err(BrokerApiError::Unauthorized)
+    }
+}
+
+async fn broker_terminal_scrollback(
+    State(state): State<BrokerState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<Uuid>,
+    Query(query): Query<TerminalScrollbackQuery>,
+) -> Result<Json<TerminalScrollbackPage>, BrokerApiError> {
+    authorize_broker_history(&state, &headers)?;
+    state
+        .terminals
+        .get(id)
+        .map(|terminal| Json(terminal.scrollback(query.from_sequence, query.limit_bytes)))
+        .ok_or(BrokerApiError::NotFound)
+}
+
+async fn broker_terminal_transcript(
+    State(state): State<BrokerState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<Uuid>,
+    Query(query): Query<TerminalTranscriptQuery>,
+) -> Result<Json<AgentTranscriptPage>, BrokerApiError> {
+    authorize_broker_history(&state, &headers)?;
+    let kinds = query
+        .kinds
+        .as_deref()
+        .map(|kinds| {
+            kinds
+                .split(',')
+                .filter(|kind| !kind.is_empty())
+                .map(|kind| {
+                    AgentTranscriptKind::parse(kind).ok_or_else(|| {
+                        BrokerApiError::BadRequest(format!(
+                            "unknown transcript record kind: {kind}"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let terminal = state.terminals.get(id).ok_or(BrokerApiError::NotFound)?;
+    terminal
+        .transcript(query.from_sequence, query.limit, &kinds)
+        .map(Json)
+        .ok_or_else(|| {
+            BrokerApiError::BadRequest(
+                "terminal has no retained semantic agent transcript; use scrollback instead"
+                    .to_owned(),
+            )
+        })
+}
+
 async fn broker_terminal_input(
     State(state): State<BrokerState>,
     AxumPath(id): AxumPath<Uuid>,
@@ -1150,7 +1423,8 @@ async fn broker_terminal_input(
         .terminals
         .get(id)
         .ok_or(BrokerApiError::NotFound)?
-        .write(request.data.as_bytes())
+        .write_confirmed(request.data.as_bytes())
+        .await
         .map_err(|error| BrokerApiError::BadRequest(error.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1219,7 +1493,7 @@ async fn shutdown_broker(State(state): State<BrokerState>) -> StatusCode {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{os::unix::fs::PermissionsExt as _, path::PathBuf};
 
     use base64::Engine as _;
     use clap::Parser;
@@ -1241,6 +1515,7 @@ mod tests {
                 &server_socket,
                 Some("/bin/sh".to_owned()),
                 replay_bytes,
+                None,
             )
             .await
             .unwrap();
@@ -1253,6 +1528,38 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("test broker did not start");
+    }
+
+    async fn start_controlled_test_broker(
+        replay_bytes: usize,
+        control_token: &str,
+    ) -> (TempDir, JoinHandle<()>, BrokerClient, BrokerClient) {
+        let directory = tempfile::tempdir().unwrap();
+        let data_directory = directory.path().to_path_buf();
+        let socket = legacy_socket_path(&data_directory);
+        let server_socket = socket.clone();
+        let server_token = control_token.to_owned();
+        let server = tokio::spawn(async move {
+            run_session_broker(
+                &data_directory,
+                &server_socket,
+                Some("/bin/sh".to_owned()),
+                replay_bytes,
+                Some(server_token),
+            )
+            .await
+            .unwrap();
+        });
+        let unauthorized = BrokerClient::new(socket.clone());
+        for _ in 0..50 {
+            if unauthorized.health().await.is_ok() {
+                let authorized =
+                    BrokerClient::with_control_token(socket, Arc::new(control_token.to_owned()));
+                return (directory, server, authorized, unauthorized);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("controlled test broker did not start");
     }
 
     async fn start_test_broker_at(
@@ -1268,6 +1575,7 @@ mod tests {
                 &server_socket,
                 Some("/bin/sh".to_owned()),
                 replay_bytes,
+                None,
             )
             .await
             .unwrap();
@@ -1291,32 +1599,78 @@ mod tests {
         assert_eq!(snapshot.sequence, 0);
     }
 
+    #[test]
+    fn broker_control_token_is_private_stable_and_fail_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let token = load_or_create_broker_control_token(directory.path()).unwrap();
+        assert_eq!(token.len(), 64);
+        assert_eq!(
+            load_or_create_broker_control_token(directory.path()).unwrap(),
+            token
+        );
+        let path = directory.path().join(BROKER_CONTROL_TOKEN_FILE);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(load_or_create_broker_control_token(directory.path()).is_err());
+    }
+
     #[tokio::test]
-    async fn websocket_fallback_writes_to_a_compatible_broker() {
-        let (_directory, server, client) = start_test_broker(1024 * 1024).await;
-        let terminal = client
+    async fn broker_history_requires_its_private_control_token() {
+        let token = "a".repeat(64);
+        let (_directory, server, authorized, unauthorized) =
+            start_controlled_test_broker(1024 * 1024, &token).await;
+        let terminal = authorized
             .create(CreateTerminal {
-                path: Some("legacy-write".into()),
+                path: Some("private-history".into()),
                 cwd: Some(PathBuf::from("/tmp")),
                 shell: Some("/bin/cat".into()),
                 clone_from: None,
             })
             .await
             .unwrap();
-        client
-            .write_via_socket(terminal.id, "LEGACY-WRITE\n".into())
+        let denied = unauthorized
+            .scrollback(terminal.id, None, DEFAULT_SCROLLBACK_BYTES)
+            .await
+            .unwrap_err();
+        assert_eq!(denied.status(), Some(StatusCode::UNAUTHORIZED));
+        authorized
+            .agent_event(
+                terminal.id,
+                &AgentEvent {
+                    provider: "omp".to_owned(),
+                    kind: crate::agent_events::AgentEventKind::Thinking,
+                    sequence: None,
+                    title: None,
+                    transcript_only: true,
+                    transcript_reset: true,
+                    transcript: vec![crate::history::AgentTranscriptInput {
+                        kind: AgentTranscriptKind::Message,
+                        source_id: Some("message-1".to_owned()),
+                        timestamp: Some(1),
+                        role: Some("user".to_owned()),
+                        name: None,
+                        text: Some("private".to_owned()),
+                        data: None,
+                        truncated: false,
+                    }],
+                },
+            )
             .await
             .unwrap();
-        let mut screen = String::new();
-        for _ in 0..50 {
-            screen = client.agent_explain(terminal.id).await.unwrap().screen;
-            if screen.contains("LEGACY-WRITE") {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(screen.contains("LEGACY-WRITE"));
-        client.shutdown().await.unwrap();
+        let denied = unauthorized
+            .transcript(terminal.id, None, 10, &[])
+            .await
+            .unwrap_err();
+        assert_eq!(denied.status(), Some(StatusCode::UNAUTHORIZED));
+        let transcript = authorized
+            .transcript(terminal.id, None, 10, &[])
+            .await
+            .unwrap();
+        assert_eq!(transcript.records[0].text.as_deref(), Some("private"));
+        authorized.shutdown().await.unwrap();
         server.await.unwrap();
     }
 
@@ -1513,6 +1867,9 @@ mod tests {
                     kind: crate::agent_events::AgentEventKind::Thinking,
                     sequence: None,
                     title: None,
+                    transcript_only: false,
+                    transcript_reset: false,
+                    transcript: Vec::new(),
                 },
             )
             .await
