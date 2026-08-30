@@ -202,11 +202,15 @@ timer and disappear silently when they exit.
 
 The managed packages are additive: they do not edit or replace existing hook files, and uninstalling
 them removes only term-server's package and dedicated local marketplace. They do nothing outside a
-term-server terminal. Events are reduced to a fixed activity category before they reach the private
-session broker; prompts, command text, tool arguments, and tool output are not forwarded. Fallback
-inference remains enabled whether a package is installed, unavailable, broken, or removed, and
-automatically takes over if a native update goes stale. Codex requires a one-time review of newly
-installed hooks through `/hooks`; start a new agent session after any package change.
+term-server terminal. Native integrations forward lifecycle state plus a size-bounded semantic
+thread of messages, tool activity/results, compaction markers, and status changes to the private
+session broker. That retained thread may contain prompts, command text, tool arguments, tool output,
+and model responses; it is available only through the capability-checked
+`term-server-supervisor transcript` CLI. `scrollback` exposes the separately retained terminal output
+as control-free text. Fallback inference remains enabled whether a package is installed, unavailable,
+broken, or removed, and automatically takes over if a native update goes stale. Codex requires a
+one-time review of newly installed hooks through `/hooks`; start a new agent session after any
+package change.
 
 ## Configuration
 

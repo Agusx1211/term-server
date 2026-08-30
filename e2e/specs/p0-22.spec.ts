@@ -78,6 +78,12 @@ test("P0-22 Supervisor terminal is singleton, ordinary, and replaceable @p0", as
   await expect(supervisorRow).toHaveAttribute("data-terminal-kind", "supervisor");
   await expect(supervisorRow.locator('[data-supervisor-identity="sidebar"]')).toBeVisible();
   await expect(supervisorRow.locator("svg.lucide-crown")).toBeVisible();
+  const pinnedSupervisor = page.locator('[data-supervisor-pinned-container="true"]');
+  await expect(pinnedSupervisor).toHaveCount(1);
+  await expect(supervisorRow).toHaveAttribute("data-supervisor-pinned", "true");
+  await expect(page.locator(".workspace-tree [data-terminal-kind=\"supervisor\"]")).toHaveCount(0);
+  await expect(supervisorRow.locator(".tree-main")).toHaveAttribute("title", "Supervisor terminal");
+  await expect(page.locator(".sidebar")).not.toContainText(".local/share/term-server");
   const supervisorPane = new TerminalPanePage(page, created.id);
   await supervisorPane.expectVisible();
   await expect(supervisorPane.root).toHaveAttribute("data-terminal-kind", "supervisor");
@@ -117,6 +123,11 @@ test("P0-22 Supervisor terminal is singleton, ordinary, and replaceable @p0", as
   await expect(regularPane).toBeVisible();
   await expect(regularPane).toHaveAttribute("data-supervisor", "false");
   await expect(regularPane.locator('[data-supervisor-identity="pane"]')).toHaveCount(0);
+  const pinnedBox = await pinnedSupervisor.boundingBox();
+  const firstWorkspaceRowBox = await page.locator(".workspace-tree .tree-row").first().boundingBox();
+  expect(pinnedBox).not.toBeNull();
+  expect(firstWorkspaceRowBox).not.toBeNull();
+  expect(pinnedBox!.y).toBeLessThan(firstWorkspaceRowBox!.y);
 
   const regularId = await regularPane.getAttribute("data-terminal-id");
   if (!regularId) throw new Error("regular pane has no terminal id");

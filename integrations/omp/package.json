@@ -1,7 +1,7 @@
 {
   "name": "term-server-agent-events",
   "version": "0.1.0",
-  "description": "Reports OMP lifecycle activity to the term-server session that launched it.",
+  "description": "Reports OMP lifecycle and retained semantic history to its term-server session.",
   "license": "MIT",
   "keywords": ["omp-extension", "term-server", "observability"],
   "omp": { "extensions": ["./extensions/term-server-agent-events.ts"] }

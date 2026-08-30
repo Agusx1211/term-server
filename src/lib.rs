@@ -13,6 +13,7 @@ pub mod build;
 pub mod config;
 pub mod debug_recording;
 pub mod files;
+pub mod history;
 pub mod pushover;
 pub mod status;
 #[cfg(unix)]

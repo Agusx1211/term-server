@@ -685,9 +685,9 @@ export function SettingsWorkspace({
           <section class="settings-card settings-card-wide">
             <header><Activity size={16} /><h2>Live agent activity</h2></header>
             <p>
-              Add privacy-bounded native lifecycle events without replacing provider hooks or
-              term-server&apos;s process, output, CPU, and terminal-signal inference.
-              {" "}For OMP, Install, Repair, and Remove apply to every discovered profile.
+              Add private native lifecycle events and retained semantic agent history without
+              replacing provider hooks or term-server&apos;s process, output, CPU, and terminal-signal
+              inference. For OMP, Install, Repair, and Remove apply to every discovered profile.
             </p>
             <div class="agent-integration-list">
               {agentIntegrations.providers.map((integration) => {
