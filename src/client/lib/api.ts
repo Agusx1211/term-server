@@ -3,6 +3,8 @@ import type {
   AgentIntegrationProvider,
   AgentIntegrationsConfig,
   ActivityView,
+  AccessSnapshot,
+  SecretGrant,
   BrowserTabCommandAck,
   BrowserTabHeartbeat,
   BrowserTabSnapshot,
@@ -166,6 +168,32 @@ export const api = {
   removeTerminal: (id: string) => request<void>(`/api/terminals/${id}`, { method: "DELETE" }),
   terminalProcesses: (id: string) =>
     request<ProcessInspectorSnapshot>(`/api/terminals/${id}/processes`),
+  terminalAccess: (id: string, signal?: AbortSignal) =>
+    request<AccessSnapshot>(`/api/terminals/${id}/access`, { signal }),
+  addTerminalSecret: (id: string, name: string, value: string, description?: string) =>
+    request<SecretGrant>(`/api/terminals/${id}/access/secrets`, {
+      method: "POST",
+      body: JSON.stringify({ name, value, description: description || undefined }),
+    }),
+  revokeTerminalSecret: (id: string, grantId: string) =>
+    request<void>(`/api/terminals/${id}/access/secrets/${encodeURIComponent(grantId)}`, {
+      method: "DELETE",
+    }),
+  approveTerminalSecret: (id: string, requestId: string, requestHash: string, value: string) =>
+    request<SecretGrant>(
+      `/api/terminals/${id}/access/requests/${encodeURIComponent(requestId)}/secret`,
+      { method: "POST", body: JSON.stringify({ requestHash, value }) },
+    ),
+  approveTerminalSudo: (id: string, requestId: string, requestHash: string, password: string) =>
+    request<void>(
+      `/api/terminals/${id}/access/requests/${encodeURIComponent(requestId)}/sudo`,
+      { method: "POST", body: JSON.stringify({ requestHash, password }) },
+    ),
+  rejectTerminalAccess: (id: string, requestId: string, requestHash: string, comment?: string) =>
+    request<void>(
+      `/api/terminals/${id}/access/requests/${encodeURIComponent(requestId)}/reject`,
+      { method: "POST", body: JSON.stringify({ requestHash, comment: comment || undefined }) },
+    ),
   terminateTerminalProcess: (id: string, processId: string) =>
     request<void>(`/api/terminals/${id}/processes/${encodeURIComponent(processId)}`, {
       method: "DELETE",

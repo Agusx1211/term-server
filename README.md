@@ -64,6 +64,7 @@ On first boot, open `https://127.0.0.1:8090`. term-server prints a random passwo
 - **Files when needed:** searchable explorer, local image and PDF previews, direct downloads, and a lazy-loaded CodeMirror editor with syntax highlighting, atomic saves, and stale-file conflict detection.
 - **Agent-connected artifacts:** multiline handoffs stay attached to the terminal and agent that created them, with inline text, image, and PDF previews plus an optional full editor.
 - **Process visibility and control:** a lightweight Linux `/proc` sampler shows the complete live descendant process tree, foreground job, CPU and memory usage, and lets you send SIGTERM to a selected process. Command lines are secret-aware and redacted; input, output, and exited processes are not retained.
+- **Terminal-scoped access approvals:** each terminal has one Access panel for secret requests, proactive in-memory secret grants, revocation, activity, and reviewed local sudo commands. Secret values never return to the browser or agent; sudo requires the user's password for the immutable command shown in the panel.
 - **Agent awareness:** Codex, Claude, Pi, OMP, and Hermes sessions show working, blocked, idle, and closed states. An agent waiting on an approval or a question is marked **Needs you** for as long as it waits, so a stalled agent is visible without opening it. An unseen return to idle gets a distinct bell until you focus that terminal. Alerts can appear in-app, as desktop notifications, in both places, or remain off. In-app cards inherit their terminal color and can be placed in any corner with a configurable dismissal time.
 - **Supervisor terminal:** one visibly marked, singleton terminal can inspect and control the other term-server sessions without embedding an AI provider into the server. Run OMP, Pi, Codex, Claude, or an ordinary shell command yourself; only descendants of that supervisor receive the embedded skill and scoped control tools. The tools expose terminal screens, input, names, process trees, creation and termination, plus open-tab listing and closure. They deliberately provide no project organizer, pane arranger, scheduler, or job system.
 - **Secure defaults:** loopback binding, HTTPS, Argon2 password hashing, signed HTTP-only SameSite cookies, origin enforcement, CSP, HSTS, login throttling, and bounded memory use.
@@ -145,6 +146,49 @@ mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
 ln -s "$PWD/skills/term-server-artifacts" \
   "${CODEX_HOME:-$HOME/.codex}/skills/term-server-artifacts"
 ```
+
+### Terminal access approvals
+
+The terminal header's shield opens an Access panel scoped to that terminal. It shows pending secret
+and sudo requests, active secret grants, use metadata, and recent decisions. A user can also add a
+secret before an agent asks for it. Values remain only in the owning session broker's memory and are
+revoked when requested, when the terminal exits, or when that broker stops; they are never returned
+by the API.
+
+Managed live-agent integrations include the bundled `term-server-access` skill. Inside a term-server
+terminal, an agent requests a value, lists available names, and runs an exact command through the
+broker without receiving the value:
+
+```bash
+"$TERM_SERVER_EXECUTABLE" access secret request \
+  --name SERVICE_API_KEY --description "Publish the staging artifact" --agent omp
+"$TERM_SERVER_EXECUTABLE" access secret list --agent omp
+"$TERM_SERVER_EXECUTABLE" access secret run \
+  --name SERVICE_API_KEY --env SERVICE_API_KEY --agent omp -- /usr/bin/command argument...
+```
+
+`--stdin` replaces `--env NAME` only for commands that explicitly consume a credential on standard
+input. Secret commands are launched without shell interpretation in a minimal allowlisted
+environment. Exact secret occurrences in combined output are redacted on a best-effort basis.
+
+A local root command is submitted without a leading `sudo`:
+
+```bash
+"$TERM_SERVER_EXECUTABLE" access sudo \
+  --description "Install the package needed for this task" --agent omp \
+  -- /usr/bin/apt-get install -y package-name
+```
+
+The panel displays the exact argument vector, working directory, fingerprint, purpose, requester,
+and waiter count. Approval requires HTTPS, a same-origin authenticated browser request, the current
+request hash, and the user's sudo password. The password is never exposed to the agent, saved as a
+secret grant, placed in command arguments or environment, or persisted by term-server.
+
+The broker requires a root-owned executable that is not group- or world-writable, canonicalizes it,
+binds its content and filesystem identity plus the working-directory identity into the request
+fingerprint, and rechecks them immediately before invoking the reviewed target through `sudo`.
+Command-specific sudoers rules continue to see the target executable rather than a term-server
+wrapper.
 
 ### Live agent activity
 

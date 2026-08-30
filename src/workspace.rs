@@ -12,6 +12,10 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
+    access::{
+        AccessDecision, AccessError, AccessManager, AccessSnapshot, AddSecretGrant, SecretApproval,
+        SecretGrantView, SudoApproval,
+    },
     ai::{PiClientConfig, PiService, UpdatePiSettings},
     debug_recording::DebugRecordingManager,
     history::{AgentTranscriptKind, AgentTranscriptPage, TerminalScrollbackPage},
@@ -148,6 +152,7 @@ pub enum WorkspaceBackend {
     Local {
         terminals: Arc<TerminalManager>,
         pi: Arc<PiService>,
+        access: AccessManager,
     },
     #[cfg(unix)]
     Broker(Arc<crate::broker::BrokerPool>),
@@ -161,7 +166,11 @@ pub enum SessionConnection {
 
 impl WorkspaceBackend {
     pub fn local(terminals: Arc<TerminalManager>, pi: Arc<PiService>) -> Self {
-        Self::Local { terminals, pi }
+        Self::Local {
+            terminals,
+            pi,
+            access: AccessManager::default(),
+        }
     }
 
     #[cfg(unix)]
@@ -237,7 +246,12 @@ impl WorkspaceBackend {
 
     pub async fn remove(&self, id: Uuid) -> Result<(), WorkspaceError> {
         match self {
-            Self::Local { terminals, .. } if terminals.remove(id) => Ok(()),
+            Self::Local {
+                terminals, access, ..
+            } if terminals.remove(id) => {
+                access.clear_terminal(id);
+                Ok(())
+            }
             Self::Local { .. } => Err(WorkspaceError::Remote {
                 status: StatusCode::NOT_FOUND,
                 message: "terminal not found".to_owned(),
@@ -399,6 +413,100 @@ impl WorkspaceBackend {
         }
     }
 
+    pub async fn access_snapshot(&self, id: Uuid) -> Result<AccessSnapshot, WorkspaceError> {
+        match self {
+            Self::Local {
+                terminals, access, ..
+            } => {
+                terminals.get(id).ok_or_else(terminal_not_found)?;
+                Ok(access.snapshot(id))
+            }
+            #[cfg(unix)]
+            Self::Broker(client) => client.access_snapshot(id).await,
+        }
+    }
+
+    pub async fn add_secret(
+        &self,
+        id: Uuid,
+        request: AddSecretGrant,
+    ) -> Result<SecretGrantView, WorkspaceError> {
+        match self {
+            Self::Local {
+                terminals, access, ..
+            } => {
+                require_local_running_terminal(terminals, id)?;
+                access.add_secret(id, request).map_err(access_error)
+            }
+            #[cfg(unix)]
+            Self::Broker(client) => client.add_secret(id, &request).await,
+        }
+    }
+
+    pub async fn revoke_secret(&self, id: Uuid, grant_id: Uuid) -> Result<(), WorkspaceError> {
+        match self {
+            Self::Local { access, .. } => access.revoke_grant(id, grant_id).map_err(access_error),
+            #[cfg(unix)]
+            Self::Broker(client) => client.revoke_secret(id, grant_id).await,
+        }
+    }
+
+    pub async fn approve_secret(
+        &self,
+        id: Uuid,
+        request_id: Uuid,
+        request: SecretApproval,
+    ) -> Result<SecretGrantView, WorkspaceError> {
+        match self {
+            Self::Local {
+                terminals, access, ..
+            } => {
+                require_local_running_terminal(terminals, id)?;
+                access
+                    .approve_secret(id, request_id, request)
+                    .map_err(access_error)
+            }
+            #[cfg(unix)]
+            Self::Broker(client) => client.approve_secret(id, request_id, &request).await,
+        }
+    }
+
+    pub async fn approve_sudo(
+        &self,
+        id: Uuid,
+        request_id: Uuid,
+        request: SudoApproval,
+    ) -> Result<(), WorkspaceError> {
+        match self {
+            Self::Local {
+                terminals, access, ..
+            } => {
+                require_local_running_terminal(terminals, id)?;
+                access
+                    .approve_sudo(id, request_id, request)
+                    .await
+                    .map_err(access_error)
+            }
+            #[cfg(unix)]
+            Self::Broker(client) => client.approve_sudo(id, request_id, &request).await,
+        }
+    }
+
+    pub async fn reject_access(
+        &self,
+        id: Uuid,
+        request_id: Uuid,
+        request: AccessDecision,
+    ) -> Result<(), WorkspaceError> {
+        match self {
+            Self::Local { access, .. } => {
+                access.reject(id, request_id, request).map_err(access_error)
+            }
+            #[cfg(unix)]
+            Self::Broker(client) => client.reject_access(id, request_id, &request).await,
+        }
+    }
+
     pub async fn pi_config(&self) -> Result<PiClientConfig, WorkspaceError> {
         match self {
             Self::Local { pi, .. } => Ok(pi.client_config()),
@@ -466,6 +574,36 @@ impl WorkspaceBackend {
                 }
             }
         }
+    }
+}
+
+fn require_local_running_terminal(
+    terminals: &TerminalManager,
+    id: Uuid,
+) -> Result<(), WorkspaceError> {
+    terminals
+        .get(id)
+        .filter(|terminal| terminal.info().pid.is_some())
+        .map(|_| ())
+        .ok_or_else(terminal_not_found)
+}
+fn terminal_not_found() -> WorkspaceError {
+    WorkspaceError::Remote {
+        status: StatusCode::NOT_FOUND,
+        message: "terminal not found".to_owned(),
+    }
+}
+
+fn access_error(error: AccessError) -> WorkspaceError {
+    let status = match &error {
+        AccessError::NotFound => StatusCode::NOT_FOUND,
+        AccessError::Stale | AccessError::Conflict(_) => StatusCode::CONFLICT,
+        AccessError::Invalid(_) => StatusCode::BAD_REQUEST,
+        AccessError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    WorkspaceError::Remote {
+        status,
+        message: error.to_string(),
     }
 }
 

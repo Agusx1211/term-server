@@ -128,6 +128,52 @@ export interface ProcessInspectorSnapshot {
   processes: ProcessRecord[];
 }
 
+export type AccessRequestKind = "secret" | "sudo";
+export type AccessRequestState = "pending" | "authenticating" | "running";
+export type AccessActivityStatus = "approved" | "rejected" | "revoked" | "failed" | "canceled";
+
+export interface AccessRequest {
+  id: string;
+  requestHash: string;
+  kind: AccessRequestKind;
+  state: AccessRequestState;
+  description: string;
+  agent: string;
+  createdAt: number;
+  waiters: number;
+  secretName: string | null;
+  command: string | null;
+  cwd: string | null;
+  fingerprint: string | null;
+}
+
+export interface SecretGrant {
+  id: string;
+  name: string;
+  source: string;
+  createdAt: number;
+  uses: number;
+  lastUsedAt: number | null;
+  lastCommand: string | null;
+}
+
+export interface AccessActivity {
+  id: string;
+  kind: AccessRequestKind;
+  status: AccessActivityStatus;
+  title: string;
+  detail: string;
+  createdAt: number;
+}
+
+export interface AccessSnapshot {
+  terminalId: string;
+  revision: number;
+  requests: AccessRequest[];
+  grants: SecretGrant[];
+  activity: AccessActivity[];
+}
+
 export interface ClientConfig {
   scrollbackLines: number;
   maxPanes: number;
