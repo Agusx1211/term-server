@@ -15,6 +15,8 @@ use clap::Parser;
 use term_server::broker::{BrokerClient, BrokerPool, legacy_socket_path, run_session_broker};
 #[cfg(unix)]
 use term_server::supervisor::{self, SupervisorService};
+#[cfg(unix)]
+use term_server::{access_cli, config::CliCommand};
 use term_server::{
     activity_view::ActivityViewService,
     agent_events::read_hook_event,
@@ -44,6 +46,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return supervisor::run_client().await.map_err(Into::into);
     }
     let cli = Cli::parse();
+    #[cfg(unix)]
+    if let Some(CliCommand::Access(command)) = cli.command.clone() {
+        std::process::exit(access_cli::run(command).await);
+    }
     let executable = env::current_exe()?;
     if let Some(provider) = cli.agent_event.as_deref() {
         #[cfg(unix)]

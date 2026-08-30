@@ -34,6 +34,7 @@ const OMP_EXTENSION: &str =
 const OMP_ACTIVITY: &str = include_str!("../integrations/omp/extensions/subagent-activity.ts");
 const HERMES_PLUGIN_YAML: &str = include_str!("../integrations/hermes/plugin.yaml");
 const HERMES_PLUGIN_INIT: &str = include_str!("../integrations/hermes/__init__.py");
+const ACCESS_SKILL: &str = include_str!("../skills/term-server-access/SKILL.md");
 const HERMES_HOME_ENV_VAR: &str = "HERMES_HOME";
 const HERMES_PLUGIN_DIR_NAME: &str = "term-server-agent-events";
 
@@ -585,6 +586,11 @@ impl AgentIntegrationService {
                 })?;
                 write_asset(&plugin_dir.join("plugin.yaml"), HERMES_PLUGIN_YAML).await?;
                 write_asset(&plugin_dir.join("__init__.py"), HERMES_PLUGIN_INIT).await?;
+                write_asset(
+                    &plugin_dir.join("skills/term-server-access/SKILL.md"),
+                    ACCESS_SKILL,
+                )
+                .await?;
                 if let Some(config_path) = hermes_config_path() {
                     let existing = tokio::fs::read_to_string(&config_path)
                         .await
@@ -735,6 +741,13 @@ impl AgentIntegrationService {
             }
             AgentIntegrationProvider::Hermes => {
                 if let Some(plugin_dir) = hermes_plugin_dir() {
+                    let _ = tokio::fs::remove_file(
+                        plugin_dir.join("skills/term-server-access/SKILL.md"),
+                    )
+                    .await;
+                    let _ =
+                        tokio::fs::remove_dir(plugin_dir.join("skills/term-server-access")).await;
+                    let _ = tokio::fs::remove_dir(plugin_dir.join("skills")).await;
                     for name in ["plugin.yaml", "__init__.py"] {
                         let _ = tokio::fs::remove_file(plugin_dir.join(name)).await;
                     }
@@ -835,6 +848,7 @@ impl AgentIntegrationService {
                 write_asset(&root.join("__init__.py"), HERMES_PLUGIN_INIT).await?;
             }
         }
+        write_asset(&Self::access_skill_path(&root, provider), ACCESS_SKILL).await?;
         Ok(())
     }
 
@@ -846,6 +860,20 @@ impl AgentIntegrationService {
             AgentIntegrationProvider::Omp => "omp-marketplace",
             AgentIntegrationProvider::Hermes => "hermes",
         })
+    }
+
+    fn access_skill_path(root: &Path, provider: AgentIntegrationProvider) -> PathBuf {
+        match provider {
+            AgentIntegrationProvider::Codex
+            | AgentIntegrationProvider::Claude
+            | AgentIntegrationProvider::Omp => root
+                .join("plugins")
+                .join(PLUGIN_NAME)
+                .join("skills/term-server-access/SKILL.md"),
+            AgentIntegrationProvider::Pi | AgentIntegrationProvider::Hermes => {
+                root.join("skills/term-server-access/SKILL.md")
+            }
+        }
     }
 
     fn assets_current(&self, provider: AgentIntegrationProvider) -> bool {
@@ -891,9 +919,11 @@ impl AgentIntegrationService {
                 ("__init__.py", HERMES_PLUGIN_INIT),
             ],
         };
-        let assets_current = assets.iter().all(|(path, expected)| {
-            std::fs::read_to_string(root.join(path)).is_ok_and(|content| content == *expected)
-        });
+        let assets_current =
+            assets.iter().all(|(path, expected)| {
+                std::fs::read_to_string(root.join(path)).is_ok_and(|content| content == *expected)
+            }) && std::fs::read_to_string(Self::access_skill_path(&root, provider))
+                .is_ok_and(|content| content == ACCESS_SKILL);
         let marketplace_current = match provider {
             AgentIntegrationProvider::Codex => json_file_matches(
                 &root.join(".agents/plugins/marketplace.json"),
@@ -1018,7 +1048,9 @@ fn hermes_config_path() -> Option<PathBuf> {
 }
 
 fn hermes_plugin_files_present(dir: &Path) -> bool {
-    dir.join("plugin.yaml").is_file() && dir.join("__init__.py").is_file()
+    dir.join("plugin.yaml").is_file()
+        && dir.join("__init__.py").is_file()
+        && dir.join("skills/term-server-access/SKILL.md").is_file()
 }
 
 fn hermes_plugin_assets_current(dir: &Path) -> bool {
@@ -1026,6 +1058,8 @@ fn hermes_plugin_assets_current(dir: &Path) -> bool {
         .is_ok_and(|content| content == HERMES_PLUGIN_YAML)
         && std::fs::read_to_string(dir.join("__init__.py"))
             .is_ok_and(|content| content == HERMES_PLUGIN_INIT)
+        && std::fs::read_to_string(dir.join("skills/term-server-access/SKILL.md"))
+            .is_ok_and(|content| content == ACCESS_SKILL)
 }
 
 /// Whether `term-server-agent-events` is in the `plugins.enabled` allow-list of
@@ -2473,6 +2507,12 @@ mod tests {
 
         std::fs::write(directory.path().join("plugin.yaml"), HERMES_PLUGIN_YAML).unwrap();
         std::fs::write(directory.path().join("__init__.py"), HERMES_PLUGIN_INIT).unwrap();
+        std::fs::create_dir_all(directory.path().join("skills/term-server-access")).unwrap();
+        std::fs::write(
+            directory.path().join("skills/term-server-access/SKILL.md"),
+            ACCESS_SKILL,
+        )
+        .unwrap();
         assert!(hermes_plugin_files_present(directory.path()));
         assert!(hermes_plugin_assets_current(directory.path()));
 
@@ -2494,6 +2534,7 @@ mod tests {
         let root = service.provider_root(AgentIntegrationProvider::Hermes);
         assert!(root.join("plugin.yaml").is_file());
         assert!(root.join("__init__.py").is_file());
+        assert!(root.join("skills/term-server-access/SKILL.md").is_file());
         assert!(
             !service
                 .provider_root(AgentIntegrationProvider::Claude)

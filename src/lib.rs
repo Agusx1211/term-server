@@ -1,3 +1,6 @@
+pub mod access;
+#[cfg(unix)]
+pub mod access_cli;
 pub mod activity_view;
 pub mod agent_detection;
 pub mod agent_events;

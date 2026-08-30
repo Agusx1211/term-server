@@ -955,6 +955,158 @@ body.pane-resizing .layout-divider.horizontal { cursor: row-resize; }
 .process-kill:hover:not(:disabled) { background: color-mix(in srgb, var(--danger) 11%, transparent); color: var(--danger); }
 .process-kill:disabled { opacity: .42; cursor: default; }
 
+.pane-access-action { position: relative; width: 31px; }
+.pane-access-action.attention { color: var(--status-warn); }
+.pane-access-action > span {
+  position: absolute; top: 1px; right: 1px; min-width: 11px; height: 11px; padding: 0 3px;
+  display: inline-flex; align-items: center; justify-content: center; border-radius: 6px;
+  background: var(--status-warn); color: #181818; font-size: 7px; font-weight: 800; line-height: 1;
+}
+.pane-access-action.active { color: var(--status-warn); }
+.access-panel {
+  width: min(460px, calc(100% - 12px));
+  --access-secret: #a78bfa;
+  --access-sudo: #e3b341;
+}
+.access-panel-header { gap: 6px; }
+.access-waiting-label {
+  display: inline-flex; align-items: center; min-height: 16px; padding: 1px 6px; border-radius: 8px;
+  font-size: 7.5px; font-weight: 750; letter-spacing: .035em; text-transform: uppercase; white-space: nowrap;
+}
+.access-waiting-label.pending { background: color-mix(in srgb, var(--status-warn) 14%, transparent); color: var(--status-warn); }
+.access-waiting-label.clear { background: color-mix(in srgb, var(--status-ok) 12%, transparent); color: var(--status-ok); }
+.access-panel-note strong { color: var(--foreground); font-weight: 620; }
+.access-panel-scroll { overscroll-behavior: contain; }
+.access-section { padding: 8px 8px 11px; }
+.access-section + .access-section { padding-top: 9px; }
+.access-request {
+  position: relative; min-width: 0; display: flex; align-items: flex-start; gap: 8px; margin-top: 4px; padding: 9px;
+  border: 1px solid var(--border); border-radius: 5px; background: color-mix(in srgb, var(--input) 42%, transparent);
+}
+.access-request.secret { border-color: color-mix(in srgb, var(--access-secret) 31%, var(--border)); }
+.access-request.sudo { border-color: color-mix(in srgb, var(--access-sudo) 34%, var(--border)); }
+.access-request-icon {
+  width: 27px; height: 27px; flex: none; display: grid; place-items: center; border: 1px solid var(--border); border-radius: 5px;
+}
+.access-request-icon.secret {
+  border-color: color-mix(in srgb, var(--access-secret) 43%, var(--border));
+  background: color-mix(in srgb, var(--access-secret) 9%, var(--panel)); color: var(--access-secret);
+}
+.access-request-icon.sudo {
+  border-color: color-mix(in srgb, var(--access-sudo) 44%, var(--border));
+  background: color-mix(in srgb, var(--access-sudo) 9%, var(--panel)); color: var(--access-sudo);
+}
+.access-request-main { min-width: 0; flex: 1; }
+.access-request-heading { min-width: 0; display: flex; align-items: center; gap: 6px; }
+.access-request-heading strong {
+  min-width: 0; overflow: hidden; flex: 1; font: 650 10.5px/14px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+.access-kind, .access-request-state {
+  flex: none; padding: 1px 5px; border-radius: 7px; font-size: 7px; font-weight: 800; letter-spacing: .045em; text-transform: uppercase;
+}
+.access-kind.secret { background: color-mix(in srgb, var(--access-secret) 12%, transparent); color: var(--access-secret); }
+.access-kind.sudo { background: color-mix(in srgb, var(--access-sudo) 12%, transparent); color: var(--access-sudo); }
+.access-request-state { background: color-mix(in srgb, var(--accent) 11%, transparent); color: var(--accent); }
+.access-request-state.running { background: color-mix(in srgb, var(--status-ok) 11%, transparent); color: var(--status-ok); }
+.access-request p { margin: 4px 0 0; color: var(--muted); font-size: 9.5px; line-height: 1.4; }
+.access-command {
+  min-width: 0; max-width: 100%; display: block; overflow: auto; margin-top: 7px; padding: 6px 7px;
+  border: 1px solid color-mix(in srgb, var(--access-sudo) 20%, var(--border)); border-radius: 4px;
+  background: color-mix(in srgb, var(--access-sudo) 4%, #101010); color: var(--foreground);
+  font: 9px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre;
+}
+.access-request-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin-top: 7px; color: var(--subtle); font-size: 8px; }
+.access-request-meta span { display: inline-flex; align-items: center; gap: 3px; }
+.access-scope {
+  min-width: 0; display: flex; justify-content: space-between; gap: 7px; margin-top: 5px; color: var(--subtle);
+  font: 7.5px/11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.access-scope span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.access-actions { display: flex; align-items: center; justify-content: flex-end; gap: 5px; margin-top: 8px; }
+.access-button {
+  min-height: 27px; display: inline-flex; align-items: center; justify-content: center; gap: 4px; padding: 0 8px;
+  border: 1px solid var(--border-strong); border-radius: 4px; background: color-mix(in srgb, var(--input) 72%, transparent);
+  color: var(--foreground); font-size: 8.5px; font-weight: 620; cursor: pointer;
+}
+.access-button:hover:not(:disabled) { background: var(--hover); }
+.access-button.primary { border-color: var(--accent); background: var(--accent); color: #fff; }
+.access-button.primary:hover:not(:disabled) { background: var(--accent-hover); }
+.access-button.danger { color: var(--danger); }
+.access-button.danger:hover:not(:disabled) { border-color: color-mix(in srgb, var(--danger) 48%, var(--border)); background: color-mix(in srgb, var(--danger) 9%, transparent); }
+.access-button:disabled, .access-icon-button:disabled, .access-section-controls button:disabled { opacity: .5; cursor: default; }
+.access-secret-entry, .access-add-secret {
+  margin-top: 8px; padding: 8px; border: 1px solid color-mix(in srgb, var(--access-secret) 34%, var(--border));
+  border-radius: 4px; background: color-mix(in srgb, var(--access-secret) 5%, var(--panel));
+}
+.access-sudo-entry {
+  border-color: color-mix(in srgb, var(--access-sudo) 38%, var(--border));
+  background: color-mix(in srgb, var(--access-sudo) 5%, var(--panel));
+}
+.access-secret-entry label, .access-add-secret label {
+  display: grid; gap: 4px; color: var(--muted); font-size: 8px; font-weight: 650; letter-spacing: .035em; text-transform: uppercase;
+}
+.access-add-secret label + label { margin-top: 7px; }
+.access-add-secret label > span { color: var(--subtle); font-weight: 500; text-transform: none; }
+.access-secret-entry input, .access-add-secret input {
+  width: 100%; height: 29px; padding: 0 7px; border: 1px solid var(--border-strong); border-radius: 3px;
+  background: var(--input); color: var(--foreground); font-size: 10px; text-transform: none;
+}
+.access-secret-entry small, .access-add-secret small {
+  display: flex; align-items: center; gap: 4px; margin-top: 5px; color: var(--subtle); font-size: 7.5px; font-weight: 400; line-height: 1.35;
+  letter-spacing: 0; text-transform: none;
+}
+.access-add-secret-heading { display: flex; align-items: center; gap: 5px; margin-bottom: 8px; color: var(--access-secret); font-size: 9px; font-weight: 680; }
+.access-empty { display: flex; align-items: center; gap: 6px; color: var(--status-ok); }
+.access-running { display: flex; align-items: center; gap: 5px; margin-top: 8px; color: var(--muted); font-size: 8.5px; }
+.access-section-controls button {
+  min-height: 21px; display: inline-flex; align-items: center; gap: 3px; padding: 0 6px;
+  border: 1px solid var(--border); border-radius: 3px; background: transparent; color: var(--muted); font-size: 8px; cursor: pointer;
+}
+.access-section-controls button:hover:not(:disabled) { background: var(--hover); color: var(--foreground); }
+.access-grant {
+  min-width: 0; min-height: 42px; display: flex; align-items: center; gap: 7px; padding: 5px 4px; border-radius: 4px;
+}
+.access-grant:hover { background: var(--hover); }
+.access-grant-icon {
+  width: 25px; height: 25px; flex: none; display: grid; place-items: center; border-radius: 5px;
+  background: color-mix(in srgb, var(--access-secret) 10%, var(--panel)); color: var(--access-secret);
+}
+.access-grant-copy { min-width: 0; flex: 1; display: grid; gap: 2px; }
+.access-grant-copy strong {
+  overflow: hidden; font: 620 9.5px/12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; text-overflow: ellipsis; white-space: nowrap;
+}
+.access-grant-copy small { overflow: hidden; color: var(--subtle); font-size: 7.5px; text-overflow: ellipsis; white-space: nowrap; }
+.access-grant-state {
+  flex: none; padding: 1px 5px; border-radius: 7px; background: color-mix(in srgb, var(--status-ok) 11%, transparent);
+  color: var(--status-ok); font-size: 7px; font-weight: 750; text-transform: uppercase;
+}
+.access-icon-button {
+  width: 25px; height: 25px; flex: none; display: grid; place-items: center; padding: 0; border: 0; border-radius: 4px;
+  background: transparent; color: var(--subtle); cursor: pointer;
+}
+.access-icon-button.danger:hover:not(:disabled) { background: color-mix(in srgb, var(--danger) 10%, transparent); color: var(--danger); }
+.access-activity-list { display: grid; }
+.access-activity {
+  min-width: 0; min-height: 37px; display: flex; align-items: center; gap: 7px; padding: 4px;
+}
+.access-activity-icon { width: 22px; height: 22px; flex: none; display: grid; place-items: center; color: var(--muted); }
+.access-activity.approved .access-activity-icon { color: var(--status-ok); }
+.access-activity.rejected .access-activity-icon { color: var(--danger); }
+.access-activity.revoked .access-activity-icon, .access-activity.canceled .access-activity-icon { color: var(--status-warn); }
+.access-activity.failed .access-activity-icon { color: var(--status-error); }
+.access-activity-copy { min-width: 0; flex: 1; display: grid; gap: 1px; }
+.access-activity-copy strong { overflow: hidden; font-size: 9px; font-weight: 620; text-overflow: ellipsis; white-space: nowrap; }
+.access-activity-copy small { overflow: hidden; color: var(--subtle); font-size: 7.5px; text-overflow: ellipsis; white-space: nowrap; }
+.access-activity time { flex: none; color: var(--subtle); font-size: 7.5px; }
+.access-panel-footer {
+  display: grid; gap: 3px; padding: 9px 10px 12px; color: var(--subtle); font-size: 7.5px;
+}
+.access-panel-footer span:first-child { display: flex; align-items: center; gap: 4px; color: var(--muted); }
+.access-panel-footer span:last-child {
+  overflow: hidden; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; text-overflow: ellipsis; white-space: nowrap;
+}
+
 .artifact-drawer {
   width: min(390px, 42%); min-width: 300px; min-height: 0; flex: none; display: flex; flex-direction: column;
   border-left: 1px solid color-mix(in srgb, var(--artifact) 42%, var(--border)); background: var(--artifact-surface);
@@ -1468,6 +1620,12 @@ body.pane-resizing .layout-divider.horizontal { cursor: row-resize; }
   .process-inspector-header > .pane-action { width: 40px; height: 40px; }
   .process-row { min-height: 56px; }
   .process-kill { width: 36px; height: 36px; }
+  .access-request { padding: 10px 9px; }
+  .access-button { min-height: 36px; padding: 0 11px; font-size: 10px; }
+  .access-icon-button { width: 36px; height: 36px; }
+  .access-grant { min-height: 52px; }
+  .access-secret-entry input, .access-add-secret input { height: 38px; font-size: 16px; }
+  .access-section-controls button { min-height: 32px; padding: 0 9px; }
   .artifact-drawer {
     width: 100%; max-width: none; border-left: 0; box-shadow: none;
   }

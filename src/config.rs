@@ -1,6 +1,9 @@
 use std::{env, net::IpAddr, path::PathBuf};
 
-use clap::{ArgAction, Parser};
+use clap::{ArgAction, Parser, Subcommand};
+
+#[cfg(unix)]
+use crate::access_cli::AccessCli;
 
 fn default_data_dir() -> PathBuf {
     if let Some(path) = env::var_os("XDG_DATA_HOME") {
@@ -36,6 +39,13 @@ fn default_client_dir() -> PathBuf {
         .into_iter()
         .find(|candidate| candidate.join("index.html").is_file())
         .unwrap_or_else(|| PathBuf::from("dist/client"))
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Subcommand)]
+pub enum CliCommand {
+    /// Request secret or sudo access through the originating terminal.
+    Access(AccessCli),
 }
 
 #[derive(Debug, Clone, Parser)]
@@ -150,6 +160,11 @@ pub struct Cli {
     /// Forward a provider lifecycle event from stdin to the session broker.
     #[arg(long, hide = true, value_name = "PROVIDER")]
     pub agent_event: Option<String>,
+
+    /// Use the terminal-scoped access control client.
+    #[cfg(unix)]
+    #[command(subcommand)]
+    pub command: Option<CliCommand>,
 
     /// Disable signed update checks and installation.
     #[arg(long, env = "TERM_SERVER_DISABLE_UPDATES", action = ArgAction::SetTrue)]
