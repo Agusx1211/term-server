@@ -7,10 +7,13 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD as BASE64, URL_SAFE as BASE64_URL_SAFE},
+};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -29,6 +32,9 @@ const MAX_SECRET_EXECUTIONS_PER_TERMINAL: usize = 8;
 const MAX_COMMAND_BYTES: usize = 64 * 1024;
 const OUTPUT_CHUNK_BYTES: usize = 8 * 1024;
 const REDACTED: &[u8] = b"[REDACTED]";
+const MIN_DERIVED_SECRET_BYTES: usize = 4;
+const MAX_DERIVED_SECRET_BYTES: usize = 1024;
+const BASE32_ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 const SAFE_COMMAND_ENVIRONMENT: &[&str] = &[
     "HOME",
     "USER",
@@ -999,7 +1005,16 @@ impl AccessManager {
         };
         let manager = self.clone();
         tokio::spawn(async move {
-            run_secret_command(command, cwd, input.delivery, secret, sender, cancellation).await;
+            run_secret_command(
+                command,
+                cwd,
+                input.delivery,
+                name,
+                secret,
+                sender,
+                cancellation,
+            )
+            .await;
             manager.finish_secret_execution(execution_id);
         });
         Ok(AccessSubscription::execution(receiver, cancel))
@@ -1379,6 +1394,7 @@ async fn run_secret_command(
     command: Vec<String>,
     cwd: PathBuf,
     delivery: SecretDelivery,
+    secret_name: String,
     secret: Zeroizing<String>,
     sender: broadcast::Sender<AgentAccessEvent>,
     cancellation: watch::Receiver<bool>,
@@ -1425,7 +1441,7 @@ async fn run_secret_command(
     let result = stream_child(
         child,
         sender.clone(),
-        Some(secret.as_bytes()),
+        Some((secret_name.as_str(), secret.as_bytes())),
         Some(cancellation),
     )
     .await;
@@ -1442,7 +1458,7 @@ async fn run_secret_command(
 async fn stream_child(
     mut child: tokio::process::Child,
     sender: broadcast::Sender<AgentAccessEvent>,
-    secret: Option<&[u8]>,
+    secret: Option<(&str, &[u8])>,
     mut cancellation: Option<watch::Receiver<bool>>,
 ) -> Result<i32, String> {
     let stdout = child.stdout.take();
@@ -1455,7 +1471,7 @@ async fn stream_child(
         tokio::spawn(read_stream(stderr, output_sender.clone()));
     }
     drop(output_sender);
-    let mut redactor = OutputRedactor::new(secret.filter(|value| !value.is_empty()));
+    let mut redactor = OutputRedactor::new(secret);
     loop {
         let next = if let Some(cancel) = cancellation.as_mut() {
             tokio::select! {
@@ -1506,36 +1522,61 @@ async fn read_stream(mut stream: impl AsyncRead + Unpin, sender: mpsc::Sender<Ze
 }
 
 struct OutputRedactor {
-    secret: Option<Zeroizing<Vec<u8>>>,
+    patterns: Vec<Zeroizing<Vec<u8>>>,
+    replacement: Vec<u8>,
     pending: Zeroizing<Vec<u8>>,
+    max_pattern_len: usize,
 }
 
 impl OutputRedactor {
-    fn new(secret: Option<&[u8]>) -> Self {
+    fn new(secret: Option<(&str, &[u8])>) -> Self {
+        let Some((name, secret)) = secret.filter(|(_, value)| !value.is_empty()) else {
+            return Self {
+                patterns: Vec::new(),
+                replacement: REDACTED.to_vec(),
+                pending: Zeroizing::new(Vec::new()),
+                max_pattern_len: 1,
+            };
+        };
+        let mut patterns = secret_redaction_variants(secret);
+        patterns.sort_by_key(|pattern| std::cmp::Reverse(pattern.len()));
+        let max_pattern_len = patterns
+            .iter()
+            .map(|pattern| pattern.len())
+            .max()
+            .unwrap_or(1);
+        let replacement = redaction_marker(name, &patterns);
         Self {
-            secret: secret.map(|value| Zeroizing::new(value.to_vec())),
+            patterns,
+            replacement,
             pending: Zeroizing::new(Vec::new()),
+            max_pattern_len,
         }
     }
 
     fn push(&mut self, bytes: &[u8], final_chunk: bool) -> Vec<u8> {
-        let Some(secret) = self.secret.as_deref() else {
+        if self.patterns.is_empty() {
             return bytes.to_vec();
-        };
+        }
         self.pending.extend_from_slice(bytes);
         let limit = if final_chunk {
             self.pending.len()
         } else {
             self.pending
                 .len()
-                .saturating_sub(secret.len().saturating_sub(1))
+                .saturating_sub(self.max_pattern_len.saturating_sub(1))
         };
         let mut output = Vec::with_capacity(limit);
         let mut offset = 0;
         while offset < limit {
-            if self.pending[offset..].starts_with(secret) {
-                output.extend_from_slice(REDACTED);
-                offset += secret.len();
+            let matched = self
+                .patterns
+                .iter()
+                .find(|pattern| self.pending[offset..].starts_with(pattern.as_slice()))
+                .map(|pattern| pattern.len());
+            if let Some(length) = matched {
+                output.extend_from_slice(&self.replacement);
+                offset += length;
             } else {
                 output.push(self.pending[offset]);
                 offset += 1;
@@ -1545,6 +1586,207 @@ impl OutputRedactor {
         self.pending.drain(..offset);
         output
     }
+}
+
+fn secret_redaction_variants(secret: &[u8]) -> Vec<Zeroizing<Vec<u8>>> {
+    let mut variants = Vec::new();
+    push_secret_variant(&mut variants, secret.to_vec());
+    if !(MIN_DERIVED_SECRET_BYTES..=MAX_DERIVED_SECRET_BYTES).contains(&secret.len()) {
+        return variants;
+    }
+
+    let base64 = BASE64.encode(secret).into_bytes();
+    push_secret_variant(&mut variants, base64_without_padding(base64.clone()));
+    push_secret_variant(&mut variants, base64);
+    let base64_url = BASE64_URL_SAFE.encode(secret).into_bytes();
+    push_secret_variant(&mut variants, base64_without_padding(base64_url.clone()));
+    push_secret_variant(&mut variants, base64_url);
+
+    let base32 = encode_base32(secret);
+    push_secret_variant(&mut variants, base64_without_padding(base32.clone()));
+    let mut base32_lower = base32.clone();
+    base32_lower.make_ascii_lowercase();
+    push_secret_variant(&mut variants, base64_without_padding(base32_lower.clone()));
+    push_secret_variant(&mut variants, base32);
+    push_secret_variant(&mut variants, base32_lower);
+
+    push_secret_variant(&mut variants, encode_hex(secret, false));
+    push_secret_variant(&mut variants, encode_hex(secret, true));
+    push_secret_variant(&mut variants, encode_percent(secret, false));
+    push_secret_variant(&mut variants, encode_percent(secret, true));
+    push_secret_variant(&mut variants, encode_hex_escape(secret, false));
+    push_secret_variant(&mut variants, encode_hex_escape(secret, true));
+    push_secret_variant(&mut variants, encode_unicode_escape(secret, false));
+    push_secret_variant(&mut variants, encode_unicode_escape(secret, true));
+    push_secret_variant(&mut variants, encode_octal(secret, true, false));
+    push_secret_variant(&mut variants, encode_octal(secret, false, false));
+    push_secret_variant(&mut variants, encode_octal(secret, false, true));
+    push_secret_variant(&mut variants, encode_binary(secret, false));
+    push_secret_variant(&mut variants, encode_binary(secret, true));
+
+    let mut sha256 = Sha256::digest(secret);
+    push_secret_variant(&mut variants, encode_hex(&sha256, false));
+    push_secret_variant(&mut variants, encode_hex(&sha256, true));
+    sha256.as_mut_slice().zeroize();
+    let mut sha512 = Sha512::digest(secret);
+    push_secret_variant(&mut variants, encode_hex(&sha512, false));
+    push_secret_variant(&mut variants, encode_hex(&sha512, true));
+    sha512.as_mut_slice().zeroize();
+    variants
+}
+
+fn push_secret_variant(variants: &mut Vec<Zeroizing<Vec<u8>>>, mut value: Vec<u8>) {
+    if value.is_empty()
+        || variants
+            .iter()
+            .any(|existing| existing.as_slice() == value.as_slice())
+    {
+        value.zeroize();
+        return;
+    }
+    variants.push(Zeroizing::new(value));
+}
+
+fn base64_without_padding(mut value: Vec<u8>) -> Vec<u8> {
+    while value.last() == Some(&b'=') {
+        value.pop();
+    }
+    value
+}
+
+fn encode_base32(value: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(value.len().div_ceil(5) * 8);
+    let mut accumulator = 0_u16;
+    let mut bits = 0_u8;
+    for byte in value {
+        accumulator = (accumulator << 8) | u16::from(*byte);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            output.push(BASE32_ALPHABET[usize::from((accumulator >> bits) & 0x1f)]);
+        }
+        if bits == 0 {
+            accumulator = 0;
+        } else {
+            accumulator &= (1_u16 << bits) - 1;
+        }
+    }
+    if bits > 0 {
+        output.push(BASE32_ALPHABET[usize::from((accumulator << (5 - bits)) & 0x1f)]);
+    }
+    while output.len() % 8 != 0 {
+        output.push(b'=');
+    }
+    output
+}
+
+fn encode_hex(value: &[u8], upper: bool) -> Vec<u8> {
+    let alphabet = if upper {
+        b"0123456789ABCDEF"
+    } else {
+        b"0123456789abcdef"
+    };
+    let mut output = Vec::with_capacity(value.len() * 2);
+    for byte in value {
+        output.push(alphabet[usize::from(byte >> 4)]);
+        output.push(alphabet[usize::from(byte & 0x0f)]);
+    }
+    output
+}
+
+fn encode_percent(value: &[u8], lower: bool) -> Vec<u8> {
+    let mut output = Vec::with_capacity(value.len() * 3);
+    let hex = Zeroizing::new(encode_hex(value, !lower));
+    for pair in hex.as_chunks::<2>().0 {
+        output.push(b'%');
+        output.extend_from_slice(pair);
+    }
+    output
+}
+
+fn encode_hex_escape(value: &[u8], upper: bool) -> Vec<u8> {
+    let mut output = Vec::with_capacity(value.len() * 4);
+    let hex = Zeroizing::new(encode_hex(value, upper));
+    for pair in hex.as_chunks::<2>().0 {
+        output.extend_from_slice(b"\\x");
+        output.extend_from_slice(pair);
+    }
+    output
+}
+
+fn encode_unicode_escape(value: &[u8], upper: bool) -> Vec<u8> {
+    let mut output = Vec::with_capacity(value.len() * 6);
+    let hex = Zeroizing::new(encode_hex(value, upper));
+    for pair in hex.as_chunks::<2>().0 {
+        output.extend_from_slice(b"\\u00");
+        output.extend_from_slice(pair);
+    }
+    output
+}
+
+fn encode_octal(value: &[u8], escaped: bool, spaced: bool) -> Vec<u8> {
+    let unit = usize::from(escaped) + 3 + usize::from(spaced);
+    let mut output = Vec::with_capacity(value.len() * unit);
+    for (index, byte) in value.iter().enumerate() {
+        if spaced && index > 0 {
+            output.push(b' ');
+        }
+        if escaped {
+            output.push(b'\\');
+        }
+        output.push(b'0' + ((byte >> 6) & 0x03));
+        output.push(b'0' + ((byte >> 3) & 0x07));
+        output.push(b'0' + (byte & 0x07));
+    }
+    output
+}
+
+fn encode_binary(value: &[u8], spaced: bool) -> Vec<u8> {
+    let mut output = Vec::with_capacity(value.len() * (8 + usize::from(spaced)));
+    for (index, byte) in value.iter().enumerate() {
+        if spaced && index > 0 {
+            output.push(b' ');
+        }
+        for shift in (0..8).rev() {
+            output.push(b'0' + ((byte >> shift) & 1));
+        }
+    }
+    output
+}
+
+fn redaction_marker(name: &str, patterns: &[Zeroizing<Vec<u8>>]) -> Vec<u8> {
+    let candidates = [
+        format!("[REDACTED: {name}]").into_bytes(),
+        b"[REDACTED: SECRET]".to_vec(),
+        b"[REDACTED]".to_vec(),
+        b"<filtered>".to_vec(),
+    ];
+    for mut candidate in candidates {
+        if !patterns
+            .iter()
+            .any(|pattern| contains_slice(&candidate, pattern))
+        {
+            return candidate;
+        }
+        candidate.zeroize();
+    }
+    for byte in b'!'..=b'~' {
+        let candidate = vec![byte];
+        if !patterns
+            .iter()
+            .any(|pattern| contains_slice(&candidate, pattern))
+        {
+            return candidate;
+        }
+    }
+    Vec::new()
+}
+fn contains_slice(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && needle.len() <= haystack.len()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
 #[cfg(target_os = "linux")]
@@ -2007,13 +2249,93 @@ mod tests {
 
     #[test]
     fn redactor_catches_secrets_split_across_output_chunks() {
-        let mut redactor = OutputRedactor::new(Some(b"secret-value"));
+        let mut redactor = OutputRedactor::new(Some(("API_KEY", b"secret-value")));
         let mut output = redactor.push(b"before secret-", false);
         output.extend(redactor.push(b"value after", true));
         assert_eq!(
             String::from_utf8(output).unwrap(),
-            "before [REDACTED] after"
+            "before [REDACTED: API_KEY] after"
         );
+    }
+
+    #[test]
+    fn redactor_catches_common_encoded_and_hashed_variations() {
+        let secret = b"s3cr3t!";
+        let sha256 = "d765af45f799c9d060386c88b6459d03fa2ca4dd32e864f95ceea43b52955a9b";
+        let sha512 = "670fd70cf9c5eb009281fbca10051b0708c3faa14350a9df6c6cc4a07fec07546db3dcf5b20310a482212b6f7047786d7a8a9c2655d8507d29d400428ed3ab48";
+        let variants = vec![
+            "s3cr3t!".to_owned(),
+            "czNjcjN0IQ==".to_owned(),
+            "czNjcjN0IQ".to_owned(),
+            "OMZWG4RTOQQQ====".to_owned(),
+            "OMZWG4RTOQQQ".to_owned(),
+            "omzwg4rtoqqq".to_owned(),
+            "73336372337421".to_owned(),
+            "73336372337421".to_uppercase(),
+            "%73%33%63%72%33%74%21".to_owned(),
+            "\\x73\\x33\\x63\\x72\\x33\\x74\\x21".to_owned(),
+            "\\u0073\\u0033\\u0063\\u0072\\u0033\\u0074\\u0021".to_owned(),
+            "\\163\\063\\143\\162\\063\\164\\041".to_owned(),
+            "163063143162063164041".to_owned(),
+            "163 063 143 162 063 164 041".to_owned(),
+            "01110011001100110110001101110010001100110111010000100001".to_owned(),
+            "01110011 00110011 01100011 01110010 00110011 01110100 00100001".to_owned(),
+            sha256.to_owned(),
+            sha256.to_uppercase(),
+            sha512.to_owned(),
+            sha512.to_uppercase(),
+        ];
+        for variant in variants {
+            let split = variant.len() / 2;
+            let mut redactor = OutputRedactor::new(Some(("SERVICE_TOKEN", secret)));
+            let mut output = redactor.push(b"prefix ", false);
+            output.extend(redactor.push(&variant.as_bytes()[..split], false));
+            output.extend(redactor.push(&variant.as_bytes()[split..], false));
+            output.extend(redactor.push(b" suffix", true));
+            assert_eq!(
+                String::from_utf8(output).unwrap(),
+                "prefix [REDACTED: SERVICE_TOKEN] suffix",
+                "variant was not redacted: {variant}"
+            );
+        }
+    }
+
+    #[test]
+    fn redaction_marker_never_reprints_the_secret_value() {
+        let mut redactor = OutputRedactor::new(Some(("API_KEY", b"API_KEY")));
+        let output = redactor.push(b"API_KEY", true);
+        assert!(!contains_slice(&output, b"API_KEY"));
+        assert_eq!(String::from_utf8(output).unwrap(), "[REDACTED: SECRET]");
+    }
+
+    #[test]
+    fn short_secrets_do_not_enable_derived_redaction() {
+        let mut redactor = OutputRedactor::new(Some(("TOKEN", b"abc")));
+        let output = redactor.push(b"YWJj abc", true);
+        assert_eq!(String::from_utf8(output).unwrap(), "YWJj [REDACTED: TOKEN]");
+    }
+
+    #[test]
+    fn redactor_catches_url_safe_and_uppercase_variations() {
+        for variant in ["MDA+Pg==", "MDA+Pg", "MDA-Pg==", "MDA-Pg"] {
+            let mut redactor = OutputRedactor::new(Some(("TOKEN", b"00>>")));
+            assert_eq!(
+                String::from_utf8(redactor.push(variant.as_bytes(), true)).unwrap(),
+                "[REDACTED: TOKEN]"
+            );
+        }
+        for variant in [
+            "746F6B656E7A",
+            "%74%6F%6B%65%6E%7A",
+            "\\x74\\x6F\\x6B\\x65\\x6E\\x7A",
+            "\\u0074\\u006F\\u006B\\u0065\\u006E\\u007A",
+        ] {
+            let mut redactor = OutputRedactor::new(Some(("TOKEN", b"tokenz")));
+            assert_eq!(
+                String::from_utf8(redactor.push(variant.as_bytes(), true)).unwrap(),
+                "[REDACTED: TOKEN]"
+            );
+        }
     }
 
     #[test]
@@ -2074,7 +2396,7 @@ mod tests {
             }
         }
         assert_eq!(return_code, Some(0));
-        assert_eq!(String::from_utf8(output).unwrap(), "[REDACTED]");
+        assert_eq!(String::from_utf8(output).unwrap(), "[REDACTED: TOKEN]");
         assert_eq!(manager.snapshot(terminal).grants[0].uses, 1);
 
         let mut command = Command::new("/usr/bin/env");
