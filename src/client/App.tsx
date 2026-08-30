@@ -680,6 +680,10 @@ export function App() {
 
   const updateUpdateChannel = async (channel: UpdateChannel) => {
     if (channel === configRef.current.updates.channel) return;
+    const previousUpdates = configRef.current.updates;
+    const requestedUpdates = { ...previousUpdates, channel };
+    configRef.current = { ...configRef.current, updates: requestedUpdates };
+    setConfig((current) => ({ ...current, updates: requestedUpdates }));
     setUpdatingUpdateChannel(true);
     setUpdateStatus(null);
     try {
@@ -689,6 +693,8 @@ export function App() {
       await checkForUpdates();
       showNotice(`Update channel changed to ${channel}`);
     } catch (error) {
+      configRef.current = { ...configRef.current, updates: previousUpdates };
+      setConfig((current) => ({ ...current, updates: previousUpdates }));
       showNotice(error instanceof Error ? error.message : "Unable to change update channel");
     } finally {
       setUpdatingUpdateChannel(false);
