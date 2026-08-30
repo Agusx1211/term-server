@@ -34,7 +34,7 @@ term-server-supervisor close-tab <tab-id>
 
 Terminal IDs, process IDs, and tab IDs are opaque. Re-list before acting when state may have changed. `close-tab` detaches a terminal pane or closes a non-dirty resource tab; it does not kill the terminal process. `kill` permanently ends the terminal session.
 
-Use `transcript` for a detected agent's retained semantic thread: user and assistant messages, tool activity and results, compaction markers, and status transitions. Use `scrollback` for retained raw terminal output rendered as control-free text. Both commands print sequence cursors for pagination; pass the returned next/end sequence back through `--from-sequence`. `--jsonl` emits machine-composable page metadata and records. History is available only through this Supervisor-authorized CLI; the MCP tool inventory intentionally does not expose it.
+Use `transcript` for a detected agent's retained semantic thread: user and assistant messages, tool activity and results, compaction markers, and status transitions. Use `scrollback` for retained raw terminal output rendered as control-free text. Both commands print sequence cursors for pagination; pass the returned next/end sequence back through `--from-sequence`. `--jsonl` emits machine-composable page metadata and records. All Supervisor operations, including history, are available only through this capability-checked CLI; there is no MCP or provider-specific tool adapter.
 
 There is no project organizer, pane arranger, scheduler, or background-job API. Compose behavior from these primitives. To follow another agent, inspect its status and screen again after waiting; only send input when the target state makes that safe.
 
