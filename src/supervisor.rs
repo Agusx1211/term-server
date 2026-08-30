@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
     fs,
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
     sync::{Mutex, RwLock, oneshot},
 };
@@ -1048,131 +1048,38 @@ async fn prepare_environment(root: &Path, executable: &Path) -> Result<(), Super
     }
     std::os::unix::fs::symlink(executable, &command)?;
 
-    let mcp_config = serde_json::json!({
-        "mcpServers": {
-            "term-server-supervisor": {
-                "command": command,
-                "args": ["mcp"],
-            }
-        }
-    });
-    write_atomic_file(
-        &root.join(".omp/mcp.json"),
-        &serde_json::to_vec_pretty(&mcp_config)?,
-        0o600,
-    )
-    .await?;
-    write_atomic_file(
-        &root.join("claude-mcp.json"),
-        &serde_json::to_vec_pretty(&mcp_config)?,
-        0o600,
-    )
-    .await?;
-
-    let pi_extension = r#"import { Type } from "typebox";
-
-const ACTIONS = new Set([
-  "terminals", "screen", "send", "rename", "create", "kill",
-  "processes", "terminate", "tabs", "close-tab",
-]);
-
-export default function termServerSupervisor(pi: any): void {
-  pi.registerTool({
-    name: "term_server_supervisor",
-    label: "Term Server Supervisor",
-    description: "Run one low-level control primitive against this Term Server instance.",
-    promptSnippet: "Inspect or control Term Server",
-    parameters: Type.Object({
-      args: Type.Array(Type.String(), {
-        description: "CLI arguments; the first item is an allowlisted supervisor action",
-      }),
-    }),
-    async execute(_toolCallId, params, signal) {
-      if (!params.args.length || !ACTIONS.has(params.args[0])) {
-        throw new Error("unsupported Term Server supervisor action");
-      }
-      const result = await pi.exec("term-server-supervisor", params.args, {
-        signal,
-        timeout: 15_000,
-      });
-      const text = (result.stdout || result.stderr || `exit code ${result.code}`).trim();
-      if (result.code !== 0) throw new Error(text);
-      return {
-        content: [{ type: "text", text }],
-        details: { code: result.code, killed: result.killed },
-      };
-    },
-  });
-}
-"#;
-    let pi_extension_path = root.join(".pi/extensions/term-server-supervisor.ts");
-    if let Some(parent) = pi_extension_path.parent() {
-        ensure_managed_directory(root, parent)?;
-    }
-    write_atomic_file(&pi_extension_path, pi_extension.as_bytes(), 0o600).await?;
-
-    if let Some(real) = find_executable("pi", &bin) {
-        write_wrapper(
-            &bin.join("pi"),
-            &format!("exec {} --approve \"$@\"\n", shell_quote(&real)),
-        )
-        .await?;
-    }
-    if let Some(real) = find_executable("claude", &bin) {
-        write_wrapper(
-            &bin.join("claude"),
-            &format!(
-                "exec {} --mcp-config {} \"$@\"\n",
-                shell_quote(&real),
-                shell_quote(&root.join("claude-mcp.json")),
-            ),
-        )
-        .await?;
-    }
-    if let Some(real) = find_executable("codex", &bin) {
-        let command_toml = serde_json::to_string(&command.display().to_string())?;
-        let override_value = format!(
-            "mcp_servers.term_server_supervisor={{command={command_toml},args=[\"mcp\"],env_vars=[\"TERM_SERVER_SESSION\",\"TERM_SERVER_SUPERVISOR_SOCKET\",\"TERM_SERVER_SUPERVISOR_TOKEN\"],enabled=true,required=true}}"
-        );
-        write_wrapper(
-            &bin.join("codex"),
-            &format!(
-                "exec {} -c {} \"$@\"\n",
-                shell_quote(&real),
-                shell_quote(Path::new(&override_value)),
-            ),
-        )
-        .await?;
+    for relative in [
+        ".omp/mcp.json",
+        ".pi/extensions/term-server-supervisor.ts",
+        "claude-mcp.json",
+        "bin/pi",
+        "bin/claude",
+        "bin/codex",
+    ] {
+        remove_legacy_supervisor_adapter(root, relative).await?;
     }
     Ok(())
 }
 
-fn find_executable(name: &str, managed_bin: &Path) -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let path = env::var_os("PATH")?;
-    for directory in env::split_paths(&path) {
-        if directory == managed_bin {
-            continue;
+async fn remove_legacy_supervisor_adapter(
+    root: &Path,
+    relative: &str,
+) -> Result<(), SupervisorError> {
+    let path = root.join(relative);
+    match fs::symlink_metadata(&path).await {
+        Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
+            fs::remove_file(path).await?;
         }
-        let candidate = directory.join(name);
-        let Ok(metadata) = candidate.metadata() else {
-            continue;
-        };
-        if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
-            return Some(candidate);
+        Ok(_) => {
+            return Err(SupervisorError::Invalid(format!(
+                "{} is not a managed supervisor adapter",
+                path.display()
+            )));
         }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
-    None
-}
-
-fn shell_quote(path: &Path) -> String {
-    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
-}
-
-async fn write_wrapper(path: &Path, command: &str) -> Result<(), SupervisorError> {
-    let contents = format!("#!/bin/sh\nset -eu\n{command}");
-    write_atomic_file(path, contents.as_bytes(), 0o700).await
+    Ok(())
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1316,8 +1223,6 @@ enum SupervisorCliCommand {
     Tabs,
     /// Close one open tab without killing its terminal session.
     CloseTab { tab_id: String },
-    /// Run the invocation-local Model Context Protocol server.
-    Mcp,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1350,9 +1255,6 @@ pub fn is_client_invocation() -> bool {
 
 pub async fn run_client() -> Result<(), SupervisorError> {
     let cli = SupervisorCli::parse();
-    if matches!(&cli.command, SupervisorCliCommand::Mcp) {
-        return run_mcp_server().await;
-    }
     let output = cli.command.output();
     let result = send_control_request(cli.command.into_request()?).await?;
     print_supervisor_result(output, result)
@@ -1515,285 +1417,6 @@ async fn send_control_request(command: SupervisorRequest) -> Result<Value, Super
     Ok(response.result.unwrap_or(Value::Null))
 }
 
-async fn run_mcp_server() -> Result<(), SupervisorError> {
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    let mut stdout = tokio::io::stdout();
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let message: Value = serde_json::from_str(&line)?;
-        if let Some(response) = handle_mcp_message(message).await {
-            stdout.write_all(&serde_json::to_vec(&response)?).await?;
-            stdout.write_all(b"\n").await?;
-            stdout.flush().await?;
-        }
-    }
-    Ok(())
-}
-
-async fn handle_mcp_message(message: Value) -> Option<Value> {
-    let id = message.get("id").cloned()?;
-    let method = message.get("method").and_then(Value::as_str)?;
-    let result = match method {
-        "initialize" => {
-            let protocol_version = message
-                .pointer("/params/protocolVersion")
-                .and_then(Value::as_str)
-                .unwrap_or("2025-03-26");
-            serde_json::json!({
-                "protocolVersion": protocol_version,
-                "capabilities": { "tools": { "listChanged": false } },
-                "serverInfo": {
-                    "name": "term-server-supervisor",
-                    "version": env!("CARGO_PKG_VERSION"),
-                },
-            })
-        }
-        "ping" => serde_json::json!({}),
-        "tools/list" => serde_json::json!({ "tools": mcp_tools() }),
-        "tools/call" => {
-            let name = message
-                .pointer("/params/name")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let arguments = message
-                .pointer("/params/arguments")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({}));
-            match mcp_tool_request(name, &arguments) {
-                Ok(request) => match send_control_request(request).await {
-                    Ok(value) => serde_json::json!({
-                        "content": [{
-                            "type": "text",
-                            "text": serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()),
-                        }],
-                        "isError": false,
-                    }),
-                    Err(error) => serde_json::json!({
-                        "content": [{ "type": "text", "text": error.to_string() }],
-                        "isError": true,
-                    }),
-                },
-                Err(error) => serde_json::json!({
-                    "content": [{ "type": "text", "text": error.to_string() }],
-                    "isError": true,
-                }),
-            }
-        }
-        _ => {
-            return Some(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": { "code": -32601, "message": format!("method not found: {method}") },
-            }));
-        }
-    };
-    Some(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }))
-}
-
-fn mcp_tools() -> Vec<Value> {
-    vec![
-        mcp_tool(
-            "terminals_list",
-            "List every terminal and detected agent.",
-            serde_json::json!({}),
-        ),
-        mcp_tool(
-            "terminal_screen",
-            "Read one terminal's current rendered screen.",
-            serde_json::json!({
-                "terminalId": { "type": "string", "format": "uuid" },
-                "tailBytes": { "type": "integer", "minimum": 0, "maximum": MAX_TAIL_BYTES, "default": 0 }
-            }),
-        ),
-        mcp_tool(
-            "terminal_send",
-            "Send text or named keys to one terminal.",
-            serde_json::json!({
-                "terminalId": { "type": "string", "format": "uuid" },
-                "text": { "type": "string" },
-                "keys": { "type": "array", "items": { "type": "string" } },
-                "enter": { "type": "boolean", "default": false }
-            }),
-        ),
-        mcp_tool(
-            "terminal_rename",
-            "Rename a terminal session.",
-            serde_json::json!({
-                "terminalId": { "type": "string", "format": "uuid" },
-                "name": { "type": "string" }
-            }),
-        ),
-        mcp_tool(
-            "terminal_create",
-            "Create a regular terminal session.",
-            serde_json::json!({
-                "name": { "type": "string" },
-                "cwd": { "type": "string" },
-                "shell": { "type": "string" }
-            }),
-        ),
-        mcp_tool(
-            "terminal_kill",
-            "Permanently kill a terminal session.",
-            serde_json::json!({
-                "terminalId": { "type": "string", "format": "uuid" }
-            }),
-        ),
-        mcp_tool(
-            "terminal_processes",
-            "Inspect a terminal's descendant process tree.",
-            serde_json::json!({
-                "terminalId": { "type": "string", "format": "uuid" }
-            }),
-        ),
-        mcp_tool(
-            "terminal_terminate",
-            "Terminate one tracked descendant process.",
-            serde_json::json!({
-                "terminalId": { "type": "string", "format": "uuid" },
-                "processId": { "type": "string" }
-            }),
-        ),
-        mcp_tool(
-            "tabs_list",
-            "List open term-server terminal panes, resources, and Settings tabs.",
-            serde_json::json!({}),
-        ),
-        mcp_tool(
-            "tab_close",
-            "Close one open tab without killing its terminal session.",
-            serde_json::json!({
-                "tabId": { "type": "string" }
-            }),
-        ),
-    ]
-}
-
-fn mcp_tool(name: &str, description: &str, properties: Value) -> Value {
-    let required = properties
-        .as_object()
-        .map(|properties| {
-            properties
-                .keys()
-                .filter(|property| !mcp_property_optional(name, property))
-                .cloned()
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    serde_json::json!({
-        "name": name,
-        "description": description,
-        "inputSchema": {
-            "type": "object",
-            "properties": properties,
-            "required": required,
-            "additionalProperties": false,
-        },
-    })
-}
-
-fn mcp_property_optional(tool: &str, property: &str) -> bool {
-    matches!(
-        (tool, property),
-        ("terminal_screen", "tailBytes")
-            | ("terminal_send", "text" | "keys" | "enter")
-            | ("terminal_create", "name" | "cwd" | "shell")
-    )
-}
-
-fn mcp_tool_request(name: &str, arguments: &Value) -> Result<SupervisorRequest, SupervisorError> {
-    let terminal_id = || required_uuid(arguments, "terminalId");
-    Ok(match name {
-        "terminals_list" => SupervisorRequest::Terminals,
-        "terminal_screen" => SupervisorRequest::Screen {
-            terminal_id: terminal_id()?,
-            tail_bytes: arguments
-                .get("tailBytes")
-                .and_then(Value::as_u64)
-                .unwrap_or_default()
-                .min(MAX_TAIL_BYTES as u64) as usize,
-        },
-        "terminal_send" => {
-            let mut data = arguments
-                .get("text")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            if let Some(keys) = arguments.get("keys").and_then(Value::as_array) {
-                for key in keys {
-                    let key = key.as_str().ok_or_else(|| {
-                        SupervisorError::Invalid("keys must contain strings".into())
-                    })?;
-                    data.push_str(key_sequence(key).ok_or_else(|| {
-                        SupervisorError::Invalid(format!("unsupported terminal key: {key}"))
-                    })?);
-                }
-            }
-            if arguments
-                .get("enter")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
-                data.push('\r');
-            }
-            if data.is_empty() {
-                return Err(SupervisorError::Invalid(
-                    "terminal_send requires text, keys, or enter".into(),
-                ));
-            }
-            SupervisorRequest::Send {
-                terminal_id: terminal_id()?,
-                data,
-            }
-        }
-        "terminal_rename" => SupervisorRequest::Rename {
-            terminal_id: terminal_id()?,
-            name: required_string(arguments, "name")?.to_owned(),
-        },
-        "terminal_create" => SupervisorRequest::Create {
-            name: optional_string(arguments, "name").map(str::to_owned),
-            cwd: optional_string(arguments, "cwd").map(PathBuf::from),
-            shell: optional_string(arguments, "shell").map(str::to_owned),
-        },
-        "terminal_kill" => SupervisorRequest::Kill {
-            terminal_id: terminal_id()?,
-        },
-        "terminal_processes" => SupervisorRequest::Processes {
-            terminal_id: terminal_id()?,
-        },
-        "terminal_terminate" => SupervisorRequest::Terminate {
-            terminal_id: terminal_id()?,
-            process_id: required_string(arguments, "processId")?.to_owned(),
-        },
-        "tabs_list" => SupervisorRequest::Tabs,
-        "tab_close" => SupervisorRequest::CloseTab {
-            tab_id: required_string(arguments, "tabId")?.to_owned(),
-        },
-        _ => {
-            return Err(SupervisorError::Invalid(format!(
-                "unknown supervisor tool: {name}"
-            )));
-        }
-    })
-}
-
-fn required_string<'a>(arguments: &'a Value, name: &str) -> Result<&'a str, SupervisorError> {
-    optional_string(arguments, name)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| SupervisorError::Invalid(format!("{name} is required")))
-}
-
-fn optional_string<'a>(arguments: &'a Value, name: &str) -> Option<&'a str> {
-    arguments.get(name).and_then(Value::as_str)
-}
-
-fn required_uuid(arguments: &Value, name: &str) -> Result<Uuid, SupervisorError> {
-    Uuid::parse_str(required_string(arguments, name)?)
-        .map_err(|_| SupervisorError::Invalid(format!("{name} must be a UUID")))
-}
-
 impl SupervisorCliCommand {
     fn into_request(self) -> Result<SupervisorRequest, SupervisorError> {
         Ok(match self {
@@ -1862,11 +1485,6 @@ impl SupervisorCliCommand {
             },
             Self::Tabs => SupervisorRequest::Tabs,
             Self::CloseTab { tab_id } => SupervisorRequest::CloseTab { tab_id },
-            Self::Mcp => {
-                return Err(SupervisorError::Invalid(
-                    "mcp is a server mode, not a control request".into(),
-                ));
-            }
         })
     }
 }
@@ -2231,13 +1849,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn supervisor_environment_is_private_and_self_contained() {
+    async fn supervisor_environment_is_private_and_cli_only() {
         let (directory, service, workspace, _terminals) = test_service().await;
+        let root = directory.path().join(ENVIRONMENT_DIRECTORY);
+        for relative in [
+            ".omp/mcp.json",
+            ".pi/extensions/term-server-supervisor.ts",
+            "claude-mcp.json",
+            "bin/pi",
+            "bin/claude",
+            "bin/codex",
+        ] {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "legacy adapter").unwrap();
+        }
+        prepare_environment(&root, &std::env::current_exe().unwrap())
+            .await
+            .unwrap();
+
         let terminal = service.open_or_create().await.unwrap();
-        assert_eq!(
-            terminal.supervisor_root.as_deref(),
-            Some(directory.path().join(ENVIRONMENT_DIRECTORY).as_path())
-        );
+        assert_eq!(terminal.supervisor_root.as_deref(), Some(root.as_path()));
         assert_eq!(terminal.supervisor_root.as_ref(), Some(&terminal.cwd));
         let credentials = fs::read(directory.path().join(CREDENTIALS_FILE_NAME))
             .await
@@ -2262,37 +1894,20 @@ mod tests {
             ".agents/skills/term-server-supervisor/SKILL.md",
             ".claude/skills/term-server-supervisor/SKILL.md",
             "bin/term-server-supervisor",
+        ] {
+            assert!(root.join(path).exists(), "missing CLI asset {path}");
+        }
+        for path in [
             ".omp/mcp.json",
             ".pi/extensions/term-server-supervisor.ts",
             "claude-mcp.json",
+            "bin/pi",
+            "bin/claude",
+            "bin/codex",
         ] {
-            assert!(
-                directory
-                    .path()
-                    .join(ENVIRONMENT_DIRECTORY)
-                    .join(path)
-                    .exists()
-            );
+            assert!(!root.join(path).exists(), "legacy adapter remains: {path}");
         }
-        let root = directory.path().join(ENVIRONMENT_DIRECTORY);
-        for config in [".omp/mcp.json", "claude-mcp.json"] {
-            let value: Value =
-                serde_json::from_slice(&fs::read(root.join(config)).await.unwrap()).unwrap();
-            let server = &value["mcpServers"]["term-server-supervisor"];
-            assert_eq!(server["args"], serde_json::json!(["mcp"]));
-            assert_eq!(
-                server["command"],
-                root.join("bin/term-server-supervisor")
-                    .display()
-                    .to_string()
-            );
-        }
-        let pi_extension =
-            fs::read_to_string(root.join(".pi/extensions/term-server-supervisor.ts"))
-                .await
-                .unwrap();
-        assert!(pi_extension.contains("pi.exec(\"term-server-supervisor\""));
-        assert!(pi_extension.contains("const ACTIONS = new Set"));
+        assert!(SupervisorCli::try_parse_from(["term-server-supervisor", "mcp"]).is_err());
         workspace.shutdown().await;
     }
 
@@ -2925,132 +2540,6 @@ mod tests {
         assert_eq!(page["nextSequence"], 4);
         assert_eq!(record["recordType"], "entry");
         assert_eq!(record["sequence"], 3);
-    }
-
-    #[test]
-    fn mcp_exposes_only_the_low_level_primitives() {
-        let tools = mcp_tools();
-        assert_eq!(tools.len(), 10);
-        assert_eq!(
-            tools
-                .iter()
-                .filter_map(|tool| tool.get("name").and_then(Value::as_str))
-                .collect::<Vec<_>>(),
-            vec![
-                "terminals_list",
-                "terminal_screen",
-                "terminal_send",
-                "terminal_rename",
-                "terminal_create",
-                "terminal_kill",
-                "terminal_processes",
-                "terminal_terminate",
-                "tabs_list",
-                "tab_close",
-            ]
-        );
-        assert!(
-            tools
-                .iter()
-                .all(|tool| tool.pointer("/inputSchema/additionalProperties")
-                    == Some(&Value::Bool(false)))
-        );
-        let required = |name: &str| {
-            tools.iter().find(|tool| tool["name"] == name).unwrap()["inputSchema"]["required"]
-                .clone()
-        };
-        assert_eq!(
-            required("terminal_rename"),
-            serde_json::json!(["name", "terminalId"])
-        );
-        assert_eq!(required("terminal_create"), serde_json::json!([]));
-    }
-
-    #[test]
-    fn mcp_send_builds_one_atomic_terminal_input() {
-        let terminal_id = Uuid::from_u128(22);
-        let request = mcp_tool_request(
-            "terminal_send",
-            &serde_json::json!({
-                "terminalId": terminal_id,
-                "text": "next",
-                "keys": ["tab"],
-                "enter": true,
-            }),
-        )
-        .unwrap();
-        match request {
-            SupervisorRequest::Send {
-                terminal_id: actual,
-                data,
-            } => {
-                assert_eq!(actual, terminal_id);
-                assert_eq!(data, "next\t\r");
-            }
-            _ => panic!("expected send request"),
-        }
-        assert!(
-            mcp_tool_request(
-                "terminal_send",
-                &serde_json::json!({
-                    "terminalId": terminal_id
-                })
-            )
-            .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn mcp_handshake_and_tool_inventory_follow_json_rpc() {
-        let initialized = handle_mcp_message(serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": { "protocolVersion": "2025-06-18" }
-        }))
-        .await
-        .unwrap();
-        assert_eq!(initialized["id"], 1);
-        assert_eq!(initialized["result"]["protocolVersion"], "2025-06-18");
-        assert_eq!(
-            initialized["result"]["serverInfo"]["name"],
-            "term-server-supervisor"
-        );
-
-        let listed = handle_mcp_message(serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": "tools",
-            "method": "tools/list",
-            "params": {}
-        }))
-        .await
-        .unwrap();
-        assert_eq!(listed["id"], "tools");
-        assert_eq!(
-            listed["result"]["tools"].as_array().unwrap().len(),
-            mcp_tools().len()
-        );
-        assert!(
-            handle_mcp_message(serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "notifications/initialized"
-            }))
-            .await
-            .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn mcp_reports_unknown_methods_without_exiting() {
-        let response = handle_mcp_message(serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "unknown"
-        }))
-        .await
-        .unwrap();
-        assert_eq!(response["error"]["code"], -32601);
-        assert_eq!(response["id"], 2);
     }
 
     #[test]
