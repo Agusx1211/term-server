@@ -11,6 +11,7 @@ import {
 
 const terminal = (overrides: Partial<TerminalInfo> = {}): TerminalInfo => ({
   id: "one",
+  kind: "regular",
   name: "shell",
   workspace: "workspace",
   path: "workspace/shell",

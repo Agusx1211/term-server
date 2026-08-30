@@ -3,6 +3,9 @@ import type {
   AgentIntegrationProvider,
   AgentIntegrationsConfig,
   ActivityView,
+  BrowserTabCommandAck,
+  BrowserTabHeartbeat,
+  BrowserTabSnapshot,
   ArtifactSkillAction,
   ArtifactSkillConfig,
   ArtifactEntry,
@@ -26,6 +29,8 @@ import type {
   StatusModulesSettings,
   UpdateStatusModulesSettings,
   UpdateStatus,
+  UpdateChannel,
+  UpdateConfig,
   ReleaseInfo,
   DebugRecordingStatus,
   DebugRecordingExport,
@@ -100,6 +105,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ commit }),
     }),
+  updateChannel: (channel: UpdateChannel) =>
+    request<UpdateConfig>("/api/config/updates", {
+      method: "PATCH",
+      body: JSON.stringify({ channel }),
+    }),
   restartBroker: (closeTerminals: boolean) =>
     request<SessionBrokerInfo>("/api/broker/restart", {
       method: "POST",
@@ -124,6 +134,25 @@ export const api = {
     method: "PATCH",
     body: JSON.stringify({ action }),
   }),
+  createSupervisor: (signal?: AbortSignal) =>
+    request<TerminalInfo>("/api/supervisor", {
+      method: "POST",
+      body: JSON.stringify({}),
+      signal,
+    }),
+  browserTabHeartbeat: (viewId: string, snapshot: BrowserTabSnapshot) =>
+    request<BrowserTabHeartbeat>(`/api/browser-tabs/${encodeURIComponent(viewId)}`, {
+      method: "PUT",
+      body: JSON.stringify(snapshot),
+    }),
+  ackBrowserTabCommand: (
+    viewId: string,
+    commandId: string,
+    ack: BrowserTabCommandAck,
+  ) => request<void>(
+    `/api/browser-tabs/${encodeURIComponent(viewId)}/commands/${encodeURIComponent(commandId)}`,
+    { method: "POST", body: JSON.stringify(ack) },
+  ),
   terminals: () => request<TerminalInfo[]>("/api/terminals"),
   createTerminal: (terminal: CreateTerminalRequest) =>
     request<TerminalInfo>("/api/terminals", { method: "POST", body: JSON.stringify(terminal) }),

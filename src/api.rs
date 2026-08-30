@@ -39,6 +39,11 @@ use uuid::Uuid;
 
 #[cfg(unix)]
 use crate::broker::BrokerWebSocket;
+#[cfg(unix)]
+use crate::supervisor::{
+    BrowserTabCommandAck, BrowserTabHeartbeat, BrowserTabSnapshot, SupervisorError,
+    SupervisorService,
+};
 use crate::{
     activity_view::{ActivityView, ActivityViewService},
     agent_integrations::{
@@ -75,6 +80,8 @@ const SESSION_COOKIE: &str = "term_server_session";
 pub struct AppState {
     pub auth: AuthService,
     pub workspace: WorkspaceBackend,
+    #[cfg(unix)]
+    pub supervisor: Arc<SupervisorService>,
     pub login_limiter: Arc<LoginLimiter>,
     pub allowed_origins: Arc<[String]>,
     pub secure: bool,
@@ -216,6 +223,19 @@ impl From<WorkspaceError> for ApiError {
     }
 }
 
+#[cfg(unix)]
+impl From<SupervisorError> for ApiError {
+    fn from(error: SupervisorError) -> Self {
+        match error {
+            SupervisorError::Unauthorized => Self::Unauthorized,
+            SupervisorError::Invalid(message) => Self::BadRequest(message),
+            SupervisorError::Workspace(error) => error.into(),
+            SupervisorError::Unavailable(message) => Self::BadGateway(message),
+            SupervisorError::Io(_) | SupervisorError::Json(_) => Self::Internal,
+        }
+    }
+}
+
 impl From<AuthError> for ApiError {
     fn from(_error: AuthError) -> Self {
         Self::Internal
@@ -238,6 +258,8 @@ impl From<FileError> for ApiError {
 impl From<UpdateError> for ApiError {
     fn from(error: UpdateError) -> Self {
         match error {
+            UpdateError::InvalidChannel => Self::BadRequest(error.to_string()),
+            UpdateError::Settings(_) => Self::Internal,
             UpdateError::Unsupported(_)
             | UpdateError::Busy
             | UpdateError::Stale
@@ -351,6 +373,12 @@ fn validated_activity_view(
 #[derive(Debug, Deserialize)]
 struct InstallUpdateRequest {
     commit: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateChannelRequest {
+    channel: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -714,6 +742,22 @@ async fn update_status(
     state.updates.check().await.map(Json).map_err(Into::into)
 }
 
+async fn update_channel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+    Json(body): Json<UpdateChannelRequest>,
+) -> Result<Json<UpdateConfig>, ApiError> {
+    require_origin(&headers, &uri, &state)?;
+    require_auth(&jar, &state)?;
+    state
+        .updates
+        .set_channel(&body.channel)
+        .map(Json)
+        .map_err(Into::into)
+}
+
 async fn install_update(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -913,6 +957,59 @@ async fn create_terminal(
     ))
 }
 
+#[cfg(unix)]
+async fn open_supervisor(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+) -> Result<Json<ClientTerminalInfo>, ApiError> {
+    require_origin(&headers, &uri, &state)?;
+    require_auth(&jar, &state)?;
+    let terminal = state.supervisor.open_or_create().await?;
+    Ok(Json(ClientTerminalInfo::new(
+        terminal,
+        &state.activity_views,
+    )))
+}
+
+#[cfg(unix)]
+async fn browser_tab_heartbeat(
+    State(state): State<AppState>,
+    Path(view_id): Path<Uuid>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+    Json(snapshot): Json<BrowserTabSnapshot>,
+) -> Result<Json<BrowserTabHeartbeat>, ApiError> {
+    require_origin(&headers, &uri, &state)?;
+    require_auth(&jar, &state)?;
+    state
+        .supervisor
+        .browser_heartbeat(view_id, snapshot)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+#[cfg(unix)]
+async fn acknowledge_browser_tab_command(
+    State(state): State<AppState>,
+    Path((view_id, command_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+    Json(ack): Json<BrowserTabCommandAck>,
+) -> Result<StatusCode, ApiError> {
+    require_origin(&headers, &uri, &state)?;
+    require_auth(&jar, &state)?;
+    state
+        .supervisor
+        .acknowledge_browser_command(view_id, command_id, ack)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn rename_terminal(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -978,6 +1075,10 @@ async fn remove_terminal(
     require_origin(&headers, &uri, &state)?;
     require_auth(&jar, &state)?;
     state.workspace.remove(id).await?;
+    #[cfg(unix)]
+    if let Err(error) = state.supervisor.revoke_if_registered(id).await {
+        tracing::warn!(%error, terminal_id = %id, "unable to revoke supervisor credentials");
+    }
     if let Err(error) = state.activity_views.remove(id) {
         tracing::warn!(
             %error,
@@ -1607,6 +1708,7 @@ pub fn build_router(state: AppState, client_directory: Option<PathBuf>) -> Route
             "/config/status-modules",
             get(status_modules_config).patch(update_status_modules_config),
         )
+        .route("/config/updates", patch(update_channel))
         .route("/config/pi", patch(update_pi_config))
         .route(
             "/config/pushover",
@@ -1666,6 +1768,18 @@ pub fn build_router(state: AppState, client_directory: Option<PathBuf>) -> Route
             header::CACHE_CONTROL,
             HeaderValue::from_static("no-store"),
         ));
+
+    #[cfg(unix)]
+    let api = api
+        .route("/supervisor", post(open_supervisor))
+        .route(
+            "/browser-tabs/{view_id}",
+            axum::routing::put(browser_tab_heartbeat).layer(DefaultBodyLimit::max(128 * 1024)),
+        )
+        .route(
+            "/browser-tabs/{view_id}/commands/{command_id}",
+            post(acknowledge_browser_tab_command),
+        );
 
     #[cfg(feature = "e2e")]
     let api = api
@@ -1734,19 +1848,27 @@ mod tests {
     };
 
     async fn test_state() -> AppState {
-        let directory = tempfile::tempdir().unwrap();
-        load_auth(directory.path(), Some("testing-password".into()), None)
+        let directory = tempfile::tempdir().unwrap().keep();
+        load_auth(&directory, Some("testing-password".into()), None)
             .await
             .unwrap();
-        let auth = load_auth(directory.path(), None, None)
-            .await
-            .unwrap()
-            .service;
+        let auth = load_auth(&directory, None, None).await.unwrap().service;
         let terminals = Arc::new(TerminalManager::new(Some("/bin/sh".into()), 1024 * 1024));
-        let pi = Arc::new(PiService::new(directory.path()));
+        let pi = Arc::new(PiService::new(&directory));
+        let workspace = WorkspaceBackend::local(terminals, pi);
+        #[cfg(unix)]
+        let supervisor = SupervisorService::new(
+            workspace.clone(),
+            &directory,
+            &std::env::current_exe().unwrap(),
+        )
+        .await
+        .unwrap();
         AppState {
             auth,
-            workspace: WorkspaceBackend::local(terminals, pi),
+            workspace,
+            #[cfg(unix)]
+            supervisor,
             login_limiter: Arc::new(LoginLimiter::default()),
             allowed_origins: Arc::from([]),
             secure: false,
@@ -1760,13 +1882,14 @@ mod tests {
                 "main".to_owned(),
                 "https://example.invalid/releases/download".to_owned(),
                 true,
+                &directory,
             )),
-            agent_integrations: Arc::new(AgentIntegrationService::new(directory.path())),
+            agent_integrations: Arc::new(AgentIntegrationService::new(&directory)),
             activity_views: ActivityViewService::in_memory(),
-            artifact_skill: Arc::new(ArtifactSkillService::new(None, directory.path())),
+            artifact_skill: Arc::new(ArtifactSkillService::new(None, &directory)),
             server_control: ServerControl::new(Handle::new()),
             debug_recording: Arc::new(DebugRecordingManager::new()),
-            pushover: Arc::new(PushoverService::new(directory.path())),
+            pushover: Arc::new(PushoverService::new(&directory)),
             status_modules: Arc::new(StatusService::disabled()),
         }
     }
@@ -2192,6 +2315,78 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn update_channel_requires_auth_origin_and_persists_in_config() {
+        let (app, cookie) = authenticated_app().await;
+        let request = |origin: Option<&str>, cookie: Option<&str>, channel: &str| {
+            let mut builder = Request::builder()
+                .method("PATCH")
+                .uri("http://localhost/api/config/updates")
+                .header(header::HOST, "localhost")
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(origin) = origin {
+                builder = builder.header(header::ORIGIN, origin);
+            }
+            if let Some(cookie) = cookie {
+                builder = builder.header(header::COOKIE, cookie);
+            }
+            builder
+                .body(Body::from(
+                    serde_json::json!({ "channel": channel }).to_string(),
+                ))
+                .unwrap()
+        };
+
+        let unauthenticated = app
+            .clone()
+            .oneshot(request(Some("http://localhost"), None, "beta"))
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let cross_origin = app
+            .clone()
+            .oneshot(request(
+                Some("https://example.invalid"),
+                Some(&cookie),
+                "beta",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cross_origin.status(), StatusCode::FORBIDDEN);
+
+        let updated = app
+            .clone()
+            .oneshot(request(Some("http://localhost"), Some(&cookie), "beta"))
+            .await
+            .unwrap();
+        assert_eq!(updated.status(), StatusCode::OK);
+        let body = to_bytes(updated.into_body(), 64 * 1024).await.unwrap();
+        let config: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(config["channel"], "beta");
+
+        let fetched = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config?agentIntegrations=lazy")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(fetched.into_body(), 64 * 1024).await.unwrap();
+        let fetched: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(fetched["updates"]["channel"], "beta");
+
+        let invalid = app
+            .oneshot(request(Some("http://localhost"), Some(&cookie), "nightly"))
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -3087,6 +3282,129 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(after_expiry.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supervisor_creation_is_authenticated_and_singleton() {
+        let (app, cookie) = authenticated_app().await;
+        let unauthenticated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/supervisor")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let open = |app: Router, cookie: String| async move {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/supervisor")
+                        .header(header::COOKIE, cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            serde_json::from_slice::<serde_json::Value>(
+                &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+            )
+            .unwrap()
+        };
+        let first = open(app.clone(), cookie.clone()).await;
+        let second = open(app.clone(), cookie.clone()).await;
+        assert_eq!(first["id"], second["id"]);
+        assert_eq!(first["kind"], "supervisor");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/terminals/{}", first["id"].as_str().unwrap()))
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn browser_tab_heartbeat_requires_auth_and_returns_pending_commands() {
+        let (app, cookie) = authenticated_app().await;
+        let view_id = Uuid::new_v4();
+        let body = serde_json::json!({
+            "title": "Test browser",
+            "focused": true,
+            "visible": true,
+            "terminalPanes": [],
+            "resources": [],
+            "settingsOpen": false,
+            "settingsActive": false
+        })
+        .to_string();
+        let unauthenticated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/browser-tabs/{view_id}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/browser-tabs/{view_id}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .as_ref(),
+            br#"{"commands":[]}"#
+        );
+
+        let unknown_ack = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/browser-tabs/{view_id}/commands/{}",
+                        Uuid::new_v4()
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::from(r#"{"ok":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown_ack.status(), StatusCode::BAD_REQUEST);
     }
 
     #[cfg(not(feature = "e2e"))]

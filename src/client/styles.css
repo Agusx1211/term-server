@@ -21,6 +21,7 @@
   --hover: #2a2d2e;
   --selected: #37373d;
   --accent: #0078d4;
+  --supervisor: #7aa2f7;
   --accent-hover: #026ec1;
   --accent-soft: #04395e;
   --artifact: #ffd84d;
@@ -64,6 +65,7 @@
   --input: #ffffff;
   --hover: #e8e8e8;
   --selected: #dbe9f4;
+  --supervisor: #4b68a1;
   --accent: #0078d4;
   --accent-hover: #006cbd;
   --accent-soft: #cfe8fa;
@@ -117,6 +119,15 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 1px s
 .icon-button { width: 24px; height: 24px; border-radius: 4px; }
 .icon-button:hover, .pane-action:hover, .row-action:hover { background: var(--hover); color: var(--foreground); }
 .icon-button.active { background: var(--selected); color: var(--foreground); }
+.supervisor-action {
+  border: 1px solid transparent; color: var(--supervisor);
+}
+.supervisor-action:hover, .supervisor-action.active {
+  border-color: color-mix(in srgb, var(--supervisor) 50%, var(--border));
+  background: color-mix(in srgb, var(--supervisor) 11%, var(--sidebar));
+  color: var(--supervisor);
+}
+.supervisor-action:disabled { opacity: .55; cursor: progress; }
 .mobile-only, .mobile-toolbar, .mobile-menu-button, .mobile-pane-actions,
 .terminal-keybar, .terminal-scroll-latest { display: none; }
 
@@ -206,6 +217,26 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
   color: var(--muted); background: color-mix(in srgb, var(--workspace-color) 8%, var(--sidebar));
 }
 .terminal-kind.agent { color: var(--workspace-color); border-color: color-mix(in srgb, var(--workspace-color) 40%, var(--border)); }
+.terminal-row.supervisor-row {
+  border-left-color: var(--supervisor);
+}
+.terminal-row.supervisor-row .terminal-title,
+.terminal-row.supervisor-row .terminal-meta,
+.terminal-kind.supervisor {
+  color: var(--supervisor);
+}
+.terminal-kind.supervisor {
+  border-color: color-mix(in srgb, var(--supervisor) 52%, var(--border));
+  background: color-mix(in srgb, var(--supervisor) 9%, var(--sidebar));
+}
+.terminal-row.supervisor-context-outside { border-left-color: var(--status-warn); }
+.terminal-row.supervisor-context-outside .terminal-title,
+.terminal-row.supervisor-context-outside .terminal-meta,
+.terminal-row.supervisor-context-outside .terminal-kind.supervisor { color: var(--status-warn); }
+.terminal-row.supervisor-context-outside .terminal-kind.supervisor {
+  border-color: color-mix(in srgb, var(--status-warn) 52%, var(--border));
+  background: color-mix(in srgb, var(--status-warn) 9%, var(--sidebar));
+}
 .terminal-copy { min-width: 0; flex: 1; display: grid; gap: 1px; }
 .terminal-title { overflow: hidden; color: var(--foreground); font-size: 11.5px; font-weight: 540; line-height: 14px; text-overflow: ellipsis; white-space: nowrap; }
 .terminal-meta {
@@ -710,6 +741,9 @@ body.pane-resizing .layout-divider.horizontal { cursor: row-resize; }
   container: terminal-pane / inline-size;
   box-shadow: inset 0 2px 0 color-mix(in srgb, var(--terminal-color) 80%, transparent);
 }
+.terminal-pane.supervisor-context-outside {
+  grid-template-rows: 30px auto minmax(0, 1fr);
+}
 .terminal-loading { position: absolute; inset: 0; display: grid; place-items: center; background: var(--editor); color: var(--muted); }
 .terminal-pane.active { box-shadow: inset 0 2px 0 var(--terminal-color), inset 0 0 0 1px color-mix(in srgb, var(--terminal-color) 48%, transparent); }
 .pane-header {
@@ -723,6 +757,32 @@ body.pane-resizing .layout-divider.horizontal { cursor: row-resize; }
 .pane-path { min-width: 0; display: flex; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .pane-path span { overflow: hidden; text-overflow: ellipsis; }
 .pane-path b { padding: 0 3px; color: var(--subtle); font-weight: normal; }
+.supervisor-identity {
+  height: 18px; flex: none; display: inline-flex; align-items: center; gap: 4px; padding: 0 5px;
+  border: 1px solid color-mix(in srgb, var(--supervisor) 50%, var(--border)); border-radius: 3px;
+  background: color-mix(in srgb, var(--supervisor) 10%, var(--panel)); color: var(--supervisor);
+  font-size: 8px; font-weight: 800; letter-spacing: .08em;
+}
+.terminal-pane.supervisor .pane-header {
+  background: color-mix(in srgb, var(--supervisor) 7%, var(--panel));
+}
+.supervisor-identity.warning {
+  border-color: color-mix(in srgb, var(--status-warn) 52%, var(--border));
+  background: color-mix(in srgb, var(--status-warn) 11%, var(--panel));
+  color: var(--status-warn);
+}
+.terminal-pane.supervisor-context-outside .pane-header {
+  background: color-mix(in srgb, var(--status-warn) 7%, var(--panel));
+}
+.supervisor-context-warning {
+  min-width: 0; display: flex; align-items: center; gap: 6px; padding: 5px 9px;
+  border-bottom: 1px solid color-mix(in srgb, var(--status-warn) 42%, var(--border));
+  background: color-mix(in srgb, var(--status-warn) 11%, var(--panel)); color: var(--status-warn);
+  font-size: 10px; line-height: 14px;
+}
+.supervisor-context-warning > svg { flex: none; }
+.supervisor-context-warning > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.supervisor-context-warning code { color: inherit; font: inherit; font-weight: 700; }
 .pane-broker-warning {
   height: 18px; flex: none; display: inline-flex; align-items: center; gap: 4px; padding: 0 5px;
   border: 1px solid color-mix(in srgb, #d29922 42%, var(--border)); border-radius: 3px;
@@ -1327,6 +1387,9 @@ body.pane-resizing .layout-divider.horizontal { cursor: row-resize; }
   }
   .pane-slot.active { display: block; }
   .terminal-pane { grid-template-rows: 44px minmax(0, 1fr) calc(45px + env(safe-area-inset-bottom)); }
+  .terminal-pane.supervisor-context-outside {
+    grid-template-rows: 44px auto minmax(0, 1fr) calc(45px + env(safe-area-inset-bottom));
+  }
   .pane-header { gap: 7px; padding: 0 4px 0 10px; cursor: default; }
   .pane-header:active { cursor: default; }
   .pane-drag-handle { display: none; }
@@ -1459,6 +1522,9 @@ body.pane-resizing .layout-divider.horizontal { cursor: row-resize; }
     max-width: 260px; min-height: 32px; height: 32px; padding: 0 7px;
   }
   .workbench.status-modules-mobile .terminal-pane { grid-template-rows: 44px minmax(0, 1fr) 45px; }
+  .workbench.status-modules-mobile .terminal-pane.supervisor-context-outside {
+    grid-template-rows: 44px auto minmax(0, 1fr) 45px;
+  }
   .workbench.status-modules-mobile .terminal-keybar {
     padding-bottom: 3px;
   }

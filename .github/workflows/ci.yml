@@ -33,7 +33,7 @@ jobs:
 
   e2e-browser-gate:
     name: E2E Chromium gate
-    if: github.event_name == 'pull_request' || github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    if: github.event_name == 'pull_request' || github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     needs: check
     runs-on: ubuntu-22.04
     timeout-minutes: 30
@@ -105,7 +105,7 @@ jobs:
 
   e2e-packaged-smoke:
     name: E2E packaged x86_64 smoke
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     needs: artifacts
     runs-on: ubuntu-22.04
     timeout-minutes: 30
@@ -149,7 +149,7 @@ jobs:
 
   publish-release:
     name: Publish signed release
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     needs: [artifacts, e2e-browser-gate, e2e-packaged-smoke]
     runs-on: ubuntu-22.04
     concurrency:
@@ -172,17 +172,7 @@ jobs:
         id: release
         run: |
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            channel="${GITHUB_REF_NAME}"
-            if [[ "$channel" != "v$version" ]]; then
-              echo "tag $channel does not match Cargo version $version" >&2
-              exit 1
-            fi
-          else
-            channel=main
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+          node scripts/release-channel.mjs "$GITHUB_REF" "$version" >> "$GITHUB_OUTPUT"
       - name: Generate and sign release metadata
         run: |
           if [[ -z "$RELEASE_SIGNING_KEY" ]]; then
@@ -214,10 +204,11 @@ jobs:
             -in artifacts/SHA256SUMS \
             -sigfile artifacts/SHA256SUMS.sig
       - name: Move the rolling tag
-        if: steps.release.outputs.channel == 'main'
+        if: steps.release.outputs.channel == 'main' || steps.release.outputs.channel == 'beta'
         run: |
-          git tag --force main "$GITHUB_SHA"
-          git push --force origin refs/tags/main
+          channel="${{ steps.release.outputs.channel }}"
+          git tag --force "$channel" "$GITHUB_SHA"
+          git push --force origin "refs/tags/$channel"
       - name: Publish release assets
         env:
           GH_TOKEN: ${{ github.token }}
@@ -228,6 +219,10 @@ jobs:
           if [[ "$channel" == main ]]; then
             title="term-server v${version} (${short_commit})"
             notes="Signed automated build of \`main\` at \`${GITHUB_SHA}\`."
+            prerelease_flag=--prerelease
+          elif [[ "$channel" == beta ]]; then
+            title="term-server beta v${version} (${short_commit})"
+            notes="Signed beta build of \`dev\` at \`${GITHUB_SHA}\`."
             prerelease_flag=--prerelease
           else
             title="term-server v${version}"

@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.15.1 - 2026-08-30
+
+Term-server now has a singleton supervisor shell for coordinating other terminal sessions, plus a signed beta update channel that can be selected from Settings.
+
+### Added
+
+- **Singleton supervisor terminal.** A compact crown action in the workspace header creates or reopens one visibly marked supervisor shell without crowding out normal terminal controls. It remains an ordinary persistent PTY with no built-in agent or provider chooser, bounds stalled creation requests, and warns when its shell leaves the managed skill-discovery directory.
+- **Scoped agent controls.** Only the supervisor environment contains the embedded skill, control CLI, and invocation-local OMP, Pi, Codex, and Claude adapters. The primitives list and read terminals, send input, create/rename/kill sessions, inspect or terminate descendant processes, and list or close browser-local terminal and resource tabs.
+- **Composable behavior.** Project cleanup, agent monitoring, and similar workflows are intentionally left to the selected agent. The server adds no pane arrangement, project organizer, scheduler, or job abstraction.
+- **Beta release channel.** Successful `dev` pushes now publish a signed rolling GitHub prerelease under `beta` after the same browser and packaged-release gates used by `main`. **Settings → Updates** persists a `main`/`beta` toggle, immediately refreshes update state, and leaves explicit version channels pinned.
+
+### Security
+
+- Supervisor calls use a private Unix socket and a random per-terminal capability whose verifier is stored owner-only. Requests, responses, browser snapshots, and generated files are bounded and symlink-hardened. This separates product roles but is not an isolation boundary against hostile processes running as the same Unix user; see `SECURITY.md`.
+
+### Upgrade notes
+
+- No breaking changes or manual migrations are required. The supervisor creates owner-only runtime files under the existing term-server data directory, and the selected `main`/`beta` update channel is persisted there.
+- Merging a regular pull request into `dev` now publishes it immediately to the signed rolling `beta` prerelease after all release gates pass. Production installation remains tied to the `dev` → `main` release merge.
+- Existing compatible terminal brokers remain attached; supervisor screen and input controls fall back to the prior broker protocol for sessions created before this release.
+- Reload open pages to pick up the crown control, supervisor context warning, and beta channel toggle. The release is safe for automatic installation over `0.15.0`.
+
+## 0.15.0 - 2026-08-19
+
+Hermes Agent (Nous Research) sessions now show their lifecycle state in the
+status pill, matching Codex, Claude, Pi, and OMP.
+
+### Added
+
+- **Hermes Agent status.** A running `hermes` session is recognized from its
+  process tree, and its state is inferred from its window title (markers for
+  blocked, working, and idle) and on-screen approval and clarification prompts,
+  so the status pill shows **Needs you**, **Working**, and **Idle** and the
+  terminal is flagged when Hermes is waiting for input.
+- **Hermes native lifecycle integration.** **Settings → Live agent activity**
+  can install a small Hermes plugin that forwards Hermes's own lifecycle events
+  (working, running a command, editing files, waiting for approval, idle, and
+  session end) to term-server for more immediate status and activity labels.
+- **Activity kinds for Hermes tools.** Hermes's terminal, file-write, and patch
+  tools map to running-a-command and editing-files activity labels.
+
+### Upgrade notes
+
+- No breaking changes, data migrations, or configuration changes. Screen-based
+  Hermes status detection works automatically for detected sessions; the
+  native lifecycle plugin is opt-in from **Settings → Live agent activity**.
+  The release is safe for automatic installation over `0.14.1`.
+- Reload open pages to pick up the client changes.
+
 ## 0.14.1 - 2026-08-18
 
 Large uploads now show a live progress bar and can be cancelled.

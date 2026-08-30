@@ -24,6 +24,8 @@ Do not point development commands at `~/.local/share/term-server` or omit
 
 All regular pull requests must target `dev`. Do not open feature, fix, dependency, or maintenance pull requests directly against `main`, and do not push changes directly to `main`.
 
+Every successful push to `dev` passes the full browser and packaged-release gates, then updates the signed rolling `beta` GitHub prerelease. Treat merging a regular pull request into `dev` as immediate beta publication. It does not update the `main` channel.
+
 `main` is the release branch. The only pull request that should target `main` is a release pull request from `dev`. Merging `dev` into `main` triggers the release automation, which builds and signs the release artifacts and publishes the metadata consumed by the installer and automatic updater. Treat every `dev` → `main` merge as an immediate production release.
 
 Before opening or merging a release pull request:

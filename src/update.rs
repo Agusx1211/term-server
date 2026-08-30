@@ -1,6 +1,7 @@
 use std::{
     env,
     fs::{self, File},
+    io::{self, Write},
     path::{Component, Path, PathBuf},
     process::Command,
     time::Duration,
@@ -9,6 +10,7 @@ use std::{
 use ed25519_dalek::{Signature, Verifier, VerifyingKey, pkcs8::DecodePublicKey};
 use flate2::read::GzDecoder;
 use futures_util::StreamExt;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -22,6 +24,8 @@ const MANIFEST_SIGNATURE_NAME: &str = "release-manifest.json.sig";
 const MAX_METADATA_BYTES: u64 = 1024 * 1024;
 const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_EXTRACTED_BYTES: u64 = 1024 * 1024 * 1024;
+const UPDATE_SETTINGS_NAME: &str = "update-settings.json";
+const UPDATE_SETTINGS_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -31,9 +35,17 @@ pub struct UpdateConfig {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredUpdateSettings {
+    schema_version: u32,
+    channel: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateStatus {
+    pub channel: String,
     pub current: build::BuildInfo,
     pub state: UpdateState,
     pub latest: Option<ReleaseInfo>,
@@ -90,12 +102,13 @@ struct Installation {
 
 pub struct UpdateService {
     client: reqwest::Client,
-    channel: String,
+    channel: RwLock<String>,
     release_base_url: String,
     verifying_key: VerifyingKey,
     installation: Option<Installation>,
     unavailable_reason: Option<String>,
     install_lock: Mutex<()>,
+    settings_path: PathBuf,
 }
 
 impl UpdateService {
@@ -104,7 +117,13 @@ impl UpdateService {
         channel: String,
         release_base_url: String,
         disabled: bool,
+        data_directory: &Path,
     ) -> Self {
+        let channel = if matches!(channel.as_str(), "main" | "beta") {
+            load_update_channel(data_directory, channel)
+        } else {
+            channel
+        };
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let verifying_key =
             VerifyingKey::from_public_key_pem(PUBLIC_KEY).expect("valid release public key");
@@ -128,21 +147,46 @@ impl UpdateService {
         };
         Self {
             client,
-            channel,
+            channel: RwLock::new(channel),
             release_base_url: release_base_url.trim_end_matches('/').to_owned(),
             verifying_key,
             installation,
             unavailable_reason,
             install_lock: Mutex::new(()),
+            settings_path: data_directory.join(UPDATE_SETTINGS_NAME),
         }
     }
 
     pub fn config(&self) -> UpdateConfig {
         UpdateConfig {
             enabled: self.installation.is_some(),
-            channel: self.channel.clone(),
+            channel: self.channel.read().clone(),
             reason: self.unavailable_reason.clone(),
         }
+    }
+
+    pub fn set_channel(&self, channel: &str) -> Result<UpdateConfig, UpdateError> {
+        if !matches!(channel, "main" | "beta") {
+            return Err(UpdateError::InvalidChannel);
+        }
+        let _install_guard = self
+            .install_lock
+            .try_lock()
+            .map_err(|_| UpdateError::Busy)?;
+        let mut current = self.channel.write();
+        if current.as_str() == channel {
+            drop(current);
+            return Ok(self.config());
+        }
+        let settings = StoredUpdateSettings {
+            schema_version: UPDATE_SETTINGS_SCHEMA_VERSION,
+            channel: channel.to_owned(),
+        };
+        persist_update_settings(&self.settings_path, &settings)
+            .map_err(|error| UpdateError::Settings(error.to_string()))?;
+        *current = settings.channel;
+        drop(current);
+        Ok(self.config())
     }
 
     pub async fn check(&self) -> Result<UpdateStatus, UpdateError> {
@@ -150,16 +194,19 @@ impl UpdateService {
             return Ok(UpdateStatus {
                 current: build::info(),
                 state: UpdateState::Unavailable,
+                channel: self.channel.read().clone(),
                 latest: None,
             });
         }
-        let release = self.fetch_verified_release().await?;
+        let channel = self.channel.read().clone();
+        let release = self.fetch_verified_release(&channel).await?;
         let state = if release.info.commit == build::COMMIT {
             UpdateState::Current
         } else {
             UpdateState::Available
         };
         Ok(UpdateStatus {
+            channel,
             current: build::info(),
             state,
             latest: Some(release.info),
@@ -182,7 +229,8 @@ impl UpdateService {
             .install_lock
             .try_lock()
             .map_err(|_| UpdateError::Busy)?;
-        let release = self.fetch_verified_release().await?;
+        let channel = self.channel.read().clone();
+        let release = self.fetch_verified_release(&channel).await?;
         if release.info.commit != expected_commit {
             return Err(UpdateError::Stale);
         }
@@ -195,7 +243,7 @@ impl UpdateService {
             .tempdir_in(&installation.root)
             .map_err(install_error)?;
         let archive_path = temporary.path().join(&release.artifact.name);
-        self.download_artifact(&release.artifact, &archive_path)
+        self.download_artifact(&channel, &release.artifact, &archive_path)
             .await?;
 
         let artifact = release.artifact.clone();
@@ -211,21 +259,28 @@ impl UpdateService {
         Ok(info)
     }
 
-    async fn fetch_verified_release(&self) -> Result<VerifiedRelease, UpdateError> {
+    async fn fetch_verified_release(&self, channel: &str) -> Result<VerifiedRelease, UpdateError> {
         let manifest_bytes = self
-            .fetch_small_file(MANIFEST_NAME, MAX_METADATA_BYTES)
+            .fetch_small_file(channel, MANIFEST_NAME, MAX_METADATA_BYTES)
             .await?;
-        let signature_bytes = self.fetch_small_file(MANIFEST_SIGNATURE_NAME, 1024).await?;
+        let signature_bytes = self
+            .fetch_small_file(channel, MANIFEST_SIGNATURE_NAME, 1024)
+            .await?;
         verify_signature(&self.verifying_key, &manifest_bytes, &signature_bytes)?;
         let manifest: ReleaseManifest = serde_json::from_slice(&manifest_bytes)
             .map_err(|error| UpdateError::InvalidRelease(error.to_string()))?;
-        validate_manifest(manifest, &self.channel)
+        validate_manifest(manifest, channel)
     }
 
-    async fn fetch_small_file(&self, name: &str, limit: u64) -> Result<Vec<u8>, UpdateError> {
+    async fn fetch_small_file(
+        &self,
+        channel: &str,
+        name: &str,
+        limit: u64,
+    ) -> Result<Vec<u8>, UpdateError> {
         let response = self
             .client
-            .get(self.release_url(name))
+            .get(self.release_url(channel, name))
             .send()
             .await?
             .error_for_status()?;
@@ -253,12 +308,13 @@ impl UpdateService {
 
     async fn download_artifact(
         &self,
+        channel: &str,
         artifact: &ReleaseArtifact,
         destination: &Path,
     ) -> Result<(), UpdateError> {
         let response = self
             .client
-            .get(self.release_url(&artifact.name))
+            .get(self.release_url(channel, &artifact.name))
             .send()
             .await?
             .error_for_status()?;
@@ -301,9 +357,59 @@ impl UpdateService {
         Ok(())
     }
 
-    fn release_url(&self, name: &str) -> String {
-        format!("{}/{}/{}", self.release_base_url, self.channel, name)
+    fn release_url(&self, channel: &str, name: &str) -> String {
+        format!("{}/{channel}/{name}", self.release_base_url)
     }
+}
+
+fn load_update_channel(data_directory: &Path, fallback: String) -> String {
+    let path = data_directory.join(UPDATE_SETTINGS_NAME);
+    match fs::read(&path) {
+        Ok(bytes) => match serde_json::from_slice::<StoredUpdateSettings>(&bytes) {
+            Ok(settings)
+                if settings.schema_version == UPDATE_SETTINGS_SCHEMA_VERSION
+                    && matches!(settings.channel.as_str(), "main" | "beta") =>
+            {
+                settings.channel
+            }
+            Ok(_) => {
+                tracing::warn!(path = %path.display(), "ignoring unsupported update settings");
+                fallback
+            }
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "ignoring invalid update settings");
+                fallback
+            }
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => fallback,
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "unable to load update settings");
+            fallback
+        }
+    }
+}
+
+fn persist_update_settings(path: &Path, settings: &StoredUpdateSettings) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("update settings path has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    serde_json::to_writer_pretty(&mut temporary, settings).map_err(io::Error::other)?;
+    temporary.write_all(b"\n")?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    sync_settings_directory(parent)
+}
+
+#[cfg(unix)]
+fn sync_settings_directory(directory: &Path) -> io::Result<()> {
+    File::open(directory)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_settings_directory(_directory: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 #[derive(Debug, Error)]
@@ -316,6 +422,10 @@ pub enum UpdateError {
     Stale,
     #[error("term-server is already running this release")]
     AlreadyCurrent,
+    #[error("the update channel must be main or beta")]
+    InvalidChannel,
+    #[error("unable to save update settings: {0}")]
+    Settings(String),
     #[error("release download failed: {0}")]
     Network(#[from] reqwest::Error),
     #[error("release signature verification failed")]
@@ -696,10 +806,102 @@ mod tests {
     }
 
     #[test]
+    fn update_channel_persists_and_reloads() {
+        let root = tempfile::tempdir().unwrap();
+        let service = UpdateService::new(
+            None,
+            "main".into(),
+            "https://example.invalid/releases/download".into(),
+            true,
+            root.path(),
+        );
+        assert_eq!(service.config().channel, "main");
+        assert_eq!(service.set_channel("beta").unwrap().channel, "beta");
+        assert!(matches!(
+            service.set_channel("nightly"),
+            Err(UpdateError::InvalidChannel)
+        ));
+        assert_eq!(service.config().channel, "beta");
+
+        let install_guard = service.install_lock.try_lock().unwrap();
+        assert!(matches!(
+            service.set_channel("main"),
+            Err(UpdateError::Busy)
+        ));
+        drop(install_guard);
+
+        let restored = UpdateService::new(
+            None,
+            "main".into(),
+            "https://example.invalid/releases/download".into(),
+            true,
+            root.path(),
+        );
+        assert_eq!(restored.config().channel, "beta");
+        let pinned = UpdateService::new(
+            None,
+            "v1.2.3".into(),
+            "https://example.invalid/releases/download".into(),
+            true,
+            root.path(),
+        );
+        assert_eq!(pinned.config().channel, "v1.2.3");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                fs::metadata(root.path().join(UPDATE_SETTINGS_NAME))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_status_still_reports_the_selected_channel() {
+        let root = tempfile::tempdir().unwrap();
+        let service = UpdateService::new(
+            None,
+            "main".into(),
+            "https://example.invalid/releases/download".into(),
+            true,
+            root.path(),
+        );
+        service.set_channel("beta").unwrap();
+        let status = service.check().await.unwrap();
+        assert_eq!(status.channel, "beta");
+        assert!(matches!(status.state, UpdateState::Unavailable));
+    }
+
+    #[test]
+    fn invalid_stored_channel_falls_back_to_startup_channel() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join(UPDATE_SETTINGS_NAME),
+            r#"{"schemaVersion":1,"channel":"nightly"}"#,
+        )
+        .unwrap();
+        let service = UpdateService::new(
+            None,
+            "main".into(),
+            "https://example.invalid/releases/download".into(),
+            true,
+            root.path(),
+        );
+        assert_eq!(service.config().channel, "main");
+    }
+
+    #[test]
     fn validates_release_identity_and_artifact() {
         let release = validate_manifest(manifest(), "main").unwrap();
         assert_eq!(release.info.version, "0.1.0");
         assert_eq!(release.artifact.size, 1024);
+        let mut beta = manifest();
+        beta.channel = "beta".into();
+        assert!(validate_manifest(beta, "beta").is_ok());
     }
 
     #[test]

@@ -31,6 +31,7 @@ const artifact = (overrides: Partial<ArtifactEntry> = {}): ArtifactEntry => ({
 
 const terminal = (overrides: Partial<TerminalInfo> = {}): TerminalInfo => ({
   id: "session-1",
+  kind: "regular",
   name: "artifact-work",
   workspace: "~/term-server",
   path: "~/term-server/artifact-work",

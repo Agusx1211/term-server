@@ -1,6 +1,6 @@
 {
   "name": "term-server",
-  "version": "0.14.1",
+  "version": "0.15.1",
   "description": "A fast, secure, Rust-powered web terminal workspace.",
   "type": "module",
   "private": true,
@@ -31,7 +31,8 @@
     "package": "bash scripts/package-release.sh",
     "start": "target/release/term-server",
     "typecheck": "tsc -p tsconfig.client.json --noEmit",
-    "test": "cargo test && vitest run",
+    "test": "cargo test && vitest run && npm run test:release",
+    "test:release": "node --test scripts/release-channel.test.mjs",
     "test:web": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "npm run build:e2e && sh -c 'has_project=0; for arg do case \"$arg\" in --project|--project=*) has_project=1;; esac; done; if [ \"$has_project\" -eq 0 ]; then set -- --project=chromium-pr \"$@\"; fi; exec playwright test --config=e2e/playwright.config.ts \"$@\"' --",
