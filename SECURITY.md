@@ -40,9 +40,12 @@ Secret values are held only in the owning session broker's memory and are zeroiz
 best-effort basis. API snapshots expose names and bounded use metadata, never values. A secret
 command is started by the broker with an allowlisted environment plus the one approved delivery
 variable, or with the value on standard input when explicitly requested; the agent process never
-receives the value. Exact output occurrences are redacted across stream boundaries, but transformed,
-encoded, hashed, or otherwise derived values cannot be reliably detected. Canceling the requester or
-closing its terminal kills the broker-started process group. This is not a sandbox: a hostile
+receives the value. The streaming redactor replaces raw values and bounded common Base64, Base32,
+hex, percent, escaped octal/hex/Unicode, binary, SHA-256, and SHA-512 forms across stdout/stderr and
+chunk boundaries with a marker naming the grant. Derived variants are enabled only for 4–1024-byte
+secrets to bound memory and false positives. Arbitrary transformations, encryption, compression,
+partial output, and unrecognized encodings cannot be reliably detected.
+Canceling the requester or closing its terminal kills the broker-started process group. This is not a sandbox: a hostile
 same-UID command can deliberately create a new session or process group and escape that cleanup.
 
 Sudo approvals cover one stored argument vector and working directory; no shell is added. The broker

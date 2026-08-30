@@ -169,7 +169,10 @@ broker without receiving the value:
 
 `--stdin` replaces `--env NAME` only for commands that explicitly consume a credential on standard
 input. Secret commands are launched without shell interpretation in a minimal allowlisted
-environment. Exact secret occurrences in combined output are redacted on a best-effort basis.
+environment. Output redaction replaces raw values and common Base64, Base32, hex, percent, escaped
+octal/hex/Unicode, binary, SHA-256, and SHA-512 forms with `[REDACTED: SECRET_NAME]` across stream
+boundaries. Derived forms are generated only for 4–1024-byte secrets to bound memory and false
+positives; arbitrary transformations remain best-effort.
 
 A local root command is submitted without a leading `sudo`:
 

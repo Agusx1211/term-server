@@ -34,7 +34,7 @@ Run an exact argument vector with a grant injected by the broker:
   -- /usr/bin/command argument...
 ```
 
-Use `--stdin` instead of `--env NAME` only when the target explicitly reads the credential from standard input. The client resolves the executable through the terminal's `PATH`, then the broker requires its canonical absolute path. The broker launches the command without shell interpretation, streams combined output, and redacts exact occurrences of the secret on a best-effort basis. It never returns the value to the agent.
+Use `--stdin` instead of `--env NAME` only when the target explicitly reads the credential from standard input. The client resolves the executable through the terminal's `PATH`, then the broker requires its canonical absolute path. The broker launches the command without shell interpretation and streams combined output. Raw values and bounded common Base64, Base32, hex, percent, escaped octal/hex/Unicode, binary, SHA-256, and SHA-512 forms are replaced with `[REDACTED: SECRET_NAME]` on a best-effort basis. It never returns the value to the agent.
 
 Revoke a grant only when the user asks or the capability is intentionally retired:
 
