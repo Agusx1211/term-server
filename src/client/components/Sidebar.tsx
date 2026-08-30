@@ -567,7 +567,11 @@ export function Sidebar({
                 onPreviewLeave={leavePreview}
                 onToggle={toggle}
                 onNew={onNew}
-                onOpen={onOpen}
+                onOpen={(id) => {
+                  clearPreviewTimers();
+                  setPreview(undefined);
+                  onOpen(id);
+                }}
                 onSplit={onSplit}
                 onRename={onRename}
                 onRemove={onRemove}
