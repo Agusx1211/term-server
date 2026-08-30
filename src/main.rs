@@ -68,6 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &socket,
                 cli.shell.clone(),
                 cli.replay_bytes(),
+                env::var("TERM_SERVER_BROKER_CONTROL_TOKEN").ok(),
             )
             .await;
         }

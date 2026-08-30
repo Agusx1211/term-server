@@ -937,7 +937,7 @@ fn claude_marketplace() -> Value {
         "owner": { "name": "term-server" },
         "plugins": [{
             "name": PLUGIN_NAME,
-            "description": "Reports Claude Code lifecycle activity to term-server.",
+            "description": "Reports Claude Code lifecycle and retained semantic history to term-server.",
             "version": "0.1.0",
             "author": { "name": "term-server" },
             "source": format!("./plugins/{PLUGIN_NAME}")
@@ -951,7 +951,7 @@ fn omp_marketplace() -> Value {
         "owner": { "name": "term-server" },
         "plugins": [{
             "name": PLUGIN_NAME,
-            "description": "Reports OMP lifecycle activity to term-server.",
+            "description": "Reports OMP lifecycle and retained semantic history to term-server.",
             "source": format!("./plugins/{PLUGIN_NAME}")
         }]
     })

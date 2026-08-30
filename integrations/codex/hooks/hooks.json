@@ -1,5 +1,5 @@
 {
-  "description": "Report privacy-bounded Codex lifecycle activity to term-server.",
+  "description": "Report Codex lifecycle and bounded semantic history to term-server.",
   "hooks": {
     "UserPromptSubmit": [
       {

@@ -3,6 +3,8 @@ use std::io::Read;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::history::{AgentTranscriptInput, AgentTranscriptKind};
+
 const MAX_HOOK_INPUT_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -54,6 +56,12 @@ pub struct AgentEvent {
     /// generating its own; other providers leave this `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub transcript_only: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub transcript_reset: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transcript: Vec<AgentTranscriptInput>,
 }
 
 impl AgentEvent {
@@ -70,11 +78,18 @@ impl AgentEvent {
             .get("hook_event_name")
             .or_else(|| input.get("event"))
             .and_then(Value::as_str)?;
+        let transcript_only = matches!(name, "transcript_snapshot" | "message_end");
         let kind = match name {
-            "UserPromptSubmit" | "agent_start" | "before_agent_start" | "PostCompact"
-            | "session_compact" | "tool_execution_end" | "PostToolUse" | "PostToolUseFailure" => {
-                AgentEventKind::Thinking
-            }
+            "UserPromptSubmit"
+            | "agent_start"
+            | "before_agent_start"
+            | "PostCompact"
+            | "session_compact"
+            | "tool_execution_end"
+            | "PostToolUse"
+            | "PostToolUseFailure"
+            | "transcript_snapshot"
+            | "message_end" => AgentEventKind::Thinking,
             "PreToolUse" | "tool_execution_start" => tool_event_kind(
                 input
                     .get("tool_name")
@@ -87,17 +102,146 @@ impl AgentEvent {
             "SessionEnd" | "session_shutdown" => AgentEventKind::Closed,
             _ => return None,
         };
+        let sequence = input.get("sequence").and_then(Value::as_u64);
+        let mut transcript = input
+            .get("transcript")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<Vec<AgentTranscriptInput>>(value).ok())
+            .unwrap_or_default();
+        if !transcript_only {
+            transcript.extend(hook_transcript_entries(name, input, sequence));
+            transcript.push(AgentTranscriptInput {
+                kind: AgentTranscriptKind::Status,
+                source_id: sequence.map(|sequence| format!("status:{sequence}")),
+                timestamp: input.get("timestamp").and_then(Value::as_u64),
+                role: None,
+                name: Some(name.to_owned()),
+                text: Some(agent_event_status(kind).to_owned()),
+                data: None,
+                truncated: false,
+            });
+        }
         Some(Self {
             provider: provider.to_owned(),
             kind,
-            sequence: input.get("sequence").and_then(Value::as_u64),
+            sequence,
             title: input
                 .get("title")
                 .and_then(Value::as_str)
                 .map(|title| title.trim().to_owned())
                 .filter(|title| !title.is_empty()),
+            transcript_only,
+            transcript_reset: input
+                .get("transcriptReset")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            transcript,
         })
     }
+}
+
+fn hook_transcript_entries(
+    event: &str,
+    input: &Value,
+    sequence: Option<u64>,
+) -> Vec<AgentTranscriptInput> {
+    let source = |prefix: &str| {
+        input
+            .get("tool_use_id")
+            .or_else(|| input.get("toolCallId"))
+            .or_else(|| input.get("event_id"))
+            .and_then(Value::as_str)
+            .map(|id| format!("{prefix}:{id}"))
+            .or_else(|| sequence.map(|sequence| format!("{prefix}:{sequence}")))
+    };
+    let timestamp = input.get("timestamp").and_then(Value::as_u64);
+    let tool_name = input
+        .get("tool_name")
+        .or_else(|| input.get("toolName"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let record = match event {
+        "UserPromptSubmit" | "before_agent_start" => input
+            .get("prompt")
+            .and_then(Value::as_str)
+            .map(|prompt| AgentTranscriptInput {
+                kind: AgentTranscriptKind::Message,
+                source_id: source("message"),
+                timestamp,
+                role: Some("user".to_owned()),
+                name: None,
+                text: Some(prompt.to_owned()),
+                data: None,
+                truncated: false,
+            }),
+        "PreToolUse" | "tool_execution_start" => {
+            let data = input
+                .get("tool_input")
+                .or_else(|| input.get("args"))
+                .cloned();
+            Some(AgentTranscriptInput {
+                kind: AgentTranscriptKind::ToolStart,
+                source_id: source("tool-start"),
+                timestamp,
+                role: None,
+                name: tool_name,
+                text: data.as_ref().and_then(semantic_text),
+                data,
+                truncated: false,
+            })
+        }
+        "PostToolUse" | "PostToolUseFailure" | "tool_execution_end" => {
+            let data = input
+                .get("tool_response")
+                .or_else(|| input.get("tool_output"))
+                .or_else(|| input.get("result"))
+                .cloned();
+            Some(AgentTranscriptInput {
+                kind: AgentTranscriptKind::ToolResult,
+                source_id: source("tool-result"),
+                timestamp,
+                role: None,
+                name: tool_name,
+                text: data.as_ref().and_then(semantic_text),
+                data,
+                truncated: false,
+            })
+        }
+        "Stop" | "StopFailure" => input
+            .get("last_assistant_message")
+            .and_then(Value::as_str)
+            .map(|message| AgentTranscriptInput {
+                kind: AgentTranscriptKind::Message,
+                source_id: source("message"),
+                timestamp,
+                role: Some("assistant".to_owned()),
+                name: None,
+                text: Some(message.to_owned()),
+                data: None,
+                truncated: false,
+            }),
+        _ => None,
+    };
+    record.into_iter().collect()
+}
+
+fn semantic_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        _ => serde_json::to_string_pretty(value).ok(),
+    }
+}
+
+fn agent_event_status(kind: AgentEventKind) -> &'static str {
+    kind.activity_label().unwrap_or(match kind {
+        AgentEventKind::Completed => "completed",
+        AgentEventKind::Closed => "closed",
+        _ => "idle",
+    })
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 pub fn read_hook_event(
@@ -154,7 +298,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalizes_provider_hook_events_without_payload_details() {
+    fn retains_semantic_hook_details_for_supervisor_history() {
         let event = AgentEvent::from_hook_input(
             "codex",
             &serde_json::json!({
@@ -164,20 +308,18 @@ mod tests {
             }),
         )
         .unwrap();
+        assert_eq!(event.provider, "codex");
+        assert_eq!(event.kind, AgentEventKind::RunningCommand);
+        assert!(!event.transcript_only);
+        assert!(!event.transcript_reset);
+        assert_eq!(event.transcript.len(), 2);
+        assert_eq!(event.transcript[0].kind, AgentTranscriptKind::ToolStart);
+        assert_eq!(event.transcript[0].name.as_deref(), Some("Bash"));
         assert_eq!(
-            event,
-            AgentEvent {
-                provider: "codex".to_owned(),
-                kind: AgentEventKind::RunningCommand,
-                sequence: None,
-                title: None,
-            }
+            event.transcript[0].data,
+            Some(serde_json::json!({ "command": "secret command" }))
         );
-        assert!(
-            !serde_json::to_string(&event)
-                .unwrap()
-                .contains("secret command")
-        );
+        assert_eq!(event.transcript[1].kind, AgentTranscriptKind::Status);
     }
 
     #[test]
@@ -237,6 +379,29 @@ mod tests {
                 .unwrap()
                 .contains("\"sequence\":42")
         );
+    }
+
+    #[test]
+    fn accepts_bounded_semantic_transcript_snapshots() {
+        let event = AgentEvent::from_hook_input(
+            "omp",
+            &serde_json::json!({
+                "hook_event_name": "transcript_snapshot",
+                "transcriptReset": true,
+                "transcript": [{
+                    "kind": "message",
+                    "sourceId": "entry-1",
+                    "role": "user",
+                    "text": "fix delivery"
+                }]
+            }),
+        )
+        .unwrap();
+        assert!(event.transcript_only);
+        assert!(event.transcript_reset);
+        assert_eq!(event.transcript.len(), 1);
+        assert_eq!(event.transcript[0].source_id.as_deref(), Some("entry-1"));
+        assert_eq!(event.transcript[0].text.as_deref(), Some("fix delivery"));
     }
 
     #[test]

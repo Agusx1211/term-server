@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.15.2 - 2026-08-30
+
+Supervisor coordination now has reliable PTY delivery, a pinned workspace identity, and secure retained session history.
+
+### Added
+
+- **Pinned Supervisor row.** The singleton Supervisor is now rendered as a special sticky row above and outside the filesystem workspace tree, without exposing its managed data-directory path.
+- **Secure retained history.** The capability-checked `term-server-supervisor` CLI can page through clean raw terminal scrollback or a detected agent's retained semantic thread in text or JSONL form. Semantic history includes messages, tool activity/results, compaction markers, and status transitions; MCP intentionally does not expose these commands.
+
+### Fixed
+
+- **Confirmed Supervisor delivery.** `terminal_send` now reports success only after the target PTY writer accepts and flushes the input. Exited terminals and sessions owned by older brokers that cannot acknowledge delivery return explicit failures instead of silently claiming success.
+
+### Security
+
+- Full scrollback and semantic transcripts share the existing server-validated Supervisor capability boundary. Regular terminals receive neither the capability nor the CLI path. Retained semantic records are size-bounded but may contain prompts, command text, tool arguments/results, and model responses.
+
+### Upgrade notes
+
+- No data migration is required. The server creates an owner-only session-broker control token on first start.
+- Existing terminals remain attached to their older draining broker, but confirmed input delivery and retained-history commands fail explicitly for those sessions. Recreate the terminal, or use **Settings → Restart all session brokers** if closing every existing terminal is acceptable.
+- Repair or reinstall managed agent integrations from Settings, then start a new agent session to capture full semantic history. Reload open pages to pick up the pinned Supervisor row. The release is safe for automatic installation over `0.15.1`.
+
 ## 0.15.1 - 2026-08-30
 
 Term-server now has a singleton supervisor shell for coordinating other terminal sessions, plus a signed beta update channel that can be selected from Settings.

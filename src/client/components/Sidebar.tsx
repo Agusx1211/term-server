@@ -96,6 +96,7 @@ interface SidebarProps {
 interface NodeProps {
   node: TerminalTreeNode;
   depth: number;
+  pinned?: boolean;
   collapsed: Set<string>;
   activeIds: string[];
   attentionTerminalIds: Set<string>;
@@ -118,6 +119,7 @@ interface NodeProps {
 function TreeNode({
   node,
   depth,
+  pinned = false,
   collapsed,
   activeIds,
   attentionTerminalIds,
@@ -152,11 +154,12 @@ function TreeNode({
         : "shell-row";
     return (
       <div
-        class={`tree-row terminal-row ${isSupervisor ? "supervisor-row" : ""} ${supervisorOutsideRoot ? "supervisor-context-outside" : ""} ${activityClass} ${needsAttention ? "activity-attention" : ""} ${activeIds.includes(terminal.id) ? "active" : ""}`}
+        class={`tree-row terminal-row ${isSupervisor ? "supervisor-row" : ""} ${pinned ? "supervisor-pinned-row" : ""} ${supervisorOutsideRoot ? "supervisor-context-outside" : ""} ${activityClass} ${needsAttention ? "activity-attention" : ""} ${activeIds.includes(terminal.id) ? "active" : ""}`}
         data-terminal-id={terminal.id}
         data-terminal-kind={terminal.kind}
         data-supervisor={isSupervisor ? "true" : "false"}
         data-supervisor-context={isSupervisor ? (supervisorOutsideRoot ? "outside" : "active") : undefined}
+        data-supervisor-pinned={pinned ? "true" : undefined}
         style={{ "--depth": depth, "--workspace-color": terminal.color }}
         onPointerEnter={(event) => (
           onPreview(terminal, event.currentTarget, event.pointerType)
@@ -175,8 +178,8 @@ function TreeNode({
           }}
           onDragEnd={onDragEnd}
           title={supervisorOutsideRoot
-            ? `Supervisor skill discovery is inactive outside ${terminal.supervisorRoot}`
-            : `${terminal.name} — ${terminal.cwd}`}
+            ? "Supervisor skill discovery is inactive outside its managed directory"
+            : isSupervisor ? "Supervisor terminal" : `${terminal.name} — ${terminal.cwd}`}
         >
           <span class={`terminal-kind ${isSupervisor ? "supervisor" : terminal.agent ? "agent" : "shell"}`} aria-hidden="true" data-supervisor-identity={isSupervisor ? "sidebar" : undefined}>
             {isSupervisor ? <Crown size={14} /> : terminal.agent ? <Bot size={15} /> : <TerminalSquare size={14} />}
@@ -351,9 +354,24 @@ export function Sidebar({
     terminal: TerminalInfo;
     position: { left: number; top: number };
   }>();
+  const supervisorNodes = useMemo<TerminalTreeNode[]>(
+    () => terminals
+      .filter((terminal) => terminal.kind === "supervisor")
+      .map((terminal) => ({
+        key: `supervisor:${terminal.id}`,
+        name: terminal.name,
+        path: `supervisor:${terminal.id}`,
+        terminal,
+        children: [],
+      })),
+    [terminals],
+  );
   const matching = useMemo(() => {
+    const workspaceTerminals = terminals.filter((terminal) => terminal.kind !== "supervisor");
     const needle = query.trim().toLocaleLowerCase();
-    return needle ? terminals.filter((terminal) => terminal.path.toLocaleLowerCase().includes(needle)) : terminals;
+    return needle
+      ? workspaceTerminals.filter((terminal) => terminal.path.toLocaleLowerCase().includes(needle))
+      : workspaceTerminals;
   }, [query, terminals]);
   const tree = useMemo(() => buildTerminalTree(matching), [matching]);
 
@@ -489,6 +507,40 @@ export function Sidebar({
     setCollapsed(new Set(categoryPaths));
     localStorage.setItem("term-server:collapsed", JSON.stringify(categoryPaths));
   };
+  const visibleCollapsed = query ? new Set<string>() : collapsed;
+  const renderNode = (node: TerminalTreeNode, pinned = false) => (
+    <TreeNode
+      key={node.key}
+      node={node}
+      depth={0}
+      pinned={pinned}
+      collapsed={visibleCollapsed}
+      activeIds={activeIds}
+      attentionTerminalIds={attentionTerminalIds}
+      artifactCounts={artifactCounts}
+      pushoverEnabled={pushover.enabled}
+      pushoverMode={pushover.mode}
+      onTogglePushoverBell={togglePushoverBell}
+      onPreview={beginPreview}
+      onPreviewLeave={leavePreview}
+      onToggle={toggle}
+      onNew={onNew}
+      onOpen={(id) => {
+        clearPreviewTimers();
+        setPreview(undefined);
+        onOpen(id);
+      }}
+      onSplit={onSplit}
+      onRename={onRename}
+      onRemove={onRemove}
+      onDragStart={(id) => {
+        clearPreviewTimers();
+        setPreview(undefined);
+        onDragStart(id);
+      }}
+      onDragEnd={onDragEnd}
+    />
+  );
 
   return (
     <aside
@@ -550,46 +602,27 @@ export function Sidebar({
             />
             {query && <button onClick={() => setQuery("")} aria-label="Clear filter"><X size={13} /></button>}
           </div>
-          <div class="tree" role="tree">
-            {tree.map((node) => (
-              <TreeNode
-                key={node.key}
-                node={node}
-                depth={0}
-                collapsed={query ? new Set() : collapsed}
-                activeIds={activeIds}
-                attentionTerminalIds={attentionTerminalIds}
-                artifactCounts={artifactCounts}
-                pushoverEnabled={pushover.enabled}
-                pushoverMode={pushover.mode}
-                onTogglePushoverBell={togglePushoverBell}
-                onPreview={beginPreview}
-                onPreviewLeave={leavePreview}
-                onToggle={toggle}
-                onNew={onNew}
-                onOpen={(id) => {
-                  clearPreviewTimers();
-                  setPreview(undefined);
-                  onOpen(id);
-                }}
-                onSplit={onSplit}
-                onRename={onRename}
-                onRemove={onRemove}
-                onDragStart={(id) => {
-                  clearPreviewTimers();
-                  setPreview(undefined);
-                  onDragStart(id);
-                }}
-                onDragEnd={onDragEnd}
-              />
-            ))}
-            {!matching.length && (
-              <div class="sidebar-empty">
-                <TerminalSquare size={20} />
-                <span>{terminals.length ? "No matching workspaces" : "No terminals yet"}</span>
-                {!terminals.length && <button onClick={() => onNew()}>Create one</button>}
+          <div class="tree">
+            {supervisorNodes.length > 0 && (
+              <div
+                class="supervisor-pinned"
+                role="group"
+                aria-label="Supervisor"
+                data-supervisor-pinned-container="true"
+              >
+                {supervisorNodes.map((node) => renderNode(node, true))}
               </div>
             )}
+            <div class="workspace-tree" role="tree">
+              {tree.map((node) => renderNode(node))}
+              {!matching.length && !supervisorNodes.length && (
+                <div class="sidebar-empty">
+                  <TerminalSquare size={20} />
+                  <span>{terminals.length ? "No matching workspaces" : "No terminals yet"}</span>
+                  {!terminals.length && <button onClick={() => onNew()}>Create one</button>}
+                </div>
+              )}
+            </div>
           </div>
         </>
       )}

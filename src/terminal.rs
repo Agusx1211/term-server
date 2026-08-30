@@ -15,7 +15,7 @@ use parking_lot::{Condvar, Mutex, RwLock};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
 
 use crate::{
@@ -24,6 +24,9 @@ use crate::{
     ai::{PiRequest, PiService, PiTaskKind},
     artifacts,
     build::BuildIdentity,
+    history::{
+        AgentTranscriptKind, AgentTranscriptPage, AgentTranscriptStore, TerminalScrollbackPage,
+    },
     terminal_state::{
         SequencedOutput, SyncMode, TERMINAL_OUTPUT_FRAME_BYTES, TerminalOutputState,
         TerminalResume, TerminalSync,
@@ -263,6 +266,8 @@ pub enum TerminalError {
     InputTooLarge,
     #[error("terminal input queue is full; wait for the terminal to catch up")]
     InputQueueFull,
+    #[error("terminal is not running")]
+    NotRunning,
     #[error("terminal I/O failed: {0}")]
     Io(String),
 }
@@ -1324,9 +1329,15 @@ struct RefreshOutcome {
     summary: Option<(u64, PiRequest)>,
 }
 
+#[derive(Debug)]
+struct TerminalInputMessage {
+    data: Bytes,
+    delivered: Option<oneshot::Sender<Result<(), String>>>,
+}
+
 #[derive(Debug, Default)]
 struct TerminalInputState {
-    messages: VecDeque<Bytes>,
+    messages: VecDeque<TerminalInputMessage>,
     queued_bytes: usize,
     responses: VecDeque<Bytes>,
     response_bytes: usize,
@@ -1366,7 +1377,20 @@ impl TerminalInputQueue {
         if data.len() > MAX_TERMINAL_INPUT_BYTES {
             return Err(TerminalError::InputTooLarge);
         }
-        self.enqueue_message(Bytes::copy_from_slice(data), accepted)
+        self.enqueue_message(Bytes::copy_from_slice(data), None, accepted)
+    }
+
+    fn enqueue_confirmed(
+        &self,
+        data: &[u8],
+        accepted: impl FnOnce(),
+    ) -> Result<oneshot::Receiver<Result<(), String>>, TerminalError> {
+        if data.len() > MAX_TERMINAL_INPUT_BYTES {
+            return Err(TerminalError::InputTooLarge);
+        }
+        let (delivered, confirmation) = oneshot::channel();
+        self.enqueue_message(Bytes::copy_from_slice(data), Some(delivered), accepted)?;
+        Ok(confirmation)
     }
 
     fn enqueue_unobserved(&self, message: Bytes) -> Result<(), TerminalError> {
@@ -1389,21 +1413,24 @@ impl TerminalInputQueue {
 
     fn enqueue_message(
         &self,
-        message: Bytes,
+        data: Bytes,
+        delivered: Option<oneshot::Sender<Result<(), String>>>,
         accepted: impl FnOnce(),
     ) -> Result<(), TerminalError> {
         let mut state = self.shared.state.lock();
         Self::check_open(&state)?;
         if state.messages.len() >= TERMINAL_INPUT_QUEUE_MESSAGES
-            || state.queued_bytes.saturating_add(message.len()) > TERMINAL_INPUT_QUEUE_BYTES
+            || state.queued_bytes.saturating_add(data.len()) > TERMINAL_INPUT_QUEUE_BYTES
         {
             return Err(TerminalError::InputQueueFull);
         }
         // The worker cannot observe this message until the accepted-input
         // bookkeeping is complete and the queue lock is released.
         accepted();
-        state.queued_bytes += message.len();
-        state.messages.push_back(message);
+        state.queued_bytes += data.len();
+        state
+            .messages
+            .push_back(TerminalInputMessage { data, delivered });
         drop(state);
         self.shared.ready.notify_one();
         Ok(())
@@ -1432,15 +1459,18 @@ impl Drop for TerminalInputQueue {
 }
 
 impl TerminalInputReceiver {
-    fn receive(&self) -> Option<Bytes> {
+    fn receive(&self) -> Option<TerminalInputMessage> {
         let mut state = self.shared.state.lock();
         loop {
-            if let Some(message) = state.responses.pop_front() {
-                state.response_bytes -= message.len();
-                return Some(message);
+            if let Some(data) = state.responses.pop_front() {
+                state.response_bytes -= data.len();
+                return Some(TerminalInputMessage {
+                    data,
+                    delivered: None,
+                });
             }
             if let Some(message) = state.messages.pop_front() {
-                state.queued_bytes -= message.len();
+                state.queued_bytes -= message.data.len();
                 return Some(message);
             }
             if state.closed || state.failure.is_some() {
@@ -1451,12 +1481,17 @@ impl TerminalInputReceiver {
     }
 
     fn fail(&self, error: &std::io::Error) {
+        let message = error.to_string();
         let mut state = self.shared.state.lock();
-        state.messages.clear();
+        for pending in state.messages.drain(..) {
+            if let Some(delivered) = pending.delivered {
+                let _ = delivered.send(Err(message.clone()));
+            }
+        }
         state.queued_bytes = 0;
         state.responses.clear();
         state.response_bytes = 0;
-        state.failure = Some(error.to_string());
+        state.failure = Some(message);
         self.shared.ready.notify_all();
     }
 }
@@ -1476,9 +1511,16 @@ fn run_terminal_input_writer<W: Write>(
     receiver: TerminalInputReceiver,
 ) -> std::io::Result<()> {
     while let Some(message) = receiver.receive() {
-        if let Err(error) = writer.write_all(&message).and_then(|()| writer.flush()) {
+        let TerminalInputMessage { data, delivered } = message;
+        if let Err(error) = writer.write_all(&data).and_then(|()| writer.flush()) {
+            if let Some(delivered) = delivered {
+                let _ = delivered.send(Err(error.to_string()));
+            }
             receiver.fail(&error);
             return Err(error);
+        }
+        if let Some(delivered) = delivered {
+            let _ = delivered.send(Ok(()));
         }
     }
     Ok(())
@@ -1596,6 +1638,7 @@ pub struct TerminalSession {
     viewports: Mutex<ClientViewports>,
     output_bytes: AtomicU64,
     activity: Mutex<SessionActivity>,
+    transcript: Mutex<AgentTranscriptStore>,
     signals: Mutex<TerminalSignals>,
     process_tracker: Mutex<ProcessTracker>,
     flow: FlowControl,
@@ -1664,6 +1707,30 @@ impl TerminalSession {
             alternate_screen: output.alternate_screen(),
             sequence: output.sequence(),
         }
+    }
+
+    pub fn scrollback(
+        &self,
+        from_sequence: Option<u64>,
+        limit_bytes: usize,
+    ) -> TerminalScrollbackPage {
+        self.output
+            .lock()
+            .scrollback_page(self.info.read().id, from_sequence, limit_bytes)
+    }
+
+    pub fn transcript(
+        &self,
+        from_sequence: Option<u64>,
+        limit: usize,
+        kinds: &[AgentTranscriptKind],
+    ) -> Option<AgentTranscriptPage> {
+        let terminal_id = self.info.read().id;
+        let transcript = self.transcript.lock();
+        let empty = transcript.is_empty();
+        let page = transcript.page(terminal_id, from_sequence, limit, kinds);
+        drop(transcript);
+        (!empty || self.info.read().agent.is_some()).then_some(page)
     }
 
     pub fn terminate_process(&self, process_id: &str) -> Result<(), ProcessSignalError> {
@@ -1737,10 +1804,26 @@ impl TerminalSession {
 
     pub fn write(&self, data: &[u8]) -> Result<(), TerminalError> {
         if self.info.read().status != TerminalStatus::Running {
-            return Ok(());
+            return Err(TerminalError::NotRunning);
         }
         self.input
             .enqueue(data, || self.observe_accepted_input(data))
+    }
+
+    pub async fn write_confirmed(&self, data: &[u8]) -> Result<(), TerminalError> {
+        if self.info.read().status != TerminalStatus::Running {
+            return Err(TerminalError::NotRunning);
+        }
+        let confirmation = self
+            .input
+            .enqueue_confirmed(data, || self.observe_accepted_input(data))?;
+        match confirmation.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(TerminalError::Io(error)),
+            Err(_) => Err(TerminalError::Io(
+                "terminal input writer stopped before delivery".to_owned(),
+            )),
+        }
     }
 
     /// Enrols a browser in flow control. Observer connections stay out, so a
@@ -2352,10 +2435,23 @@ impl TerminalSession {
 
     fn apply_agent_event(
         &self,
-        event: AgentEvent,
+        mut event: AgentEvent,
         pi_summaries_enabled: bool,
         now: u64,
     ) -> RefreshOutcome {
+        let transcript = std::mem::take(&mut event.transcript);
+        if event.transcript_reset {
+            self.transcript
+                .lock()
+                .replace(&event.provider, transcript, now);
+        } else if !transcript.is_empty() {
+            self.transcript
+                .lock()
+                .extend(&event.provider, transcript, now);
+        }
+        if event.transcript_only {
+            return RefreshOutcome::default();
+        }
         let mut activity = self.activity.lock();
         let mut info = self.info.write();
         if !activity.accept_native_sequence(&event.provider, event.sequence) {
@@ -2743,6 +2839,7 @@ impl TerminalManager {
         for (name, value) in environment {
             command.env(name, value);
         }
+        command.env_remove("TERM_SERVER_BROKER_CONTROL_TOKEN");
         command.env("TERM_SERVER_SESSION", id.to_string());
         if let (Some(executable), Some(socket)) = (&self.executable, &self.agent_event_socket) {
             command.env("TERM_SERVER_EXECUTABLE", executable);
@@ -2769,6 +2866,7 @@ impl TerminalManager {
         let input = TerminalInputQueue::spawn(id, writer)?;
         let killer = child.clone_killer();
         let (events, _) = broadcast::channel(TERMINAL_EVENT_CAPACITY);
+        let replay_bytes = self.replay_bytes.load(Ordering::Relaxed);
         let session = Arc::new(TerminalSession {
             info: RwLock::new(TerminalInfo {
                 kind,
@@ -2797,7 +2895,7 @@ impl TerminalManager {
             input,
             killer: Mutex::new(killer),
             output: Mutex::new(TerminalOutputState::new(
-                self.replay_bytes.load(Ordering::Relaxed),
+                replay_bytes,
                 DEFAULT_VIEWPORT_SIZE.rows,
                 DEFAULT_VIEWPORT_SIZE.cols,
             )),
@@ -2808,6 +2906,7 @@ impl TerminalManager {
                 automatic_name,
                 ..SessionActivity::default()
             }),
+            transcript: Mutex::new(AgentTranscriptStore::new(replay_bytes)),
             signals: Mutex::new(TerminalSignals::default()),
             process_tracker: Mutex::new(ProcessTracker::default()),
             flow: FlowControl::default(),
@@ -3662,6 +3761,18 @@ mod tests {
         }
     }
 
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "writer closed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     fn spawn_test_input_writer<W: Write + Send + 'static>(
         writer: W,
     ) -> (TerminalInputQueue, thread::JoinHandle<io::Result<()>>) {
@@ -3706,6 +3817,50 @@ mod tests {
         drop(queue);
         worker.join().unwrap().unwrap();
         assert_eq!(&*output.lock(), b"blockedqueued");
+    }
+
+    #[tokio::test]
+    async fn confirmed_terminal_input_waits_for_the_writer() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (queue, worker) = spawn_test_input_writer(BlockingWriter {
+            output: output.clone(),
+            started: Some(started_tx),
+            release: release_rx,
+        });
+        let mut confirmation = queue.enqueue_confirmed(b"wake", || {}).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut confirmation)
+                .await
+                .is_err()
+        );
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), confirmation)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(&*output.lock(), b"wake");
+        drop(queue);
+        worker.join().unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn confirmed_terminal_input_reports_writer_failure() {
+        let (queue, worker) = spawn_test_input_writer(FailingWriter);
+        let confirmation = queue.enqueue_confirmed(b"wake", || {}).unwrap();
+
+        let error = confirmation.await.unwrap().unwrap_err();
+        assert!(error.contains("writer closed"));
+        assert!(matches!(
+            queue.enqueue(b"later", || {}).unwrap_err(),
+            TerminalError::Io(_)
+        ));
+        drop(queue);
+        assert!(worker.join().unwrap().is_err());
     }
 
     #[test]
@@ -4818,6 +4973,9 @@ mod tests {
                     kind,
                     sequence: None,
                     title: None,
+                    transcript_only: false,
+                    transcript_reset: false,
+                    transcript: Vec::new(),
                 },
                 pi.clone(),
             ));
@@ -4848,6 +5006,9 @@ mod tests {
                 kind: AgentEventKind::Completed,
                 sequence: None,
                 title: None,
+                transcript_only: false,
+                transcript_reset: false,
+                transcript: Vec::new(),
             },
             pi.clone(),
         ));
@@ -4864,6 +5025,9 @@ mod tests {
                 kind: AgentEventKind::Closed,
                 sequence: None,
                 title: None,
+                transcript_only: false,
+                transcript_reset: false,
+                transcript: Vec::new(),
             },
             pi,
         ));
@@ -4900,6 +5064,9 @@ mod tests {
             kind,
             sequence,
             title: None,
+            transcript_only: false,
+            transcript_reset: false,
+            transcript: Vec::new(),
         };
         let apply = |provider, kind, sequence| {
             manager.apply_agent_event(info.id, event(provider, kind, sequence), pi.clone())
@@ -4977,6 +5144,9 @@ mod tests {
                 kind: AgentEventKind::Thinking,
                 sequence: None,
                 title: Some("checkout latency fix".to_owned()),
+                transcript_only: false,
+                transcript_reset: false,
+                transcript: Vec::new(),
             },
             pi,
         ));
@@ -4993,6 +5163,86 @@ mod tests {
         drop(activity);
         assert_eq!(session.info().name, "checkout latency fix");
         assert!(manager.remove(info.id));
+    }
+
+    #[test]
+    fn retained_agent_transcript_survives_terminal_exit_and_pages() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = TerminalManager::new(Some("/bin/true".to_owned()), 1024 * 1024);
+        let info = manager
+            .create(CreateTerminal {
+                path: Some("closed-history".to_owned()),
+                cwd: Some(directory.path().to_path_buf()),
+                shell: Some("/bin/true".to_owned()),
+                clone_from: None,
+            })
+            .unwrap();
+        for _ in 0..50 {
+            if manager.get(info.id).unwrap().info().status == TerminalStatus::Exited {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            manager.get(info.id).unwrap().info().status,
+            TerminalStatus::Exited
+        );
+        let pi = Arc::new(PiService::new(directory.path()));
+        assert!(manager.apply_agent_event(
+            info.id,
+            AgentEvent {
+                provider: "omp".to_owned(),
+                kind: AgentEventKind::Thinking,
+                sequence: None,
+                title: None,
+                transcript_only: true,
+                transcript_reset: true,
+                transcript: vec![
+                    crate::history::AgentTranscriptInput {
+                        kind: AgentTranscriptKind::Message,
+                        source_id: Some("message-1".to_owned()),
+                        timestamp: Some(1),
+                        role: Some("user".to_owned()),
+                        name: None,
+                        text: Some("first".to_owned()),
+                        data: None,
+                        truncated: false,
+                    },
+                    crate::history::AgentTranscriptInput {
+                        kind: AgentTranscriptKind::Message,
+                        source_id: Some("message-2".to_owned()),
+                        timestamp: Some(2),
+                        role: Some("assistant".to_owned()),
+                        name: None,
+                        text: Some("second".to_owned()),
+                        data: None,
+                        truncated: false,
+                    },
+                    crate::history::AgentTranscriptInput {
+                        kind: AgentTranscriptKind::ToolResult,
+                        source_id: Some("tool-1".to_owned()),
+                        timestamp: Some(3),
+                        role: None,
+                        name: Some("bash".to_owned()),
+                        text: Some("done".to_owned()),
+                        data: None,
+                        truncated: false,
+                    },
+                ],
+            },
+            pi,
+        ));
+
+        let session = manager.get(info.id).unwrap();
+        let first = session.transcript(None, 2, &[]).unwrap();
+        assert_eq!(first.records.len(), 2);
+        assert!(first.has_more);
+        let second = session
+            .transcript(Some(first.next_sequence), 2, &[])
+            .unwrap();
+        assert_eq!(second.records.len(), 1);
+        assert_eq!(second.records[0].text.as_deref(), Some("done"));
+        assert!(!second.has_more);
     }
 
     #[test]
@@ -5702,6 +5952,9 @@ mod tests {
             kind,
             sequence: None,
             title: None,
+            transcript_only: false,
+            transcript_reset: false,
+            transcript: Vec::new(),
         };
 
         assert!(manager.apply_agent_event(info.id, event(AgentEventKind::Thinking), pi.clone()));
