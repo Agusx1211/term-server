@@ -169,7 +169,10 @@ broker without receiving the value:
 
 `--stdin` replaces `--env NAME` only for commands that explicitly consume a credential on standard
 input. Secret commands are launched without shell interpretation in a minimal allowlisted
-environment. Exact secret occurrences in combined output are redacted on a best-effort basis.
+environment. Output redaction replaces raw values and common Base64, Base32, hex, percent, escaped
+octal/hex/Unicode, binary, SHA-256, and SHA-512 forms with `[REDACTED: SECRET_NAME]` across stream
+boundaries. Derived forms are generated only for 4–1024-byte secrets to bound memory and false
+positives; arbitrary transformations remain best-effort.
 
 A local root command is submitted without a leading `sudo`:
 
@@ -203,7 +206,7 @@ keep using the existing state machine.
 
 Use the compact crown action in the workspace header to create or reopen the singleton supervisor. It is a normal persistent terminal: there is no provider chooser and closing its pane does not stop it. Creation requests time out instead of leaving the control busy indefinitely. Run `omp`, `pi`, `codex`, or `claude` as usual, or stay in the shell.
 
-The terminal starts in a private managed directory containing provider-local instructions and the `term-server-supervisor` skill. Its `PATH` contains the matching control CLI, Codex and Claude receive invocation-local MCP configuration, OMP receives project-local MCP configuration, and Pi receives a project-local extension. Existing `HOME` and provider credential locations are left unchanged. Normal terminals receive none of this environment and cannot authenticate to the control socket.
+The terminal starts in a private managed directory containing provider-local instructions and the `term-server-supervisor` skill. Its `PATH` contains the scoped control CLI, which is the only supervisor control interface. Codex, Claude, Pi, and OMP discover the same skill through their normal project-local paths; term-server does not inject MCP servers or provider-specific tool adapters. Existing `HOME` and provider credential locations are left unchanged. Normal terminals receive none of this environment and cannot authenticate to the control socket.
 
 The sidebar row and pane header turn amber when the shell leaves the managed supervisor directory, and the pane shows the exact root to return to before starting an agent. Subdirectories remain valid because provider skill discovery walks their ancestors.
 

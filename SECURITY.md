@@ -21,9 +21,9 @@ Pi-generated titles and notification summaries are independently disabled by def
 
 ## Supervisor terminal boundary
 
-The supervisor capability is a product-level boundary between terminal roles, not an operating-system sandbox. Only the singleton supervisor shell receives its control token, private socket path, skill, PATH entry, and invocation-local provider adapters; the server stores only a token hash and rejects calls after that terminal exits or is killed. Control requests, browser-view snapshots, and responses are size-bounded, and generated supervisor files refuse symlinked managed directories.
+The supervisor capability is a product-level boundary between terminal roles, not an operating-system sandbox. Only the singleton supervisor shell receives its control token, private socket path, skill, and PATH entry; the server stores only a token hash and rejects calls after that terminal exits or is killed. Control requests, browser-view snapshots, and responses are size-bounded, and generated supervisor files refuse symlinked managed directories.
 
-Full terminal scrollback and semantic agent transcripts are sensitive retained session data. They are reachable only through the supervisor control request path: the server validates the supervisor terminal ID and capability before querying the owning session broker, which independently requires a private broker-control token that terminal children never inherit. Regular terminal environments receive neither capability nor the supervisor CLI path, and the MCP adapter does not expose history tools. Transcript records are size-bounded and retained only with the terminal session, but may contain user messages, tool arguments, command output, and model responses; treat exported text or JSONL accordingly.
+Full terminal scrollback and semantic agent transcripts are sensitive retained session data. They are reachable only through the supervisor control request path: the server validates the supervisor terminal ID and capability before querying the owning session broker, which independently requires a private broker-control token that terminal children never inherit. Regular terminal environments receive neither capability nor the supervisor CLI path. The Supervisor exposes no MCP server or provider-specific tool adapter; all operations use the capability-checked CLI. Transcript records are size-bounded and retained only with the terminal session, but may contain user messages, tool arguments, command output, and model responses; treat exported text or JSONL accordingly.
 
 Every terminal still runs as the same operating-system user. A deliberately hostile same-UID process may be able to inspect another process through `/proc`, ptrace it, access its PTY, or otherwise recover inherited environment values. Preventing that requires separate Unix identities or sandboxing terminal processes, which term-server does not provide. Do not use the supervisor feature as a security boundary between mutually untrusted agents.
 
@@ -40,9 +40,12 @@ Secret values are held only in the owning session broker's memory and are zeroiz
 best-effort basis. API snapshots expose names and bounded use metadata, never values. A secret
 command is started by the broker with an allowlisted environment plus the one approved delivery
 variable, or with the value on standard input when explicitly requested; the agent process never
-receives the value. Exact output occurrences are redacted across stream boundaries, but transformed,
-encoded, hashed, or otherwise derived values cannot be reliably detected. Canceling the requester or
-closing its terminal kills the broker-started process group. This is not a sandbox: a hostile
+receives the value. The streaming redactor replaces raw values and bounded common Base64, Base32,
+hex, percent, escaped octal/hex/Unicode, binary, SHA-256, and SHA-512 forms across stdout/stderr and
+chunk boundaries with a marker naming the grant. Derived variants are enabled only for 4–1024-byte
+secrets to bound memory and false positives. Arbitrary transformations, encryption, compression,
+partial output, and unrecognized encodings cannot be reliably detected.
+Canceling the requester or closing its terminal kills the broker-started process group. This is not a sandbox: a hostile
 same-UID command can deliberately create a new session or process group and escape that cleanup.
 
 Sudo approvals cover one stored argument vector and working directory; no shell is added. The broker
