@@ -9,6 +9,7 @@ import {
   ChevronRight,
   ChevronsDownUp,
   CircleCheck,
+  Crown,
   CirclePause,
   CircleX,
   Download,
@@ -56,6 +57,7 @@ import {
   SIDEBAR_WIDTH_STORAGE_KEY,
 } from "../lib/sidebar-width";
 import { buildTerminalTree, type TerminalTreeNode } from "../lib/tree";
+import { supervisorContextActive } from "../lib/supervisor-context";
 import { FileExplorer } from "./FileExplorer";
 import { WorkingDuration } from "./WorkingDuration";
 
@@ -69,6 +71,8 @@ interface SidebarProps {
   attentionTerminalIds: Set<string>;
   artifactCounts: ReadonlyMap<string, number>;
   mobileOpen: boolean;
+  supervisor?: TerminalInfo;
+  supervisorCreating: boolean;
   creating: boolean;
   settingsActive: boolean;
   updateAvailable: boolean;
@@ -76,6 +80,7 @@ interface SidebarProps {
   previewSettings: TerminalPreviewSettings;
   pushover: PushoverConfig;
   theme: ThemeName;
+  onSupervisor: () => void;
   onMobileClose: () => void;
   onNew: (cwd?: string) => void;
   onOpen: (id: string) => void;
@@ -138,6 +143,8 @@ function TreeNode({
   if (!hasChildren && terminal) {
     const needsAttention = attentionTerminalIds.has(terminal.id);
     const artifactCount = artifactCounts.get(terminal.id) ?? 0;
+    const isSupervisor = terminal.kind === "supervisor";
+    const supervisorOutsideRoot = isSupervisor && !supervisorContextActive(terminal);
     const activityClass = terminal.agent
       ? `agent-row agent-${terminal.agent.status}`
       : terminal.command
@@ -145,8 +152,11 @@ function TreeNode({
         : "shell-row";
     return (
       <div
-        class={`tree-row terminal-row ${activityClass} ${needsAttention ? "activity-attention" : ""} ${activeIds.includes(terminal.id) ? "active" : ""}`}
+        class={`tree-row terminal-row ${isSupervisor ? "supervisor-row" : ""} ${supervisorOutsideRoot ? "supervisor-context-outside" : ""} ${activityClass} ${needsAttention ? "activity-attention" : ""} ${activeIds.includes(terminal.id) ? "active" : ""}`}
         data-terminal-id={terminal.id}
+        data-terminal-kind={terminal.kind}
+        data-supervisor={isSupervisor ? "true" : "false"}
+        data-supervisor-context={isSupervisor ? (supervisorOutsideRoot ? "outside" : "active") : undefined}
         style={{ "--depth": depth, "--workspace-color": terminal.color }}
         onPointerEnter={(event) => (
           onPreview(terminal, event.currentTarget, event.pointerType)
@@ -164,21 +174,23 @@ function TreeNode({
             onDragStart(terminal.id);
           }}
           onDragEnd={onDragEnd}
-          title={`${terminal.name} — ${terminal.cwd}`}
+          title={supervisorOutsideRoot
+            ? `Supervisor skill discovery is inactive outside ${terminal.supervisorRoot}`
+            : `${terminal.name} — ${terminal.cwd}`}
         >
-          <span class={`terminal-kind ${terminal.agent ? "agent" : "shell"}`} aria-hidden="true">
-            {terminal.agent ? <Bot size={15} /> : <TerminalSquare size={14} />}
+          <span class={`terminal-kind ${isSupervisor ? "supervisor" : terminal.agent ? "agent" : "shell"}`} aria-hidden="true" data-supervisor-identity={isSupervisor ? "sidebar" : undefined}>
+            {isSupervisor ? <Crown size={14} /> : terminal.agent ? <Bot size={15} /> : <TerminalSquare size={14} />}
           </span>
           <span class="terminal-copy">
             <span class="terminal-title">{terminal.name}</span>
             <span class="terminal-meta">
-              <span>
-                {terminal.agent
+              <span>{supervisorOutsideRoot
+                ? "Return to supervisor directory"
+                : terminal.agent
                   ? agentSubtitle(terminal.agent)
                   : terminal.command
                     ? commandSubtitle(terminal.command)
-                    : terminal.program}
-              </span>
+                    : isSupervisor ? "Supervisor shell" : terminal.program}</span>
               {artifactCount > 0 && (
                 <span
                   class="terminal-artifact-count"
@@ -304,10 +316,13 @@ export function Sidebar({
   attentionTerminalIds,
   artifactCounts,
   mobileOpen,
+  supervisor,
+  supervisorCreating,
   creating,
   settingsActive,
   updateAvailable,
   fileRoot,
+  onSupervisor,
   previewSettings,
   pushover,
   theme,
@@ -494,6 +509,22 @@ export function Sidebar({
             title={filesOpen ? "Terminal workspaces" : "File explorer"}
           >
             {filesOpen ? <TerminalSquare size={15} /> : <FolderSearch size={15} />}
+          </button>
+          <button
+            class={`icon-button supervisor-action ${supervisor ? "active" : ""}`}
+            onClick={onSupervisor}
+            disabled={supervisorCreating}
+            aria-busy={supervisorCreating}
+            aria-label={supervisorCreating
+              ? "Creating supervisor terminal"
+              : supervisor ? "Open supervisor terminal" : "Create supervisor terminal"}
+            title={supervisorCreating
+              ? "Creating supervisor terminal…"
+              : supervisor ? "Open supervisor terminal" : "Create supervisor terminal"}
+            data-supervisor-action="true"
+            data-supervisor-open={supervisor ? "true" : "false"}
+          >
+            <Crown size={15} />
           </button>
           {!filesOpen && (
             <>

@@ -15,6 +15,7 @@ const broker: SessionBrokerInfo = {
 
 const terminal = (id: string, version: string, commit: string): TerminalInfo => ({
   id,
+  kind: "regular",
   name: id,
   workspace: "~",
   path: `~/${id}`,

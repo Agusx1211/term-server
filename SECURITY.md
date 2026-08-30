@@ -15,7 +15,17 @@ Generated credentials and private keys are written with owner-only permissions o
 
 Official update metadata and checksum lists are signed with Ed25519. Installed releases verify the embedded public key before parsing release metadata, then verify the selected archive's signed size and SHA-256 checksum and the extracted binary's version and commit before installation. A checksum without a valid signature is not trusted.
 
+The rolling `main` and `beta` channels use the same signature and package verification. Changing channels requires an authenticated same-origin request and is persisted owner-only. Beta changes release cadence, not the trust model: it follows `dev` and may contain code that has not reached the release branch.
+
 Pi-generated titles and notification summaries are independently disabled by default. Enabling titles sends a bounded copy of the submitted task message to the selected Pi model provider. Enabling notification summaries sends a bounded, ANSI-sanitized tail of terminal output, which may contain source code, command output, paths, or secrets. Use only a provider appropriate for that data. term-server starts Pi without project context, sessions, skills, or built-in tools and exposes only a single metadata-result tool, but model-provider data handling remains governed by the selected provider.
+
+## Supervisor terminal boundary
+
+The supervisor capability is a product-level boundary between terminal roles, not an operating-system sandbox. Only the singleton supervisor shell receives its control token, private socket path, skill, PATH entry, and invocation-local provider adapters; the server stores only a token hash and rejects calls after that terminal exits or is killed. Control requests, browser-view snapshots, and responses are size-bounded, and generated supervisor files refuse symlinked managed directories.
+
+Every terminal still runs as the same operating-system user. A deliberately hostile same-UID process may be able to inspect another process through `/proc`, ptrace it, access its PTY, or otherwise recover inherited environment values. Preventing that requires separate Unix identities or sandboxing terminal processes, which term-server does not provide. Do not use the supervisor feature as a security boundary between mutually untrusted agents.
+
+Terminal screens and process output returned to a supervisor agent are untrusted content and can contain prompt-injection text. The embedded skill tells agents to treat that content as data, but model behavior is not an enforcement mechanism. Review destructive requests and keep normal provider approval policies enabled.
 
 ## Optional provider status modules
 

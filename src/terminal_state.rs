@@ -158,6 +158,14 @@ impl TerminalOutputState {
         }
     }
 
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub fn screen_size(&self) -> (u16, u16) {
+        self.terminal.parser.screen().size()
+    }
+
     pub fn grid_epoch(&self) -> u64 {
         self.grid_epoch
     }

@@ -11,6 +11,7 @@ const terminal = (
   commandStatus?: ForegroundCommandStatus,
 ): TerminalInfo => ({
   id: "terminal",
+  kind: "regular",
   name: "terminal",
   workspace: "~",
   path: "terminal",

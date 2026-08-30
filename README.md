@@ -25,6 +25,16 @@ curl -fsSL https://raw.githubusercontent.com/Agusx1211/term-server/main/install.
 ~/.local/bin/term-server
 ```
 
+To bootstrap the beta channel before the toggle is available locally:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Agusx1211/term-server/main/install.sh \
+  | TERM_SERVER_CHANNEL=beta sh
+TERM_SERVER_UPDATE_CHANNEL=beta ~/.local/bin/term-server
+```
+
+After the first login, enable **Settings → Updates → Receive beta releases**; that persisted selection replaces the startup environment override.
+
 The default locations are `~/.local/bin/term-server` and `~/.local/lib/term-server/client`. Override them with `TERM_SERVER_BIN_DIR` and `TERM_SERVER_INSTALL_DIR`. To inspect the installer before running it:
 
 ```bash
@@ -33,9 +43,9 @@ less install.sh
 sh install.sh
 ```
 
-`main` is a moving development channel. Pin a versioned release instead when stable releases become available.
+`main` is the rolling current release. `beta` is a signed prerelease built from every successful `dev` push after the full browser and packaged-release gates pass. In **Settings → Updates**, enable **Receive beta releases** to follow `beta`; turn it off to return to `main`. The selection is stored in term-server's data directory and survives restarts. Explicit version channels such as `v1.2.3` remain pinned and cannot be changed from the toggle.
 
-Installed releases check their configured channel for signed updates after login and every six hours. When an update is available, the sidebar and **Settings → Updates** show an **Update** action. Updating verifies the signed release manifest, target architecture, archive size and SHA-256 checksum, and the new binary's embedded version and source commit before replacing any files. The HTTPS process then restarts itself, keeps compatible older brokers available for their existing terminals, and starts the current broker for new terminals.
+Installed releases check their selected channel after login and every six hours. When an update is available, the sidebar and **Settings → Updates** show an **Update** action. Updating verifies the signed release manifest, channel, target architecture, archive size and SHA-256 checksum, and the new binary's embedded version and source commit before replacing any files. The HTTPS process then restarts itself, keeps compatible older brokers available for their existing terminals, and starts the current broker for new terminals.
 
 The broker is a hidden mode of the same executable. Brokers listen on generation-specific Unix sockets inside the data directory with user-only permissions and accept no network connections. An explicit service stop stops every broker and terminal; an in-process signed update leaves compatible brokers running. The broker protocol is versioned so future web processes can reject an incompatible handoff instead of silently corrupting a session.
 
@@ -55,6 +65,7 @@ On first boot, open `https://127.0.0.1:8090`. term-server prints a random passwo
 - **Agent-connected artifacts:** multiline handoffs stay attached to the terminal and agent that created them, with inline text, image, and PDF previews plus an optional full editor.
 - **Process visibility and control:** a lightweight Linux `/proc` sampler shows the complete live descendant process tree, foreground job, CPU and memory usage, and lets you send SIGTERM to a selected process. Command lines are secret-aware and redacted; input, output, and exited processes are not retained.
 - **Agent awareness:** Codex, Claude, Pi, OMP, and Hermes sessions show working, blocked, idle, and closed states. An agent waiting on an approval or a question is marked **Needs you** for as long as it waits, so a stalled agent is visible without opening it. An unseen return to idle gets a distinct bell until you focus that terminal. Alerts can appear in-app, as desktop notifications, in both places, or remain off. In-app cards inherit their terminal color and can be placed in any corner with a configurable dismissal time.
+- **Supervisor terminal:** one visibly marked, singleton terminal can inspect and control the other term-server sessions without embedding an AI provider into the server. Run OMP, Pi, Codex, Claude, or an ordinary shell command yourself; only descendants of that supervisor receive the embedded skill and scoped control tools. The tools expose terminal screens, input, names, process trees, creation and termination, plus open-tab listing and closure. They deliberately provide no project organizer, pane arranger, scheduler, or job system.
 - **Secure defaults:** loopback binding, HTTPS, Argon2 password hashing, signed HTTP-only SameSite cookies, origin enforcement, CSP, HSTS, login throttling, and bounded memory use.
 - **Deployment choices:** one native executable plus static browser assets, with Docker Compose and a systemd user service included.
 
@@ -144,6 +155,16 @@ thinking, running a command, waiting for approval, and compacting context. These
 the existing terminal subtitle; working, blocked, idle, ready, closed, and completion notifications
 keep using the existing state machine.
 
+### Supervisor terminal
+
+Use the compact crown action in the workspace header to create or reopen the singleton supervisor. It is a normal persistent terminal: there is no provider chooser and closing its pane does not stop it. Creation requests time out instead of leaving the control busy indefinitely. Run `omp`, `pi`, `codex`, or `claude` as usual, or stay in the shell.
+
+The terminal starts in a private managed directory containing provider-local instructions and the `term-server-supervisor` skill. Its `PATH` contains the matching control CLI, Codex and Claude receive invocation-local MCP configuration, OMP receives project-local MCP configuration, and Pi receives a project-local extension. Existing `HOME` and provider credential locations are left unchanged. Normal terminals receive none of this environment and cannot authenticate to the control socket.
+
+The sidebar row and pane header turn amber when the shell leaves the managed supervisor directory, and the pane shows the exact root to return to before starting an agent. Subdirectories remain valid because provider skill discovery walks their ancestors.
+
+The agent composes behavior from low-level primitives: list terminals and detected agents, read a rendered screen or bounded output tail, send text or named keys, create or rename a terminal, inspect or terminate a descendant process, and list or close open terminal panes and non-dirty resource tabs. Closing a pane leaves its PTY alive; killing a terminal ends it. There is no built-in “organize project,” layout-arrangement, delayed-action, scheduler, or job command.
+
 ### Blocked agents and screen detection
 
 An agent waiting on a person is its own state. A permission prompt, a question, or a menu leaves the
@@ -212,7 +233,7 @@ Run `term-server --help` for generated CLI help. CLI flags take precedence over 
 | `--cached-terminals` | `TERM_SERVER_CACHED_TERMINALS` | `16` | Mounted terminal renderers per browser tab; `0` keeps only visible panes |
 | `--client-dir` | `TERM_SERVER_CLIENT_DIR` | auto-detected | Compiled browser application |
 | `--disable-updates` | `TERM_SERVER_DISABLE_UPDATES` | off | Disable signed update checks and installation |
-| `--update-channel` | `TERM_SERVER_UPDATE_CHANNEL` | `main` | Signed release channel to follow |
+| `--update-channel` | `TERM_SERVER_UPDATE_CHANNEL` | `main` | Startup release channel; Settings persists `main`/`beta`, while version tags stay pinned |
 | — | `TERM_SERVER_RELEASE_BASE_URL` | GitHub releases | Alternate HTTPS release base URL |
 | `--log` | `TERM_SERVER_LOG` | `term_server=info,tower_http=info` | Rust tracing filter |
 

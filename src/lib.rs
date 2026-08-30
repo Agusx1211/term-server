@@ -15,6 +15,8 @@ pub mod debug_recording;
 pub mod files;
 pub mod pushover;
 pub mod status;
+#[cfg(unix)]
+pub mod supervisor;
 pub mod terminal;
 mod terminal_state;
 pub mod tls;

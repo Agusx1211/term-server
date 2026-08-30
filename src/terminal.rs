@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
@@ -178,10 +178,21 @@ pub struct ForegroundCommandInfo {
     pub started_at: u64,
     pub completed_at: Option<u64>,
 }
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TerminalKind {
+    #[default]
+    Regular,
+    Supervisor,
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalInfo {
+    #[serde(default)]
+    pub kind: TerminalKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_root: Option<PathBuf>,
     pub id: Uuid,
     pub name: String,
     pub workspace: String,
@@ -209,6 +220,26 @@ pub struct CreateTerminal {
     pub cwd: Option<PathBuf>,
     pub shell: Option<String>,
     pub clone_from: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateSupervisorTerminal {
+    #[serde(flatten)]
+    pub terminal: CreateTerminal,
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalScreenSnapshot {
+    pub screen: String,
+    pub tail: String,
+    pub rows: u16,
+    pub cols: u16,
+    pub alternate_screen: bool,
+    pub sequence: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1622,6 +1653,19 @@ impl TerminalSession {
         self.process_tracker.lock().snapshot()
     }
 
+    pub fn screen_snapshot(&self, tail_bytes: usize) -> TerminalScreenSnapshot {
+        let output = self.output.lock();
+        let (rows, cols) = output.screen_size();
+        TerminalScreenSnapshot {
+            screen: output.detection_text(),
+            tail: output.text_tail(tail_bytes),
+            rows,
+            cols,
+            alternate_screen: output.alternate_screen(),
+            sequence: output.sequence(),
+        }
+    }
+
     pub fn terminate_process(&self, process_id: &str) -> Result<(), ProcessSignalError> {
         #[cfg(target_os = "linux")]
         {
@@ -2614,6 +2658,26 @@ impl TerminalManager {
     }
 
     pub fn create(&self, request: CreateTerminal) -> Result<TerminalInfo, TerminalError> {
+        self.create_with(request, TerminalKind::Regular, BTreeMap::new())
+    }
+
+    pub fn create_supervisor(
+        &self,
+        request: CreateSupervisorTerminal,
+    ) -> Result<TerminalInfo, TerminalError> {
+        self.create_with(
+            request.terminal,
+            TerminalKind::Supervisor,
+            request.environment,
+        )
+    }
+
+    fn create_with(
+        &self,
+        request: CreateTerminal,
+        kind: TerminalKind,
+        environment: BTreeMap<String, String>,
+    ) -> Result<TerminalInfo, TerminalError> {
         self.prune_exited_sessions();
         let requested_name = request
             .path
@@ -2654,10 +2718,11 @@ impl TerminalManager {
             }
             (name, false)
         } else {
-            (executable_name(&shell), true)
+            (executable_name(&shell), kind == TerminalKind::Regular)
         };
         let workspace = workspace_for(&cwd, &self.home_directory);
         let path = terminal_path(&workspace, &name);
+        let supervisor_root = (kind == TerminalKind::Supervisor).then(|| cwd.clone());
 
         let id = Uuid::new_v4();
         let pty_system = native_pty_system();
@@ -2675,6 +2740,9 @@ impl TerminalManager {
         let mut command = CommandBuilder::new(&shell);
         command.cwd(&cwd);
         configure_terminal_environment(&mut command);
+        for (name, value) in environment {
+            command.env(name, value);
+        }
         command.env("TERM_SERVER_SESSION", id.to_string());
         if let (Some(executable), Some(socket)) = (&self.executable, &self.agent_event_socket) {
             command.env("TERM_SERVER_EXECUTABLE", executable);
@@ -2703,6 +2771,8 @@ impl TerminalManager {
         let (events, _) = broadcast::channel(TERMINAL_EVENT_CAPACITY);
         let session = Arc::new(TerminalSession {
             info: RwLock::new(TerminalInfo {
+                kind,
+                supervisor_root,
                 id,
                 name,
                 color: color_for(&workspace),

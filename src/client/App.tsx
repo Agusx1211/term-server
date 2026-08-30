@@ -16,6 +16,9 @@ import type {
   ArtifactSkillAction,
   AgentInfo,
   ArtifactEntry,
+  BrowserTabCommand,
+  BrowserTabCommandAck,
+  BrowserTabSnapshot,
   ClientConfig,
   DebugRecordingExport,
   DebugRecordingStatus,
@@ -27,10 +30,18 @@ import type {
   TerminalInfo,
   UpdateActivityView,
   UpdateStatus,
+  UpdateChannel,
   UploadedFile,
 } from "../shared/types";
 import { api, ApiError } from "./lib/api";
 import { withBrokerSessions } from "./lib/broker-generations";
+import {
+  DIRTY_RESOURCE_CLOSE_ERROR,
+  buildBrowserTabSnapshot,
+  commandAck,
+  decideBrowserTabCommand,
+  getBrowserViewId,
+} from "./lib/browser-tabs";
 import { buildPushoverMessage, pushoverBellEnabled } from "./lib/pushover";
 import {
   debugRecordingEventCount,
@@ -42,6 +53,7 @@ import {
   takeFrontendRecording,
 } from "./lib/debug-recording";
 import { installE2EDiagnostics } from "./lib/e2e-diagnostics";
+import { armSupervisorRequestTimeout } from "./lib/supervisor-request";
 import {
   agentNeedsAttention,
   parseViewedAgentRevisions,
@@ -336,6 +348,11 @@ export function App() {
     installE2EDiagnostics();
   }, []);
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
+  const browserViewIdRef = useRef<string>();
+  const [browserPresence, setBrowserPresence] = useState(() => ({
+    focused: typeof document !== "undefined" && document.hasFocus(),
+    visible: typeof document !== "undefined" && document.visibilityState === "visible",
+  }));
   const authGeneration = useRef(0);
   const [workspaceLoaded, setWorkspaceLoaded] = useState(false);
   const [terminals, setTerminals] = useState<TerminalInfo[]>([]);
@@ -351,8 +368,10 @@ export function App() {
   const uploadSequence = useRef(0);
   const [theme, setTheme] = useState<ThemeName>(initialTheme);
   const [creating, setCreating] = useState(false);
+  const [creatingSupervisor, setCreatingSupervisor] = useState(false);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
   const [checkingForUpdate, setCheckingForUpdate] = useState(false);
+  const [updatingUpdateChannel, setUpdatingUpdateChannel] = useState(false);
   const [installingUpdate, setInstallingUpdate] = useState(false);
   const [restartingBroker, setRestartingBroker] = useState(false);
   const [updatingAgentIntegration, setUpdatingAgentIntegration] =
@@ -384,6 +403,10 @@ export function App() {
   const [artifacts, setArtifacts] = useState<ArtifactEntry[]>([]);
   const [resources, setResources] = useState<ResourceTab[]>([]);
   const [activeResource, setActiveResource] = useState<string>();
+  const resourcesRef = useRef(resources);
+  resourcesRef.current = resources;
+  const activeResourceRef = useRef(activeResource);
+  activeResourceRef.current = activeResource;
   const knownArtifactIds = useRef(new Set<string>());
   const artifactsInitialized = useRef(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -408,6 +431,9 @@ export function App() {
   configRef.current = config;
   const activeIdRef = useRef(activeId);
   activeIdRef.current = activeId;
+  const browserSnapshotRef = useRef<BrowserTabSnapshot>();
+  const browserHeartbeatRef = useRef<() => void>();
+  const supervisorRequestRef = useRef<Promise<TerminalInfo> | null>(null);
 
   const trackAuthRequest = (): AbortController => {
     const controller = new AbortController();
@@ -423,6 +449,7 @@ export function App() {
     authGeneration.current += 1;
     for (const controller of authControllers.current) controller.abort();
     authControllers.current.clear();
+    browserHeartbeatRef.current = undefined;
     agentIntegrationsRequested.current = false;
     setAuthenticated(false);
   };
@@ -631,6 +658,7 @@ export function App() {
     setCheckingForUpdate(true);
     try {
       const status = await api.updateStatus();
+      if (status.channel !== configRef.current.updates.channel) return;
       setUpdateStatus(status);
       if (notify) {
         showNotice(
@@ -647,6 +675,23 @@ export function App() {
       }
     } finally {
       setCheckingForUpdate(false);
+    }
+  };
+
+  const updateUpdateChannel = async (channel: UpdateChannel) => {
+    if (channel === configRef.current.updates.channel) return;
+    setUpdatingUpdateChannel(true);
+    setUpdateStatus(null);
+    try {
+      const updates = await api.updateChannel(channel);
+      configRef.current = { ...configRef.current, updates };
+      setConfig((current) => ({ ...current, updates }));
+      await checkForUpdates();
+      showNotice(`Update channel changed to ${channel}`);
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : "Unable to change update channel");
+    } finally {
+      setUpdatingUpdateChannel(false);
     }
   };
 
@@ -763,6 +808,23 @@ export function App() {
     return () => {
       controller.abort();
       releaseAuthRequest(controller);
+    };
+  }, []);
+  useEffect(() => {
+    const updatePresence = () => {
+      setBrowserPresence({
+        focused: document.hasFocus(),
+        visible: document.visibilityState === "visible",
+      });
+    };
+    window.addEventListener("focus", updatePresence);
+    window.addEventListener("blur", updatePresence);
+    document.addEventListener("visibilitychange", updatePresence);
+    updatePresence();
+    return () => {
+      window.removeEventListener("focus", updatePresence);
+      window.removeEventListener("blur", updatePresence);
+      document.removeEventListener("visibilitychange", updatePresence);
     };
   }, []);
 
@@ -1059,7 +1121,39 @@ export function App() {
     })),
     [terminals],
   );
+  const supervisorActive = terminals.some((terminal) => (
+    terminal.kind === "supervisor" && terminal.status === "running"
+  ));
   const visibleTerminals = paneIds.map((id) => terminalById.get(id)).filter(Boolean) as TerminalInfo[];
+  const browserTabSnapshot = useMemo(
+    () => buildBrowserTabSnapshot({
+      title: documentTitle(terminals),
+      focused: browserPresence.focused,
+      visible: browserPresence.visible,
+      terminalPanes: paneIds.flatMap((id) => {
+        const terminal = terminalById.get(id);
+        return terminal ? [{ terminalId: terminal.id, label: terminal.name }] : [];
+      }),
+      activeTerminalId: activeId,
+      terminalViewActive: !activeResource && !settingsActive,
+      resources: resources.map(({ path, name, dirty }) => ({ path, name, dirty })),
+      activeResourcePath: activeResource,
+      settingsOpen,
+      settingsActive,
+    }),
+    [
+      terminals,
+      browserPresence,
+      paneIds,
+      terminalById,
+      activeId,
+      activeResource,
+      resources,
+      settingsOpen,
+      settingsActive,
+    ],
+  );
+  browserSnapshotRef.current = browserTabSnapshot;
   const renderedIds = [...mountedIds, ...paneIds.filter((id) => !mountedIds.includes(id))];
   const mountedTerminals = renderedIds.map((id) => terminalById.get(id)).filter(Boolean) as TerminalInfo[];
   const rectangles = useMemo(() => paneRects(layout), [layout]);
@@ -1165,19 +1259,29 @@ export function App() {
       document.removeEventListener("visibilitychange", markActiveActivityViewed);
     };
   }, [activeId, activeResource, settingsActive, mobileSidebar, paneIds]);
-
   const openTerminal = (id: string, split = false) => {
     setLayout((current) => {
       const currentIds = idsFromLayout(current);
-      if (currentIds.includes(id)) return current;
-      if (!current) return paneLeaf(id);
-      const targetId = activeId && currentIds.includes(activeId) ? activeId : currentIds[0]!;
-      if (split && currentIds.length < config.maxPanes) {
-        return arrangeLayout(current, id, targetId, "right", config.maxPanes) ?? current;
+      if (currentIds.includes(id)) {
+        layoutRef.current = current;
+        return current;
       }
-      return arrangeLayout(current, id, targetId, "center", config.maxPanes) ?? current;
+      if (!current) {
+        const next = paneLeaf(id);
+        layoutRef.current = next;
+        return next;
+      }
+      const targetId = activeIdRef.current && currentIds.includes(activeIdRef.current)
+        ? activeIdRef.current
+        : currentIds[0]!;
+      const next = split && currentIds.length < config.maxPanes
+        ? arrangeLayout(current, id, targetId, "right", config.maxPanes) ?? current
+        : arrangeLayout(current, id, targetId, "center", config.maxPanes) ?? current;
+      layoutRef.current = next;
+      return next;
     });
-    setActiveId(id);
+    activeIdRef.current = id;
+    activeResourceRef.current = undefined;
     setActiveResource(undefined);
     setSettingsActive(false);
     setMobileSidebar(false);
@@ -1186,6 +1290,7 @@ export function App() {
   const openSettings = () => {
     setSettingsOpen(true);
     setSettingsActive(true);
+    activeResourceRef.current = undefined;
     setActiveResource(undefined);
     setMobileSidebar(false);
   };
@@ -1211,6 +1316,7 @@ export function App() {
         dirty: false,
       };
       setResources((current) => current.some((resource) => resource.path === file.path) ? current : [...current, next]);
+      activeResourceRef.current = file.path;
       setActiveResource(file.path);
       setSettingsActive(false);
       setMobileSidebar(false);
@@ -1230,6 +1336,7 @@ export function App() {
         index === existing ? { ...tab, dirty: resource.dirty } : resource
       ));
     });
+    activeResourceRef.current = tab.path;
     setActiveResource(tab.path);
     setSettingsActive(false);
     setMobileSidebar(false);
@@ -1271,21 +1378,112 @@ export function App() {
     openTerminal(sessionId);
   };
 
-  const closeResource = (path: string) => {
-    const index = resources.findIndex((resource) => resource.path === path);
-    const resource = resources[index];
-    if (!resource) return;
-    if (resource.dirty && !confirm(`Close “${resource.name}” without saving?`)) return;
-    const next = resources.filter((candidate) => candidate.path !== path);
+  const closeResource = (path: string, promptForDirty = true): boolean => {
+    const currentResources = resourcesRef.current;
+    const index = currentResources.findIndex((resource) => resource.path === path);
+    const resource = currentResources[index];
+    if (!resource) return true;
+    if (resource.dirty && (!promptForDirty || !confirm(`Close “${resource.name}” without saving?`))) {
+      return false;
+    }
+    const next = currentResources.filter((candidate) => candidate.path !== path);
+    resourcesRef.current = next;
     setResources(next);
-    if (activeResource === path) setActiveResource(next[Math.min(index, next.length - 1)]?.path);
+    if (activeResourceRef.current === path) {
+      const nextActive = next[Math.min(index, next.length - 1)]?.path;
+      activeResourceRef.current = nextActive;
+      setActiveResource(nextActive);
+    }
+    return true;
   };
 
   const closePane = (id: string) => {
-    const next = removePaneAndSelect(layout, id, activeIdRef.current);
+    const next = removePaneAndSelect(layoutRef.current, id, activeIdRef.current);
+    layoutRef.current = next.layout;
+    activeIdRef.current = next.activeId;
     setLayout(next.layout);
     setActiveId(next.activeId);
   };
+  const applyBrowserTabCommand = (command: BrowserTabCommand): BrowserTabCommandAck => {
+    const decision = decideBrowserTabCommand(command, {
+      resources: resourcesRef.current,
+    });
+    if (!decision.ok) return commandAck(decision);
+
+    if (command.type === "closeTerminalPane") closePane(command.terminalId);
+    if (command.type === "closeResource" && !closeResource(command.path, false)) {
+      return { ok: false, error: DIRTY_RESOURCE_CLOSE_ERROR };
+    }
+    if (command.type === "closeSettings") closeSettings();
+    return commandAck(decision);
+  };
+  useEffect(() => {
+    if (!authenticated || !supervisorActive) {
+      browserHeartbeatRef.current = undefined;
+      return;
+    }
+
+    const viewId = browserViewIdRef.current ?? getBrowserViewId();
+    browserViewIdRef.current = viewId;
+    let disposed = false;
+    let inFlight = false;
+    let queued = false;
+    const sendHeartbeat = () => {
+      if (disposed || browserHeartbeatRef.current !== sendHeartbeat) return;
+      if (inFlight) {
+        queued = true;
+        return;
+      }
+      const snapshot = browserSnapshotRef.current;
+      if (!snapshot) return;
+
+      inFlight = true;
+      void (async () => {
+        try {
+          const heartbeat = await api.browserTabHeartbeat(viewId, snapshot);
+          for (const command of heartbeat.commands) {
+            let ack: BrowserTabCommandAck;
+            try {
+              ack = applyBrowserTabCommand(command);
+            } catch (error) {
+              ack = {
+                ok: false,
+                error: error instanceof Error ? error.message : "Unable to apply browser tab command",
+              };
+            }
+            try {
+              await api.ackBrowserTabCommand(viewId, command.id, ack);
+            } catch (error) {
+              if (error instanceof ApiError && error.status === 401) invalidateAuthentication();
+            }
+          }
+        } catch (error) {
+          if (!disposed && error instanceof ApiError && error.status === 401) {
+            invalidateAuthentication();
+          }
+        } finally {
+          inFlight = false;
+          if (queued) {
+            queued = false;
+            sendHeartbeat();
+          }
+        }
+      })();
+    };
+
+    browserHeartbeatRef.current = sendHeartbeat;
+    sendHeartbeat();
+    const timer = window.setInterval(sendHeartbeat, 1_000);
+    return () => {
+      disposed = true;
+      clearInterval(timer);
+      if (browserHeartbeatRef.current === sendHeartbeat) browserHeartbeatRef.current = undefined;
+    };
+  }, [authenticated, supervisorActive]);
+
+  useEffect(() => {
+    browserHeartbeatRef.current?.();
+  }, [browserTabSnapshot]);
 
   const forgetTerminal = (id: string) => {
     setTerminals((current) => current.filter((terminal) => terminal.id !== id));
@@ -1390,6 +1588,54 @@ export function App() {
     } finally {
       setCreating(false);
     }
+  };
+  const openSupervisor = () => {
+    const existing = terminalsRef.current.find((terminal) => (
+      terminal.kind === "supervisor" && terminal.status === "running"
+    ));
+    if (existing) {
+      openTerminal(existing.id);
+      return;
+    }
+    if (supervisorRequestRef.current) return;
+
+    const generation = authGeneration.current;
+    const controller = trackAuthRequest();
+    const cancelTimeout = armSupervisorRequestTimeout(controller);
+    setCreatingSupervisor(true);
+    const request = api.createSupervisor(controller.signal);
+    supervisorRequestRef.current = request;
+    void request
+      .then((created) => {
+        if (generation !== authGeneration.current) return;
+        const currentSupervisor = terminalsRef.current.find((terminal) => (
+          terminal.kind === "supervisor" && terminal.status === "running"
+        ));
+        const target = currentSupervisor ?? created;
+        if (!currentSupervisor) {
+          setTerminals((current) => (
+            [
+              ...current.filter((terminal) => terminal.kind !== "supervisor"),
+              created,
+            ].sort((left, right) => left.path.localeCompare(right.path))
+          ));
+        }
+        openTerminal(target.id);
+      })
+      .catch((error) => {
+        if (generation === authGeneration.current) {
+          const message = error instanceof DOMException && error.name === "AbortError"
+            ? "Supervisor creation timed out; try again"
+            : error instanceof Error ? error.message : "Unable to open supervisor";
+          showNotice(message);
+        }
+      })
+      .finally(() => {
+        cancelTimeout();
+        releaseAuthRequest(controller);
+        if (supervisorRequestRef.current === request) supervisorRequestRef.current = null;
+        setCreatingSupervisor(false);
+      });
   };
 
   const removeTerminal = async (terminal: TerminalInfo) => {
@@ -1847,6 +2093,10 @@ export function App() {
           attentionTerminalIds={attentionTerminalIds}
           artifactCounts={artifactCounts}
           mobileOpen={mobileSidebar}
+          supervisor={terminals.find((terminal) => (
+            terminal.kind === "supervisor" && terminal.status === "running"
+          ))}
+          supervisorCreating={creatingSupervisor}
           creating={creating}
           settingsActive={settingsActive}
           updateAvailable={updateStatus?.state === "available"}
@@ -1855,6 +2105,7 @@ export function App() {
           pushover={config.pushover}
           theme={theme}
           onMobileClose={closeMobileSidebar}
+          onSupervisor={openSupervisor}
           onNew={(cwd) => void createTerminal(cwd)}
           onOpen={(id) => openTerminal(id)}
           onSplit={(id) => openTerminal(id, true)}
@@ -1879,12 +2130,14 @@ export function App() {
               settingsOpen={settingsOpen}
               settingsActive={settingsActive}
               onTerminal={() => {
+                activeResourceRef.current = undefined;
                 setActiveResource(undefined);
                 setSettingsActive(false);
               }}
               onSettings={openSettings}
               onCloseSettings={closeSettings}
               onActivate={(path) => {
+                activeResourceRef.current = path;
                 setActiveResource(path);
                 setSettingsActive(false);
               }}
@@ -2079,9 +2332,13 @@ export function App() {
                   tabs={resources}
                   activePath={activeResource}
                   theme={theme}
-                  onDirty={(path, dirty) => setResources((current) => current.map((resource) => (
-                    resource.path === path ? { ...resource, dirty } : resource
-                  )))}
+                  onDirty={(path, dirty) => {
+                    const next = resourcesRef.current.map((resource) => (
+                      resource.path === path ? { ...resource, dirty } : resource
+                    ));
+                    resourcesRef.current = next;
+                    setResources(next);
+                  }}
                   onNotice={showNotice}
                   onOpenArtifactSession={returnToArtifactSession}
                   onDeleteArtifact={deleteArtifact}
@@ -2103,6 +2360,7 @@ export function App() {
                 updateStatus={updateStatus}
                 checkingForUpdate={checkingForUpdate}
                 installingUpdate={installingUpdate}
+                updatingUpdateChannel={updatingUpdateChannel}
                 restartingBroker={restartingBroker}
                 passwordManagedExternally={config.passwordManagedExternally}
                 notificationMode={notificationMode}
@@ -2133,6 +2391,7 @@ export function App() {
                   void updateArtifactSkill(provider, action)
                 )}
                 onCheckForUpdate={() => void checkForUpdates(true)}
+                onUpdateChannelChange={(channel) => void updateUpdateChannel(channel)}
                 onInstallUpdate={() => void installUpdate()}
                 onRestartBroker={() => void restartBroker()}
                 onNotificationModeChange={(mode) => void updateNotificationMode(mode)}

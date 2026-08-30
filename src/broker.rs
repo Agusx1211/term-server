@@ -17,6 +17,7 @@ use axum::{
     routing::{any, get, patch, post},
 };
 use bytes::Bytes;
+use futures_util::SinkExt;
 use http_body_util::{BodyExt, Full};
 use hyper::{Method, Request};
 use hyper_util::rt::TokioIo;
@@ -26,7 +27,9 @@ use tokio::{
     net::{UnixListener, UnixStream},
     sync::{Mutex, Notify, RwLock},
 };
-use tokio_tungstenite::{WebSocketStream, client_async};
+use tokio_tungstenite::{
+    WebSocketStream, client_async, tungstenite::Message as TungsteniteMessage,
+};
 use uuid::Uuid;
 
 use crate::{
@@ -35,8 +38,9 @@ use crate::{
     build::{self, BuildIdentity},
     config::Cli,
     terminal::{
-        AgentDetectionExplain, CreateTerminal, ProcessInspectorSnapshot, RenameTerminal,
-        TerminalInfo, TerminalManager, TerminalViewport, normalize_terminal_path,
+        AgentDetectionExplain, CreateSupervisorTerminal, CreateTerminal, ProcessInspectorSnapshot,
+        RenameTerminal, TerminalInfo, TerminalManager, TerminalScreenSnapshot, TerminalViewport,
+        normalize_terminal_path,
     },
     terminal_state::TerminalResume,
     workspace::{
@@ -65,6 +69,18 @@ struct HealthResponse {
     protocol_version: u32,
     build: BuildIdentity,
     sessions: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalScreenQuery {
+    #[serde(default)]
+    tail_bytes: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WriteTerminalInput {
+    data: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -138,6 +154,14 @@ impl BrokerClient {
             .await
     }
 
+    pub async fn create_supervisor(
+        &self,
+        request: CreateSupervisorTerminal,
+    ) -> Result<TerminalInfo, BrokerError> {
+        self.send_json(Method::POST, "/supervisor", Some(&request))
+            .await
+    }
+
     pub async fn rename(
         &self,
         id: Uuid,
@@ -162,6 +186,40 @@ impl BrokerClient {
     pub async fn agent_explain(&self, id: Uuid) -> Result<AgentDetectionExplain, BrokerError> {
         self.get_json(&format!("/terminals/{id}/agent-explain"))
             .await
+    }
+
+    pub async fn screen(
+        &self,
+        id: Uuid,
+        tail_bytes: usize,
+    ) -> Result<TerminalScreenSnapshot, BrokerError> {
+        self.get_json(&format!("/terminals/{id}/screen?tailBytes={tail_bytes}"))
+            .await
+    }
+
+    pub async fn write(&self, id: Uuid, data: String) -> Result<(), BrokerError> {
+        self.send_empty(
+            Method::POST,
+            &format!("/terminals/{id}/input"),
+            Some(&WriteTerminalInput { data }),
+        )
+        .await
+    }
+
+    async fn write_via_socket(&self, id: Uuid, data: String) -> Result<(), BrokerError> {
+        let mut socket = self.terminal_socket(id, None, None, false).await?;
+        socket
+            .send(TungsteniteMessage::Text(
+                serde_json::json!({ "type": "input", "data": data })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .map_err(|error| BrokerError::Unavailable(error.to_string()))?;
+        socket
+            .close(None)
+            .await
+            .map_err(|error| BrokerError::Unavailable(error.to_string()))
     }
 
     pub async fn pi_config(&self) -> Result<PiClientConfig, BrokerError> {
@@ -559,6 +617,23 @@ impl BrokerPool {
         Ok(self.current.terminal(terminal))
     }
 
+    pub async fn create_supervisor(
+        &self,
+        request: CreateSupervisorTerminal,
+    ) -> Result<TerminalInfo, BrokerError> {
+        let _guard = self.create_lock.lock().await;
+        let terminals = self.list().await?;
+        if let Some(path) = request.terminal.path.as_deref() {
+            ensure_unique_terminal_name(path, None, &terminals)?;
+        }
+        let terminal = self.current.client.create_supervisor(request).await?;
+        self.owners
+            .write()
+            .await
+            .insert(terminal.id, self.current.clone());
+        Ok(self.current.terminal(terminal))
+    }
+
     pub async fn rename(
         &self,
         id: Uuid,
@@ -590,6 +665,34 @@ impl BrokerPool {
 
     pub async fn agent_explain(&self, id: Uuid) -> Result<AgentDetectionExplain, BrokerError> {
         self.owner(id).await?.client.agent_explain(id).await
+    }
+
+    pub async fn screen(
+        &self,
+        id: Uuid,
+        tail_bytes: usize,
+    ) -> Result<TerminalScreenSnapshot, BrokerError> {
+        let generation = self.owner(id).await?;
+        match generation.client.screen(id, tail_bytes).await {
+            Ok(snapshot) => Ok(snapshot),
+            Err(error) if error.status() == Some(StatusCode::NOT_FOUND) => generation
+                .client
+                .agent_explain(id)
+                .await
+                .map(|explain| legacy_screen_snapshot(explain.screen, tail_bytes)),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn write(&self, id: Uuid, data: String) -> Result<(), BrokerError> {
+        let generation = self.owner(id).await?;
+        match generation.client.write(id, data.clone()).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.status() == Some(StatusCode::NOT_FOUND) => {
+                generation.client.write_via_socket(id, data).await
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub async fn pi_config(&self) -> Result<PiClientConfig, BrokerError> {
@@ -707,6 +810,33 @@ fn ensure_unique_terminal_name(
         });
     }
     Ok(())
+}
+
+fn legacy_screen_snapshot(screen: String, tail_bytes: usize) -> TerminalScreenSnapshot {
+    let rows = screen.lines().count().max(1).min(u16::MAX as usize) as u16;
+    let cols = screen
+        .lines()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or_default()
+        .min(u16::MAX as usize) as u16;
+    let tail = if tail_bytes == 0 {
+        String::new()
+    } else {
+        let mut start = screen.len().saturating_sub(tail_bytes);
+        while !screen.is_char_boundary(start) {
+            start += 1;
+        }
+        screen[start..].to_owned()
+    };
+    TerminalScreenSnapshot {
+        screen,
+        tail,
+        rows,
+        cols,
+        alternate_screen: false,
+        sequence: 0,
+    }
 }
 
 fn remote_error(status: StatusCode, bytes: &[u8]) -> BrokerError {
@@ -847,6 +977,7 @@ pub async fn run_session_broker(
         .route("/health", get(broker_health))
         .route("/config", axum::routing::put(configure_broker))
         .route("/pi", get(broker_pi_config).patch(update_broker_pi))
+        .route("/supervisor", post(create_broker_supervisor))
         .route(
             "/terminals",
             get(list_broker_terminals).post(create_broker_terminal),
@@ -857,6 +988,8 @@ pub async fn run_session_broker(
         )
         .route("/terminals/{id}/processes", get(broker_terminal_processes))
         .route("/terminals/{id}/agent-explain", get(broker_agent_explain))
+        .route("/terminals/{id}/screen", get(broker_terminal_screen))
+        .route("/terminals/{id}/input", post(broker_terminal_input))
         .route(
             "/terminals/{id}/agent-event",
             post(broker_terminal_agent_event),
@@ -934,6 +1067,21 @@ async fn create_broker_terminal(
     Ok((StatusCode::CREATED, Json(terminal)))
 }
 
+async fn create_broker_supervisor(
+    State(state): State<BrokerState>,
+    Json(request): Json<CreateSupervisorTerminal>,
+) -> Result<(StatusCode, Json<TerminalInfo>), BrokerApiError> {
+    let terminals = state.terminals.clone();
+    let terminal = tokio::task::spawn_blocking(move || terminals.create_supervisor(request))
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "broker supervisor creation task failed");
+            BrokerApiError::Internal
+        })?
+        .map_err(|error| BrokerApiError::BadRequest(error.to_string()))?;
+    Ok((StatusCode::CREATED, Json(terminal)))
+}
+
 async fn broker_terminal_agent_event(
     State(state): State<BrokerState>,
     AxumPath(id): AxumPath<Uuid>,
@@ -979,6 +1127,32 @@ async fn broker_terminal_processes(
         .get(id)
         .map(|terminal| Json(terminal.process_inspector()))
         .ok_or(BrokerApiError::NotFound)
+}
+
+async fn broker_terminal_screen(
+    State(state): State<BrokerState>,
+    AxumPath(id): AxumPath<Uuid>,
+    Query(query): Query<TerminalScreenQuery>,
+) -> Result<Json<TerminalScreenSnapshot>, BrokerApiError> {
+    state
+        .terminals
+        .get(id)
+        .map(|terminal| Json(terminal.screen_snapshot(query.tail_bytes.min(64 * 1024))))
+        .ok_or(BrokerApiError::NotFound)
+}
+
+async fn broker_terminal_input(
+    State(state): State<BrokerState>,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(request): Json<WriteTerminalInput>,
+) -> Result<StatusCode, BrokerApiError> {
+    state
+        .terminals
+        .get(id)
+        .ok_or(BrokerApiError::NotFound)?
+        .write(request.data.as_bytes())
+        .map_err(|error| BrokerApiError::BadRequest(error.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn broker_agent_explain(
@@ -1106,6 +1280,44 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("test broker did not start");
+    }
+
+    #[test]
+    fn legacy_screen_fallback_is_bounded_and_utf8_safe() {
+        let snapshot = legacy_screen_snapshot("alpha\nβeta".into(), 5);
+        assert_eq!(snapshot.screen, "alpha\nβeta");
+        assert_eq!(snapshot.tail, "βeta");
+        assert_eq!((snapshot.rows, snapshot.cols), (2, 5));
+        assert_eq!(snapshot.sequence, 0);
+    }
+
+    #[tokio::test]
+    async fn websocket_fallback_writes_to_a_compatible_broker() {
+        let (_directory, server, client) = start_test_broker(1024 * 1024).await;
+        let terminal = client
+            .create(CreateTerminal {
+                path: Some("legacy-write".into()),
+                cwd: Some(PathBuf::from("/tmp")),
+                shell: Some("/bin/cat".into()),
+                clone_from: None,
+            })
+            .await
+            .unwrap();
+        client
+            .write_via_socket(terminal.id, "LEGACY-WRITE\n".into())
+            .await
+            .unwrap();
+        let mut screen = String::new();
+        for _ in 0..50 {
+            screen = client.agent_explain(terminal.id).await.unwrap().screen;
+            if screen.contains("LEGACY-WRITE") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(screen.contains("LEGACY-WRITE"));
+        client.shutdown().await.unwrap();
+        server.await.unwrap();
     }
 
     async fn wait_for_control(
