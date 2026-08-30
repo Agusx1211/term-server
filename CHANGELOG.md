@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.16.1 - 2026-08-30
+
+Secret execution now redacts common encoded and hashed forms, and Supervisor control uses only its scoped CLI.
+
+### Changed
+
+- **CLI-only Supervisor controls.** The `term-server-supervisor` CLI is now the only Supervisor control interface. The JSON-RPC server, OMP and Claude MCP configuration, Codex and Claude wrappers, and Pi tool adapter have been removed; managed environment repair deletes those legacy files while preserving the shared skill and scoped CLI.
+
+### Security
+
+- **Encoded secret redaction.** Secret-bearing commands replace the named raw secret and bounded Base64, Base32, hexadecimal, percent-encoded, escaped, binary, SHA-256, and SHA-512 forms with `[REDACTED: NAME]`. One streaming matcher covers standard output, standard error, and chunk boundaries; derived patterns and pending output are zeroed after use.
+
+### Upgrade notes
+
+- No data migration is required. Starting the upgraded server repairs the managed Supervisor environment and removes legacy MCP and provider-specific adapter files.
+- Start a new agent session in the Supervisor after upgrading so it discovers the CLI-only skill environment. Existing terminal Access grants remain in memory only until their owning broker restarts. The release is safe for automatic installation over `0.16.0`.
+
 ## 0.16.0 - 2026-08-30
 
 Secret and sudo approvals now live inside each terminal, with one browser control surface and one bundled agent interface.
