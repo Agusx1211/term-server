@@ -11,6 +11,7 @@ import {
   ClipboardCopy,
   ClipboardPaste,
   CopyPlus,
+  Crown,
   EllipsisVertical,
   GripVertical,
   Hand,
@@ -59,6 +60,7 @@ import {
   MIN_TERMINAL_FONT_SIZE,
   terminalZoomPercent,
 } from "../lib/terminal-zoom";
+import { supervisorContextActive } from "../lib/supervisor-context";
 import { addTerminalStreamProtocol, closeTerminalSocket, TerminalSocketFailureTracker } from "../lib/terminal-socket";
 import {
   encodeBytesBase64,
@@ -286,6 +288,9 @@ export function TerminalPane({
   );
   const artifactSignature = artifacts.map((artifact) => artifact.id).join("\u0000");
   const artifactsVisible = artifactsOpen && artifacts.length > 0;
+  const isSupervisor = terminal.kind === "supervisor";
+  const supervisorOutsideRoot = isSupervisor && !supervisorContextActive(terminal);
+  const supervisorRoot = terminal.supervisorRoot ?? "the supervisor directory";
 
   useEffect(() => {
     const handle = diagnostics.current;
@@ -1866,11 +1871,14 @@ export function TerminalPane({
   return (
     <section
       role="region"
-      aria-label={`Terminal ${terminal.name}`}
+      aria-label={isSupervisor ? "Supervisor terminal" : `Terminal ${terminal.name}`}
       data-terminal-id={terminal.id}
       data-pane-id={paneId}
+      data-terminal-kind={terminal.kind}
+      data-supervisor={isSupervisor ? "true" : "false"}
+      data-supervisor-context={isSupervisor ? (supervisorOutsideRoot ? "outside" : "active") : undefined}
       ref={pane}
-      class={`terminal-pane ${active ? "active" : ""} ${artifactsVisible ? "artifacts-visible" : ""}`}
+      class={`terminal-pane ${isSupervisor ? "supervisor" : ""} ${supervisorOutsideRoot ? "supervisor-context-outside" : ""} ${active ? "active" : ""} ${artifactsVisible ? "artifacts-visible" : ""}`}
       style={{
         "--terminal-color": terminal.color,
         "--terminal-background": mixedTerminalBackground(theme, terminal.color),
@@ -1897,6 +1905,19 @@ export function TerminalPane({
           <GripVertical size={13} />
         </span>
         <span class="terminal-color" style={{ background: terminal.color }} />
+        {isSupervisor && (
+          <span
+            class={`supervisor-identity ${supervisorOutsideRoot ? "warning" : ""}`}
+            data-supervisor-identity="pane"
+            title={supervisorOutsideRoot
+              ? `Supervisor skill discovery is inactive outside ${supervisorRoot}`
+              : "Supervisor controls active"}
+          >
+            <Crown size={11} aria-hidden="true" />
+            {supervisorOutsideRoot && <TriangleAlert size={11} aria-hidden="true" />}
+            {supervisorOutsideRoot ? "SUPERVISOR · CONTEXT OFF" : "SUPERVISOR"}
+          </span>
+        )}
         <TerminalPath path={terminal.path} />
         {terminal.broker && (
           terminal.broker.version !== config.build.version
@@ -2050,6 +2071,14 @@ export function TerminalPane({
           )}
         </div>
       </header>
+      {supervisorOutsideRoot && (
+        <div class="supervisor-context-warning" role="status">
+          <TriangleAlert size={14} aria-hidden="true" />
+          <span>
+            Supervisor skill discovery is inactive here. Return to <code>{supervisorRoot}</code> before starting an agent.
+          </span>
+        </div>
+      )}
       <div class="terminal-body">
         <div
           ref={container}

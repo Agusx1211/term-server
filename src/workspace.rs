@@ -15,9 +15,10 @@ use crate::{
     ai::{PiClientConfig, PiService, UpdatePiSettings},
     debug_recording::DebugRecordingManager,
     terminal::{
-        CreateTerminal, ProcessInspectorSnapshot, ProcessSignalError, RenameTerminal,
-        TerminalError, TerminalEvent, TerminalInfo, TerminalManager, TerminalSession,
-        TerminalSizeState, TerminalViewport, terminate_descendant_process,
+        CreateSupervisorTerminal, CreateTerminal, ProcessInspectorSnapshot, ProcessSignalError,
+        RenameTerminal, TerminalError, TerminalEvent, TerminalInfo, TerminalManager,
+        TerminalScreenSnapshot, TerminalSession, TerminalSizeState, TerminalViewport,
+        terminate_descendant_process,
     },
     terminal_state::{
         SequencedOutput, SyncMode, TERMINAL_OUTPUT_FRAME_BYTES, TerminalResume, TerminalSync,
@@ -192,6 +193,26 @@ impl WorkspaceBackend {
         }
     }
 
+    pub async fn create_supervisor(
+        &self,
+        request: CreateSupervisorTerminal,
+    ) -> Result<TerminalInfo, WorkspaceError> {
+        match self {
+            Self::Local { terminals, .. } => {
+                let terminals = terminals.clone();
+                tokio::task::spawn_blocking(move || terminals.create_supervisor(request))
+                    .await
+                    .map_err(|error| WorkspaceError::Unavailable(error.to_string()))?
+                    .map_err(|error| WorkspaceError::Remote {
+                        status: StatusCode::BAD_REQUEST,
+                        message: error.to_string(),
+                    })
+            }
+            #[cfg(unix)]
+            Self::Broker(client) => client.create_supervisor(request).await,
+        }
+    }
+
     pub async fn rename(
         &self,
         id: Uuid,
@@ -256,6 +277,42 @@ impl WorkspaceBackend {
                 }),
             #[cfg(unix)]
             Self::Broker(client) => client.agent_explain(id).await,
+        }
+    }
+
+    pub async fn screen(
+        &self,
+        id: Uuid,
+        tail_bytes: usize,
+    ) -> Result<TerminalScreenSnapshot, WorkspaceError> {
+        match self {
+            Self::Local { terminals, .. } => terminals
+                .get(id)
+                .map(|terminal| terminal.screen_snapshot(tail_bytes.min(64 * 1024)))
+                .ok_or_else(|| WorkspaceError::Remote {
+                    status: StatusCode::NOT_FOUND,
+                    message: "terminal not found".to_owned(),
+                }),
+            #[cfg(unix)]
+            Self::Broker(client) => client.screen(id, tail_bytes.min(64 * 1024)).await,
+        }
+    }
+
+    pub async fn write(&self, id: Uuid, data: String) -> Result<(), WorkspaceError> {
+        match self {
+            Self::Local { terminals, .. } => terminals
+                .get(id)
+                .ok_or_else(|| WorkspaceError::Remote {
+                    status: StatusCode::NOT_FOUND,
+                    message: "terminal not found".to_owned(),
+                })?
+                .write(data.as_bytes())
+                .map_err(|error| WorkspaceError::Remote {
+                    status: StatusCode::BAD_REQUEST,
+                    message: error.to_string(),
+                }),
+            #[cfg(unix)]
+            Self::Broker(client) => client.write(id, data).await,
         }
     }
 

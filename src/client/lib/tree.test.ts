@@ -4,6 +4,7 @@ import { buildTerminalTree } from "./tree";
 
 const terminal = (id: string, workspace: string, name: string): TerminalInfo => ({
   id,
+  kind: "regular",
   name,
   workspace,
   path: `${workspace}/${name}`,

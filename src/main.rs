@@ -13,6 +13,8 @@ use axum_server::Handle;
 use clap::Parser;
 #[cfg(unix)]
 use term_server::broker::{BrokerClient, BrokerPool, legacy_socket_path, run_session_broker};
+#[cfg(unix)]
+use term_server::supervisor::{self, SupervisorService};
 use term_server::{
     activity_view::ActivityViewService,
     agent_events::read_hook_event,
@@ -37,6 +39,10 @@ const AGENT_EVENT_FORWARD_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    if supervisor::is_client_invocation() {
+        return supervisor::run_client().await.map_err(Into::into);
+    }
     let cli = Cli::parse();
     let executable = env::current_exe()?;
     if let Some(provider) = cli.agent_event.as_deref() {
@@ -98,11 +104,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tls = load_tls(&cli).await?;
     let address = cli.socket_addr()?;
     let workspace = load_workspace(&cli, &executable).await?;
+    #[cfg(unix)]
+    let supervisor = SupervisorService::new(workspace.clone(), &cli.data_dir, &executable).await?;
+    #[cfg(unix)]
+    supervisor.start().await?;
     let updates = Arc::new(UpdateService::new(
         client_directory.as_deref(),
         cli.update_channel.clone(),
         cli.release_base_url.clone(),
         cli.disable_updates,
+        &cli.data_dir,
     ));
     let handle = Handle::new();
     let server_control = ServerControl::new(handle.clone());
@@ -116,6 +127,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState {
         auth: loaded_auth.service,
         workspace: workspace.clone(),
+        #[cfg(unix)]
+        supervisor,
         login_limiter: Arc::new(LoginLimiter::default()),
         allowed_origins: cli.allowed_origins.clone().into(),
         secure: cli.is_https(),

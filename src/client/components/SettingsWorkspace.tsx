@@ -39,6 +39,7 @@ import type {
   SessionBrokerInfo,
   StatusModulesSettings,
   UpdateConfig,
+  UpdateChannel,
   UpdateStatus,
   UpdateStatusModulesSettings,
 } from "../../shared/types";
@@ -83,6 +84,7 @@ interface SettingsWorkspaceProps {
   updateStatus: UpdateStatus | null;
   checkingForUpdate: boolean;
   installingUpdate: boolean;
+  updatingUpdateChannel: boolean;
   restartingBroker: boolean;
   passwordManagedExternally: boolean;
   notificationMode: NotificationMode;
@@ -113,6 +115,7 @@ interface SettingsWorkspaceProps {
     action: ArtifactSkillAction,
   ) => void;
   onCheckForUpdate: () => void;
+  onUpdateChannelChange: (channel: UpdateChannel) => void;
   onInstallUpdate: () => void;
   onRestartBroker: () => void;
   onNotificationModeChange: (mode: NotificationMode) => void;
@@ -215,6 +218,7 @@ export function SettingsWorkspace({
   updateStatus,
   checkingForUpdate,
   installingUpdate,
+  updatingUpdateChannel,
   restartingBroker,
   passwordManagedExternally,
   notificationMode,
@@ -239,6 +243,7 @@ export function SettingsWorkspace({
   onAgentIntegration,
   onArtifactSkill,
   onCheckForUpdate,
+  onUpdateChannelChange,
   onInstallUpdate,
   onRestartBroker,
   onNotificationModeChange,
@@ -262,6 +267,7 @@ export function SettingsWorkspace({
   const outdatedBrokers = broker?.generations.filter(
     (generation) => !generation.current && generation.sessions > 0,
   ) ?? [];
+  const rollingUpdateChannel = updateConfig.channel === "main" || updateConfig.channel === "beta";
   const updatePreviewSettings = (changes: Partial<TerminalPreviewSettings>) => {
     onTerminalPreviewSettingsChange({ ...terminalPreviewSettings, ...changes });
   };
@@ -822,6 +828,27 @@ export function SettingsWorkspace({
                 <span>term-server v{build.version}</span>
                 <code title={build.commit}>{build.commit.slice(0, 12)}</code>
               </div>
+              <label class={`settings-toggle ${updateConfig.channel === "beta" ? "active" : ""}`}>
+                {updatingUpdateChannel
+                  ? <LoaderCircle class="spin" size={14} />
+                  : <Sparkles size={14} />}
+                <span>Receive beta releases</span>
+                <input
+                  type="checkbox"
+                  checked={updateConfig.channel === "beta"}
+                  disabled={!rollingUpdateChannel || updatingUpdateChannel || checkingForUpdate || installingUpdate}
+                  onChange={(event) => onUpdateChannelChange(
+                    event.currentTarget.checked ? "beta" : "main",
+                  )}
+                />
+              </label>
+              <p class="settings-hint">
+                {!rollingUpdateChannel
+                  ? `Pinned channel: ${updateConfig.channel}.`
+                  : updateConfig.channel === "beta"
+                    ? "Beta follows dev and may contain changes that have not reached main."
+                    : "Main follows the current release branch."}
+              </p>
               {broker?.restartRequired && (
                 <div class="settings-broker-warning">
                   <div class="settings-broker-warning-title">
@@ -892,7 +919,7 @@ export function SettingsWorkspace({
               )}
               {updateConfig.enabled && (
                 <p class="settings-hint">
-                  Channel: {updateConfig.channel}. Running terminals stay active while the server reconnects.
+                  Running terminals stay active while the server reconnects.
                 </p>
               )}
             </div>

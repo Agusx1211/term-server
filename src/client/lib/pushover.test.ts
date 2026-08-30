@@ -10,6 +10,7 @@ import {
 function terminal(overrides: Partial<TerminalInfo> = {}): TerminalInfo {
   return {
     id: "term-1",
+    kind: "regular",
     name: "fix the bug",
     workspace: "workspace",
     path: "/workspace",

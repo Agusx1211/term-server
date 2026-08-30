@@ -1,4 +1,5 @@
 export type TerminalStatus = "running" | "exited";
+export type TerminalKind = "regular" | "supervisor";
 export type AgentStatus = "working" | "blocked" | "idle" | "closed";
 
 export interface AgentActivity {
@@ -39,6 +40,9 @@ export interface UpdateActivityView {
 
 export interface TerminalInfo {
   id: string;
+  kind: TerminalKind;
+  /** Managed skill root for supervisor terminals; omitted by older brokers. */
+  supervisorRoot?: string | null;
   name: string;
   workspace: string;
   path: string;
@@ -57,6 +61,43 @@ export interface TerminalInfo {
   broker?: BuildInfo | null;
   /** Present on REST responses; broker-ready messages from older patch releases omit it. */
   activityViewed?: ActivityView;
+}
+
+export interface BrowserTerminalPaneSnapshot {
+  terminalId: string;
+  label: string;
+  active: boolean;
+}
+
+export interface BrowserResourceSnapshot {
+  path: string;
+  name: string;
+  dirty: boolean;
+  active: boolean;
+}
+
+export interface BrowserTabSnapshot {
+  title: string;
+  focused: boolean;
+  visible: boolean;
+  terminalPanes: BrowserTerminalPaneSnapshot[];
+  resources: BrowserResourceSnapshot[];
+  settingsOpen: boolean;
+  settingsActive: boolean;
+}
+
+export interface BrowserTabHeartbeat {
+  commands: BrowserTabCommand[];
+}
+
+export type BrowserTabCommand =
+  | { id: string; type: "closeTerminalPane"; terminalId: string }
+  | { id: string; type: "closeResource"; path: string }
+  | { id: string; type: "closeSettings" };
+
+export interface BrowserTabCommandAck {
+  ok: boolean;
+  error?: string;
 }
 
 export interface CreateTerminalRequest {
@@ -170,6 +211,8 @@ export interface SessionBrokerGenerationInfo extends BuildInfo {
   current: boolean;
 }
 
+export type UpdateChannel = "main" | "beta";
+
 export interface UpdateConfig {
   enabled: boolean;
   channel: string;
@@ -181,6 +224,7 @@ export interface ReleaseInfo extends BuildInfo {
 }
 
 export interface UpdateStatus {
+  channel: string;
   current: BuildInfo;
   state: "current" | "available" | "unavailable";
   latest: ReleaseInfo | null;

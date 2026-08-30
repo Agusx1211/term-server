@@ -42,6 +42,27 @@ interface CreatedTerminal {
   readonly name: string;
 }
 
+async function createFixtureTerminal(
+  page: Page,
+  terminalPath: string,
+  shell: string,
+): Promise<CreatedTerminal> {
+  return page.evaluate(async ({ path, shellPath }) => {
+    const response = await fetch("/api/terminals", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path, cwd: "/tmp", shell: shellPath }),
+    });
+    if (!response.ok) throw new Error(`terminal creation failed (${response.status})`);
+    const terminal = await response.json() as Partial<CreatedTerminal>;
+    if (typeof terminal.id !== "string" || typeof terminal.name !== "string") {
+      throw new Error("terminal creation response is missing identity");
+    }
+    return { id: terminal.id, name: terminal.name };
+  }, { path: terminalPath, shellPath: shell });
+}
+
 function runMarker(testInfo: { workerIndex: number; parallelIndex: number; repeatEachIndex: number; retry: number }, label: string): string {
   return `R02-${testInfo.workerIndex}-${testInfo.parallelIndex}-${testInfo.repeatEachIndex}-${testInfo.retry}-${label}`;
 }
@@ -279,33 +300,33 @@ test("R-02 Renderer transition dimension refresh @p1 @nightly @rendering @transi
   const workbench = new WorkbenchPage(page);
   await workbench.expectVisible();
 
-  const mountEvent = page.evaluate(async (timeout) => {
-    const api = (window as E2EWindow).__TERM_SERVER_E2E__;
-    if (!api) throw new Error("term-server E2E diagnostics are unavailable");
-    return api.waitForEvent((event) => event.type === "mount", { timeout });
-  }, WAIT_TIMEOUT_MS);
-  const createResponsePromise = page.waitForResponse((response) => {
-    const url = new URL(response.url());
-    return response.request().method() === "POST" && url.pathname === "/api/terminals";
-  });
-  await workbench.createTerminal();
-  const createResponse = await createResponsePromise;
-  expect(createResponse.ok()).toBe(true);
-  const created = await createResponse.json() as CreatedTerminal;
+  const created = await createFixtureTerminal(
+    page,
+    `r02-${runMarker(testInfo, "terminal")}`,
+    server.fixturePath,
+  );
   expect(created.id).toMatch(/^[A-Za-z0-9][A-Za-z0-9._-]*$/);
 
-  // Hold the real addon import so the initial DOM renderer can be measured and
-  // exercised before the WebGL transition. The timer is a renderer lifecycle
-  // control, not a test sleep; all progress below is event/barrier-driven.
+  // Hold the real addon import before the pane mounts so the initial DOM
+  // renderer can be measured and exercised before the WebGL transition.
   await page.evaluate(({ id }) => {
     const api = (window as E2EWindow).__TERM_SERVER_E2E__;
     if (!api) throw new Error("term-server E2E diagnostics are unavailable");
     api.controls.renderer.delayWebGL(id, 10_000);
   }, { id: created.id });
-
+  const mountEvent = page.evaluate(async ({ id, timeout }) => {
+    const api = (window as E2EWindow).__TERM_SERVER_E2E__;
+    if (!api) throw new Error("term-server E2E diagnostics are unavailable");
+    return api.waitForEvent(
+      (event) => event.type === "mount"
+        && event.terminalId === id
+        && event.snapshot.kind === "pane",
+      { timeout },
+    );
+  }, { id: created.id, timeout: WAIT_TIMEOUT_MS });
+  const terminal = await workbench.openTerminal({ id: created.id, name: created.name });
   const mounted = await mountEvent;
   expect(mounted.terminalId).toBe(created.id);
-  const terminal = workbench.terminal(created.id, created.name);
   await terminal.expectVisible();
   const terminalContainer = terminal.xtermHost;
   const terminalViewport = terminalContainer.locator(".xterm-screen");
