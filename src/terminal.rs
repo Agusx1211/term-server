@@ -787,7 +787,10 @@ impl SessionActivity {
             return;
         }
         if self.initial_title_prompt.is_none() {
-            self.initial_title_prompt = submitted_prompt;
+            self.initial_title_prompt = submitted_prompt.and_then(|prompt| {
+                let prompt = prompt.trim();
+                (!prompt.is_empty() && !prompt.starts_with('/')).then(|| prompt.to_owned())
+            });
         }
         let Some(prompt) = self.initial_title_prompt.clone() else {
             return;
@@ -5577,6 +5580,10 @@ mod tests {
             Some("approve the command".to_owned()),
         );
         assert_eq!(activity.pending_title_prompt, None);
+
+        activity.queue_title_for_submission(&AgentStatus::Idle, Some("/model".to_owned()));
+        assert_eq!(activity.pending_title_prompt, None);
+        assert_eq!(activity.initial_title_prompt, None);
 
         activity.queue_title_for_submission(
             &AgentStatus::Idle,
