@@ -204,6 +204,35 @@ const notificationDurations: Array<{
   { duration: 0, label: "Keep open" },
 ];
 
+const settingsSections = [
+  {
+    id: "workspace",
+    label: "Workspace",
+    description: "Appearance, terminal behavior, and browser limits",
+    Icon: LayoutDashboard,
+  },
+  {
+    id: "notifications",
+    label: "Notifications",
+    description: "Completion alerts and mobile push",
+    Icon: Bell,
+  },
+  {
+    id: "agents",
+    label: "Agents",
+    description: "Agent metadata, integrations, and skills",
+    Icon: Sparkles,
+  },
+  {
+    id: "system",
+    label: "System",
+    description: "Updates, diagnostics, and access",
+    Icon: Shield,
+  },
+] as const;
+
+type SettingsSection = (typeof settingsSections)[number]["id"];
+
 export function SettingsWorkspace({
   active,
   theme,
@@ -278,6 +307,9 @@ export function SettingsWorkspace({
     setPushoverAppKey(pushover.appKey);
   }, [pushover.userKey, pushover.appKey]);
   const pushoverKeysDirty = pushoverUserKey !== pushover.userKey || pushoverAppKey !== pushover.appKey;
+  const [activeSection, setActiveSection] = useState<SettingsSection>("workspace");
+  const activeSectionDetails = settingsSections.find(({ id }) => id === activeSection)
+    ?? settingsSections[0];
 
   return (
     <section class={`settings-workspace ${active ? "visible" : ""}`} aria-hidden={!active}>
@@ -286,12 +318,44 @@ export function SettingsWorkspace({
           <span class="settings-page-icon"><Settings size={24} /></span>
           <span>
             <h1>Settings</h1>
-            <p>Configure this browser and the term-server workspace.</p>
+            <p>Preferences for this browser and the term-server workspace.</p>
           </span>
         </header>
 
-        <div class="settings-grid">
-          <section class="settings-card">
+        <div class="settings-layout">
+          <nav class="settings-navigation" aria-label="Settings sections">
+            {settingsSections.map(({ id, label, description, Icon }) => (
+              <button
+                key={id}
+                type="button"
+                class={activeSection === id ? "active" : ""}
+                aria-label={label}
+                aria-current={activeSection === id ? "page" : undefined}
+                onClick={() => setActiveSection(id)}
+              >
+                <Icon size={16} />
+                <span>
+                  <b>{label}</b>
+                  <small>{description}</small>
+                </span>
+              </button>
+            ))}
+          </nav>
+
+          <main class="settings-content">
+            <header class="settings-section-header">
+              <activeSectionDetails.Icon size={18} />
+              <span>
+                <h2>{activeSectionDetails.label}</h2>
+                <p>{activeSectionDetails.description}</p>
+              </span>
+            </header>
+
+            <div class="settings-grid">
+          <section
+            class="settings-card"
+            hidden={activeSection !== "workspace"}
+          >
             <header><Sun size={16} /><h2>Appearance</h2></header>
             <p>Choose how the workspace is rendered in this browser.</p>
             <div class="theme-switch" role="group" aria-label="Color theme">
@@ -304,7 +368,10 @@ export function SettingsWorkspace({
             </div>
           </section>
 
-          <section class="settings-card">
+          <section
+            class="settings-card"
+            hidden={activeSection !== "workspace"}
+          >
             <header><LayoutDashboard size={16} /><h2>Terminal behavior</h2></header>
             <p>Control terminal creation and destructive actions in this browser.</p>
             <label class={`settings-toggle ${tileNewTerminals ? "active" : ""}`}>
@@ -327,6 +394,14 @@ export function SettingsWorkspace({
               />
             </label>
             <p class="settings-hint">Turn this off to make every terminal kill action immediate.</p>
+          </section>
+
+          <section
+            class="settings-card settings-card-wide"
+            hidden={activeSection !== "workspace"}
+          >
+            <header><Eye size={16} /><h2>Terminal previews</h2></header>
+            <p>Preview terminal contents from the workspace list without switching panes.</p>
             <label class={`settings-toggle ${terminalPreviewSettings.enabled ? "active" : ""}`}>
               <Eye size={14} />
               <span>Live terminal hover previews</span>
@@ -438,13 +513,19 @@ export function SettingsWorkspace({
                 Reset preview controls
               </button>
             </fieldset>
+          </section>
+
+          <section
+            class="settings-card terminal-resource-card"
+            hidden={activeSection !== "workspace"}
+          >
+            <header><Gauge size={16} /><h2>Terminal resources</h2></header>
+            <p>Balance instant switching and terminal history against browser memory.</p>
             <fieldset class="terminal-preview-setting">
               <legend>Kept-alive terminals</legend>
               <p class="settings-hint">
-                A kept-alive terminal holds its scrollback and its connection while it is off
-                screen, so switching back to it is instant and loses nothing. Beyond this many, the
-                least recently used one is discarded and has to be rebuilt from the server when you
-                return to it.
+                Keep recently used terminals mounted for instant switching. Higher values use more
+                browser memory.
               </p>
               <label class="terminal-preview-range">
                 <span>
@@ -463,9 +544,8 @@ export function SettingsWorkspace({
                   )}
                 />
                 <small>
-                  This browser only, and it is this browser that pays: each one holds its own
-                  scrollback in memory. Raise it freely for a workspace of quiet shells; a phone, or
-                  a row of agents that have each scrolled a long way, will want it lower.
+                  This browser pays the memory cost. Lower the limit on phones or when many agents
+                  have large scrollback histories.
                 </small>
               </label>
               {cachedTerminalsOverridden && (
@@ -481,8 +561,8 @@ export function SettingsWorkspace({
             <fieldset class="terminal-preview-setting">
               <legend>Terminal scrollback</legend>
               <p class="settings-hint">
-                This browser keeps its own terminal history. Changing the limit recreates each
-                mounted renderer without changing the terminal process or server history.
+                History kept by each terminal renderer in this browser. Changing it does not
+                restart terminal processes.
               </p>
               <label class="terminal-preview-range">
                 <span>
@@ -501,7 +581,7 @@ export function SettingsWorkspace({
                   )}
                 />
                 <small>
-                  Resolved browser value; the server default is {serverScrollbackLines.toLocaleString()} lines.
+                  Server default: {serverScrollbackLines.toLocaleString()} lines.
                 </small>
               </label>
               {scrollbackLinesOverridden && (
@@ -516,7 +596,10 @@ export function SettingsWorkspace({
             </fieldset>
           </section>
 
-          <section class="settings-card">
+          <section
+            class="settings-card"
+            hidden={activeSection !== "workspace"}
+          >
             <header><Gauge size={16} /><h2>Status bar limits</h2></header>
             <p>Show AI provider limit modules in the bottom status bar.</p>
             <label class={`settings-toggle ${statusModules.enabled ? "active" : ""}`}>
@@ -545,7 +628,10 @@ export function SettingsWorkspace({
             <p class="settings-hint">Small screens hide the limit modules unless this is on.</p>
           </section>
 
-          <section class="settings-card settings-card-wide">
+          <section
+            class="settings-card"
+            hidden={activeSection !== "agents"}
+          >
             <header><PackageOpen size={16} /><h2>Artifact skill</h2></header>
             <p>
               Use term-server&apos;s bundled artifact skill as the source of truth for every agent.
@@ -612,7 +698,10 @@ export function SettingsWorkspace({
             </p>
           </section>
 
-          <section class="settings-card settings-card-wide">
+          <section
+            class="settings-card"
+            hidden={activeSection !== "notifications"}
+          >
             <header><Bell size={16} /><h2>Completion notifications</h2></header>
             <p>Choose how agent and long-running command completion alerts behave in this browser.</p>
             <div class="notification-mode-grid" role="radiogroup" aria-label="Completion notification delivery">
@@ -682,7 +771,10 @@ export function SettingsWorkspace({
             </p>
           </section>
 
-          <section class="settings-card settings-card-wide">
+          <section
+            class="settings-card settings-card-wide"
+            hidden={activeSection !== "agents"}
+          >
             <header><Activity size={16} /><h2>Live agent activity</h2></header>
             <p>
               Add private native lifecycle events and retained semantic agent history without
@@ -768,7 +860,10 @@ export function SettingsWorkspace({
             </p>
           </section>
 
-          <section class="settings-card">
+          <section
+            class="settings-card"
+            hidden={activeSection !== "agents"}
+          >
             <header><Sparkles size={16} /><h2>Agent metadata</h2></header>
             <p>Use Pi to generate concise labels from bounded terminal context.</p>
             <label class={`settings-toggle ${pi.titlesEnabled ? "active" : ""} ${pi.available ? "" : "disabled"}`}>
@@ -820,7 +915,10 @@ export function SettingsWorkspace({
             )}
           </section>
 
-          <section class="settings-card">
+          <section
+            class="settings-card"
+            hidden={activeSection !== "system"}
+          >
             <header><Download size={16} /><h2>Updates</h2></header>
             <p>Install releases authenticated by the embedded signing key.</p>
             <div class="settings-update">
@@ -925,7 +1023,10 @@ export function SettingsWorkspace({
             </div>
           </section>
 
-          <section class="settings-card settings-card-wide">
+          <section
+            class="settings-card settings-card-wide"
+            hidden={activeSection !== "system"}
+          >
             <header><Video size={16} /><h2>Debug recording</h2></header>
             <p>
               Capture everything needed to debug terminal rendering problems. If a
@@ -998,7 +1099,10 @@ export function SettingsWorkspace({
             </p>
           </section>
 
-          <section class="settings-card settings-card-wide">
+          <section
+            class="settings-card"
+            hidden={activeSection !== "notifications"}
+          >
             <header><Bell size={16} /><h2>Pushover notifications</h2></header>
             <p>
               Get a mobile push notification when an agent finishes. Configure the
@@ -1073,7 +1177,10 @@ export function SettingsWorkspace({
             </p>
           </section>
 
-          <section class="settings-card">
+          <section
+            class="settings-card"
+            hidden={activeSection !== "system"}
+          >
             <header><Shield size={16} /><h2>Security</h2></header>
             <p>Manage access to this terminal server.</p>
             <ChangePassword
@@ -1082,6 +1189,8 @@ export function SettingsWorkspace({
             />
             <button class="settings-logout" onClick={onLogout}><LogOut size={14} /> Sign out</button>
           </section>
+            </div>
+          </main>
         </div>
       </div>
     </section>
