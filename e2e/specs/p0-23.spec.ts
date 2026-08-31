@@ -15,7 +15,8 @@ test("P0-23 Beta update channel persists through Settings @p0", async ({ page, b
   await new LoginPage(page).login();
   const workbench = new WorkbenchPage(page);
   await workbench.expectVisible();
-  await workbench.openSettings();
+  const settings = await workbench.openSettings();
+  await settings.openSection("System");
 
   const beta = page.getByRole("checkbox", { name: "Receive beta releases", exact: true });
   await expect(beta).not.toBeChecked();
@@ -31,6 +32,7 @@ test("P0-23 Beta update channel persists through Settings @p0", async ({ page, b
   await page.reload();
   await workbench.expectVisible();
   await workbench.openSettings();
+  await settings.openSection("System");
   const persisted = page.getByRole("checkbox", { name: "Receive beta releases", exact: true });
   await expect(persisted).toBeChecked();
   await expect(page.getByText("Beta follows dev and may contain changes that have not reached main.", {
