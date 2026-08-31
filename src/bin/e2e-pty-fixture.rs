@@ -264,12 +264,13 @@ impl RuntimeState {
         *hold = Some(token);
         true
     }
-    fn release(&self, token: &str) -> bool {
+    fn release(&self, token: &str, before_wake: impl FnOnce()) -> bool {
         let mut hold = lock_unpoisoned(&self.hold);
         if hold.as_deref() != Some(token) {
             return false;
         }
         *hold = None;
+        before_wake();
         self.hold_changed.notify_all();
         true
     }
@@ -807,11 +808,11 @@ impl InputParser {
     }
     fn release_immediately(&self, raw: &[u8], token: String) {
         self.output.record("command", json!({"operation": "RELEASE", "command_base64": base64::engine::general_purpose::STANDARD.encode(raw)}));
-        if self.runtime.release(&token) {
-            self.output
-                .record("release", json!({"token": token.clone()}));
-            self.output.marker("RELEASE", &[token]);
-        } else {
+        let released = self.runtime.release(&token, || {
+            self.output.record("release", json!({"token": &token}));
+            self.output.marker("RELEASE", std::slice::from_ref(&token));
+        });
+        if !released {
             self.output.error(raw, "release-token-not-held");
         }
     }

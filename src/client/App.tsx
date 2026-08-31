@@ -152,6 +152,10 @@ import { Login } from "./components/Login";
 import { Sidebar } from "./components/Sidebar";
 import { SettingsWorkspace } from "./components/SettingsWorkspace";
 import { StatusModules } from "./components/StatusModules";
+import {
+  useVirtualAudioController,
+  VirtualAudioControl,
+} from "./components/VirtualAudioControl";
 import { TermServerLogo } from "./components/TermServerLogo";
 import { WelcomeSection } from "./components/WelcomeSection";
 import { ResourceTabBar } from "./components/ResourceTabs";
@@ -180,6 +184,7 @@ const defaultConfig: ClientConfig = {
   secure: true,
   hostname: "",
   passwordManagedExternally: true,
+  virtualAudioAvailable: false,
   pi: {
     available: false,
     enabled: false,
@@ -357,6 +362,10 @@ export function App() {
   const [workspaceLoaded, setWorkspaceLoaded] = useState(false);
   const [terminals, setTerminals] = useState<TerminalInfo[]>([]);
   const [config, setConfig] = useState(defaultConfig);
+  const virtualAudio = useVirtualAudioController(
+    authenticated === true,
+    config.virtualAudioAvailable,
+  );
   const [layout, setLayout] = useState<PaneLayout | null>(initialPaneLayout);
   const [mountedIds, setMountedIds] = useState<string[]>(initialPanes);
   const [activeId, setActiveId] = useState<string>();
@@ -2096,6 +2105,7 @@ export function App() {
               </button>
             </nav>
           )}
+          <VirtualAudioControl controller={virtualAudio} placement="mobile" />
         </header>
         {mobileSidebar && <button class="sidebar-scrim" onClick={closeMobileSidebar} aria-label="Close sidebar" />}
         <Sidebar
@@ -2450,6 +2460,7 @@ export function App() {
           onMobileVisibilityChange={setStatusModulesMobileVisible}
         />
         <span class="statusbar-group statusbar-right">
+          <VirtualAudioControl controller={virtualAudio} placement="desktop" />
           <span
             class="statusbar-item statusbar-build"
             title={`term-server v${config.build.version} · ${config.build.commit}`}

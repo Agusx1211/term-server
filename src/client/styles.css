@@ -1368,6 +1368,51 @@ body.pane-resizing .layout-divider.horizontal { cursor: row-resize; }
 .statusbar-stream-issue { color: var(--statusbar-warn); }
 .statusbar-stream-issue.disconnected { color: var(--statusbar-error); }
 
+.virtual-audio-control { position: relative; flex: none; color: inherit; }
+.virtual-audio-mobile { display: none; }
+.virtual-audio-trigger {
+  height: 20px; display: flex; align-items: center; gap: 5px; padding: 0 4px;
+  border: 0; border-radius: 3px; background: transparent; color: inherit; font: inherit; cursor: pointer;
+}
+.virtual-audio-trigger:hover, .virtual-audio-trigger:active, .virtual-audio-trigger[aria-expanded="true"] {
+  background: color-mix(in srgb, currentColor 10%, transparent);
+}
+.virtual-audio-trigger.active { color: var(--statusbar-ok); }
+.virtual-audio-trigger.warning { color: var(--statusbar-warn); }
+.virtual-audio-state {
+  width: 7px; height: 7px; flex: none; border-radius: 50%; background: var(--statusbar-unconfigured);
+}
+.virtual-audio-state.active { background: var(--statusbar-ok); }
+.virtual-audio-state.warning { background: var(--statusbar-warn); }
+.virtual-audio-popover {
+  position: absolute; right: 0; bottom: calc(100% + 7px); z-index: 140;
+  width: min(340px, calc(100vw - 16px)); max-height: min(470px, calc(var(--visual-viewport-height) - 56px));
+  overflow-y: auto; padding: 12px; border: 1px solid var(--border-strong); border-radius: 7px;
+  background: var(--panel); color: var(--foreground); box-shadow: 0 10px 28px var(--shadow);
+  font-size: 11px;
+}
+.virtual-audio-header {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
+  padding-bottom: 9px; border-bottom: 1px solid var(--border);
+}
+.virtual-audio-header strong { font-size: 12px; }
+.virtual-audio-header span { color: var(--muted); font-size: 10px; }
+.virtual-audio-field { display: grid; gap: 6px; margin-top: 11px; }
+.virtual-audio-field > span { display: flex; align-items: center; gap: 6px; font-weight: 600; }
+.virtual-audio-field select {
+  width: 100%; height: 34px; padding: 0 9px; border: 1px solid var(--border);
+  border-radius: 5px; background: var(--input); color: var(--foreground); font: inherit;
+}
+.virtual-audio-field select:focus { border-color: var(--accent); outline: 1px solid var(--accent); }
+.virtual-audio-field small { color: var(--muted); font-size: 10px; }
+.virtual-audio-routes {
+  display: flex; flex-wrap: wrap; gap: 5px 12px; margin-top: 12px; padding-top: 9px;
+  border-top: 1px solid var(--border); color: var(--muted); font-size: 10px;
+}
+.virtual-audio-note, .virtual-audio-error { margin: 9px 0 0; line-height: 1.4; }
+.virtual-audio-note { color: var(--muted); }
+.virtual-audio-error { color: var(--status-error); overflow-wrap: anywhere; }
+
 .statusbar-modules {
   min-width: 0; flex: 1 1 auto; position: relative; display: flex; align-items: center; overflow: visible;
 }
@@ -1556,6 +1601,19 @@ body.pane-resizing .layout-divider.horizontal { cursor: row-resize; }
   }
   .mobile-pane-navigation button:hover, .mobile-pane-navigation button:active { background: var(--hover); color: var(--foreground); }
   .mobile-pane-navigation span { min-width: 30px; color: var(--subtle); font: 10px ui-monospace, monospace; text-align: center; }
+  .virtual-audio-desktop { display: none; }
+  .virtual-audio-mobile { display: flex; align-self: flex-end; }
+  .virtual-audio-mobile .virtual-audio-trigger {
+    width: 44px; height: var(--mobile-toolbar-height); justify-content: center; padding: 0;
+    color: var(--muted);
+  }
+  .virtual-audio-mobile .virtual-audio-trigger.active { color: var(--status-ok); }
+  .virtual-audio-mobile .virtual-audio-trigger.warning { color: var(--status-warn); }
+  .virtual-audio-mobile .virtual-audio-trigger-label { display: none; }
+  .virtual-audio-mobile .virtual-audio-popover {
+    top: calc(100% + 6px); right: 0; bottom: auto;
+    max-height: calc(var(--visual-viewport-height) - var(--mobile-toolbar-height) - env(safe-area-inset-top) - 14px);
+  }
   .workspace-area { grid-row: 2; width: 100%; }
 
   .mobile-only { display: inline-grid; }
