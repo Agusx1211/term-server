@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.17.0 - 2026-08-31
+
+Browser audio can now act as a shared virtual microphone and speaker for voice-capable tools running on the terminal host.
+
+### Added
+
+- **Virtual microphone and speaker.** The new desktop and mobile **Audio** panel independently routes a selected browser microphone into the host's default **Term Server Microphone** and host speaker audio back to a selected browser output. Concurrent microphone inputs are averaged, speaker audio fans out to every listening tab, each direction uses a bounded 60 ms jitter buffer, and either route can remain **Off**.
+- **Broker-managed audio lifecycle.** Virtual PulseAudio or PipeWire Pulse compatibility devices are created on demand, previous host defaults are restored on clean shutdown, and stale devices and defaults are repaired after a crash. The dedicated 48 kHz mono PCM WebSocket is authenticated and origin-checked; audio is never persisted or included in debug recordings.
+
+### Upgrade notes
+
+- No data migration is required. Virtual audio is optional and Linux-only; it requires a PulseAudio server or PipeWire Pulse compatibility service, `pactl`, `parec`, `module-pipe-source`, and `module-pipe-sink`. Missing components keep the Audio panel off without affecting terminals.
+- Reload open browser pages to load the Audio panel and worklet. The release is safe for automatic installation over `0.16.2`.
+
 ## 0.16.2 - 2026-08-31
 
 Terminal navigation and Supervisor coordination are clearer, with pending access approvals visible from the workspace.
