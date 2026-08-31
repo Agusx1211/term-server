@@ -14,16 +14,25 @@ export interface AgentStatusPresentation {
 /**
  * How an agent's state reads in the sidebar and on a pane header.
  *
- * A blocked agent outranks an unseen completion: it is waiting on a person
- * right now, where a completion has already happened and will keep. Blocked is
- * also never "seen away" the way a completion is, because the condition holds
- * until someone answers it.
+ * Pending access and a blocked agent outrank an unseen completion: both are
+ * waiting on a person right now, where a completion has already happened and
+ * will keep. Neither is "seen away" because the condition holds until someone
+ * answers it.
  */
 export function agentStatusPresentation(
   agent: Pick<AgentInfo, "kind" | "status">,
   needsAttention: boolean,
+  pendingAccessRequests = 0,
 ): AgentStatusPresentation {
   const kind = agent.kind || "agent";
+  if (pendingAccessRequests > 0) {
+    const request = pendingAccessRequests === 1 ? "request" : "requests";
+    return {
+      tone: "blocked",
+      label: "Needs you",
+      description: `${kind} is waiting for ${pendingAccessRequests} access ${request}`,
+    };
+  }
   if (agent.status === "blocked") {
     return { tone: "blocked", label: "Needs you", description: `${kind} is waiting for input` };
   }

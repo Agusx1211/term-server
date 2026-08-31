@@ -24,6 +24,7 @@ import {
   Radio,
   Search,
   Settings,
+  ShieldCheck,
   SplitSquareHorizontal,
   TerminalSquare,
   Trash2,
@@ -145,6 +146,8 @@ function TreeNode({
   if (!hasChildren && terminal) {
     const needsAttention = attentionTerminalIds.has(terminal.id);
     const artifactCount = artifactCounts.get(terminal.id) ?? 0;
+    const pendingAccessRequests = terminal.pendingAccessRequests ?? 0;
+    const waitingForAccess = pendingAccessRequests > 0;
     const isSupervisor = terminal.kind === "supervisor";
     const supervisorOutsideRoot = isSupervisor && !supervisorContextActive(terminal);
     const activityClass = terminal.agent
@@ -154,12 +157,13 @@ function TreeNode({
         : "shell-row";
     return (
       <div
-        class={`tree-row terminal-row ${isSupervisor ? "supervisor-row" : ""} ${pinned ? "supervisor-pinned-row" : ""} ${supervisorOutsideRoot ? "supervisor-context-outside" : ""} ${activityClass} ${needsAttention ? "activity-attention" : ""} ${activeIds.includes(terminal.id) ? "active" : ""}`}
+        class={`tree-row terminal-row ${isSupervisor ? "supervisor-row" : ""} ${pinned ? "supervisor-pinned-row" : ""} ${supervisorOutsideRoot ? "supervisor-context-outside" : ""} ${activityClass} ${waitingForAccess ? "access-attention" : needsAttention ? "activity-attention" : ""} ${activeIds.includes(terminal.id) ? "active" : ""}`}
         data-terminal-id={terminal.id}
         data-terminal-kind={terminal.kind}
         data-supervisor={isSupervisor ? "true" : "false"}
         data-supervisor-context={isSupervisor ? (supervisorOutsideRoot ? "outside" : "active") : undefined}
         data-supervisor-pinned={pinned ? "true" : undefined}
+        data-pending-access-requests={waitingForAccess ? String(pendingAccessRequests) : undefined}
         style={{ "--depth": depth, "--workspace-color": terminal.color }}
         onPointerEnter={(event) => (
           onPreview(terminal, event.currentTarget, event.pointerType)
@@ -204,8 +208,14 @@ function TreeNode({
               )}
             </span>
           </span>
-          {terminal.agent && <AgentState agent={terminal.agent} needsAttention={needsAttention} />}
-          {!terminal.agent && terminal.command && (
+          {(terminal.agent || waitingForAccess) && (
+            <AgentState
+              agent={terminal.agent}
+              needsAttention={needsAttention}
+              pendingAccessRequests={pendingAccessRequests}
+            />
+          )}
+          {!waitingForAccess && !terminal.agent && terminal.command && (
             <CommandState command={terminal.command} needsAttention={needsAttention} />
           )}
           {terminal.status === "exited" && <span class="tree-status">{terminal.exitCode ?? "exit"}</span>}
@@ -685,17 +695,36 @@ const AGENT_STATUS_ICONS: Record<AgentStatusTone, typeof Activity> = {
   closed: CircleX,
 };
 
-function AgentState({ agent, needsAttention }: { agent: AgentInfo; needsAttention: boolean }) {
-  const { tone, label, description } = agentStatusPresentation(agent, needsAttention);
-  const Icon = AGENT_STATUS_ICONS[tone];
+function AgentState({
+  agent,
+  needsAttention,
+  pendingAccessRequests,
+}: {
+  agent: AgentInfo | null;
+  needsAttention: boolean;
+  pendingAccessRequests: number;
+}) {
+  const presentationAgent = agent ?? { kind: "agent", status: "working" as const };
+  const { tone, label, description } = agentStatusPresentation(
+    presentationAgent,
+    needsAttention,
+    pendingAccessRequests,
+  );
+  const Icon = pendingAccessRequests > 0 ? ShieldCheck : AGENT_STATUS_ICONS[tone];
+  const working = tone === "working" && agent;
   return (
     <span
       class={`activity-status-badge ${tone}`}
-      title={agent.summary ?? description}
+      title={pendingAccessRequests > 0 ? description : agent?.summary ?? description}
       aria-label={tone === "working" ? undefined : description}
     >
       <Icon size={12} strokeWidth={2.2} aria-hidden="true" />
-      {tone === "working" ? <WorkingDuration since={agent.statusChangedAt} /> : <span class="activity-status-label">{label}</span>}
+      {working
+        ? <WorkingDuration since={agent.statusChangedAt} />
+        : <span class="activity-status-label">{label}</span>}
+      {pendingAccessRequests > 0 && (
+        <span class="activity-status-count">{pendingAccessRequests}</span>
+      )}
     </span>
   );
 }

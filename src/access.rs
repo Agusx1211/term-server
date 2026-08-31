@@ -22,6 +22,8 @@ use tokio::{
 };
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
+
+use crate::terminal::TerminalInfo;
 const ACCESS_EVENT_CAPACITY: usize = 256;
 const ACCESS_ACTIVITY_LIMIT: usize = 100;
 const MAX_DESCRIPTION_BYTES: usize = 2 * 1024;
@@ -471,6 +473,29 @@ impl AccessManager {
             requests,
             grants,
             activity,
+        }
+    }
+
+    pub fn populate_pending_request_counts(&self, terminals: &mut [TerminalInfo]) {
+        for terminal in terminals.iter_mut() {
+            terminal.pending_access_requests = Some(0);
+        }
+        let state = self.inner.state.lock();
+        for request in state
+            .requests
+            .values()
+            .filter(|request| request.state == AccessRequestState::Pending)
+        {
+            if let Some(terminal) = terminals
+                .iter_mut()
+                .find(|terminal| terminal.id == request.terminal_id)
+            {
+                let count = terminal
+                    .pending_access_requests
+                    .as_mut()
+                    .expect("pending access count initialized");
+                *count = count.saturating_add(1);
+            }
         }
     }
 
@@ -2083,6 +2108,7 @@ fn current_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal::{TerminalKind, TerminalStatus};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
@@ -2092,6 +2118,83 @@ mod tests {
             start_ticks: current_process_start_ticks().unwrap_or_default(),
             agent: "omp".to_owned(),
         }
+    }
+
+    fn terminal_info(id: Uuid) -> TerminalInfo {
+        TerminalInfo {
+            kind: TerminalKind::Regular,
+            supervisor_root: None,
+            id,
+            name: "test".to_owned(),
+            workspace: "test".to_owned(),
+            path: "test".to_owned(),
+            cwd: PathBuf::from("/tmp"),
+            shell: "sh".to_owned(),
+            program: "sh".to_owned(),
+            color: "#ffffff".to_owned(),
+            agent: None,
+            command: None,
+            created_at: 0,
+            pid: None,
+            status: TerminalStatus::Running,
+            exit_code: None,
+            clients: 0,
+            pending_access_requests: None,
+            broker: None,
+        }
+    }
+
+    fn pending_secret(
+        manager: &AccessManager,
+        terminal_id: Uuid,
+        name: &str,
+    ) -> AccessSubscription {
+        manager
+            .request_secret(
+                terminal_id,
+                AgentSecretRequest {
+                    context: context(),
+                    name: name.to_owned(),
+                    description: "Use the service".to_owned(),
+                },
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn pending_request_counts_follow_request_lifecycle() {
+        let manager = AccessManager::default();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let _subscriptions = [
+            pending_secret(&manager, first, "FIRST_TOKEN"),
+            pending_secret(&manager, first, "SECOND_TOKEN"),
+            pending_secret(&manager, second, "OTHER_TOKEN"),
+        ];
+        let mut terminals = [
+            terminal_info(first),
+            terminal_info(second),
+            terminal_info(Uuid::new_v4()),
+        ];
+
+        manager.populate_pending_request_counts(&mut terminals);
+        assert_eq!(terminals[0].pending_access_requests, Some(2));
+        assert_eq!(terminals[1].pending_access_requests, Some(1));
+        assert_eq!(terminals[2].pending_access_requests, Some(0));
+
+        let resolved = manager.snapshot(first).requests.remove(0);
+        manager
+            .reject(
+                first,
+                resolved.id,
+                AccessDecision {
+                    request_hash: resolved.request_hash,
+                    comment: None,
+                },
+            )
+            .unwrap();
+        manager.populate_pending_request_counts(&mut terminals);
+        assert_eq!(terminals[0].pending_access_requests, Some(1));
     }
 
     #[tokio::test]

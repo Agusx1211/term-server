@@ -57,6 +57,8 @@ export interface TerminalInfo {
   status: TerminalStatus;
   exitCode: number | null;
   clients: number;
+  /** Pending secret or sudo requests; broker-ready messages and older brokers omit it. */
+  pendingAccessRequests?: number;
   /** Present on REST responses; broker-ready messages omit it. */
   broker?: BuildInfo | null;
   /** Present on REST responses; broker-ready messages from older patch releases omit it. */
