@@ -212,6 +212,9 @@ pub struct TerminalInfo {
     pub status: TerminalStatus,
     pub exit_code: Option<u32>,
     pub clients: usize,
+    /// Populated by the access manager on list responses; session-ready messages omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_access_requests: Option<usize>,
     #[serde(default)]
     pub broker: Option<BuildIdentity>,
 }
@@ -2892,6 +2895,7 @@ impl TerminalManager {
                 status: TerminalStatus::Running,
                 exit_code: None,
                 clients: 0,
+                pending_access_requests: None,
                 broker: None,
             }),
             master: Mutex::new(pair.master),

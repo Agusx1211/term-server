@@ -21,6 +21,14 @@ describe("agent status presentation", () => {
     expect(agentStatusPresentation(agent("blocked"), true).tone).toBe("blocked");
   });
 
+  it("surfaces pending access over a working or completed state", () => {
+    expect(agentStatusPresentation(agent("working"), true, 2)).toEqual({
+      tone: "blocked",
+      label: "Needs you",
+      description: "codex is waiting for 2 access requests",
+    });
+  });
+
   it("shows an unseen completion as ready", () => {
     expect(agentStatusPresentation(agent("idle"), true)).toEqual({
       tone: "attention",

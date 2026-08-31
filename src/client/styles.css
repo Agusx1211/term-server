@@ -208,9 +208,11 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
 .terminal-row.command-running { background: color-mix(in srgb, #4daafc 7%, var(--sidebar)); }
 .terminal-row.command-live { background: color-mix(in srgb, #3fb950 7%, var(--sidebar)); }
 .terminal-row.command-completed { background: color-mix(in srgb, #8c959f 5%, var(--sidebar)); }
+.terminal-row.access-attention { background: color-mix(in srgb, #f0883e 12%, var(--sidebar)); }
 .terminal-row.activity-attention { background: color-mix(in srgb, #c586c0 12%, var(--sidebar)); }
 .terminal-row.active { box-shadow: inset 2px 0 0 var(--workspace-color); }
 .terminal-row.activity-attention.active { background: color-mix(in srgb, #c586c0 16%, var(--selected)); }
+.terminal-row.access-attention.active { background: color-mix(in srgb, #f0883e 16%, var(--selected)); }
 .terminal-row:hover { background: var(--hover); }
 .tree-main { height: 100%; min-width: 0; flex: 1; display: flex; align-items: center; gap: 5px; border: 0; padding: 0; background: transparent; text-align: left; cursor: pointer; }
 .terminal-drag-source { cursor: grab; }
@@ -279,6 +281,10 @@ body.sidebar-resizing, body.sidebar-resizing * { cursor: col-resize !important; 
 .activity-status-badge.attention, .pane-activity.attention { --activity-color: #c586c0; }
 .activity-status-badge.blocked, .pane-activity.blocked { --activity-color: #f0883e; }
 .activity-status-badge.blocked { min-width: 72px; }
+.activity-status-count {
+  min-width: 14px; height: 14px; display: inline-grid; place-items: center; padding: 0 3px; border-radius: 7px;
+  background: color-mix(in srgb, var(--activity-color) 24%, var(--sidebar)); font-variant-numeric: tabular-nums; letter-spacing: 0;
+}
 .activity-status-badge.attention, .pane-activity.attention,
 .activity-status-badge.blocked, .pane-activity.blocked {
   animation: activity-attention-arrive .48s cubic-bezier(.2, .9, .25, 1.25) both;

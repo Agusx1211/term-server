@@ -29,7 +29,6 @@ interface AccessPanelProps {
   open: boolean;
   terminal: TerminalInfo;
   onClose: () => void;
-  onPendingCountChange: (count: number) => void;
   onNotice: (message: string) => void;
 }
 
@@ -45,7 +44,6 @@ export function AccessPanel({
   open,
   terminal,
   onClose,
-  onPendingCountChange,
   onNotice,
 }: AccessPanelProps) {
   const [snapshot, setSnapshot] = useState<AccessSnapshot>(() => emptySnapshot(terminal.id));
@@ -65,6 +63,7 @@ export function AccessPanel({
   }, [terminal.id]);
 
   useEffect(() => {
+    if (!open) return;
     const controller = new AbortController();
     let timer = 0;
     setSnapshot(emptySnapshot(terminal.id));
@@ -87,9 +86,8 @@ export function AccessPanel({
       controller.abort();
       clearTimeout(timer);
     };
-  }, [refresh, terminal.id]);
+  }, [open, refresh, terminal.id]);
 
-  useEffect(() => onPendingCountChange(pendingCount), [onPendingCountChange, pendingCount]);
 
   const perform = async (key: string, action: () => Promise<unknown>, notice: string) => {
     setBusy(key);

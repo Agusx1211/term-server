@@ -34,9 +34,10 @@ use zeroize::Zeroizing;
 
 use crate::{
     access::{
-        AccessDecision, AccessError, AccessManager, AccessSnapshot, AccessSubscription,
-        AddSecretGrant, AgentAccessEvent, AgentRequestContext, AgentSecretExecute, AgentSecretName,
-        AgentSecretRequest, AgentSudoRequest, SecretApproval, SecretGrantView, SudoApproval,
+        AccessDecision, AccessError, AccessManager, AccessRequestState, AccessSnapshot,
+        AccessSubscription, AddSecretGrant, AgentAccessEvent, AgentRequestContext,
+        AgentSecretExecute, AgentSecretName, AgentSecretRequest, AgentSudoRequest, SecretApproval,
+        SecretGrantView, SudoApproval,
     },
     agent_events::AgentEvent,
     ai::{PiClientConfig, PiService, UpdatePiSettings},
@@ -626,6 +627,28 @@ impl BrokerGeneration {
         terminal.broker = Some(self.build.clone());
         terminal
     }
+
+    async fn terminals(&self) -> Result<Vec<TerminalInfo>, BrokerError> {
+        let mut terminals = self.client.list().await?;
+        for terminal in terminals
+            .iter_mut()
+            .filter(|terminal| terminal.pending_access_requests.is_none())
+        {
+            let pending = match self.client.access_snapshot(terminal.id).await {
+                Ok(snapshot) => snapshot
+                    .requests
+                    .iter()
+                    .filter(|request| request.state == AccessRequestState::Pending)
+                    .count(),
+                // Brokers from before integrated access have no snapshot route
+                // and cannot have requests to report.
+                Err(BrokerError::Remote { status, .. }) if status == StatusCode::NOT_FOUND => 0,
+                Err(error) => return Err(error),
+            };
+            terminal.pending_access_requests = Some(pending);
+        }
+        Ok(terminals)
+    }
 }
 
 pub struct BrokerPool {
@@ -794,7 +817,7 @@ impl BrokerPool {
         let mut terminals = Vec::new();
         let mut owners = HashMap::new();
         for generation in generations {
-            let listed = match generation.client.list().await {
+            let listed = match generation.terminals().await {
                 Ok(listed) => listed,
                 Err(error) if !generation.current => {
                     tracing::warn!(
@@ -1346,6 +1369,19 @@ struct BrokerState {
     control_token: Option<String>,
 }
 
+impl BrokerState {
+    fn terminal_info(&self, mut terminal: TerminalInfo) -> TerminalInfo {
+        self.access
+            .populate_pending_request_counts(std::slice::from_mut(&mut terminal));
+        terminal
+    }
+
+    fn terminal_infos(&self, mut terminals: Vec<TerminalInfo>) -> Vec<TerminalInfo> {
+        self.access.populate_pending_request_counts(&mut terminals);
+        terminals
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct BrokerPeerCredentials {
     pid: Option<u32>,
@@ -1605,7 +1641,7 @@ async fn update_broker_pi(
 }
 
 async fn list_broker_terminals(State(state): State<BrokerState>) -> Json<Vec<TerminalInfo>> {
-    Json(state.terminals.list())
+    Json(state.terminal_infos(state.terminals.list()))
 }
 
 async fn create_broker_terminal(
@@ -1620,7 +1656,7 @@ async fn create_broker_terminal(
             BrokerApiError::Internal
         })?
         .map_err(|error| BrokerApiError::BadRequest(error.to_string()))?;
-    Ok((StatusCode::CREATED, Json(terminal)))
+    Ok((StatusCode::CREATED, Json(state.terminal_info(terminal))))
 }
 
 async fn create_broker_supervisor(
@@ -1635,7 +1671,7 @@ async fn create_broker_supervisor(
             BrokerApiError::Internal
         })?
         .map_err(|error| BrokerApiError::BadRequest(error.to_string()))?;
-    Ok((StatusCode::CREATED, Json(terminal)))
+    Ok((StatusCode::CREATED, Json(state.terminal_info(terminal))))
 }
 
 async fn broker_terminal_agent_event(
@@ -1659,7 +1695,7 @@ async fn rename_broker_terminal(
         .terminals
         .rename(id, &request.path)
         .map_err(|error| BrokerApiError::BadRequest(error.to_string()))?
-        .map(Json)
+        .map(|terminal| Json(state.terminal_info(terminal)))
         .ok_or(BrokerApiError::NotFound)
 }
 

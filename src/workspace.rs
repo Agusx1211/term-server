@@ -180,7 +180,13 @@ impl WorkspaceBackend {
 
     pub async fn list(&self) -> Result<Vec<TerminalInfo>, WorkspaceError> {
         match self {
-            Self::Local { terminals, .. } => Ok(terminals.list()),
+            Self::Local {
+                terminals, access, ..
+            } => {
+                let mut terminals = terminals.list();
+                access.populate_pending_request_counts(&mut terminals);
+                Ok(terminals)
+            }
             #[cfg(unix)]
             Self::Broker(client) => client.list().await,
         }
@@ -229,16 +235,22 @@ impl WorkspaceBackend {
         request: RenameTerminal,
     ) -> Result<TerminalInfo, WorkspaceError> {
         match self {
-            Self::Local { terminals, .. } => terminals
-                .rename(id, &request.path)
-                .map_err(|error| WorkspaceError::Remote {
-                    status: StatusCode::BAD_REQUEST,
-                    message: error.to_string(),
-                })?
-                .ok_or_else(|| WorkspaceError::Remote {
-                    status: StatusCode::NOT_FOUND,
-                    message: "terminal not found".to_owned(),
-                }),
+            Self::Local {
+                terminals, access, ..
+            } => {
+                let mut terminal = terminals
+                    .rename(id, &request.path)
+                    .map_err(|error| WorkspaceError::Remote {
+                        status: StatusCode::BAD_REQUEST,
+                        message: error.to_string(),
+                    })?
+                    .ok_or_else(|| WorkspaceError::Remote {
+                        status: StatusCode::NOT_FOUND,
+                        message: "terminal not found".to_owned(),
+                    })?;
+                access.populate_pending_request_counts(std::slice::from_mut(&mut terminal));
+                Ok(terminal)
+            }
             #[cfg(unix)]
             Self::Broker(client) => client.rename(id, request).await,
         }
