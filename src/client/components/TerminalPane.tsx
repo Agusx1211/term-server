@@ -272,7 +272,7 @@ export function TerminalPane({
   visibleState.current = visible;
   const [processesOpen, setProcessesOpen] = useState(false);
   const [accessOpen, setAccessOpen] = useState(false);
-  const [accessPendingCount, setAccessPendingCount] = useState(0);
+  const accessPendingCount = terminal.pendingAccessRequests ?? 0;
   const knownArtifactIds = useRef(new Set(artifacts.map((artifact) => artifact.id)));
   const [artifactsOpen, setArtifactsOpen] = useState(artifacts.length > 0);
   const [actionsOpen, setActionsOpen] = useState(false);
@@ -1941,7 +1941,11 @@ export function TerminalPane({
           </span>
         )}
         {terminal.agent && (
-          <PaneAgentState agent={terminal.agent} needsAttention={needsAttention} />
+          <PaneAgentState
+            agent={terminal.agent}
+            needsAttention={needsAttention}
+            pendingAccessRequests={accessPendingCount}
+          />
         )}
         {!terminal.agent && terminal.command && (
           <PaneCommandState command={terminal.command} needsAttention={needsAttention} />
@@ -2274,7 +2278,6 @@ export function TerminalPane({
         open={accessOpen}
         terminal={terminal}
         onClose={() => setAccessOpen(false)}
-        onPendingCountChange={setAccessPendingCount}
         onNotice={onNotice}
       />
       {processesOpen && <ProcessInspector terminalId={terminal.id} onClose={() => setProcessesOpen(false)} />}
@@ -2299,14 +2302,23 @@ const AGENT_STATUS_ICONS: Record<AgentStatusTone, typeof Activity> = {
 function PaneAgentState({
   agent,
   needsAttention,
+  pendingAccessRequests,
 }: {
   agent: NonNullable<TerminalInfo["agent"]>;
   needsAttention: boolean;
+  pendingAccessRequests: number;
 }) {
-  const { tone, label, description } = agentStatusPresentation(agent, needsAttention);
+  const { tone, label, description } = agentStatusPresentation(
+    agent,
+    needsAttention,
+    pendingAccessRequests,
+  );
   const Icon = AGENT_STATUS_ICONS[tone];
   return (
-    <span class={`pane-activity ${tone}`} title={agent.summary ?? description}>
+    <span
+      class={`pane-activity ${tone}`}
+      title={pendingAccessRequests > 0 ? description : agent.summary ?? description}
+    >
       <Bot size={12} aria-hidden="true" />
       <span class="pane-activity-kind">{agent.kind}</span>
       <span class="pane-activity-state">

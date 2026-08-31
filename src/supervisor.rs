@@ -1189,7 +1189,7 @@ enum SupervisorCliCommand {
         #[arg(long)]
         jsonl: bool,
     },
-    /// Send text or a named key to one terminal.
+    /// Send text, single-character keys, or named keys to one terminal.
     Send {
         terminal_id: Uuid,
         #[arg(long)]
@@ -1489,20 +1489,30 @@ impl SupervisorCliCommand {
     }
 }
 
-fn key_sequence(key: &str) -> Option<&'static str> {
-    match key.to_ascii_lowercase().as_str() {
-        "enter" => Some("\r"),
-        "tab" => Some("\t"),
-        "escape" | "esc" => Some("\x1b"),
-        "ctrl-c" => Some("\x03"),
-        "ctrl-d" => Some("\x04"),
-        "ctrl-z" => Some("\x1a"),
-        "up" => Some("\x1b[A"),
-        "down" => Some("\x1b[B"),
-        "right" => Some("\x1b[C"),
-        "left" => Some("\x1b[D"),
-        _ => None,
+const NAMED_KEY_SEQUENCES: [(&str, &str); 11] = [
+    ("enter", "\r"),
+    ("tab", "\t"),
+    ("escape", "\x1b"),
+    ("esc", "\x1b"),
+    ("ctrl-c", "\x03"),
+    ("ctrl-d", "\x04"),
+    ("ctrl-z", "\x1a"),
+    ("up", "\x1b[A"),
+    ("down", "\x1b[B"),
+    ("right", "\x1b[C"),
+    ("left", "\x1b[D"),
+];
+
+fn key_sequence(key: &str) -> Option<&str> {
+    for &(name, sequence) in &NAMED_KEY_SEQUENCES {
+        if key.eq_ignore_ascii_case(name) {
+            return Some(sequence);
+        }
     }
+
+    let mut characters = key.chars();
+    characters.next()?;
+    characters.next().is_none().then_some(key)
 }
 
 #[cfg(test)]
@@ -2378,6 +2388,58 @@ mod tests {
         assert!(snapshot.screen.contains("SUPERVISOR-SCREEN-MARKER"));
         assert!(snapshot.tail.contains("SUPERVISOR-SCREEN-MARKER"));
         assert!(snapshot.rows > 0 && snapshot.cols > 0);
+        workspace.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn send_cli_plain_key_reaches_raw_mode_terminal() {
+        async fn wait_for_screen(workspace: &WorkspaceBackend, terminal_id: Uuid, marker: &str) {
+            for _ in 0..50 {
+                if workspace
+                    .screen(terminal_id, 0)
+                    .await
+                    .unwrap()
+                    .screen
+                    .contains(marker)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("terminal screen never contained {marker}");
+        }
+
+        let (_directory, service, workspace, _terminals) = test_service().await;
+        let terminal = workspace
+            .create(CreateTerminal {
+                path: Some("raw-key-target".into()),
+                cwd: Some(PathBuf::from("/tmp")),
+                shell: Some("/bin/sh".into()),
+                clone_from: None,
+            })
+            .await
+            .unwrap();
+        workspace
+            .write(
+                terminal.id,
+                "printf 'RAW-KEY-READY\\n'; stty raw -echo; key=$(dd bs=1 count=1 2>/dev/null); stty sane; printf '\\r\\nRAW-KEY:%s\\n' \"$key\"\r".into(),
+            )
+            .await
+            .unwrap();
+
+        wait_for_screen(&workspace, terminal.id, "RAW-KEY-READY").await;
+
+        let request = SupervisorCliCommand::Send {
+            terminal_id: terminal.id,
+            text: None,
+            keys: vec!["q".into()],
+            enter: false,
+        }
+        .into_request()
+        .unwrap();
+        service.execute(request, Uuid::nil()).await.unwrap();
+
+        wait_for_screen(&workspace, terminal.id, "RAW-KEY:q").await;
         workspace.shutdown().await;
     }
 

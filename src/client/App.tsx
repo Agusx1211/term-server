@@ -1671,7 +1671,11 @@ export function App() {
     setTerminals((current) => current.map((terminal) => (
       terminal.id === next.id
         ? withActivityView(
-            { ...next, broker: next.broker ?? terminal.broker },
+            {
+              ...next,
+              broker: next.broker ?? terminal.broker,
+              pendingAccessRequests: terminal.pendingAccessRequests,
+            },
             activityView(terminal),
           )
         : terminal

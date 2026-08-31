@@ -212,6 +212,9 @@ pub struct TerminalInfo {
     pub status: TerminalStatus,
     pub exit_code: Option<u32>,
     pub clients: usize,
+    /// Populated by the access manager on list responses; session-ready messages omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_access_requests: Option<usize>,
     #[serde(default)]
     pub broker: Option<BuildIdentity>,
 }
@@ -787,7 +790,10 @@ impl SessionActivity {
             return;
         }
         if self.initial_title_prompt.is_none() {
-            self.initial_title_prompt = submitted_prompt;
+            self.initial_title_prompt = submitted_prompt.and_then(|prompt| {
+                let prompt = prompt.trim();
+                (!prompt.is_empty() && !prompt.starts_with('/')).then(|| prompt.to_owned())
+            });
         }
         let Some(prompt) = self.initial_title_prompt.clone() else {
             return;
@@ -2889,6 +2895,7 @@ impl TerminalManager {
                 status: TerminalStatus::Running,
                 exit_code: None,
                 clients: 0,
+                pending_access_requests: None,
                 broker: None,
             }),
             master: Mutex::new(pair.master),
@@ -5577,6 +5584,10 @@ mod tests {
             Some("approve the command".to_owned()),
         );
         assert_eq!(activity.pending_title_prompt, None);
+
+        activity.queue_title_for_submission(&AgentStatus::Idle, Some("/model".to_owned()));
+        assert_eq!(activity.pending_title_prompt, None);
+        assert_eq!(activity.initial_title_prompt, None);
 
         activity.queue_title_for_submission(
             &AgentStatus::Idle,
