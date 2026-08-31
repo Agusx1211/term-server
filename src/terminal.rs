@@ -1519,10 +1519,10 @@ fn run_terminal_input_writer<W: Write>(
     while let Some(message) = receiver.receive() {
         let TerminalInputMessage { data, delivered } = message;
         if let Err(error) = writer.write_all(&data).and_then(|()| writer.flush()) {
+            receiver.fail(&error);
             if let Some(delivered) = delivered {
                 let _ = delivered.send(Err(error.to_string()));
             }
-            receiver.fail(&error);
             return Err(error);
         }
         if let Some(delivered) = delivered {
