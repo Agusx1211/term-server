@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.16.2 - 2026-08-31
+
+Terminal navigation and Supervisor coordination are clearer, with pending access approvals visible from the workspace.
+
+### Added
+
+- **Visible access requests.** Server-side terminal metadata carries pending secret and sudo request counts, showing an amber **Needs you** pill with the count in the sidebar and pane on desktop and mobile even when the pane is unmounted.
+
+### Changed
+
+- **Improved terminal titles.** Automatic title generation ignores agent slash commands, sends only the initial task text to the metadata model, and normalizes compact responses into readable lowercase names.
+- **Settings page cleanup.** Settings are grouped into Workspace, Notifications, Agents, and System sections, with responsive navigation and a more compact terminal card that substantially reduces page scrolling.
+
+### Fixed
+
+- **Raw-mode Supervisor input.** `term-server-supervisor send --key` accepts single Unicode characters in addition to named keys, allowing raw-mode TUIs to receive deliberate one-keystroke input.
+
+### Upgrade notes
+
+- No data migration is required. Reload open browser pages to pick up the interface changes, and start a new agent session in the Supervisor to discover the updated `--key` guidance. The release is safe for automatic installation over `0.16.1`.
+
 ## 0.16.1 - 2026-08-30
 
 Secret execution now redacts common encoded and hashed forms, and Supervisor control uses only its scoped CLI.
