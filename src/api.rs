@@ -299,6 +299,7 @@ struct ClientConfig {
     secure: bool,
     hostname: String,
     password_managed_externally: bool,
+    virtual_audio_available: bool,
     pi: PiClientConfig,
     agent_integrations: AgentIntegrationsConfig,
     artifact_skill: ArtifactSkillConfig,
@@ -691,6 +692,7 @@ async fn config(
         secure: state.secure,
         hostname: state.hostname.clone(),
         password_managed_externally: state.auth.password_is_externally_managed(),
+        virtual_audio_available: cfg!(unix) && broker.is_some(),
         pi,
         agent_integrations,
         artifact_skill: state.artifact_skill.status(),
@@ -2279,6 +2281,7 @@ mod tests {
         let config: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(config["statusModules"]["enabled"], false);
         assert_eq!(config["statusModules"]["showOnMobile"], true);
+        assert_eq!(config["virtualAudioAvailable"], false);
     }
 
     #[test]

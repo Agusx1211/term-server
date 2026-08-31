@@ -1,6 +1,6 @@
-const FRAME_SAMPLES = 960;
-const JITTER_SAMPLES = FRAME_SAMPLES * 3;
-const MAX_BUFFERED_SAMPLES = FRAME_SAMPLES * 25;
+export const FRAME_SAMPLES = 960;
+export const JITTER_SAMPLES = FRAME_SAMPLES * 3;
+export const MAX_BUFFERED_SAMPLES = FRAME_SAMPLES * 25;
 
 class TermServerCaptureProcessor extends AudioWorkletProcessor {
   constructor() {
@@ -26,15 +26,13 @@ class TermServerCaptureProcessor extends AudioWorkletProcessor {
   }
 }
 
-class TermServerPlaybackProcessor extends AudioWorkletProcessor {
+export class PlaybackRingBuffer {
   constructor() {
-    super();
     this.samples = new Float32Array(MAX_BUFFERED_SAMPLES);
     this.readOffset = 0;
     this.writeOffset = 0;
     this.length = 0;
     this.playing = false;
-    this.port.onmessage = ({ data }) => this.enqueue(data);
   }
 
   enqueue(data) {
@@ -54,12 +52,10 @@ class TermServerPlaybackProcessor extends AudioWorkletProcessor {
     this.length += incoming.length;
   }
 
-  process(_inputs, outputs) {
-    const output = outputs[0]?.[0];
-    if (!output) return true;
+  render(output) {
     output.fill(0);
     if (!this.playing && this.length >= JITTER_SAMPLES) this.playing = true;
-    if (!this.playing) return true;
+    if (!this.playing) return;
     const available = Math.min(output.length, this.length);
     for (let index = 0; index < available; index += 1) {
       output[index] = this.samples[this.readOffset];
@@ -67,6 +63,20 @@ class TermServerPlaybackProcessor extends AudioWorkletProcessor {
     }
     this.length -= available;
     if (available < output.length) this.playing = false;
+  }
+}
+
+class TermServerPlaybackProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.buffer = new PlaybackRingBuffer();
+    this.port.onmessage = ({ data }) => this.buffer.enqueue(data);
+  }
+
+  process(_inputs, outputs) {
+    const output = outputs[0]?.[0];
+    if (!output) return true;
+    this.buffer.render(output);
     return true;
   }
 }

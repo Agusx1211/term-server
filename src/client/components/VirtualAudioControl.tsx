@@ -4,6 +4,7 @@ import {
   AUDIO_OFF_DEVICE_ID,
   INITIAL_VIRTUAL_AUDIO_SNAPSHOT,
   type VirtualAudioSnapshot,
+  UNSUPPORTED_VIRTUAL_AUDIO_SNAPSHOT,
   VirtualAudioClient,
 } from "../lib/virtual-audio";
 
@@ -14,12 +15,19 @@ export interface VirtualAudioController {
   selectOutput(deviceId: string): Promise<void>;
 }
 
-export function useVirtualAudioController(enabled: boolean): VirtualAudioController {
+export function useVirtualAudioController(
+  enabled: boolean,
+  supported: boolean,
+): VirtualAudioController {
   const [snapshot, setSnapshot] = useState<VirtualAudioSnapshot>(INITIAL_VIRTUAL_AUDIO_SNAPSHOT);
   const client = useRef<VirtualAudioClient>();
   useEffect(() => {
     if (!enabled) {
       setSnapshot(INITIAL_VIRTUAL_AUDIO_SNAPSHOT);
+      return;
+    }
+    if (!supported) {
+      setSnapshot(UNSUPPORTED_VIRTUAL_AUDIO_SNAPSHOT);
       return;
     }
     const next = new VirtualAudioClient(setSnapshot);
@@ -29,7 +37,7 @@ export function useVirtualAudioController(enabled: boolean): VirtualAudioControl
       client.current = undefined;
       next.dispose();
     };
-  }, [enabled]);
+  }, [enabled, supported]);
   return {
     snapshot,
     async selectInput(deviceId) {
@@ -75,7 +83,7 @@ export function VirtualAudioControl({ controller, placement }: VirtualAudioContr
       ? "Reconnecting"
       : snapshot.available
         ? active ? "Forwarding" : "Ready"
-        : "Unavailable";
+        : snapshot.error ? "Unavailable" : "Off";
   const inputOptions = [...snapshot.inputDevices];
   if (
     snapshot.inputDeviceId !== AUDIO_OFF_DEVICE_ID

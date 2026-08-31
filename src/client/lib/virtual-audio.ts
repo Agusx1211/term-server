@@ -42,6 +42,11 @@ export const INITIAL_VIRTUAL_AUDIO_SNAPSHOT: VirtualAudioSnapshot = {
   outputSelectionSupported: false,
 };
 
+export const UNSUPPORTED_VIRTUAL_AUDIO_SNAPSHOT: VirtualAudioSnapshot = {
+  ...INITIAL_VIRTUAL_AUDIO_SNAPSHOT,
+  connection: "unavailable",
+};
+
 interface AudioReadyMessage {
   type: "ready";
   available: boolean;
@@ -368,19 +373,41 @@ export class VirtualAudioClient {
     if (message.type === "ready") {
       this.sampleRate = message.sampleRate;
       const supported = message.available && message.channels === 1 && message.frameSamples > 0;
+      const error = message.error || (
+        message.available ? "Unsupported host audio format" : "Host virtual audio is unavailable"
+      );
+      if (!supported) {
+        this.inputSelection += 1;
+        this.outputSelection += 1;
+        this.stopInput();
+        this.stopOutput();
+        this.update({
+          connection: "unavailable",
+          available: false,
+          inputDeviceId: AUDIO_OFF_DEVICE_ID,
+          outputDeviceId: AUDIO_OFF_DEVICE_ID,
+          inputEnabled: false,
+          outputEnabled: false,
+          inputDeviceName: message.inputDevice,
+          outputDeviceName: message.outputDevice,
+          inputPeers: message.inputPeers,
+          outputPeers: message.outputPeers,
+          error,
+        });
+        this.closeContextIfIdle();
+        return;
+      }
       this.update({
-        connection: supported ? "ready" : "unavailable",
-        available: supported,
+        connection: "ready",
+        available: true,
         inputDeviceName: message.inputDevice,
         outputDeviceName: message.outputDevice,
         inputPeers: message.inputPeers,
         outputPeers: message.outputPeers,
-        error: message.error || (supported ? undefined : "Unsupported host audio format"),
+        error: undefined,
       });
-      if (supported) {
-        this.sendControl("input", this.snapshot.inputDeviceId !== AUDIO_OFF_DEVICE_ID);
-        this.sendControl("output", this.snapshot.outputDeviceId !== AUDIO_OFF_DEVICE_ID);
-      }
+      this.sendControl("input", this.snapshot.inputDeviceId !== AUDIO_OFF_DEVICE_ID);
+      this.sendControl("output", this.snapshot.outputDeviceId !== AUDIO_OFF_DEVICE_ID);
       return;
     }
     if (message.type === "state") {

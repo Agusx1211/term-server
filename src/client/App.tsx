@@ -184,6 +184,7 @@ const defaultConfig: ClientConfig = {
   secure: true,
   hostname: "",
   passwordManagedExternally: true,
+  virtualAudioAvailable: false,
   pi: {
     available: false,
     enabled: false,
@@ -352,7 +353,6 @@ export function App() {
     installE2EDiagnostics();
   }, []);
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
-  const virtualAudio = useVirtualAudioController(authenticated === true);
   const browserViewIdRef = useRef<string>();
   const [browserPresence, setBrowserPresence] = useState(() => ({
     focused: typeof document !== "undefined" && document.hasFocus(),
@@ -362,6 +362,10 @@ export function App() {
   const [workspaceLoaded, setWorkspaceLoaded] = useState(false);
   const [terminals, setTerminals] = useState<TerminalInfo[]>([]);
   const [config, setConfig] = useState(defaultConfig);
+  const virtualAudio = useVirtualAudioController(
+    authenticated === true,
+    config.virtualAudioAvailable,
+  );
   const [layout, setLayout] = useState<PaneLayout | null>(initialPaneLayout);
   const [mountedIds, setMountedIds] = useState<string[]>(initialPanes);
   const [activeId, setActiveId] = useState<string>();

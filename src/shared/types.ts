@@ -183,6 +183,7 @@ export interface ClientConfig {
   secure: boolean;
   hostname: string;
   passwordManagedExternally: boolean;
+  virtualAudioAvailable: boolean;
   pi: PiConfig;
   agentIntegrations: AgentIntegrationsConfig;
   artifactSkill: ArtifactSkillConfig;

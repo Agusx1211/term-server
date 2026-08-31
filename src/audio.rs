@@ -2,7 +2,10 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::Path,
     process::Stdio,
-    sync::Arc,
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -13,10 +16,10 @@ use parking_lot::Mutex as SyncMutex;
 use serde::Deserialize;
 use tempfile::TempDir;
 use tokio::{
-    fs::{File, OpenOptions},
     io::{AsyncReadExt, AsyncWriteExt},
+    net::unix::pipe::{self, Receiver, Sender},
     process::{Child, Command},
-    sync::{Mutex, broadcast, mpsc, watch},
+    sync::{Mutex, broadcast, mpsc, oneshot, watch},
     task::JoinHandle,
 };
 use uuid::Uuid;
@@ -103,19 +106,20 @@ pub struct AudioHub {
 }
 
 struct AudioHubInner {
-    status: VirtualAudioStatus,
-    input: Option<mpsc::Sender<InputFrame>>,
+    status: watch::Sender<VirtualAudioStatus>,
+    input: SyncMutex<Option<mpsc::Sender<InputFrame>>>,
     active_inputs: Arc<SyncMutex<HashSet<Uuid>>>,
     output: broadcast::Sender<Bytes>,
     routes: SyncMutex<AudioRoutes>,
     counts: watch::Sender<AudioPeerCounts>,
     runtime: Mutex<Option<AudioRuntime>>,
+    initializes_runtime: bool,
+    shutting_down: AtomicBool,
 }
 
 struct AudioRuntime {
-    tasks: Vec<JoinHandle<()>>,
-    pulse: PulseSetup,
-    keepalive: Child,
+    shutdown: Option<oneshot::Sender<()>>,
+    task: JoinHandle<()>,
 }
 
 struct InputFrame {
@@ -125,92 +129,49 @@ struct InputFrame {
 
 impl AudioHub {
     pub async fn start() -> Self {
-        match PulseSetup::start().await {
-            Ok((pulse, input_pipe, output_pipe, keepalive)) => {
-                let (input, input_receiver) = mpsc::channel(256);
-                let active_inputs = Arc::new(SyncMutex::new(HashSet::new()));
-                let input_active = active_inputs.clone();
-                let (output, _) = broadcast::channel(32);
-                let input_task = tokio::spawn(async move {
-                    if let Err(error) =
-                        run_input_pipe(input_pipe, input_receiver, input_active).await
-                    {
-                        tracing::warn!(%error, "virtual microphone stream stopped");
-                    }
-                });
-                let output_sender = output.clone();
-                let output_task = tokio::spawn(async move {
-                    if let Err(error) = run_output_pipe(output_pipe, output_sender).await {
-                        tracing::warn!(%error, "virtual speaker stream stopped");
-                    }
-                });
-                let (counts, _) = watch::channel(AudioPeerCounts::default());
-                tracing::info!(
-                    input_device = VIRTUAL_MICROPHONE,
-                    output_device = VIRTUAL_SPEAKER,
-                    "virtual audio devices are ready"
-                );
-                Self {
-                    inner: Arc::new(AudioHubInner {
-                        status: VirtualAudioStatus::available(),
-                        input: Some(input),
-                        active_inputs,
-                        output,
-                        routes: SyncMutex::new(AudioRoutes::default()),
-                        counts,
-                        runtime: Mutex::new(Some(AudioRuntime {
-                            tasks: vec![input_task, output_task],
-                            pulse,
-                            keepalive,
-                        })),
-                    }),
-                }
-            }
+        let status = match PulseSetup::sweep_stale().await {
+            Ok(()) => VirtualAudioStatus::available(),
             Err(error) => {
                 tracing::warn!(%error, "virtual audio is unavailable");
-                Self::unavailable(format!(
+                VirtualAudioStatus::unavailable(format!(
                     "PulseAudio/PipeWire virtual audio is unavailable: {}",
                     truncate_error(&error, 300)
                 ))
             }
-        }
+        };
+        Self::new(status, true)
     }
 
-    pub fn unavailable(error: impl Into<String>) -> Self {
-        let (output, _) = broadcast::channel(1);
+    fn new(status: VirtualAudioStatus, initializes_runtime: bool) -> Self {
+        let (status, _) = watch::channel(status);
+        let (output, _) = broadcast::channel(32);
         let (counts, _) = watch::channel(AudioPeerCounts::default());
         Self {
             inner: Arc::new(AudioHubInner {
-                status: VirtualAudioStatus::unavailable(error),
-                input: None,
+                status,
+                input: SyncMutex::new(None),
                 active_inputs: Arc::new(SyncMutex::new(HashSet::new())),
                 output,
                 routes: SyncMutex::new(AudioRoutes::default()),
                 counts,
                 runtime: Mutex::new(None),
+                initializes_runtime,
+                shutting_down: AtomicBool::new(false),
             }),
         }
     }
 
     #[cfg(test)]
     pub fn test_available() -> Self {
-        let (output, _) = broadcast::channel(1);
-        let (counts, _) = watch::channel(AudioPeerCounts::default());
-        Self {
-            inner: Arc::new(AudioHubInner {
-                status: VirtualAudioStatus::available(),
-                input: None,
-                active_inputs: Arc::new(SyncMutex::new(HashSet::new())),
-                output,
-                routes: SyncMutex::new(AudioRoutes::default()),
-                counts,
-                runtime: Mutex::new(None),
-            }),
-        }
+        Self::new(VirtualAudioStatus::available(), false)
     }
 
     fn status(&self) -> VirtualAudioStatus {
-        self.inner.status.clone()
+        self.inner.status.borrow().clone()
+    }
+
+    fn status_receiver(&self) -> watch::Receiver<VirtualAudioStatus> {
+        self.inner.status.subscribe()
     }
 
     fn attach(&self) -> AudioPeer {
@@ -240,21 +201,89 @@ impl AudioHub {
         self.inner.output.subscribe()
     }
 
-    fn set_route(
+    async fn ensure_started(&self) -> Result<(), String> {
+        let status_error = || {
+            self.status()
+                .error
+                .unwrap_or_else(|| "virtual audio is unavailable".to_owned())
+        };
+        if !self.status().available {
+            return Err(status_error());
+        }
+        if !self.inner.initializes_runtime {
+            return Ok(());
+        }
+        if self.inner.shutting_down.load(Ordering::Acquire) {
+            return Err("virtual audio is shutting down".to_owned());
+        }
+
+        let mut runtime = self.inner.runtime.lock().await;
+        if runtime.is_some() {
+            return if self.status().available {
+                Ok(())
+            } else {
+                Err(status_error())
+            };
+        }
+
+        let (pulse, input_pipe, output_pipe, keepalive) = match PulseSetup::start().await {
+            Ok(setup) => setup,
+            Err(error) => {
+                let message = format!(
+                    "PulseAudio/PipeWire virtual audio is unavailable: {}",
+                    truncate_error(&error, 300)
+                );
+                self.inner
+                    .status
+                    .send_replace(VirtualAudioStatus::unavailable(message.clone()));
+                return Err(message);
+            }
+        };
+        let (input, input_receiver) = mpsc::channel(256);
+        *self.inner.input.lock() = Some(input);
+        let input_active = self.inner.active_inputs.clone();
+        let input_task = tokio::spawn(run_input_pipe(input_pipe, input_receiver, input_active));
+        let output_task = tokio::spawn(run_output_pipe(output_pipe, self.inner.output.clone()));
+        let (shutdown, shutdown_receiver) = oneshot::channel();
+        let task = tokio::spawn(monitor_audio_runtime(
+            Arc::downgrade(&self.inner),
+            pulse,
+            keepalive,
+            input_task,
+            output_task,
+            shutdown_receiver,
+        ));
+        *runtime = Some(AudioRuntime {
+            shutdown: Some(shutdown),
+            task,
+        });
+        tracing::info!(
+            input_device = VIRTUAL_MICROPHONE,
+            output_device = VIRTUAL_SPEAKER,
+            "virtual audio devices are ready"
+        );
+        Ok(())
+    }
+
+    async fn set_route(
         &self,
         peer: Uuid,
         input: Option<bool>,
         output: Option<bool>,
     ) -> Result<(), String> {
-        if (input == Some(true) || output == Some(true)) && !self.inner.status.available {
+        if input == Some(true) || output == Some(true) {
+            self.ensure_started().await?;
+        }
+        let mut routes = self.inner.routes.lock();
+        if (input == Some(true) || output == Some(true)) && !self.inner.status.borrow().available {
             return Err(self
                 .inner
                 .status
+                .borrow()
                 .error
                 .clone()
                 .unwrap_or_else(|| "virtual audio is unavailable".to_owned()));
         }
-        let mut routes = self.inner.routes.lock();
         let Some(route) = routes.peers.get_mut(&peer) else {
             return Err("audio connection is closed".to_owned());
         };
@@ -271,46 +300,107 @@ impl AudioHub {
             route.output = enabled;
         }
         let counts = routes.counts();
-        drop(routes);
         self.inner.counts.send_replace(counts);
         Ok(())
     }
 
     fn push_input(&self, peer: Uuid, data: Bytes) {
-        let Some(sender) = self.inner.input.as_ref() else {
-            return;
-        };
         if data.len() != AUDIO_FRAME_BYTES {
             return;
         }
+        let input = self.inner.input.lock();
+        let Some(sender) = input.as_ref() else {
+            return;
+        };
         let _ = sender.try_send(InputFrame { peer, data });
     }
 
     fn detach(&self, peer: Uuid) {
         let mut routes = self.inner.routes.lock();
         let removed = routes.peers.remove(&peer);
-        let counts = routes.counts();
-        drop(routes);
         if removed.is_some() {
             self.inner.active_inputs.lock().remove(&peer);
         }
+        let counts = routes.counts();
         self.inner.counts.send_replace(counts);
     }
 
     pub async fn shutdown(&self) {
+        self.inner.shutting_down.store(true, Ordering::Release);
         let Some(mut runtime) = self.inner.runtime.lock().await.take() else {
             return;
         };
-        let _ = runtime.keepalive.kill().await;
-        let _ = runtime.keepalive.wait().await;
-        for task in &runtime.tasks {
-            task.abort();
+        if let Some(shutdown) = runtime.shutdown.take() {
+            let _ = shutdown.send(());
         }
-        for task in runtime.tasks.drain(..) {
-            let _ = task.await;
-        }
-        runtime.pulse.cleanup().await;
+        let _ = runtime.task.await;
+        self.inner.input.lock().take();
     }
+}
+
+async fn monitor_audio_runtime(
+    inner: Weak<AudioHubInner>,
+    pulse: PulseSetup,
+    mut keepalive: Child,
+    mut input_task: JoinHandle<std::io::Result<()>>,
+    mut output_task: JoinHandle<std::io::Result<()>>,
+    mut shutdown: oneshot::Receiver<()>,
+) {
+    let (failure, input_finished, output_finished) = tokio::select! {
+        _ = &mut shutdown => (None, false, false),
+        result = keepalive.wait() => (Some(match result {
+            Ok(status) => format!("virtual microphone keepalive stopped ({status})"),
+            Err(error) => format!("could not monitor virtual microphone keepalive: {error}"),
+        }), false, false),
+        result = &mut input_task => (Some(worker_failure("microphone", result)), true, false),
+        result = &mut output_task => (Some(worker_failure("speaker", result)), false, true),
+    };
+
+    if let Some(error) = failure {
+        tracing::warn!(%error, "virtual audio runtime stopped");
+        if let Some(inner) = inner.upgrade() {
+            mark_audio_unavailable(&inner, error);
+        }
+    }
+    if !input_finished {
+        input_task.abort();
+        let _ = input_task.await;
+    }
+    if !output_finished {
+        output_task.abort();
+        let _ = output_task.await;
+    }
+    if keepalive.try_wait().ok().flatten().is_none() {
+        let _ = keepalive.kill().await;
+        let _ = keepalive.wait().await;
+    }
+    pulse.cleanup().await;
+}
+
+fn worker_failure(
+    device: &str,
+    result: Result<std::io::Result<()>, tokio::task::JoinError>,
+) -> String {
+    match result {
+        Ok(Ok(())) => format!("virtual {device} pipe stopped"),
+        Ok(Err(error)) => format!("virtual {device} pipe stopped: {error}"),
+        Err(error) => format!("virtual {device} pipe task failed: {error}"),
+    }
+}
+
+fn mark_audio_unavailable(inner: &AudioHubInner, error: String) {
+    inner.input.lock().take();
+    let mut routes = inner.routes.lock();
+    inner
+        .status
+        .send_replace(VirtualAudioStatus::unavailable(error));
+    for route in routes.peers.values_mut() {
+        route.input = false;
+        route.output = false;
+    }
+    inner.active_inputs.lock().clear();
+    let counts = routes.counts();
+    inner.counts.send_replace(counts);
 }
 
 struct AudioPeer {
@@ -321,14 +411,14 @@ struct AudioPeer {
 }
 
 impl AudioPeer {
-    fn set_input(&mut self, enabled: bool) -> Result<(), String> {
-        self.hub.set_route(self.id, Some(enabled), None)?;
+    async fn set_input(&mut self, enabled: bool) -> Result<(), String> {
+        self.hub.set_route(self.id, Some(enabled), None).await?;
         self.input_enabled = enabled;
         Ok(())
     }
 
-    fn set_output(&mut self, enabled: bool) -> Result<(), String> {
-        self.hub.set_route(self.id, None, Some(enabled))?;
+    async fn set_output(&mut self, enabled: bool) -> Result<(), String> {
+        self.hub.set_route(self.id, None, Some(enabled)).await?;
         self.output_enabled = enabled;
         Ok(())
     }
@@ -351,12 +441,14 @@ enum AudioClientMessage {
 pub async fn serve_audio_socket(socket: WebSocket, hub: AudioHub) {
     let (mut sender, mut receiver) = socket.split();
     let mut peer = hub.attach();
+    let mut status = hub.status_receiver();
     let mut counts = hub.counts_receiver();
     let mut output = hub.output_receiver();
+    status.borrow_and_update();
+    counts.borrow_and_update();
     if send_ready(&mut sender, &hub).await.is_err() {
         return;
     }
-    counts.borrow_and_update();
 
     loop {
         tokio::select! {
@@ -375,8 +467,12 @@ pub async fn serve_audio_socket(socket: WebSocket, hub: AudioHub) {
                             }
                             Ok(message) => {
                                 let result = match message {
-                                    AudioClientMessage::Input { enabled } => peer.set_input(enabled),
-                                    AudioClientMessage::Output { enabled } => peer.set_output(enabled),
+                                    AudioClientMessage::Input { enabled } => {
+                                        peer.set_input(enabled).await
+                                    }
+                                    AudioClientMessage::Output { enabled } => {
+                                        peer.set_output(enabled).await
+                                    }
                                     AudioClientMessage::Ping => unreachable!(),
                                 };
                                 if let Err(error) = result {
@@ -410,6 +506,14 @@ pub async fn serve_audio_socket(socket: WebSocket, hub: AudioHub) {
                     Message::Close(_) => break,
                     Message::Pong(_) => {}
                 }
+            }
+            changed = status.changed() => {
+                if changed.is_err() { break }
+                if !status.borrow_and_update().available {
+                    peer.input_enabled = false;
+                    peer.output_enabled = false;
+                }
+                if send_ready(&mut sender, &hub).await.is_err() { break }
             }
             changed = counts.changed() => {
                 if changed.is_err() { break }
@@ -556,7 +660,7 @@ impl AudioMixer {
 }
 
 async fn run_input_pipe(
-    mut pipe: File,
+    mut pipe: Sender,
     mut receiver: mpsc::Receiver<InputFrame>,
     active_inputs: Arc<SyncMutex<HashSet<Uuid>>>,
 ) -> std::io::Result<()> {
@@ -584,7 +688,10 @@ async fn run_input_pipe(
     }
 }
 
-async fn run_output_pipe(mut pipe: File, output: broadcast::Sender<Bytes>) -> std::io::Result<()> {
+async fn run_output_pipe(
+    mut pipe: Receiver,
+    output: broadcast::Sender<Bytes>,
+) -> std::io::Result<()> {
     loop {
         let mut frame = vec![0_u8; AUDIO_FRAME_BYTES];
         pipe.read_exact(&mut frame).await?;
@@ -602,8 +709,60 @@ struct PulseSetup {
     previous_output: String,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct PulseModule {
+    id: u32,
+    device_name: String,
+}
+
 impl PulseSetup {
-    async fn start() -> Result<(Self, File, File, Child), String> {
+    async fn sweep_stale() -> Result<(), String> {
+        let modules = pactl(&["list", "short", "modules"]).await?;
+        let mut stale = Vec::new();
+        for module in parse_virtual_audio_modules(&modules) {
+            let Some(pid) = virtual_audio_pid(&module.device_name) else {
+                continue;
+            };
+            if !process_is_alive(pid) {
+                stale.push(module);
+            }
+        }
+        if stale.is_empty() {
+            return Ok(());
+        }
+
+        let stale_devices = stale
+            .iter()
+            .map(|module| module.device_name.as_str())
+            .collect::<HashSet<_>>();
+        let input_repair = repair_stale_default(
+            "source",
+            "get-default-source",
+            "set-default-source",
+            &stale_devices,
+        )
+        .await
+        .err();
+        let output_repair = repair_stale_default(
+            "sink",
+            "get-default-sink",
+            "set-default-sink",
+            &stale_devices,
+        )
+        .await
+        .err();
+        let mut cleanup_error = input_repair.or(output_repair);
+        for module in stale {
+            if let Err(error) =
+                pactl_owned(vec!["unload-module".to_owned(), module.id.to_string()]).await
+            {
+                cleanup_error.get_or_insert(error);
+            }
+        }
+        cleanup_error.map_or(Ok(()), Err)
+    }
+
+    async fn start() -> Result<(Self, Sender, Receiver, Child), String> {
         let previous_input = pactl(&["get-default-source"]).await?;
         let previous_output = pactl(&["get-default-sink"]).await?;
         let directory = tempfile::Builder::new()
@@ -661,8 +820,8 @@ impl PulseSetup {
             previous_output,
         };
         let result = async {
-            let input_pipe = open_pipe(&input_path).await?;
-            let output_pipe = open_pipe(&output_path).await?;
+            let input_pipe = open_sender(&input_path).await?;
+            let output_pipe = open_receiver(&output_path).await?;
             pactl_owned(vec![
                 "set-default-source".to_owned(),
                 setup.input_name.clone(),
@@ -738,11 +897,24 @@ impl PulseSetup {
     }
 }
 
-async fn open_pipe(path: &Path) -> Result<File, String> {
+async fn open_sender(path: &Path) -> Result<Sender, String> {
+    open_pipe(path, |options, path| options.open_sender(path)).await
+}
+
+async fn open_receiver(path: &Path) -> Result<Receiver, String> {
+    open_pipe(path, |options, path| options.open_receiver(path)).await
+}
+
+async fn open_pipe<T>(
+    path: &Path,
+    open: impl Fn(&pipe::OpenOptions, &Path) -> std::io::Result<T>,
+) -> Result<T, String> {
     let mut last_error = None;
     for _ in 0..50 {
-        match OpenOptions::new().read(true).write(true).open(path).await {
-            Ok(file) => return Ok(file),
+        let mut options = pipe::OpenOptions::new();
+        options.read_write(true);
+        match open(&options, path) {
+            Ok(pipe) => return Ok(pipe),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 last_error = Some(error);
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -756,6 +928,73 @@ async fn open_pipe(path: &Path) -> Result<File, String> {
             .map(|error| error.to_string())
             .unwrap_or_else(|| "unknown error".to_owned())
     ))
+}
+
+fn parse_virtual_audio_modules(output: &str) -> Vec<PulseModule> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(4, '\t');
+            let id = fields.next()?.parse::<u32>().ok()?;
+            let module_name = fields.next()?;
+            let arguments = fields.next()?;
+            let name_key = match module_name {
+                "module-pipe-source" => "source_name=",
+                "module-pipe-sink" => "sink_name=",
+                _ => return None,
+            };
+            let device_name = arguments
+                .split_ascii_whitespace()
+                .find_map(|argument| argument.strip_prefix(name_key))?;
+            virtual_audio_pid(device_name)?;
+            Some(PulseModule {
+                id,
+                device_name: device_name.to_owned(),
+            })
+        })
+        .collect()
+}
+
+fn virtual_audio_pid(device_name: &str) -> Option<u32> {
+    ["term_server_microphone_", "term_server_speaker_"]
+        .iter()
+        .find_map(|prefix| device_name.strip_prefix(prefix))
+        .and_then(|pid| pid.parse::<u32>().ok())
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    let Some(pid) = i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    else {
+        return false;
+    };
+    !matches!(
+        rustix::process::test_kill_process(pid),
+        Err(rustix::io::Errno::SRCH)
+    )
+}
+
+async fn repair_stale_default(
+    kind: &str,
+    get_default: &str,
+    set_default: &str,
+    stale_devices: &HashSet<&str>,
+) -> Result<(), String> {
+    let current = pactl(&[get_default]).await?;
+    if !stale_devices.contains(current.as_str()) {
+        return Ok(());
+    }
+    let list_kind = if kind == "source" { "sources" } else { "sinks" };
+    let devices = pactl(&["list", "short", list_kind]).await?;
+    let fallback = devices
+        .lines()
+        .filter_map(|line| line.split('\t').nth(1))
+        .find(|name| virtual_audio_pid(name).is_none())
+        .ok_or_else(|| format!("no host {kind} is available to replace stale virtual audio"))?;
+    pactl_owned(vec![set_default.to_owned(), fallback.to_owned()])
+        .await
+        .map(|_| ())
 }
 
 async fn load_module(name: &str, arguments: &[String]) -> Result<u32, String> {
@@ -892,6 +1131,54 @@ mod tests {
         let mut output = [0_u8; AUDIO_FRAME_BYTES];
         mixer.mix_into(&mut output);
         assert_eq!(first_sample(&output), 22);
+    }
+
+    #[test]
+    fn parses_only_term_server_pipe_modules() {
+        let modules = parse_virtual_audio_modules(
+            "41\tmodule-pipe-source\tsource_name=term_server_microphone_123 file=/tmp/mic\t0\n\
+             42\tmodule-pipe-sink\tsink_name=term_server_speaker_456 file=/tmp/speaker\t0\n\
+             43\tmodule-null-sink\tsink_name=term_server_speaker_789\t0\n\
+             44\tmodule-pipe-sink\tsink_name=unrelated\t0",
+        );
+        assert_eq!(
+            modules,
+            vec![
+                PulseModule {
+                    id: 41,
+                    device_name: "term_server_microphone_123".to_owned(),
+                },
+                PulseModule {
+                    id: 42,
+                    device_name: "term_server_speaker_456".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PulseAudio/PipeWire session and parec"]
+    async fn pulse_setup_restores_host_defaults() {
+        PulseSetup::sweep_stale().await.unwrap();
+        let previous_input = pactl(&["get-default-source"]).await.unwrap();
+        let previous_output = pactl(&["get-default-sink"]).await.unwrap();
+        let (setup, input_pipe, output_pipe, mut keepalive) = PulseSetup::start().await.unwrap();
+        let active_input = pactl(&["get-default-source"]).await;
+        let active_output = pactl(&["get-default-sink"]).await;
+
+        let _ = keepalive.kill().await;
+        let _ = keepalive.wait().await;
+        drop(input_pipe);
+        drop(output_pipe);
+        setup.cleanup().await;
+
+        assert_eq!(active_input.unwrap(), setup.input_name);
+        assert_eq!(active_output.unwrap(), setup.output_name);
+        assert_eq!(
+            pactl(&["get-default-source"]).await.unwrap(),
+            previous_input
+        );
+        assert_eq!(pactl(&["get-default-sink"]).await.unwrap(), previous_output);
     }
 
     #[test]
