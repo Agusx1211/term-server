@@ -9,6 +9,8 @@ pub mod ai;
 pub mod api;
 pub mod artifact_skill;
 pub mod artifacts;
+#[cfg(unix)]
+pub mod audio;
 pub mod auth;
 #[cfg(unix)]
 pub mod broker;

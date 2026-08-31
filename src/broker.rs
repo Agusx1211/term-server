@@ -41,6 +41,7 @@ use crate::{
     },
     agent_events::AgentEvent,
     ai::{PiClientConfig, PiService, UpdatePiSettings},
+    audio::{AudioHub, serve_audio_socket},
     build::{self, BuildIdentity},
     config::Cli,
     history::{
@@ -482,6 +483,14 @@ impl BrokerClient {
         )
         .await
         .map_err(|error| BrokerError::Unavailable(error.to_string()))?;
+        Ok(socket)
+    }
+
+    pub async fn audio_socket(&self) -> Result<BrokerWebSocket, BrokerError> {
+        let stream = UnixStream::connect(self.socket_path.as_ref()).await?;
+        let (socket, _) = client_async("ws://localhost/audio/socket", stream)
+            .await
+            .map_err(|error| BrokerError::Unavailable(error.to_string()))?;
         Ok(socket)
     }
 
@@ -1137,6 +1146,10 @@ impl BrokerPool {
             .await
     }
 
+    pub async fn audio_socket(&self) -> Result<BrokerWebSocket, BrokerError> {
+        self.current.client.audio_socket().await
+    }
+
     pub async fn info(&self) -> Result<SessionBrokerInfo, BrokerError> {
         let mut generations = Vec::new();
         let mut sessions = 0;
@@ -1363,6 +1376,7 @@ fn load_or_create_broker_control_token(data_directory: &Path) -> Result<String, 
 #[derive(Clone)]
 struct BrokerState {
     terminals: Arc<TerminalManager>,
+    audio: AudioHub,
     access: AccessManager,
     pi: Arc<PiService>,
     shutdown: Arc<Notify>,
@@ -1508,8 +1522,13 @@ pub async fn run_session_broker(
     let pi = Arc::new(PiService::new(data_directory));
     terminals.start_monitor(pi.clone());
     let shutdown = Arc::new(Notify::new());
+    #[cfg(test)]
+    let audio = AudioHub::test_available();
+    #[cfg(not(test))]
+    let audio = AudioHub::start().await;
     let state = BrokerState {
         terminals,
+        audio: audio.clone(),
         pi,
         access: broker_access_manager(),
         shutdown: shutdown.clone(),
@@ -1585,6 +1604,7 @@ pub async fn run_session_broker(
         )
         .route("/terminals/{id}/socket", any(broker_terminal_socket))
         .route("/terminals/{id}/observe", any(broker_terminal_observer))
+        .route("/audio/socket", any(broker_audio_socket))
         .route("/shutdown", axum::routing::post(shutdown_broker))
         .with_state(state);
 
@@ -1597,6 +1617,7 @@ pub async fn run_session_broker(
         shutdown.notified().await;
     })
     .await;
+    audio.shutdown().await;
     let _ = tokio::fs::remove_file(&path).await;
     result.map_err(Into::into)
 }
@@ -2082,6 +2103,18 @@ async fn broker_terminal_observer(
         }))
 }
 
+async fn broker_audio_socket(
+    State(state): State<BrokerState>,
+    websocket: WebSocketUpgrade,
+) -> Response {
+    websocket
+        .max_message_size(4 * 1024)
+        .max_frame_size(4 * 1024)
+        .write_buffer_size(64 * 1024)
+        .max_write_buffer_size(512 * 1024)
+        .on_upgrade(move |socket| serve_audio_socket(socket, state.audio))
+}
+
 async fn shutdown_broker(State(state): State<BrokerState>) -> StatusCode {
     state.terminals.shutdown();
     let shutdown = state.shutdown.clone();
@@ -2102,6 +2135,8 @@ mod tests {
     use tempfile::TempDir;
     use tokio::task::JoinHandle;
     use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
+
+    use crate::audio::{AUDIO_FRAME_SAMPLES, AUDIO_SAMPLE_RATE};
 
     use super::*;
 
@@ -2296,6 +2331,80 @@ mod tests {
         })
         .await
         .expect("terminal control message timeout")
+    }
+
+    async fn wait_for_audio_state(
+        socket: &mut BrokerWebSocket,
+        input_peers: u64,
+        output_peers: u64,
+    ) -> serde_json::Value {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(message) = socket.next().await {
+                if let TungsteniteMessage::Text(text) = message.unwrap() {
+                    let value = serde_json::from_str::<serde_json::Value>(&text).unwrap();
+                    if value["type"] == "state"
+                        && value["inputPeers"] == input_peers
+                        && value["outputPeers"] == output_peers
+                    {
+                        return value;
+                    }
+                }
+            }
+            panic!("audio socket ended before receiving peer counts");
+        })
+        .await
+        .expect("audio peer state timeout")
+    }
+
+    #[tokio::test]
+    async fn audio_socket_mixes_inputs_and_fans_out_output_across_clients() {
+        let (_directory, server, client) = start_test_broker(1024 * 1024).await;
+        let mut first = client.audio_socket().await.unwrap();
+        let ready = wait_for_control(&mut first, "ready").await;
+        assert_eq!(ready["available"], true);
+        assert_eq!(ready["sampleRate"], AUDIO_SAMPLE_RATE);
+        assert_eq!(ready["frameSamples"], AUDIO_FRAME_SAMPLES);
+
+        let mut second = client.audio_socket().await.unwrap();
+        let ready = wait_for_control(&mut second, "ready").await;
+        assert_eq!(ready["inputPeers"], 0);
+        assert_eq!(ready["outputPeers"], 0);
+
+        first
+            .send(TungsteniteMessage::Text(
+                r#"{"type":"input","enabled":true}"#.into(),
+            ))
+            .await
+            .unwrap();
+        first
+            .send(TungsteniteMessage::Text(
+                r#"{"type":"output","enabled":true}"#.into(),
+            ))
+            .await
+            .unwrap();
+        wait_for_audio_state(&mut first, 1, 1).await;
+
+        second
+            .send(TungsteniteMessage::Text(
+                r#"{"type":"input","enabled":true}"#.into(),
+            ))
+            .await
+            .unwrap();
+        let state = wait_for_audio_state(&mut second, 2, 1).await;
+        assert_eq!(state["inputEnabled"], true);
+        assert_eq!(state["outputEnabled"], false);
+
+        second
+            .send(TungsteniteMessage::Binary(vec![0_u8; 2].into()))
+            .await
+            .unwrap();
+        let error = wait_for_control(&mut second, "error").await;
+        assert_eq!(error["message"], "invalid virtual audio frame size");
+
+        first.close(None).await.unwrap();
+        wait_for_audio_state(&mut second, 1, 0).await;
+        client.shutdown().await.unwrap();
+        server.await.unwrap();
     }
 
     async fn wait_for_control_without_size(

@@ -152,6 +152,10 @@ import { Login } from "./components/Login";
 import { Sidebar } from "./components/Sidebar";
 import { SettingsWorkspace } from "./components/SettingsWorkspace";
 import { StatusModules } from "./components/StatusModules";
+import {
+  useVirtualAudioController,
+  VirtualAudioControl,
+} from "./components/VirtualAudioControl";
 import { TermServerLogo } from "./components/TermServerLogo";
 import { WelcomeSection } from "./components/WelcomeSection";
 import { ResourceTabBar } from "./components/ResourceTabs";
@@ -348,6 +352,7 @@ export function App() {
     installE2EDiagnostics();
   }, []);
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
+  const virtualAudio = useVirtualAudioController(authenticated === true);
   const browserViewIdRef = useRef<string>();
   const [browserPresence, setBrowserPresence] = useState(() => ({
     focused: typeof document !== "undefined" && document.hasFocus(),
@@ -2096,6 +2101,7 @@ export function App() {
               </button>
             </nav>
           )}
+          <VirtualAudioControl controller={virtualAudio} placement="mobile" />
         </header>
         {mobileSidebar && <button class="sidebar-scrim" onClick={closeMobileSidebar} aria-label="Close sidebar" />}
         <Sidebar
@@ -2450,6 +2456,7 @@ export function App() {
           onMobileVisibilityChange={setStatusModulesMobileVisible}
         />
         <span class="statusbar-group statusbar-right">
+          <VirtualAudioControl controller={virtualAudio} placement="desktop" />
           <span
             class="statusbar-item statusbar-build"
             title={`term-server v${config.build.version} · ${config.build.commit}`}

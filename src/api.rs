@@ -1587,6 +1587,34 @@ async fn terminal_socket(
         }))
 }
 
+async fn audio_socket(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+    websocket: WebSocketUpgrade,
+) -> Result<Response, ApiError> {
+    require_origin(&headers, &uri, &state)?;
+    require_auth(&jar, &state)?;
+    #[cfg(unix)]
+    {
+        let broker = state.workspace.connect_audio().await?;
+        Ok(websocket
+            .max_message_size(4 * 1024)
+            .max_frame_size(4 * 1024)
+            .write_buffer_size(64 * 1024)
+            .max_write_buffer_size(512 * 1024)
+            .on_upgrade(move |socket| proxy_audio_socket(socket, broker)))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = websocket;
+        Err(ApiError::BadRequest(
+            "virtual audio is only available on Unix hosts".to_owned(),
+        ))
+    }
+}
+
 fn require_terminal_stream_protocol(protocol: Option<u8>) -> Result<(), ApiError> {
     if protocol == Some(TERMINAL_STREAM_PROTOCOL) {
         return Ok(());
@@ -1654,6 +1682,46 @@ async fn proxy_terminal_socket(
         }
     }
     recorder.disconnect(&terminal_id, "socket closed");
+}
+
+#[cfg(unix)]
+async fn proxy_audio_socket(socket: WebSocket, broker: BrokerWebSocket) {
+    use tokio_tungstenite::tungstenite::Message as BrokerMessage;
+
+    let (mut browser_sender, mut browser_receiver) = socket.split();
+    let (mut broker_sender, mut broker_receiver) = broker.split();
+    loop {
+        tokio::select! {
+            message = broker_receiver.next() => {
+                let Some(Ok(message)) = message else { break; };
+                let outgoing = match message {
+                    BrokerMessage::Text(text) => Message::Text(text.to_string().into()),
+                    BrokerMessage::Binary(bytes) => Message::Binary(bytes.to_vec().into()),
+                    BrokerMessage::Close(_) => Message::Close(None),
+                    BrokerMessage::Ping(payload) => {
+                        if proxy_send(&mut broker_sender, BrokerMessage::Pong(payload)).await.is_err() { break; }
+                        continue;
+                    }
+                    BrokerMessage::Pong(_) | BrokerMessage::Frame(_) => continue,
+                };
+                if proxy_send(&mut browser_sender, outgoing).await.is_err() { break; }
+            }
+            message = browser_receiver.next() => {
+                let Some(Ok(message)) = message else { break; };
+                let outgoing = match message {
+                    Message::Text(text) => BrokerMessage::Text(text.to_string().into()),
+                    Message::Binary(bytes) => BrokerMessage::Binary(bytes.to_vec().into()),
+                    Message::Close(_) => BrokerMessage::Close(None),
+                    Message::Ping(payload) => {
+                        if proxy_send(&mut browser_sender, Message::Pong(payload)).await.is_err() { break; }
+                        continue;
+                    }
+                    Message::Pong(_) => continue,
+                };
+                if proxy_send(&mut broker_sender, outgoing).await.is_err() { break; }
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1888,6 +1956,7 @@ pub fn build_router(state: AppState, client_directory: Option<PathBuf>) -> Route
             delete(terminate_terminal_process),
         )
         .route("/terminals/{id}/socket", any(terminal_socket))
+        .route("/audio/socket", any(audio_socket))
         .route("/artifacts", get(list_artifacts))
         .route(
             "/artifacts/{session_id}/{artifact_id}",
