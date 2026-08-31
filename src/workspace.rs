@@ -576,6 +576,16 @@ impl WorkspaceBackend {
         }
     }
 
+    #[cfg(unix)]
+    pub async fn connect_audio(&self) -> Result<crate::broker::BrokerWebSocket, WorkspaceError> {
+        match self {
+            Self::Local { .. } => Err(WorkspaceError::Unavailable(
+                "virtual audio requires the session broker".to_owned(),
+            )),
+            Self::Broker(pool) => pool.audio_socket().await,
+        }
+    }
+
     pub async fn shutdown(&self) {
         match self {
             Self::Local { terminals, .. } => terminals.shutdown(),
