@@ -210,7 +210,7 @@ The terminal starts in a private managed directory containing provider-local ins
 
 The sidebar row and pane header turn amber when the shell leaves the managed supervisor directory, and the pane shows the exact root to return to before starting an agent. Subdirectories remain valid because provider skill discovery walks their ancestors.
 
-The agent composes behavior from low-level primitives: list terminals and detected agents, read a rendered screen or bounded output tail, send text or named keys, create or rename a terminal, inspect or terminate a descendant process, and list or close open terminal panes and non-dirty resource tabs. Closing a pane leaves its PTY alive; killing a terminal ends it. There is no built-in “organize project,” layout-arrangement, delayed-action, scheduler, or job command.
+The agent composes behavior from low-level primitives: list terminals and detected agents, read a rendered screen or bounded output tail, send text, single-character keys, or named keys, create or rename a terminal, inspect or terminate a descendant process, and list or close open terminal panes and non-dirty resource tabs. Closing a pane leaves its PTY alive; killing a terminal ends it. There is no built-in “organize project,” layout-arrangement, delayed-action, scheduler, or job command.
 
 ### Blocked agents and screen detection
 

@@ -24,6 +24,7 @@ Mutating primitives:
 
 ```sh
 term-server-supervisor send <terminal-id> --text '<text>' --enter
+term-server-supervisor send <terminal-id> --key q
 term-server-supervisor send <terminal-id> --key ctrl-c
 term-server-supervisor rename <terminal-id> '<name>'
 term-server-supervisor create [--cwd <absolute-path>] [--name <name>] [--shell <path>]
@@ -31,6 +32,8 @@ term-server-supervisor kill <terminal-id>
 term-server-supervisor terminate <terminal-id> <process-id>
 term-server-supervisor close-tab <tab-id>
 ```
+
+Use `--key <character>` for raw-mode applications that expect one keystroke at a time. Named keys include `enter`, `tab`, `escape`, `ctrl-c`, `ctrl-d`, `ctrl-z`, and the four arrow keys.
 
 Terminal IDs, process IDs, and tab IDs are opaque. Re-list before acting when state may have changed. `close-tab` detaches a terminal pane or closes a non-dirty resource tab; it does not kill the terminal process. `kill` permanently ends the terminal session.
 
