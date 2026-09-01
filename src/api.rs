@@ -1666,7 +1666,9 @@ async fn proxy_terminal_socket(
     broker: BrokerWebSocket,
     recorder: &DebugRecordingManager,
 ) {
-    use tokio_tungstenite::tungstenite::Message as BrokerMessage;
+    use axum::extract::ws::Utf8Bytes;
+    use bytes::Bytes;
+    use tokio_tungstenite::tungstenite::{Message as BrokerMessage, Utf8Bytes as BrokerUtf8Bytes};
 
     recorder.connect(&terminal_id);
     let (mut browser_sender, mut browser_receiver) = socket.split();
@@ -1679,11 +1681,16 @@ async fn proxy_terminal_socket(
                 let outgoing = match message {
                     BrokerMessage::Text(text) => {
                         record_broker_control(recorder, &terminal_id, &text);
-                        Message::Text(text.to_string().into())
+                        // Both stacks back their payloads with `bytes::Bytes`,
+                        // so the frame moves across without a copy. The UTF-8
+                        // re-validation cannot fail for text that already
+                        // parsed as a text frame.
+                        let Ok(text) = Utf8Bytes::try_from(Bytes::from(text)) else { break; };
+                        Message::Text(text)
                     }
                     BrokerMessage::Binary(bytes) => {
                         record_broker_frame(recorder, &terminal_id, &bytes);
-                        Message::Binary(bytes.to_vec().into())
+                        Message::Binary(bytes)
                     }
                     BrokerMessage::Close(_) => Message::Close(None),
                     BrokerMessage::Ping(payload) => {
@@ -1699,11 +1706,12 @@ async fn proxy_terminal_socket(
                 let outgoing = match message {
                     Message::Text(text) => {
                         record_browser_message(recorder, &terminal_id, &text, &mut checkpoint_recording);
-                        BrokerMessage::Text(text.to_string().into())
+                        let Ok(text) = BrokerUtf8Bytes::try_from(Bytes::from(text)) else { break; };
+                        BrokerMessage::Text(text)
                     }
                     Message::Binary(bytes) => {
                         record_browser_binary(recorder, &terminal_id, &bytes, &mut checkpoint_recording);
-                        BrokerMessage::Binary(bytes.to_vec().into())
+                        BrokerMessage::Binary(bytes)
                     }
                     Message::Close(_) => BrokerMessage::Close(None),
                     Message::Ping(payload) => {
@@ -1731,7 +1739,9 @@ async fn proxy_audio_socket(socket: WebSocket, broker: BrokerWebSocket) {
                 let Some(Ok(message)) = message else { break; };
                 let outgoing = match message {
                     BrokerMessage::Text(text) => Message::Text(text.to_string().into()),
-                    BrokerMessage::Binary(bytes) => Message::Binary(bytes.to_vec().into()),
+                    // Both stacks back binary payloads with `bytes::Bytes`, so the
+                    // audio frame moves across without a copy.
+                    BrokerMessage::Binary(bytes) => Message::Binary(bytes),
                     BrokerMessage::Close(_) => Message::Close(None),
                     BrokerMessage::Ping(payload) => {
                         if proxy_send(&mut broker_sender, BrokerMessage::Pong(payload)).await.is_err() { break; }
@@ -1745,7 +1755,7 @@ async fn proxy_audio_socket(socket: WebSocket, broker: BrokerWebSocket) {
                 let Some(Ok(message)) = message else { break; };
                 let outgoing = match message {
                     Message::Text(text) => BrokerMessage::Text(text.to_string().into()),
-                    Message::Binary(bytes) => BrokerMessage::Binary(bytes.to_vec().into()),
+                    Message::Binary(bytes) => BrokerMessage::Binary(bytes),
                     Message::Close(_) => BrokerMessage::Close(None),
                     Message::Ping(payload) => {
                         if proxy_send(&mut browser_sender, Message::Pong(payload)).await.is_err() { break; }
@@ -1761,10 +1771,17 @@ async fn proxy_audio_socket(socket: WebSocket, broker: BrokerWebSocket) {
 
 #[cfg(unix)]
 fn record_broker_control(recorder: &DebugRecordingManager, terminal_id: &Uuid, text: &str) {
+    if !recorder.is_active() {
+        return;
+    }
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
         recorder.control(terminal_id, value);
     }
 }
+
+/// The browser message that announces an incoming binary checkpoint upload.
+#[cfg(unix)]
+const CHECKPOINT_BINARY_MESSAGE_TYPE: &str = "checkpointBinary";
 
 /// Tracks an announced binary checkpoint upload so the proxy can record its
 /// chunk frames as checkpoint content instead of terminal input.
@@ -1784,31 +1801,44 @@ fn record_browser_message(
     text: &str,
     checkpoint: &mut BrowserCheckpointRecording,
 ) {
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
-        if value.get("type").and_then(serde_json::Value::as_str) == Some("checkpointBinary") {
-            checkpoint.sequence = value
-                .get("sequence")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-            checkpoint.epoch = value
-                .get("epoch")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-            checkpoint.offset = 0;
-            checkpoint.remaining = value
-                .get("size")
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|size| usize::try_from(size).ok())
-                .unwrap_or(0);
-        }
-        recorder.control(
-            terminal_id,
-            serde_json::json!({
-                "type": "client",
-                "message": value,
-            }),
-        );
+    // Checkpoint announcements are still tracked while recording is off, so a
+    // recording started mid-upload classifies the chunks that follow instead
+    // of logging them as terminal input. The substring test keeps the far more
+    // frequent acks and resizes off the JSON parser.
+    let active = recorder.is_active();
+    if !active && !text.contains(CHECKPOINT_BINARY_MESSAGE_TYPE) {
+        return;
     }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return;
+    };
+    if value.get("type").and_then(serde_json::Value::as_str) == Some(CHECKPOINT_BINARY_MESSAGE_TYPE)
+    {
+        checkpoint.sequence = value
+            .get("sequence")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        checkpoint.epoch = value
+            .get("epoch")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        checkpoint.offset = 0;
+        checkpoint.remaining = value
+            .get("size")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|size| usize::try_from(size).ok())
+            .unwrap_or(0);
+    }
+    if !active {
+        return;
+    }
+    recorder.control(
+        terminal_id,
+        serde_json::json!({
+            "type": "client",
+            "message": value,
+        }),
+    );
 }
 
 /// Binary checkpoint chunks travel on the same frame type as raw terminal
@@ -1826,20 +1856,24 @@ fn record_browser_binary(
         if sequence == checkpoint.sequence {
             let payload = &bytes[9..];
             let consumed = payload.len().min(checkpoint.remaining);
-            recorder.control(
-                terminal_id,
-                serde_json::json!({
-                    "type": "client",
-                    "message": {
-                        "type": "checkpointBinaryChunk",
-                        "sequence": checkpoint.sequence,
-                        "epoch": checkpoint.epoch,
-                        "offset": checkpoint.offset,
-                        "data": base64::engine::general_purpose::STANDARD.encode(payload),
-                        "final": consumed == checkpoint.remaining,
-                    },
-                }),
-            );
+            // The chunk accounting runs either way; only the (expensive)
+            // base64 capture is gated on an active recording.
+            if recorder.is_active() {
+                recorder.control(
+                    terminal_id,
+                    serde_json::json!({
+                        "type": "client",
+                        "message": {
+                            "type": "checkpointBinaryChunk",
+                            "sequence": checkpoint.sequence,
+                            "epoch": checkpoint.epoch,
+                            "offset": checkpoint.offset,
+                            "data": base64::engine::general_purpose::STANDARD.encode(payload),
+                            "final": consumed == checkpoint.remaining,
+                        },
+                    }),
+                );
+            }
             checkpoint.offset += consumed;
             checkpoint.remaining -= consumed;
             return;
@@ -1852,7 +1886,7 @@ fn record_browser_binary(
 fn record_broker_frame(recorder: &DebugRecordingManager, terminal_id: &Uuid, bytes: &[u8]) {
     // Terminal frames carry a 1-byte kind followed by an 8-byte big-endian
     // sequence and then the payload.
-    if bytes.len() < 9 {
+    if !recorder.is_active() || bytes.len() < 9 {
         return;
     }
     let kind = bytes[0];
@@ -1862,6 +1896,104 @@ fn record_broker_frame(recorder: &DebugRecordingManager, terminal_id: &Uuid, byt
         0 => recorder.snapshot(terminal_id, sequence, payload),
         1 => recorder.output(terminal_id, sequence, payload),
         _ => {}
+    }
+}
+
+#[cfg(all(test, unix))]
+mod proxy_recording_tests {
+    use super::*;
+    use crate::debug_recording::DebugRecordEvent;
+
+    fn checkpoint_frame(sequence: u64, payload: &[u8]) -> Vec<u8> {
+        let mut frame = vec![2u8];
+        frame.extend_from_slice(&sequence.to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    #[test]
+    fn broker_frames_are_not_captured_while_recording_is_off() {
+        let recorder = DebugRecordingManager::new();
+        let id = Uuid::new_v4();
+        let mut frame = vec![1u8];
+        frame.extend_from_slice(&7u64.to_be_bytes());
+        frame.extend_from_slice(&vec![b'x'; 64 * 1024]);
+        record_broker_frame(&recorder, &id, &frame);
+        record_broker_control(&recorder, &id, r#"{"type":"ready"}"#);
+        assert_eq!(recorder.status().events, 0);
+
+        recorder.start();
+        record_broker_frame(&recorder, &id, &frame);
+        record_broker_control(&recorder, &id, r#"{"type":"ready"}"#);
+        assert_eq!(recorder.status().events, 2);
+    }
+
+    #[test]
+    fn browser_messages_are_not_captured_while_recording_is_off() {
+        let recorder = DebugRecordingManager::new();
+        let id = Uuid::new_v4();
+        let mut checkpoint = BrowserCheckpointRecording::default();
+        record_browser_message(
+            &recorder,
+            &id,
+            r#"{"type":"ack","sequence":4}"#,
+            &mut checkpoint,
+        );
+        record_browser_binary(&recorder, &id, b"ls -la\n", &mut checkpoint);
+        assert_eq!(recorder.status().events, 0);
+
+        recorder.start();
+        record_browser_message(
+            &recorder,
+            &id,
+            r#"{"type":"ack","sequence":4}"#,
+            &mut checkpoint,
+        );
+        record_browser_binary(&recorder, &id, b"ls -la\n", &mut checkpoint);
+        assert_eq!(recorder.status().events, 2);
+    }
+
+    /// A checkpoint upload announced while recording was off must still be
+    /// tracked, so a recording started mid-upload logs the remaining chunks as
+    /// checkpoint content rather than terminal input.
+    #[test]
+    fn checkpoint_uploads_stay_tracked_across_a_mid_upload_start() {
+        let recorder = DebugRecordingManager::new();
+        let id = Uuid::new_v4();
+        let mut checkpoint = BrowserCheckpointRecording::default();
+        record_browser_message(
+            &recorder,
+            &id,
+            r#"{"type":"checkpointBinary","sequence":9,"epoch":2,"size":8}"#,
+            &mut checkpoint,
+        );
+        assert_eq!(recorder.status().events, 0);
+        assert_eq!(checkpoint.remaining, 8);
+
+        record_browser_binary(
+            &recorder,
+            &id,
+            &checkpoint_frame(9, b"abcd"),
+            &mut checkpoint,
+        );
+        assert_eq!(checkpoint.offset, 4);
+        assert_eq!(checkpoint.remaining, 4);
+
+        recorder.start();
+        record_browser_binary(
+            &recorder,
+            &id,
+            &checkpoint_frame(9, b"efgh"),
+            &mut checkpoint,
+        );
+        let export = recorder.export().expect("recording buffer");
+        assert_eq!(export.events.len(), 1);
+        let DebugRecordEvent::Control { message } = &export.events[0].event else {
+            panic!("expected a control event");
+        };
+        assert_eq!(message["message"]["type"], "checkpointBinaryChunk");
+        assert_eq!(message["message"]["offset"], 4);
+        assert_eq!(message["message"]["final"], true);
     }
 }
 

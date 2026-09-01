@@ -106,7 +106,7 @@ struct RecordingBuffer {
 
 impl RecordingBuffer {
     fn record(&mut self, terminal: &Uuid, event: DebugRecordEvent) {
-        if self.truncated {
+        if self.truncated || self.stopped_at.is_some() {
             return;
         }
         let ts = current_millis();
@@ -224,8 +224,12 @@ impl DebugRecordingManager {
     }
 
     pub fn clear(&self) {
+        // Flip the flag while holding the lock so a recorder thread that
+        // already passed the fast-path check and is waiting on the mutex sees
+        // a consistent state instead of a missing buffer.
+        let mut guard = self.inner.lock().unwrap();
         self.active.store(false, Ordering::SeqCst);
-        *self.inner.lock().unwrap() = None;
+        *guard = None;
         self.events.store(0, Ordering::Relaxed);
     }
 
@@ -246,22 +250,37 @@ impl DebugRecordingManager {
         })
     }
 
+    /// Whether capture is currently on. Callers on hot paths must check this
+    /// *before* building an event so an inactive recorder costs a single
+    /// atomic load. Never cache the result: recording can start or stop
+    /// between two frames of the same connection.
+    #[inline]
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::Relaxed)
+    }
+
     #[inline]
     fn record(&self, terminal: &Uuid, event: DebugRecordEvent) {
         // Fast path: single atomic load, no allocation, no locking when off.
-        if !self.active.load(Ordering::Relaxed) {
+        if !self.is_active() {
             return;
         }
-        self.inner
-            .lock()
-            .unwrap()
-            .as_mut()
-            .expect("active recording buffer")
-            .record(terminal, event);
+        let mut guard = self.inner.lock().unwrap();
+        // `clear()` may have dropped the buffer while this thread waited for
+        // the lock; the event is simply lost rather than panicking (which,
+        // with `panic = "abort"`, would take the whole server down).
+        let Some(buffer) = guard.as_mut() else {
+            return;
+        };
+        buffer.record(terminal, event);
+        drop(guard);
         self.events.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn output(&self, terminal: &Uuid, sequence: u64, bytes: &[u8]) {
+        if !self.is_active() {
+            return;
+        }
         self.record(
             terminal,
             DebugRecordEvent::Output {
@@ -272,6 +291,9 @@ impl DebugRecordingManager {
     }
 
     pub fn input(&self, terminal: &Uuid, bytes: &[u8]) {
+        if !self.is_active() {
+            return;
+        }
         self.record(
             terminal,
             DebugRecordEvent::Input {
@@ -281,6 +303,9 @@ impl DebugRecordingManager {
     }
 
     pub fn control(&self, terminal: &Uuid, message: impl Serialize) {
+        if !self.is_active() {
+            return;
+        }
         let Ok(message) = serde_json::to_value(message) else {
             return;
         };
@@ -288,6 +313,9 @@ impl DebugRecordingManager {
     }
 
     pub fn snapshot(&self, terminal: &Uuid, sequence: u64, bytes: &[u8]) {
+        if !self.is_active() {
+            return;
+        }
         self.record(
             terminal,
             DebugRecordEvent::Snapshot {
@@ -302,6 +330,9 @@ impl DebugRecordingManager {
     }
 
     pub fn disconnect(&self, terminal: &Uuid, reason: &str) {
+        if !self.is_active() {
+            return;
+        }
         self.record(
             terminal,
             DebugRecordEvent::Disconnect {
@@ -330,6 +361,9 @@ impl DebugRecordingManager {
     }
 
     pub fn note(&self, terminal: &Uuid, event: &str) {
+        if !self.is_active() {
+            return;
+        }
         self.record(
             terminal,
             DebugRecordEvent::Control {
@@ -428,5 +462,95 @@ mod tests {
         let restarted = manager.start();
         assert!(restarted.active);
         assert_eq!(restarted.events, 0);
+    }
+
+    #[test]
+    fn is_active_tracks_the_recording_lifecycle() {
+        let manager = DebugRecordingManager::new();
+        assert!(!manager.is_active());
+        manager.start();
+        assert!(manager.is_active());
+        manager.stop();
+        assert!(!manager.is_active());
+        manager.start();
+        assert!(manager.is_active());
+        manager.clear();
+        assert!(!manager.is_active());
+    }
+
+    /// A payload far larger than the whole byte budget must not even be
+    /// encoded while recording is off, so the buffer stays untouched.
+    #[test]
+    fn inactive_recorder_ignores_large_payloads() {
+        let manager = DebugRecordingManager::with_max_bytes(1024);
+        let id = Uuid::new_v4();
+        let huge = vec![b'x'; 4 * 1024 * 1024];
+        manager.output(&id, 0, &huge);
+        manager.snapshot(&id, 0, &huge);
+        manager.input(&id, &huge);
+        let status = manager.status();
+        assert_eq!(status.events, 0);
+        assert_eq!(status.bytes, 0);
+        assert!(!status.truncated);
+        assert!(manager.export().is_none());
+    }
+
+    /// Counts how many times the recorder asked serde to serialize a control
+    /// message, so the test can prove the inactive path never does.
+    struct CountingMessage<'a>(&'a AtomicU64);
+
+    impl Serialize for CountingMessage<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            serializer.serialize_str("counted")
+        }
+    }
+
+    #[test]
+    fn inactive_recorder_does_not_serialize_control_messages() {
+        let manager = DebugRecordingManager::new();
+        let id = Uuid::new_v4();
+        let calls = AtomicU64::new(0);
+        manager.control(&id, CountingMessage(&calls));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        // ...but an active recording still captures the message.
+        manager.start();
+        manager.control(&id, CountingMessage(&calls));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(manager.status().events, 1);
+    }
+
+    /// `clear()` used to drop the buffer after flipping the flag, so a frame
+    /// that had already passed the fast-path check hit an `expect` on `None`
+    /// and aborted the process (release builds use `panic = "abort"`).
+    #[test]
+    fn clear_racing_with_records_never_panics() {
+        use std::sync::Arc;
+
+        let manager = Arc::new(DebugRecordingManager::new());
+        let terminal = Uuid::new_v4();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut recorders = Vec::new();
+        for _ in 0..4 {
+            let manager = Arc::clone(&manager);
+            let stop = Arc::clone(&stop);
+            recorders.push(std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    manager.output(&terminal, 0, b"a terminal frame");
+                    manager.control(&terminal, serde_json::json!({ "type": "pong" }));
+                    manager.note(&terminal, "burst");
+                }
+            }));
+        }
+        for _ in 0..1_000 {
+            manager.start();
+            manager.clear();
+        }
+        stop.store(true, Ordering::Relaxed);
+        for recorder in recorders {
+            recorder.join().expect("recorder thread must not panic");
+        }
+        // A poisoned mutex would make this `lock().unwrap()` panic.
+        assert_eq!(manager.status().events, 0);
     }
 }
