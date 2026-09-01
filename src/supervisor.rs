@@ -51,6 +51,10 @@ const MAX_BROWSER_RESOURCES: usize = 256;
 const MAX_BROWSER_TITLE_BYTES: usize = 512;
 const MAX_BROWSER_LABEL_BYTES: usize = 512;
 const MAX_BROWSER_PATH_BYTES: usize = 8 * 1024;
+/// Accept errors such as descriptor exhaustion are transient, so the control
+/// socket waits and retries instead of giving up on the listener.
+const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(50);
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
 const SUPERVISOR_SKILL: &str = include_str!("../skills/term-server-supervisor/SKILL.md");
 const SUPERVISOR_CONTEXT: &str = r#"# Term-server supervisor
 
@@ -474,6 +478,49 @@ struct SupervisorCredentials {
     token_hash: String,
 }
 
+/// Doubles the accept backoff, up to its ceiling.
+fn next_accept_backoff(current: Duration) -> Duration {
+    (current * 2).min(ACCEPT_BACKOFF_MAX)
+}
+
+/// The bound supervisor control socket. Binding it is what makes a server the
+/// single instance for a data directory, so it is claimed before anything else
+/// in that directory is opened: a second server that is going to be rejected
+/// must not first reconfigure the running one's session broker.
+#[derive(Debug)]
+pub struct SupervisorControlSocket {
+    listener: UnixListener,
+}
+
+impl SupervisorControlSocket {
+    pub async fn claim(data_directory: &Path) -> Result<Self, SupervisorError> {
+        fs::create_dir_all(data_directory).await?;
+        let data_directory = fs::canonicalize(data_directory).await?;
+        Self::bind(data_directory.join(CONTROL_SOCKET_NAME)).await
+    }
+
+    async fn bind(socket_path: PathBuf) -> Result<Self, SupervisorError> {
+        if let Some(parent) = socket_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        let listener = match UnixListener::bind(&socket_path) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+                if UnixStream::connect(&socket_path).await.is_ok() {
+                    return Err(SupervisorError::Unavailable(
+                        "a supervisor control service is already running".into(),
+                    ));
+                }
+                fs::remove_file(&socket_path).await?;
+                UnixListener::bind(&socket_path)?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        set_private_permissions(&socket_path)?;
+        Ok(Self { listener })
+    }
+}
+
 pub struct SupervisorService {
     workspace: WorkspaceBackend,
     socket_path: PathBuf,
@@ -508,28 +555,22 @@ impl SupervisorService {
     }
 
     pub async fn start(self: &Arc<Self>) -> Result<(), SupervisorError> {
-        if let Some(parent) = self.socket_path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        let listener = match UnixListener::bind(&self.socket_path) {
-            Ok(listener) => listener,
-            Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
-                if UnixStream::connect(&self.socket_path).await.is_ok() {
-                    return Err(SupervisorError::Unavailable(
-                        "a supervisor control service is already running".into(),
-                    ));
-                }
-                fs::remove_file(&self.socket_path).await?;
-                UnixListener::bind(&self.socket_path)?
-            }
-            Err(error) => return Err(error.into()),
-        };
-        set_private_permissions(&self.socket_path)?;
+        let socket = SupervisorControlSocket::bind(self.socket_path.clone()).await?;
+        self.serve(socket);
+        Ok(())
+    }
+
+    /// Serves the control socket claimed earlier by
+    /// [`SupervisorControlSocket::claim`].
+    pub fn serve(self: &Arc<Self>, socket: SupervisorControlSocket) {
         let service = self.clone();
+        let listener = socket.listener;
         tokio::spawn(async move {
+            let mut backoff = ACCEPT_BACKOFF_MIN;
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
+                        backoff = ACCEPT_BACKOFF_MIN;
                         let service = service.clone();
                         tokio::spawn(async move {
                             if let Err(error) = service.handle_connection(stream).await {
@@ -538,13 +579,21 @@ impl SupervisorService {
                         });
                     }
                     Err(error) => {
-                        tracing::warn!(%error, "supervisor control socket stopped accepting connections");
-                        break;
+                        // Descriptor exhaustion and aborted connections are
+                        // transient. Dropping the listener here would refuse
+                        // every later CLI and MCP call until the server is
+                        // restarted, so back off and keep accepting.
+                        tracing::warn!(
+                            %error,
+                            backoff_ms = backoff.as_millis() as u64,
+                            "supervisor control socket failed to accept a connection"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        backoff = next_accept_backoff(backoff);
                     }
                 }
             }
         });
-        Ok(())
     }
 
     pub async fn open_or_create(&self) -> Result<TerminalInfo, SupervisorError> {
@@ -2609,5 +2658,40 @@ mod tests {
         assert!(constant_time_eq(b"same", b"same"));
         assert!(!constant_time_eq(b"same", b"samf"));
         assert!(!constant_time_eq(b"same", b"same-longer"));
+    }
+
+    #[tokio::test]
+    async fn claiming_the_control_socket_rejects_a_second_server_and_recovers_stale_sockets() {
+        let directory = tempfile::tempdir().unwrap();
+        let claimed = SupervisorControlSocket::claim(directory.path())
+            .await
+            .unwrap();
+        let rejected = SupervisorControlSocket::claim(directory.path())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&rejected, SupervisorError::Unavailable(message) if message.contains("already running")),
+            "unexpected error: {rejected}"
+        );
+
+        // A server that died leaves its socket file behind; the next one still
+        // has to be able to claim it.
+        drop(claimed);
+        SupervisorControlSocket::claim(directory.path())
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn accept_backoff_doubles_up_to_its_ceiling() {
+        assert_eq!(
+            next_accept_backoff(ACCEPT_BACKOFF_MIN),
+            ACCEPT_BACKOFF_MIN * 2
+        );
+        assert_eq!(
+            next_accept_backoff(ACCEPT_BACKOFF_MAX / 2 + Duration::from_millis(1)),
+            ACCEPT_BACKOFF_MAX
+        );
+        assert_eq!(next_accept_backoff(ACCEPT_BACKOFF_MAX), ACCEPT_BACKOFF_MAX);
     }
 }

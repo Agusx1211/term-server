@@ -14,7 +14,7 @@ use clap::Parser;
 #[cfg(unix)]
 use term_server::broker::{BrokerClient, BrokerPool, legacy_socket_path, run_session_broker};
 #[cfg(unix)]
-use term_server::supervisor::{self, SupervisorService};
+use term_server::supervisor::{self, SupervisorControlSocket, SupervisorService};
 #[cfg(unix)]
 use term_server::{access_cli, config::CliCommand};
 use term_server::{
@@ -97,6 +97,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(directory)
     };
 
+    // Claiming the supervisor control socket is what makes this process the
+    // single server for its data directory. It happens before the workspace is
+    // opened so a second server cannot reconfigure the running server's session
+    // broker on its way to being rejected.
+    #[cfg(unix)]
+    let control_socket = SupervisorControlSocket::claim(&cli.data_dir).await?;
     let loaded_auth = load_auth(
         &cli.data_dir,
         env::var("TERM_SERVER_PASSWORD").ok(),
@@ -114,7 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(unix)]
     let supervisor = SupervisorService::new(workspace.clone(), &cli.data_dir, &executable).await?;
     #[cfg(unix)]
-    supervisor.start().await?;
+    supervisor.serve(control_socket);
     let updates = Arc::new(UpdateService::new(
         client_directory.as_deref(),
         cli.update_channel.clone(),
