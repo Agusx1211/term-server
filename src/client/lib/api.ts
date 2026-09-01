@@ -49,21 +49,89 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    ...init,
-    cache: "no-store",
-    headers: {
-      ...(init?.body ? { "content-type": "application/json" } : {}),
-      ...init?.headers,
-    },
-  });
-  if (!response.ok) {
-    const body = (await response.json().catch(() => null)) as { error?: string } | null;
-    throw new ApiError(body?.error ?? `Request failed (${response.status})`, response.status);
+/**
+ * Default budget for a JSON API call. Without it a request that is never
+ * answered (a server restarted mid-save, a dropped connection the OS has not
+ * noticed yet) leaves its UI wedged until the TCP timeout, and re-entrancy
+ * guards such as the editor's Save keep refusing new attempts for minutes.
+ */
+export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+/** Endpoints that shell out to agent CLIs (`COMMAND_TIMEOUT` is 60 s server-side). */
+const COMMAND_REQUEST_TIMEOUT_MS = 120_000;
+/** Endpoints that reach the release host, whose own HTTP client waits 5 minutes. */
+const RELEASE_REQUEST_TIMEOUT_MS = 360_000;
+/** Downloading, verifying, and installing a release. */
+const INSTALL_REQUEST_TIMEOUT_MS = 900_000;
+/** Endpoints that call an external provider (status modules allow 60 s each). */
+const PROVIDER_REQUEST_TIMEOUT_MS = 90_000;
+
+export const REQUEST_TIMEOUT_ERROR = "Request timed out";
+
+interface TimedRequestInit extends RequestInit {
+  /** Override the default budget; 0 disables the timeout entirely. */
+  readonly timeoutMs?: number;
+}
+
+interface RequestDeadline {
+  readonly signal: AbortSignal;
+  timedOut(): boolean;
+  dispose(): void;
+}
+
+/**
+ * Abort the request once the budget elapses, while still honouring a caller
+ * supplied signal. `AbortSignal.any` is not available everywhere the client
+ * runs, so the two sources are combined by hand.
+ */
+function requestDeadline(signal: AbortSignal | null | undefined, timeoutMs: number): RequestDeadline {
+  const controller = new AbortController();
+  let expired = false;
+  const timer = timeoutMs > 0
+    ? setTimeout(() => {
+      expired = true;
+      controller.abort();
+    }, timeoutMs)
+    : undefined;
+  const forward = () => controller.abort();
+  if (signal) {
+    if (signal.aborted) controller.abort();
+    else signal.addEventListener("abort", forward, { once: true });
   }
-  if (response.status === 204) return undefined as T;
-  return response.json() as Promise<T>;
+  return {
+    signal: controller.signal,
+    timedOut: () => expired,
+    dispose: () => {
+      if (timer !== undefined) clearTimeout(timer);
+      signal?.removeEventListener("abort", forward);
+    },
+  };
+}
+
+async function request<T>(path: string, init?: TimedRequestInit): Promise<T> {
+  const { timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, signal, ...rest } = init ?? {};
+  const deadline = requestDeadline(signal, timeoutMs);
+  try {
+    const response = await fetch(path, {
+      ...rest,
+      signal: deadline.signal,
+      cache: "no-store",
+      headers: {
+        ...(rest.body ? { "content-type": "application/json" } : {}),
+        ...rest.headers,
+      },
+    });
+    if (!response.ok) {
+      const body = (await response.json().catch(() => null)) as { error?: string } | null;
+      throw new ApiError(body?.error ?? `Request failed (${response.status})`, response.status);
+    }
+    if (response.status === 204) return undefined as T;
+    return await response.json() as T;
+  } catch (error) {
+    if (deadline.timedOut()) throw new ApiError(REQUEST_TIMEOUT_ERROR, 0);
+    throw error;
+  } finally {
+    deadline.dispose();
+  }
 }
 
 interface ConfigRequestOptions {
@@ -94,18 +162,22 @@ export const api = {
       : "";
     return request<ClientConfig>(`/api/config${query}`, { signal: options.signal });
   },
-  statusModules: (signal?: AbortSignal) => request<StatusModulesResponse>("/api/status-modules", { signal }),
+  statusModules: (signal?: AbortSignal) => request<StatusModulesResponse>("/api/status-modules", {
+    signal,
+    timeoutMs: PROVIDER_REQUEST_TIMEOUT_MS,
+  }),
   statusModulesConfig: () => request<StatusModulesSettings>("/api/config/status-modules"),
   updateStatusModulesConfig: (config: UpdateStatusModulesSettings) =>
     request<StatusModulesSettings>("/api/config/status-modules", {
       method: "PATCH",
       body: JSON.stringify(config),
     }),
-  updateStatus: () => request<UpdateStatus>("/api/update"),
+  updateStatus: () => request<UpdateStatus>("/api/update", { timeoutMs: RELEASE_REQUEST_TIMEOUT_MS }),
   installUpdate: (commit: string) =>
     request<ReleaseInfo>("/api/update", {
       method: "POST",
       body: JSON.stringify({ commit }),
+      timeoutMs: INSTALL_REQUEST_TIMEOUT_MS,
     }),
   updateChannel: (channel: UpdateChannel) =>
     request<UpdateConfig>("/api/config/updates", {
@@ -120,21 +192,28 @@ export const api = {
   updatePiConfig: (config: UpdatePiConfig) =>
     request<PiConfig>("/api/config/pi", { method: "PATCH", body: JSON.stringify(config) }),
   agentIntegrations: (signal?: AbortSignal) =>
-    request<AgentIntegrationsConfig>("/api/config/agent-integrations", { signal }),
+    request<AgentIntegrationsConfig>("/api/config/agent-integrations", {
+      signal,
+      timeoutMs: COMMAND_REQUEST_TIMEOUT_MS,
+    }),
   updateAgentIntegration: (
     provider: AgentIntegrationProvider,
     action: AgentIntegrationAction,
   ) => request<AgentIntegrationsConfig>(`/api/config/agent-integrations/${provider}`, {
     method: "PATCH",
     body: JSON.stringify({ action }),
+    timeoutMs: COMMAND_REQUEST_TIMEOUT_MS,
   }),
-  artifactSkill: () => request<ArtifactSkillConfig>("/api/config/artifact-skill"),
+  artifactSkill: () => request<ArtifactSkillConfig>("/api/config/artifact-skill", {
+    timeoutMs: COMMAND_REQUEST_TIMEOUT_MS,
+  }),
   updateArtifactSkill: (
     provider: AgentIntegrationProvider,
     action: ArtifactSkillAction,
   ) => request<ArtifactSkillConfig>(`/api/config/artifact-skill/${provider}`, {
     method: "PATCH",
     body: JSON.stringify({ action }),
+    timeoutMs: COMMAND_REQUEST_TIMEOUT_MS,
   }),
   createSupervisor: (signal?: AbortSignal) =>
     request<TerminalInfo>("/api/supervisor", {
@@ -203,10 +282,13 @@ export const api = {
     request<void>(`/api/artifacts/${sessionId}/${artifactId}`, { method: "DELETE" }),
   fileMetadata: (target: FileTarget) => request<FileEntry>(`/api/files/meta?${fileQuery(target)}`),
   listFiles: (target: FileTarget) => request<DirectoryListing>(`/api/files/list?${fileQuery(target)}`),
-  searchFiles: (root: string, query: string, cwd?: string) => {
+  // `signal` lets a caller abort a superseded search. The server stops the
+  // filesystem walk when the request is dropped, so aborting is what keeps a
+  // fast typist from stacking up full-tree walks.
+  searchFiles: (root: string, query: string, cwd?: string, signal?: AbortSignal) => {
     const params = new URLSearchParams({ root, query });
     if (cwd) params.set("cwd", cwd);
-    return request<FileSearchResults>(`/api/files/search?${params}`);
+    return request<FileSearchResults>(`/api/files/search?${params}`, { signal });
   },
   readFile: (target: FileTarget) => request<FileDocument>(`/api/files/content?${fileQuery(target)}`),
   saveFile: (file: SaveFileRequest) =>
@@ -283,5 +365,6 @@ export const api = {
     request<{ ok: true }>("/api/pushover/send", {
       method: "POST",
       body: JSON.stringify(notification),
+      timeoutMs: PROVIDER_REQUEST_TIMEOUT_MS,
     }),
 };

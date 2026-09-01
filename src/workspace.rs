@@ -1074,7 +1074,9 @@ pub(crate) async fn serve_terminal_socket(
                 break;
             }
             Ok(TerminalEvent::Size(size)) => {
-                if let Some(recorder) = recorder {
+                if let Some(recorder) = recorder
+                    && recorder.is_active()
+                {
                     recorder.control(&terminal_id, serde_json::json!({ "type": "size", "cols": size.cols, "rows": size.rows, "focused": size.focused_client.is_some(), "controller": size.focused_client == Some(client_id), "responder": size.responder_client == Some(client_id), "epoch": size.epoch }));
                 }
                 let message = serde_json::to_string(&size_message(size, client_id))
@@ -1633,7 +1635,9 @@ async fn send_terminal_bytes(
     terminal_id: Uuid,
     recorder: Option<&DebugRecordingManager>,
 ) -> Result<(), ()> {
-    if let Some(recorder) = recorder {
+    if let Some(recorder) = recorder
+        && recorder.is_active()
+    {
         match kind {
             TERMINAL_FRAME_SNAPSHOT => recorder.snapshot(&terminal_id, sequence, bytes),
             TERMINAL_FRAME_OUTPUT => recorder.output(&terminal_id, sequence, bytes),
@@ -1659,7 +1663,10 @@ async fn send_terminal_control(
     terminal_id: Uuid,
     recorder: Option<&DebugRecordingManager>,
 ) -> Result<(), ()> {
+    // `control()` re-checks the flag, but the `to_value` above it is the
+    // expensive half; skip it entirely while recording is off.
     if let Some(recorder) = recorder
+        && recorder.is_active()
         && let Ok(value) = serde_json::to_value(&message)
     {
         recorder.control(&terminal_id, value);

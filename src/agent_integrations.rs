@@ -566,14 +566,17 @@ impl AgentIntegrationService {
             AgentIntegrationProvider::Omp => {
                 let profiles = self.omp_profiles();
                 self.prepare_package(provider).await?;
-                let mut failed = false;
+                let mut failures = Vec::new();
                 for profile in &profiles {
-                    if self.install_omp_profile(executable, profile).await.is_err() {
-                        failed = true;
+                    if let Err(error) = self.install_omp_profile(executable, profile).await {
+                        failures.push((profile.label.clone(), error));
                     }
                 }
-                if failed {
-                    return Err("unable to update one or more OMP profiles".to_owned());
+                if !failures.is_empty() {
+                    return Err(omp_profile_failure_error(
+                        "unable to update one or more OMP profiles",
+                        failures,
+                    ));
                 }
             }
             AgentIntegrationProvider::Hermes => {
@@ -592,12 +595,10 @@ impl AgentIntegrationService {
                 )
                 .await?;
                 if let Some(config_path) = hermes_config_path() {
-                    let existing = tokio::fs::read_to_string(&config_path)
-                        .await
-                        .unwrap_or_default();
+                    let existing = read_user_config(&config_path).await?;
                     let updated = ensure_hermes_plugin_enabled(&existing);
                     if updated != existing {
-                        write_asset(&config_path, &updated).await?;
+                        write_user_config(&config_path, &updated).await?;
                     }
                 }
             }
@@ -684,12 +685,14 @@ impl AgentIntegrationService {
             }
             AgentIntegrationProvider::Omp => {
                 let marketplace_root = self.provider_root(provider);
-                let mut failed = false;
+                let mut failures = Vec::new();
                 for profile in self.omp_profiles() {
-                    let Ok(inspection) = self.inspect_omp_profile(executable, &profile).await
-                    else {
-                        failed = true;
-                        continue;
+                    let inspection = match self.inspect_omp_profile(executable, &profile).await {
+                        Ok(inspection) => inspection,
+                        Err(error) => {
+                            failures.push((profile.label.clone(), error));
+                            continue;
+                        }
                     };
                     let ours = inspection
                         .source
@@ -706,7 +709,7 @@ impl AgentIntegrationService {
                     let managed_plugin =
                         plugin.is_some_and(|plugin| omp_plugin_user_owned(plugin) && owns_plugin);
                     if managed_plugin
-                        && run_command(
+                        && let Err(error) = run_command(
                             executable,
                             omp_profile_args(
                                 &profile,
@@ -714,15 +717,14 @@ impl AgentIntegrationService {
                             ),
                         )
                         .await
-                        .is_err()
                     {
-                        failed = true;
+                        failures.push((profile.label.clone(), error));
                         continue;
                     }
                     if !ours {
                         continue;
                     }
-                    if run_command(
+                    if let Err(error) = run_command(
                         executable,
                         omp_profile_args(
                             &profile,
@@ -730,13 +732,15 @@ impl AgentIntegrationService {
                         ),
                     )
                     .await
-                    .is_err()
                     {
-                        failed = true;
+                        failures.push((profile.label.clone(), error));
                     }
                 }
-                if failed {
-                    return Err("unable to remove one or more OMP profiles".to_owned());
+                if !failures.is_empty() {
+                    return Err(omp_profile_failure_error(
+                        "unable to remove one or more OMP profiles",
+                        failures,
+                    ));
                 }
             }
             AgentIntegrationProvider::Hermes => {
@@ -758,7 +762,7 @@ impl AgentIntegrationService {
                 {
                     let updated = remove_hermes_plugin_enabled(&existing);
                     if updated != existing {
-                        let _ = write_asset(&config_path, &updated).await;
+                        let _ = write_user_config(&config_path, &updated).await;
                     }
                 }
             }
@@ -1088,9 +1092,8 @@ fn hermes_enabled_plugins_contain(content: &str, name: &str) -> bool {
         .position(|line| yaml_key_at_indent(line, 2) == Some("enabled"))
         .map(|offset| plugins_index + 1 + offset);
     if let Some(enabled_index) = enabled_index {
-        let line = lines[enabled_index].trim();
-        if line == "enabled: []" || line == "enabled: [] # herdr" {
-            return false;
+        if let Some(items) = hermes_enabled_flow_items(&lines[enabled_index]) {
+            return items.iter().any(|item| item == name);
         }
         let list_start = enabled_index + 1;
         let list_end = lines[list_start..plugins_end]
@@ -1170,15 +1173,20 @@ fn update_hermes_enabled_plugin(content: &str, enabled: bool) -> String {
         .map(|offset| plugins_index + 1 + offset);
 
     if let Some(enabled_index) = enabled_index {
-        let line = lines[enabled_index].trim();
-        if line == "enabled: []" || line == "enabled: [] # herdr" {
-            if enabled {
-                lines[enabled_index] = "  enabled:".to_string();
-                lines.insert(
-                    enabled_index + 1,
-                    "    - term-server-agent-events".to_string(),
-                );
+        // `enabled: [a, b]` is a flow sequence, so its items live on the key
+        // line. Splicing a `- item` under it would produce a YAML parse error
+        // and break the whole config, so rewrite the line as a block list.
+        if let Some(mut items) = hermes_enabled_flow_items(&lines[enabled_index]) {
+            let existing_item_index = items.iter().position(|item| item == HERMES_PLUGIN_DIR_NAME);
+            match (enabled, existing_item_index) {
+                (true, Some(_)) | (false, None) => return content.to_string(),
+                (true, None) => items.insert(0, HERMES_PLUGIN_DIR_NAME.to_string()),
+                (false, Some(index)) => {
+                    items.remove(index);
+                }
             }
+            let replacement = hermes_enabled_plugin_lines(&items);
+            lines.splice(enabled_index..enabled_index + 1, replacement);
             return join_yaml_lines(lines, trailing_newline);
         }
 
@@ -1249,6 +1257,21 @@ fn update_hermes_enabled_plugin(content: &str, enabled: bool) -> String {
     }
 
     content.to_string()
+}
+
+/// The items of a `  enabled: [...]` flow sequence, or `None` when the value is
+/// not a flow sequence (a block list, or a key with nothing after the colon).
+fn hermes_enabled_flow_items(line: &str) -> Option<Vec<String>> {
+    yaml_key_value_at_indent(line, 2, "enabled").and_then(yaml_flow_sequence_items)
+}
+
+fn hermes_enabled_plugin_lines(items: &[String]) -> Vec<String> {
+    if items.is_empty() {
+        return vec!["  enabled: []".to_string()];
+    }
+    let mut lines = vec!["  enabled:".to_string()];
+    lines.extend(items.iter().map(|item| format!("    - {item}")));
+    lines
 }
 
 fn hermes_flat_plugin_lines(items: &[String]) -> Vec<String> {
@@ -1752,6 +1775,20 @@ fn classify_omp_profile_status(
     )
 }
 
+/// Name every OMP profile that failed and why.
+///
+/// `install_omp_profile` reports specific, actionable problems - a marketplace
+/// name taken by someone else, an unowned user plugin, a profile that did not
+/// reach the managed state - and the summary alone hid all of them.
+fn omp_profile_failure_error(summary: &str, failures: Vec<(String, String)>) -> String {
+    let detail = failures
+        .into_iter()
+        .map(|(label, error)| format!("'{label}': {error}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("{summary}: {detail}")
+}
+
 fn aggregate_omp_status(profiles: Vec<AgentIntegrationProfileStatus>) -> AgentIntegrationStatus {
     let state = if profiles.is_empty() {
         AgentIntegrationState::NotInstalled
@@ -1923,6 +1960,62 @@ fn paths_match(left: &Path, right: &Path) -> bool {
     let left = left.canonicalize().unwrap_or_else(|_| left.to_path_buf());
     let right = right.canonicalize().unwrap_or_else(|_| right.to_path_buf());
     left == right
+}
+
+/// Read a configuration file term-server only edits.
+///
+/// A missing file starts empty, which is what creates a first Hermes config.
+/// Any other read failure - unreadable, not UTF-8, an I/O error - aborts,
+/// because treating it as empty would replace the user's configuration with a
+/// three-line stub.
+async fn read_user_config(path: &Path) -> Result<String, String> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(content) => Ok(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(format!("unable to read {}: {error}", path.display())),
+    }
+}
+
+/// Replace a configuration file the user owns, atomically.
+///
+/// The file is written to a sibling temporary file, flushed, and renamed into
+/// place, so an interrupted write cannot leave a truncated config behind. The
+/// existing permissions are preserved; a file we create stays owner-only.
+async fn write_user_config(path: &Path, content: &str) -> Result<(), String> {
+    let path = path.to_owned();
+    let content = content.to_owned();
+    tokio::task::spawn_blocking(move || write_user_config_blocking(&path, &content))
+        .await
+        .map_err(|error| format!("unable to write the configuration file: {error}"))?
+}
+
+fn write_user_config_blocking(path: &Path, content: &str) -> Result<(), String> {
+    use std::io::Write;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("invalid configuration path: {}", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("unable to create {}: {error}", parent.display()))?;
+    let describe = |error: std::io::Error| format!("unable to write {}: {error}", path.display());
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(describe)?;
+    temporary.write_all(content.as_bytes()).map_err(describe)?;
+    temporary.as_file().sync_all().map_err(describe)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(path) {
+            let mode = metadata.permissions().mode() & 0o7777;
+            temporary
+                .as_file()
+                .set_permissions(std::fs::Permissions::from_mode(mode))
+                .map_err(describe)?;
+        }
+    }
+    temporary
+        .persist(path)
+        .map_err(|error| describe(error.error))?;
+    Ok(())
 }
 
 async fn write_asset(path: &Path, content: &str) -> Result<(), String> {
@@ -2412,6 +2505,20 @@ mod tests {
         assert!(error.contains("review"));
         assert!(error.contains(MARKETPLACE_NAME));
         assert!(error.contains("different marketplace"));
+
+        // Install and remove used to swallow this and report only the generic
+        // summary, so the user had no idea which profile refused or why.
+        let reported = omp_profile_failure_error(
+            "unable to update one or more OMP profiles",
+            vec![
+                (profile.label.clone(), error.clone()),
+                ("work".to_owned(), "omp exited with status 1".to_owned()),
+            ],
+        );
+        assert!(reported.starts_with("unable to update one or more OMP profiles: "));
+        assert!(reported.contains("'review': "));
+        assert!(reported.contains("different marketplace"));
+        assert!(reported.contains("'work': omp exited with status 1"));
     }
 
     #[test]
@@ -2497,6 +2604,122 @@ mod tests {
             "some-other-plugin"
         ));
         assert_eq!(remove_hermes_plugin_enabled(&removed), removed);
+    }
+
+    #[test]
+    fn hermes_non_empty_flow_list_is_edited_as_a_list_not_corrupted() {
+        // `enabled: [foo]` used to be spliced into as if it were a block list,
+        // which wrote a `- item` under a flow value and produced a config that
+        // no YAML parser accepts.
+        let inline = "theme: dark\nplugins:\n  enabled: [some-other-plugin]\nmodel: hermes-4\n";
+        assert!(!hermes_enabled_plugins_contain(
+            inline,
+            HERMES_PLUGIN_DIR_NAME
+        ));
+        assert!(hermes_enabled_plugins_contain(inline, "some-other-plugin"));
+
+        let added = ensure_hermes_plugin_enabled(inline);
+        assert_eq!(
+            added,
+            concat!(
+                "theme: dark\n",
+                "plugins:\n",
+                "  enabled:\n",
+                "    - term-server-agent-events\n",
+                "    - some-other-plugin\n",
+                "model: hermes-4\n",
+            )
+        );
+        assert!(hermes_enabled_plugins_contain(
+            &added,
+            HERMES_PLUGIN_DIR_NAME
+        ));
+        assert!(hermes_enabled_plugins_contain(&added, "some-other-plugin"));
+
+        // An already enabled flow entry is recognized, so status does not
+        // report NeedsRepair and Repair does not rewrite the file.
+        let enabled = "plugins:\n  enabled: [term-server-agent-events, some-other-plugin]\n";
+        assert!(hermes_enabled_plugins_contain(
+            enabled,
+            HERMES_PLUGIN_DIR_NAME
+        ));
+        assert_eq!(ensure_hermes_plugin_enabled(enabled), enabled);
+
+        // Removal drops only our entry and keeps the rest.
+        let removed = remove_hermes_plugin_enabled(enabled);
+        assert_eq!(removed, "plugins:\n  enabled:\n    - some-other-plugin\n");
+        assert!(!hermes_enabled_plugins_contain(
+            &removed,
+            HERMES_PLUGIN_DIR_NAME
+        ));
+
+        // Removing the only entry leaves a valid empty flow list.
+        let only = "plugins:\n  enabled: ['term-server-agent-events'] # herdr\n";
+        assert!(hermes_enabled_plugins_contain(only, HERMES_PLUGIN_DIR_NAME));
+        assert_eq!(
+            remove_hermes_plugin_enabled(only),
+            "plugins:\n  enabled: []\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_hermes_config_is_never_replaced_by_a_stub() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.yaml");
+        // Not UTF-8: `read_to_string` fails with InvalidData rather than
+        // NotFound, which used to be swallowed into an empty config.
+        std::fs::write(&config, [b'p', b'l', 0x80, b'\n']).unwrap();
+        let error = read_user_config(&config).await.unwrap_err();
+        assert!(error.contains("unable to read"), "{error}");
+        assert_eq!(std::fs::read(&config).unwrap(), [b'p', b'l', 0x80, b'\n']);
+
+        // A directory in its place fails the same way.
+        let occupied = directory.path().join("nested");
+        std::fs::create_dir(&occupied).unwrap();
+        assert!(read_user_config(&occupied).await.is_err());
+
+        // Only a missing file starts an empty configuration.
+        assert_eq!(
+            read_user_config(&directory.path().join("missing.yaml"))
+                .await
+                .unwrap(),
+            ""
+        );
+    }
+
+    #[tokio::test]
+    async fn writing_a_user_config_is_atomic_and_keeps_its_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.yaml");
+        std::fs::write(&config, "plugins:\n  enabled: []\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o640)).unwrap();
+        }
+
+        write_user_config(&config, "plugins:\n  enabled:\n    - x\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            "plugins:\n  enabled:\n    - x\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&config).unwrap().permissions().mode() & 0o777,
+                0o640
+            );
+        }
+        // No temporary file is left behind next to the config.
+        let leftovers = std::fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name() != "config.yaml")
+            .count();
+        assert_eq!(leftovers, 0);
     }
 
     #[test]

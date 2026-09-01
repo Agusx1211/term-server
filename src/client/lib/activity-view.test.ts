@@ -94,6 +94,67 @@ describe("server-synced activity views", () => {
     });
   });
 
+  it("keeps identities when the poll reports the same terminals", () => {
+    const current = [terminal({ id: "one" }), terminal({ id: "two" })];
+    const polled = [terminal({ id: "one" }), terminal({ id: "two" })];
+    const merged = mergeTerminalActivityViews(polled, current);
+
+    expect(merged).toBe(current);
+    expect(merged[0]).toBe(current[0]);
+    expect(merged[1]).toBe(current[1]);
+  });
+
+  it("keeps identities when only the merged watermark differs in key order", () => {
+    // `withActivityView` rebuilds the object with a spread, so a terminal whose
+    // watermark was merged earlier can carry its keys in a different order.
+    const current = [withActivityView(
+      terminal({ id: "one", activityViewed: undefined }),
+      { agentCompletedAt: 20, commandCompletedAt: 30 },
+    )];
+    const merged = mergeTerminalActivityViews(
+      [terminal({ id: "one", activityViewed: { agentCompletedAt: 20, commandCompletedAt: 30 } })],
+      current,
+    );
+
+    expect(merged).toBe(current);
+  });
+
+  it("replaces only the terminals that actually changed", () => {
+    const current = [terminal({ id: "one" }), terminal({ id: "two" })];
+    const merged = mergeTerminalActivityViews(
+      [terminal({ id: "one" }), terminal({ id: "two", name: "renamed" })],
+      current,
+    );
+
+    expect(merged).not.toBe(current);
+    expect(merged[0]).toBe(current[0]);
+    expect(merged[1]).not.toBe(current[1]);
+    expect(merged[1]?.name).toBe("renamed");
+  });
+
+  it("returns a new list when a terminal appears or disappears", () => {
+    const current = [terminal({ id: "one" })];
+    const added = mergeTerminalActivityViews(
+      [terminal({ id: "one" }), terminal({ id: "two" })],
+      current,
+    );
+    expect(added).not.toBe(current);
+    expect(added).toHaveLength(2);
+    expect(mergeTerminalActivityViews([], current)).toEqual([]);
+  });
+
+  it("returns a new list when the terminals are reordered", () => {
+    const current = [terminal({ id: "one" }), terminal({ id: "two" })];
+    const merged = mergeTerminalActivityViews(
+      [terminal({ id: "two" }), terminal({ id: "one" })],
+      current,
+    );
+
+    expect(merged).not.toBe(current);
+    expect(merged[0]).toBe(current[1]);
+    expect(merged[1]).toBe(current[0]);
+  });
+
   it("migrates only legacy browser watermarks newer than the server", () => {
     expect(legacyActivityViewUpdate(
       terminal(),
