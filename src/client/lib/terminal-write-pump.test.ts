@@ -157,14 +157,26 @@ describe("createMessageChannelScheduler", () => {
     const scheduler = createMessageChannelScheduler();
     const ran: string[] = [];
     const cancelStale = scheduler.schedule(() => ran.push("stale"));
-    scheduler.schedule(() => ran.push("fresh"));
+    // MessagePort delivery is a platform macrotask that vitest's fake timers
+    // cannot drive, and a `setTimeout(0)` races it (the two come from different
+    // task sources, and under load the timer fires first). Resolve from inside
+    // the task instead, so the wait ends exactly when the port delivered it.
+    // The client tsconfig predates Promise.withResolvers, so use the executor
+    // form.
+    const fresh = new Promise<void>((resolve) => {
+      scheduler.schedule(() => {
+        ran.push("fresh");
+        resolve();
+      });
+    });
 
     cancelStale();
-    // MessagePort delivery is a platform macrotask that vitest's fake timers
-    // cannot drive, so yield to the event loop once for it to arrive. The
-    // client tsconfig predates Promise.withResolvers, so use the executor form.
-    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    await fresh;
+    expect(ran).toEqual(["fresh"]);
 
+    // The stale task's own port message is still queued behind the one that
+    // ran "fresh"; let it arrive and confirm it finds nothing to run.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
     expect(ran).toEqual(["fresh"]);
   });
 });
