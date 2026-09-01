@@ -14,6 +14,11 @@ use serde::{Deserialize, Serialize};
 const SETTINGS_FILE: &str = "pi-settings.json";
 const TRAINING_DIRECTORY: &str = "training";
 const COMPLETIONS_FILE: &str = "completions.jsonl";
+/// Rotate the training log once it passes this size, keeping at most
+/// [`MAX_ROTATED_COMPLETIONS`] older generations. The log records raw terminal
+/// output, so it has to stay bounded on disk.
+const MAX_COMPLETIONS_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_ROTATED_COMPLETIONS: u32 = 2;
 const MAX_CONTEXT_CHARS: usize = 12_000;
 const MAX_USER_PROMPT_CHARS: usize = 16_000;
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(45);
@@ -178,7 +183,7 @@ impl PiService {
             .map(PiSettings::from)
             .unwrap_or_default();
         let training_dir = data_directory.join(TRAINING_DIRECTORY);
-        if let Err(error) = fs::create_dir_all(&training_dir) {
+        if let Err(error) = create_private_directory(&training_dir) {
             tracing::warn!(%error, path = %training_dir.display(), "unable to create training directory");
         }
         let providers = default_models_path()
@@ -276,10 +281,7 @@ impl PiService {
                 request.kind.as_str()
             ));
         }
-        request.recent_output = truncate_chars(&request.recent_output, MAX_CONTEXT_CHARS);
-        request.user_prompt = request
-            .user_prompt
-            .map(|prompt| truncate_chars(&prompt, MAX_USER_PROMPT_CHARS));
+        clamp_request(&mut request);
 
         let model = self.settings.read().model.clone();
         let Some((label, base_url, api_key, model_id)) = self.resolve_model(&model) else {
@@ -302,27 +304,31 @@ impl PiService {
             Err(error) => {
                 // Record the failed attempt too so the raw request is captured for training.
                 let result: Result<String, String> = Err(error.clone());
-                let _ = self.save_completion(
-                    &label,
-                    request.kind,
-                    &system_prompt,
-                    &user_message,
-                    "",
-                    &result,
-                );
+                let _ = self
+                    .save_completion(
+                        &label,
+                        request.kind,
+                        &system_prompt,
+                        &user_message,
+                        "",
+                        &result,
+                    )
+                    .await;
                 return Err(error);
             }
         };
 
         let validated = validate_result(request.kind, &raw);
-        let _ = self.save_completion(
-            &label,
-            request.kind,
-            &system_prompt,
-            &user_message,
-            &raw,
-            &validated,
-        );
+        let _ = self
+            .save_completion(
+                &label,
+                request.kind,
+                &system_prompt,
+                &user_message,
+                &raw,
+                &validated,
+            )
+            .await;
         validated
     }
 
@@ -428,7 +434,7 @@ impl PiService {
     /// Append a full completion record (system prompt, user message, raw model
     /// response and the validated output) to the training log so it can later be
     /// used to fine-tune a small metadata model.
-    fn save_completion(
+    async fn save_completion(
         &self,
         model: &str,
         kind: PiTaskKind,
@@ -453,15 +459,15 @@ impl PiService {
         });
         let mut line = serde_json::to_vec(&record).map_err(|error| error.to_string())?;
         line.push(b'\n');
-        // A tiny synchronous append is simpler and race-free for a training log.
+        // A single append stays race-free between tasks, but it is a blocking
+        // file write, so it runs off the runtime worker.
         let path = self.training_dir.join(COMPLETIONS_FILE);
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|error| error.to_string())?;
-        file.write_all(&line).map_err(|error| error.to_string())?;
+        let destination = path.clone();
+        tokio::task::spawn_blocking(move || {
+            append_training_line(&destination, &line, MAX_COMPLETIONS_BYTES)
+        })
+        .await
+        .map_err(|error| error.to_string())??;
         tracing::debug!(path = %path.display(), model, kind = kind.as_str(), "saved completion for training");
         Ok(())
     }
@@ -550,6 +556,20 @@ fn normalize_title(value: &str) -> String {
     words.join(" ").to_lowercase()
 }
 
+/// Trim a request to what the model is asked to read.
+///
+/// The terminal context is trimmed from the front: the caller already passes
+/// the tail of the scrollback, and the last lines are exactly the ones a
+/// summary has to describe. The initial user message is trimmed from the back,
+/// because a title comes from how a task was introduced.
+fn clamp_request(request: &mut PiRequest) {
+    request.recent_output = truncate_chars_tail(&request.recent_output, MAX_CONTEXT_CHARS);
+    request.user_prompt = request
+        .user_prompt
+        .take()
+        .map(|prompt| truncate_chars(&prompt, MAX_USER_PROMPT_CHARS));
+}
+
 fn truncate_chars(value: &str, maximum: usize) -> String {
     if value.chars().count() <= maximum {
         return value.to_owned();
@@ -559,6 +579,100 @@ fn truncate_chars(value: &str, maximum: usize) -> String {
         .take(maximum.saturating_sub(1))
         .collect::<String>()
         + "…"
+}
+
+/// Like [`truncate_chars`], but keeps the end of the value instead of its
+/// start.
+fn truncate_chars_tail(value: &str, maximum: usize) -> String {
+    let total = value.chars().count();
+    if total <= maximum {
+        return value.to_owned();
+    }
+    let kept = maximum.saturating_sub(1);
+    let mut result = String::from("…");
+    result.extend(value.chars().skip(total - kept));
+    result
+}
+
+/// Create the training directory owner-only. It holds raw terminal output.
+fn create_private_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)?;
+        if fs::metadata(path)?.permissions().mode() & 0o077 != 0 {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path)
+    }
+}
+
+/// Append one record to the training log, rotating it first when it has grown
+/// past `max_bytes`. Blocking: call it from a blocking thread.
+fn append_training_line(path: &Path, line: &[u8], max_bytes: u64) -> Result<(), String> {
+    use std::io::Write;
+
+    rotate_training_log(path, max_bytes)?;
+    let mut file = open_private_append(path)?;
+    file.write_all(line).map_err(|error| error.to_string())
+}
+
+fn rotate_training_log(path: &Path, max_bytes: u64) -> Result<(), String> {
+    let size = match fs::metadata(path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    if size < max_bytes {
+        return Ok(());
+    }
+    for generation in (1..=MAX_ROTATED_COMPLETIONS).rev() {
+        let older = rotated_completions_path(path, generation);
+        if generation == MAX_ROTATED_COMPLETIONS {
+            let _ = fs::remove_file(&older);
+            continue;
+        }
+        if older.exists() {
+            let _ = fs::rename(&older, rotated_completions_path(path, generation + 1));
+        }
+    }
+    fs::rename(path, rotated_completions_path(path, 1)).map_err(|error| error.to_string())
+}
+
+fn rotated_completions_path(path: &Path, generation: u32) -> PathBuf {
+    path.with_file_name(format!("completions.{generation}.jsonl"))
+}
+
+fn open_private_append(path: &Path) -> Result<fs::File, String> {
+    let mut options = fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path).map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    {
+        // `mode` only applies when the file is created; tighten a log written
+        // by an older build too.
+        use std::os::unix::fs::PermissionsExt;
+        if file
+            .metadata()
+            .is_ok_and(|metadata| metadata.permissions().mode() & 0o077 != 0)
+        {
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        }
+    }
+    Ok(file)
 }
 
 fn current_millis() -> u64 {
@@ -921,6 +1035,7 @@ mod tests {
                 "fix checkout latency",
                 &ok,
             )
+            .await
             .unwrap();
         let err: Result<String, String> = Err("invalid title".to_owned());
         service
@@ -932,6 +1047,7 @@ mod tests {
                 "some raw response",
                 &err,
             )
+            .await
             .unwrap();
 
         let path = directory
@@ -1017,5 +1133,107 @@ mod tests {
         let user = user_prompt_for(&request);
         assert!(user.contains("Tests passed successfully"));
         assert!(!system_prompt_for(request.kind).contains("Tests passed successfully"));
+    }
+
+    #[test]
+    fn summary_context_keeps_the_newest_terminal_lines() {
+        // The caller passes the tail of the scrollback, so trimming from the
+        // front would drop exactly the lines the summary has to describe.
+        let mut request = PiRequest {
+            kind: PiTaskKind::Summary,
+            workspace: "~/project".to_owned(),
+            program: "claude".to_owned(),
+            agent: "claude".to_owned(),
+            user_prompt: Some("x".repeat(MAX_USER_PROMPT_CHARS + 500)),
+            recent_output: format!(
+                "{}\nall 42 tests passed",
+                "older noise\n".repeat(MAX_CONTEXT_CHARS)
+            ),
+        };
+        clamp_request(&mut request);
+
+        assert_eq!(request.recent_output.chars().count(), MAX_CONTEXT_CHARS);
+        assert!(request.recent_output.ends_with("all 42 tests passed"));
+        assert!(request.recent_output.starts_with('\u{2026}'));
+
+        // A title still comes from the start of the initial message.
+        let prompt = request.user_prompt.unwrap();
+        assert_eq!(prompt.chars().count(), MAX_USER_PROMPT_CHARS);
+        assert!(prompt.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn short_values_are_not_truncated_from_either_end() {
+        assert_eq!(truncate_chars_tail("keep me", 32), "keep me");
+        assert_eq!(truncate_chars("keep me", 32), "keep me");
+        assert_eq!(truncate_chars_tail("abcdef", 3), "\u{2026}ef");
+    }
+
+    #[test]
+    fn rotates_the_training_log_at_the_size_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(COMPLETIONS_FILE);
+
+        append_training_line(&path, b"first\n", 12).unwrap();
+        append_training_line(&path, b"second\n", 12).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "first\nsecond\n");
+
+        // The log is now over the limit, so the next append rotates it first.
+        append_training_line(&path, b"third\n", 12).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "third\n");
+        assert_eq!(
+            fs::read_to_string(rotated_completions_path(&path, 1)).unwrap(),
+            "first\nsecond\n"
+        );
+
+        // A second rotation ages the previous generation out, and only
+        // MAX_ROTATED_COMPLETIONS generations are kept.
+        append_training_line(&path, b"fourth\n", 1).unwrap();
+        append_training_line(&path, b"fifth\n", 1).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "fifth\n");
+        assert_eq!(
+            fs::read_to_string(rotated_completions_path(&path, 1)).unwrap(),
+            "fourth\n"
+        );
+        assert_eq!(
+            fs::read_to_string(rotated_completions_path(&path, 2)).unwrap(),
+            "third\n"
+        );
+        assert!(!rotated_completions_path(&path, 3).exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_training_log_is_private_to_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let service = PiService::new(directory.path());
+        let ok: Result<String, String> = Ok("fix checkout latency".to_owned());
+        service
+            .save_completion(
+                "local/qwen3.5-0.8b",
+                PiTaskKind::Title,
+                "system",
+                "user",
+                "fix checkout latency",
+                &ok,
+            )
+            .await
+            .unwrap();
+
+        let training = directory.path().join(TRAINING_DIRECTORY);
+        assert_eq!(
+            fs::metadata(&training).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(training.join(COMPLETIONS_FILE))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 }
