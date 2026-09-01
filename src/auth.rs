@@ -324,6 +324,14 @@ struct AttemptWindow {
     resets_at: u64,
 }
 
+/// How long a failed-login window lasts.
+const LOGIN_WINDOW_SECONDS: u64 = 15 * 60;
+/// Upper bound on tracked clients. Expired windows are dropped on every call,
+/// so this only bites when a flood of distinct clients is in flight at once;
+/// past the cap the window that expires soonest is evicted, which keeps a
+/// public instance from accumulating one entry per probing address forever.
+const MAX_TRACKED_CLIENTS: usize = 4_096;
+
 #[derive(Default)]
 pub struct LoginLimiter {
     attempts: Mutex<HashMap<String, AttemptWindow>>,
@@ -332,16 +340,23 @@ pub struct LoginLimiter {
 impl LoginLimiter {
     pub fn consume(&self, key: &str, now: u64) -> Result<(), u64> {
         let mut attempts = self.attempts.lock();
+        // Windows that have already elapsed carry no information; dropping them
+        // here is the only thing that bounds the map for clients that never log
+        // in successfully.
+        attempts.retain(|_, window| window.resets_at > now);
+        if attempts.len() >= MAX_TRACKED_CLIENTS && !attempts.contains_key(key) {
+            let evicted = attempts
+                .iter()
+                .min_by_key(|(_, window)| window.resets_at)
+                .map(|(client, _)| client.clone());
+            if let Some(evicted) = evicted {
+                attempts.remove(&evicted);
+            }
+        }
         let window = attempts.entry(key.to_owned()).or_insert(AttemptWindow {
             attempts: 0,
-            resets_at: now + 15 * 60,
+            resets_at: now + LOGIN_WINDOW_SECONDS,
         });
-        if window.resets_at <= now {
-            *window = AttemptWindow {
-                attempts: 0,
-                resets_at: now + 15 * 60,
-            };
-        }
         window.attempts = window.attempts.saturating_add(1);
         if window.attempts > 8 {
             Err(window.resets_at.saturating_sub(now).max(1))
@@ -352,6 +367,11 @@ impl LoginLimiter {
 
     pub fn reset(&self, key: &str) {
         self.attempts.lock().remove(key);
+    }
+
+    #[cfg(test)]
+    fn tracked(&self) -> usize {
+        self.attempts.lock().len()
     }
 }
 
@@ -488,6 +508,34 @@ mod tests {
         assert_eq!(limiter.consume("client", 1_000), Err(900));
         limiter.reset("client");
         assert!(limiter.consume("client", 1_000).is_ok());
+    }
+
+    #[test]
+    fn limiter_drops_windows_that_have_expired() {
+        let limiter = LoginLimiter::default();
+        assert!(limiter.consume("first", 1_000).is_ok());
+        assert!(limiter.consume("second", 1_000).is_ok());
+        assert_eq!(limiter.tracked(), 2);
+
+        // A later attempt from a third client sweeps the two elapsed windows.
+        let later = 1_000 + LOGIN_WINDOW_SECONDS + 1;
+        assert!(limiter.consume("third", later).is_ok());
+        assert_eq!(limiter.tracked(), 1);
+
+        // The sweep resets the count rather than carrying it across windows.
+        for _ in 0..8 {
+            assert!(limiter.consume("first", later).is_ok());
+        }
+        assert!(limiter.consume("first", later).is_err());
+    }
+
+    #[test]
+    fn limiter_caps_the_number_of_tracked_clients() {
+        let limiter = LoginLimiter::default();
+        for index in 0..(MAX_TRACKED_CLIENTS + 500) {
+            assert!(limiter.consume(&format!("client-{index}"), 1_000).is_ok());
+        }
+        assert_eq!(limiter.tracked(), MAX_TRACKED_CLIENTS);
     }
     #[cfg(feature = "e2e")]
     #[tokio::test]
