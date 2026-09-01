@@ -59,6 +59,45 @@ describe("debug-recording", () => {
     expect(taken.events).toHaveLength(MAX_FRONTEND_RECORDING_EVENTS);
   });
 
+  it("keeps the newest events in order once the cap is reached", () => {
+    resetDebugRecording();
+    startDebugRecording();
+    const overflow = 100;
+    for (let i = 0; i < MAX_FRONTEND_RECORDING_EVENTS + overflow; i += 1) {
+      recordDebugEvent("cap", { type: "notice", message: `event-${i}` });
+    }
+
+    const taken = takeFrontendRecording();
+    expect(taken.truncated).toBe(true);
+    expect(taken.events).toHaveLength(MAX_FRONTEND_RECORDING_EVENTS);
+    expect(taken.events[0]?.event).toEqual({ type: "notice", message: `event-${overflow}` });
+    expect(taken.events.at(-1)?.event).toEqual({
+      type: "notice",
+      message: `event-${MAX_FRONTEND_RECORDING_EVENTS + overflow - 1}`,
+    });
+    const ordered = taken.events.every((entry, index) => (
+      index === 0 || entry.ts >= (taken.events[index - 1]?.ts ?? 0)
+    ));
+    expect(ordered).toBe(true);
+    stopDebugRecording();
+  });
+
+  it("starts a fresh buffer after the cap was reached", () => {
+    resetDebugRecording();
+    startDebugRecording();
+    for (let i = 0; i < MAX_FRONTEND_RECORDING_EVENTS + 1; i += 1) {
+      recordDebugEvent("cap", { type: "connect" });
+    }
+    takeFrontendRecording();
+
+    recordDebugEvent("next", { type: "notice", message: "after" });
+    const taken = takeFrontendRecording();
+    expect(taken.truncated).toBe(false);
+    expect(taken.events).toHaveLength(1);
+    expect(taken.events[0]?.terminal).toBe("next");
+    stopDebugRecording();
+  });
+
   it("base64 encodes bytes and text", () => {
     expect(encodeTextBase64("hi")).toBe("aGk=");
     expect(encodeBytesBase64(new Uint8Array([0x00, 0x01, 0xff]))).toBe("AAH/");

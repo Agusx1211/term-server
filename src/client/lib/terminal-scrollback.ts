@@ -31,3 +31,20 @@ export function resolveTerminalScrollback(
     ? clampTerminalScrollback(serverDefault)
     : clampTerminalScrollback(override);
 }
+
+/**
+ * The value a scrollback field should commit for what the user typed, or
+ * `undefined` while the text is not yet a usable number.
+ *
+ * Clamping every keystroke made the field unusable: an emptied box reads as
+ * `Number("") === 0`, clamps up to the minimum and is written straight back, so
+ * the next digit lands on "1000" instead of replacing it and 5,000 can never be
+ * typed at all. Nothing is committed until the field holds a number.
+ */
+export function commitTerminalScrollbackDraft(text: string): number | undefined {
+  const trimmed = text.trim();
+  if (trimmed === "") return undefined;
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed)) return undefined;
+  return clampTerminalScrollback(parsed);
+}

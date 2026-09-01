@@ -51,11 +51,14 @@ pub struct UpdateStatus {
     pub latest: Option<ReleaseInfo>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum UpdateState {
     Current,
     Available,
+    /// The channel publishes an older release than the running build. Offering
+    /// it as an update would silently downgrade the installation.
+    Older,
     Unavailable,
 }
 
@@ -200,11 +203,7 @@ impl UpdateService {
         }
         let channel = self.channel.read().clone();
         let release = self.fetch_verified_release(&channel).await?;
-        let state = if release.info.commit == build::COMMIT {
-            UpdateState::Current
-        } else {
-            UpdateState::Available
-        };
+        let state = update_state(&release.info.version, &release.info.commit);
         Ok(UpdateStatus {
             channel,
             current: build::info(),
@@ -399,16 +398,16 @@ fn persist_update_settings(path: &Path, settings: &StoredUpdateSettings) -> io::
     temporary.write_all(b"\n")?;
     temporary.as_file().sync_all()?;
     temporary.persist(path).map_err(|error| error.error)?;
-    sync_settings_directory(parent)
+    sync_directory(parent)
 }
 
 #[cfg(unix)]
-fn sync_settings_directory(directory: &Path) -> io::Result<()> {
+fn sync_directory(directory: &Path) -> io::Result<()> {
     File::open(directory)?.sync_all()
 }
 
 #[cfg(not(unix))]
-fn sync_settings_directory(_directory: &Path) -> io::Result<()> {
+fn sync_directory(_directory: &Path) -> io::Result<()> {
     Ok(())
 }
 
@@ -436,6 +435,142 @@ pub enum UpdateError {
     ChecksumMismatch,
     #[error("update installation failed: {0}")]
     Install(String),
+}
+
+/// How a signed release compares to the running build.
+///
+/// A different commit alone does not mean newer. `install.sh` honours
+/// `TERM_SERVER_CHANNEL=beta` for the download but does not persist it, and
+/// the CLI default is `main`, so a beta installation checks the `main` channel
+/// and finds a genuinely signed, genuinely older release. Presenting that as
+/// an available update downgrades the user with no way back.
+///
+/// A rebuild of the same version under a different commit is still an update:
+/// that is exactly what the rolling `beta` prerelease publishes.
+fn update_state(version: &str, commit: &str) -> UpdateState {
+    if commit == build::COMMIT {
+        return UpdateState::Current;
+    }
+    match (
+        ReleaseVersion::parse(version),
+        ReleaseVersion::parse(build::VERSION),
+    ) {
+        (Some(release), Some(running)) if release < running => UpdateState::Older,
+        _ => UpdateState::Available,
+    }
+}
+
+/// A `MAJOR.MINOR.PATCH[-prerelease][+build]` version, ordered by semver rules.
+///
+/// Only what the release manifest can carry is modelled, and an unparseable
+/// version simply leaves the comparison undecided rather than blocking an
+/// update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReleaseVersion {
+    major: u64,
+    minor: u64,
+    patch: u64,
+    prerelease: Vec<PrereleaseIdentifier>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PrereleaseIdentifier {
+    Numeric(u64),
+    Alphanumeric(String),
+}
+
+impl ReleaseVersion {
+    fn parse(value: &str) -> Option<Self> {
+        let value = value.split_once('+').map_or(value, |(head, _)| head);
+        let (core, prerelease) = match value.split_once('-') {
+            Some((core, prerelease)) => (core, Some(prerelease)),
+            None => (value, None),
+        };
+        let mut numbers = core.split('.');
+        let major = parse_version_number(numbers.next()?)?;
+        let minor = parse_version_number(numbers.next()?)?;
+        let patch = parse_version_number(numbers.next()?)?;
+        if numbers.next().is_some() {
+            return None;
+        }
+        let prerelease = match prerelease {
+            None => Vec::new(),
+            Some(prerelease) => prerelease
+                .split('.')
+                .map(parse_prerelease_identifier)
+                .collect::<Option<Vec<_>>>()?,
+        };
+        Some(Self {
+            major,
+            minor,
+            patch,
+            prerelease,
+        })
+    }
+}
+
+impl Ord for ReleaseVersion {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+
+        (self.major, self.minor, self.patch)
+            .cmp(&(other.major, other.minor, other.patch))
+            .then_with(
+                || match (self.prerelease.is_empty(), other.prerelease.is_empty()) {
+                    // A release always outranks a prerelease of the same version.
+                    (true, true) => Ordering::Equal,
+                    (true, false) => Ordering::Greater,
+                    (false, true) => Ordering::Less,
+                    (false, false) => self.prerelease.cmp(&other.prerelease),
+                },
+            )
+    }
+}
+
+impl PartialOrd for ReleaseVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PrereleaseIdentifier {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+
+        match (self, other) {
+            (Self::Numeric(left), Self::Numeric(right)) => left.cmp(right),
+            (Self::Alphanumeric(left), Self::Alphanumeric(right)) => left.cmp(right),
+            // Numeric identifiers always have lower precedence.
+            (Self::Numeric(_), Self::Alphanumeric(_)) => Ordering::Less,
+            (Self::Alphanumeric(_), Self::Numeric(_)) => Ordering::Greater,
+        }
+    }
+}
+
+impl PartialOrd for PrereleaseIdentifier {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn parse_version_number(value: &str) -> Option<u64> {
+    if value.is_empty() || (value.len() > 1 && value.starts_with('0')) {
+        return None;
+    }
+    value.parse().ok()
+}
+
+fn parse_prerelease_identifier(value: &str) -> Option<PrereleaseIdentifier> {
+    if value.is_empty() {
+        return None;
+    }
+    if value.chars().all(|character| character.is_ascii_digit()) {
+        return parse_version_number(value).map(PrereleaseIdentifier::Numeric);
+    }
+    value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        .then(|| PrereleaseIdentifier::Alphanumeric(value.to_owned()))
 }
 
 fn detect_installation(client_directory: Option<&Path>) -> Result<Installation, String> {
@@ -591,7 +726,33 @@ fn extract_archive(
             ));
         }
     }
-    Ok(extraction_root.join(package_name))
+    let package = extraction_root.join(package_name);
+    sync_package(&package)?;
+    Ok(package)
+}
+
+/// Flush the unpacked release to disk before anything is renamed into place.
+///
+/// `replace_installation` publishes these files by renaming them over the live
+/// installation. A rename can be durable while the contents behind it are not,
+/// so a power loss inside the writeback window can leave a zero-length
+/// `term-server` or an empty `client/index.html` - and the rollback copies are
+/// gone with the temporary directory.
+fn sync_package(path: &Path) -> Result<(), UpdateError> {
+    let metadata = fs::symlink_metadata(path).map_err(install_error)?;
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path).map_err(install_error)? {
+            sync_package(&entry.map_err(install_error)?.path())?;
+        }
+        return sync_directory(path).map_err(install_error);
+    }
+    if metadata.is_file() {
+        File::open(path)
+            .map_err(install_error)?
+            .sync_all()
+            .map_err(install_error)?;
+    }
+    Ok(())
 }
 
 fn validate_archive_path(path: &Path, package_name: &str) -> Result<(), UpdateError> {
@@ -725,6 +886,13 @@ fn replace_installation(
             true,
         );
         return Err(install_error(error));
+    }
+    // The binary, client/ and skills/ all live directly in the installation
+    // root, so one directory sync makes every rename above durable. The swap
+    // has already succeeded, so a failure here is worth a warning, not an
+    // install error.
+    if let Err(error) = sync_directory(&installation.root) {
+        tracing::warn!(%error, root = %installation.root.display(), "unable to flush the updated installation directory");
     }
     Ok(())
 }
@@ -910,6 +1078,62 @@ mod tests {
         let mut malformed = manifest();
         malformed.artifacts[0].sha256 = "ABC".to_owned();
         assert!(validate_manifest(malformed, "main").is_err());
+    }
+
+    #[test]
+    fn an_older_channel_release_is_not_offered_as_an_update() {
+        // A beta installation that never persisted its channel checks `main`
+        // and finds a genuinely signed, genuinely older release. Installing it
+        // would downgrade the user with no way back.
+        let other_commit = "c".repeat(40);
+        let running = ReleaseVersion::parse(build::VERSION).expect("the crate version parses");
+        let older = format!("{}.{}.{}", running.major, running.minor, running.patch + 1);
+        let newer = format!("{}.{}.{}", running.major + 1, running.minor, running.patch);
+
+        assert_eq!(
+            update_state(&older, &other_commit),
+            UpdateState::Available,
+            "a higher patch release is still an update"
+        );
+        assert_eq!(update_state(&newer, &other_commit), UpdateState::Available);
+        assert_eq!(update_state("0.0.1", &other_commit), UpdateState::Older);
+        // A rebuild of the running version under another commit is what the
+        // rolling beta prerelease publishes, so it stays installable.
+        assert_eq!(
+            update_state(build::VERSION, &other_commit),
+            UpdateState::Available
+        );
+        assert_eq!(
+            update_state(build::VERSION, build::COMMIT),
+            UpdateState::Current
+        );
+        // An unparseable version leaves the comparison undecided rather than
+        // blocking updates outright.
+        assert_eq!(
+            update_state("nightly", &other_commit),
+            UpdateState::Available
+        );
+    }
+
+    #[test]
+    fn orders_versions_by_semver_precedence() {
+        let parse = |value: &str| ReleaseVersion::parse(value).expect(value);
+        assert!(parse("0.17.0") > parse("0.16.9"));
+        assert!(parse("1.0.0") > parse("0.99.99"));
+        assert!(parse("0.17.1") > parse("0.17.0"));
+        assert_eq!(parse("0.17.0"), parse("0.17.0+build.7"));
+        // A prerelease sorts below the release it leads to, and prerelease
+        // identifiers follow semver precedence.
+        assert!(parse("0.17.0-beta.1") < parse("0.17.0"));
+        assert!(parse("0.17.0-beta.2") > parse("0.17.0-beta.1"));
+        assert!(parse("0.17.0-beta.10") > parse("0.17.0-beta.9"));
+        assert!(parse("0.17.0-beta") > parse("0.17.0-9"));
+        assert!(parse("0.17.0-beta.1") < parse("0.17.0-beta.1.1"));
+        assert!(ReleaseVersion::parse("0.17").is_none());
+        assert!(ReleaseVersion::parse("0.17.0.1").is_none());
+        assert!(ReleaseVersion::parse("v0.17.0").is_none());
+        assert!(ReleaseVersion::parse("0.017.0").is_none());
+        assert!(ReleaseVersion::parse("0.17.0-").is_none());
     }
 
     #[test]

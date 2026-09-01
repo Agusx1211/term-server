@@ -23,6 +23,16 @@ const MAX_CHECKPOINT_BYTES: usize = 4 * 1024 * 1024;
 const MIN_RESERVED_VIEWPORT_COLS: usize = 128;
 const CELL_BYTES: usize = std::mem::size_of::<vt100::Cell>();
 const MAX_PENDING_SEQUENCE_BYTES: usize = 64 * 1024;
+/// Charged against the delta budget for every retained read on top of its
+/// payload. A read costs a ring slot, its own heap allocation and a safe
+/// sequence entry, so a program emitting one byte at a time would otherwise
+/// fill the ring with tens of millions of chunks and gigabytes of residency.
+const DELTA_CHUNK_OVERHEAD_BYTES: usize = 64;
+/// How far a scrollback or tail start may be advanced to reach a sequence the
+/// stateless text cleaners can start from. Long enough to clear a realistic
+/// escape sequence, short enough that falling back to the raw start (which is
+/// what happens for reads larger than this) is never the worse outcome.
+const MAX_SAFE_START_SKIP_BYTES: usize = 4 * 1024;
 const MAX_TRACKED_SGR_BYTES: usize = 64 * 1024;
 const KITTY_KEYBOARD_STACK_LIMIT: usize = 16;
 /// Maximum payload in one terminal output WebSocket frame. PTY reads and
@@ -188,7 +198,7 @@ impl TerminalOutputState {
                 .safe_browser_checkpoint_sequences
                 .binary_search(&sequence)
                 .is_err()
-            || self.delta.outputs_since(sequence, self.sequence).is_none()
+            || !self.delta.can_replay_from(sequence, self.sequence)
             || self
                 .browser_checkpoint
                 .as_ref()
@@ -266,8 +276,69 @@ impl TerminalOutputState {
         Some(Bytes::from(snapshot))
     }
 
+    /// Advances a start sequence onto one where the canonical tracker was in
+    /// Ground with no pending UTF-8.
+    ///
+    /// The text cleaners run statelessly over one page, so a start inside an
+    /// escape sequence emits its remainder as literal text (leaking the tail of
+    /// an OSC title or hyperlink) and a start inside a scalar yields a
+    /// replacement character. Only starts the caller did not choose are moved,
+    /// and only by `MAX_SAFE_START_SKIP_BYTES`, so snapping never trades a
+    /// meaningful amount of scrollback for a cosmetic fix.
+    fn safe_start_sequence(&self, sequence: u64, latest_sequence: u64) -> u64 {
+        let index = self
+            .safe_browser_checkpoint_sequences
+            .partition_point(|candidate| *candidate < sequence);
+        self.safe_browser_checkpoint_sequences
+            .get(index)
+            .copied()
+            .filter(|safe| {
+                *safe <= latest_sequence
+                    && safe.saturating_sub(sequence) <= MAX_SAFE_START_SKIP_BYTES as u64
+            })
+            .unwrap_or(sequence)
+    }
+
+    /// The parser-safe sequence a page should end on, so an escape sequence or
+    /// a wide scalar split across two reads is never cut in half.
+    ///
+    /// Prefers the last safe sequence within the byte budget. When the budget
+    /// covers no complete safe span the page instead grows to the next one,
+    /// which costs less than one publish and keeps every page non-empty.
+    fn safe_end_sequence(&self, start_sequence: u64, end_sequence: u64, latest: u64) -> u64 {
+        if end_sequence >= latest {
+            return end_sequence;
+        }
+        let index = self
+            .safe_browser_checkpoint_sequences
+            .partition_point(|candidate| *candidate <= end_sequence);
+        if let Some(previous) = index
+            .checked_sub(1)
+            .and_then(|index| self.safe_browser_checkpoint_sequences.get(index).copied())
+            && previous > start_sequence
+        {
+            return previous;
+        }
+        self.safe_browser_checkpoint_sequences
+            .get(index)
+            .copied()
+            .filter(|next| {
+                *next <= latest
+                    && next.saturating_sub(end_sequence) <= TERMINAL_OUTPUT_FRAME_BYTES as u64
+            })
+            .unwrap_or(end_sequence)
+    }
+
     pub fn text_tail(&self, maximum_bytes: usize) -> String {
-        self.delta.text_tail(maximum_bytes)
+        let latest_sequence = self.sequence;
+        let earliest_sequence = self.delta.earliest_sequence(latest_sequence);
+        let start_sequence = latest_sequence
+            .saturating_sub(maximum_bytes as u64)
+            .max(earliest_sequence);
+        self.delta.text_from(
+            self.safe_start_sequence(start_sequence, latest_sequence),
+            latest_sequence,
+        )
     }
 
     pub fn scrollback_page(
@@ -279,19 +350,37 @@ impl TerminalOutputState {
         let latest_sequence = self.sequence;
         let earliest_sequence = self.delta.earliest_sequence(latest_sequence);
         let requested_sequence = from_sequence.unwrap_or(earliest_sequence);
-        let start_sequence = requested_sequence.clamp(earliest_sequence, latest_sequence);
-        let (end_sequence, bytes) = self.delta.page_from(
+        let clamped_sequence = requested_sequence.clamp(earliest_sequence, latest_sequence);
+        // A sequence the caller passed back from a previous page is honoured
+        // exactly; only the ring front, which sits mid-read after a trim, is
+        // snapped forward.
+        let start_sequence = if requested_sequence <= earliest_sequence {
+            self.safe_start_sequence(clamped_sequence, latest_sequence)
+        } else {
+            clamped_sequence
+        };
+        let (mut end_sequence, mut bytes) = self.delta.page_from(
             start_sequence,
             latest_sequence,
             limit_bytes.clamp(1, MAX_SCROLLBACK_BYTES),
         );
+        let safe_end = self.safe_end_sequence(start_sequence, end_sequence, latest_sequence);
+        if safe_end != end_sequence {
+            // Safe sequences are publish boundaries, so a budget of exactly
+            // this span lands the page on one.
+            (end_sequence, bytes) = self.delta.page_from(
+                start_sequence,
+                latest_sequence,
+                (safe_end - start_sequence) as usize,
+            );
+        }
         TerminalScrollbackPage {
             terminal_id,
             earliest_sequence,
             start_sequence,
             end_sequence,
             latest_sequence,
-            truncated: requested_sequence < earliest_sequence,
+            truncated: requested_sequence < start_sequence,
             has_more: end_sequence < latest_sequence,
             text: clean_terminal_text(&bytes),
         }
@@ -347,8 +436,8 @@ impl DeltaBuffer {
         }
         self.bytes += chunk.bytes.len();
         self.chunks.push_back(chunk);
-        while self.bytes > self.maximum_bytes {
-            let excess = self.bytes - self.maximum_bytes;
+        while self.charged_bytes() > self.maximum_bytes {
+            let excess = self.charged_bytes() - self.maximum_bytes;
             let Some(front) = self.chunks.front_mut() else {
                 break;
             };
@@ -363,23 +452,39 @@ impl DeltaBuffer {
         }
     }
 
+    /// Payload plus the fixed per-chunk cost the ring pays to retain it.
+    fn charged_bytes(&self) -> usize {
+        self.bytes
+            .saturating_add(self.chunks.len() * DELTA_CHUNK_OVERHEAD_BYTES)
+    }
+
     fn earliest_sequence(&self, current_sequence: u64) -> u64 {
         self.chunks
             .front()
             .map_or(current_sequence, |chunk| chunk.sequence)
     }
 
+    /// Whether the ring still spans `sequence`. This is the bounds check on its
+    /// own, without materializing the replay it would produce.
+    fn can_replay_from(&self, sequence: u64, current_sequence: u64) -> bool {
+        sequence <= current_sequence && sequence >= self.earliest_sequence(current_sequence)
+    }
+
+    /// Index of the first chunk that can hold `sequence`. Chunks are pushed in
+    /// ascending sequence order and only ever trimmed from the front, so the
+    /// ring is sorted and this is a binary search rather than a scan.
+    fn first_chunk_index(&self, sequence: u64) -> usize {
+        self.chunks
+            .partition_point(|chunk| chunk.end_sequence() <= sequence)
+    }
+
     fn outputs_since(&self, sequence: u64, current_sequence: u64) -> Option<Vec<SequencedOutput>> {
-        if sequence > current_sequence {
-            return None;
-        }
-        let earliest = self.earliest_sequence(current_sequence);
-        if sequence < earliest {
+        if !self.can_replay_from(sequence, current_sequence) {
             return None;
         }
         Some(
             self.chunks
-                .iter()
+                .range(self.first_chunk_index(sequence)..)
                 .filter_map(|chunk| chunk.slice_from(sequence))
                 .collect(),
         )
@@ -401,19 +506,8 @@ impl DeltaBuffer {
         (end_sequence, bytes)
     }
 
-    fn text_tail(&self, maximum_bytes: usize) -> String {
-        let mut remaining = maximum_bytes;
-        let mut chunks = Vec::new();
-        for chunk in self.chunks.iter().rev() {
-            if remaining == 0 {
-                break;
-            }
-            let start = chunk.bytes.len().saturating_sub(remaining);
-            chunks.push(chunk.bytes.slice(start..));
-            remaining = remaining.saturating_sub(chunk.bytes.len() - start);
-        }
-        chunks.reverse();
-        let bytes = chunks.concat();
+    fn text_from(&self, sequence: u64, latest: u64) -> String {
+        let (_, bytes) = self.page_from(sequence, latest, usize::MAX);
         crate::terminal::sanitize_terminal_text(&String::from_utf8_lossy(&bytes))
     }
 }
@@ -2012,7 +2106,8 @@ mod tests {
 
     #[test]
     fn delta_buffer_slices_and_evicts_exactly() {
-        let mut delta = DeltaBuffer::new(5);
+        // The budget covers both retained reads plus five payload bytes.
+        let mut delta = DeltaBuffer::new(5 + 2 * DELTA_CHUNK_OVERHEAD_BYTES);
         delta.push(output(0, b"abc"));
         delta.push(output(3, b"def"));
         assert_eq!(delta.bytes, 5);
@@ -2028,7 +2123,7 @@ mod tests {
 
     #[test]
     fn delta_buffer_pages_on_publish_boundaries() {
-        let mut delta = DeltaBuffer::new(16);
+        let mut delta = DeltaBuffer::new(16 + 2 * DELTA_CHUNK_OVERHEAD_BYTES);
         delta.push(output(0, b"abc"));
         delta.push(output(3, b"def"));
 
@@ -2052,6 +2147,138 @@ mod tests {
         assert_eq!(second.text, "second\n");
         assert!(!second.has_more);
         assert_eq!(second.end_sequence, second.latest_sequence);
+    }
+
+    #[test]
+    fn delta_buffer_charges_per_chunk_overhead_for_tiny_publishes() {
+        let mut delta = DeltaBuffer::new(4 * 1024);
+        for sequence in 0..8_192 {
+            delta.push(output(sequence, b"x"));
+        }
+
+        assert!(delta.charged_bytes() <= 4 * 1024);
+        assert!(delta.chunks.len() <= 4 * 1024 / DELTA_CHUNK_OVERHEAD_BYTES);
+    }
+
+    #[test]
+    fn delta_buffer_replay_bounds_match_the_materialized_replay() {
+        let mut delta = DeltaBuffer::new(4 * 1024);
+        for index in 0..16 {
+            delta.push(output(index * 512, &[b'x'; 512]));
+        }
+        let latest = 16 * 512;
+        let earliest = delta.earliest_sequence(latest);
+        assert!(earliest > 0, "the ring must have evicted its front");
+
+        for sequence in [
+            0,
+            earliest - 1,
+            earliest,
+            earliest + 1,
+            latest - 1,
+            latest,
+            latest + 1,
+        ] {
+            assert_eq!(
+                delta.can_replay_from(sequence, latest),
+                delta.outputs_since(sequence, latest).is_some(),
+                "bounds disagree at {sequence}"
+            );
+        }
+    }
+
+    #[test]
+    fn browser_checkpoint_outside_the_delta_ring_is_rejected() {
+        let mut state = TerminalOutputState::new(256 * 1024, 4, 20);
+        state.publish(Bytes::from_static(b"start"));
+        let stale = state.sequence;
+        let epoch = state.grid_epoch();
+        for _ in 0..64 {
+            state.publish(Bytes::from(vec![b'x'; 4 * 1024]));
+        }
+        let current = state.sequence;
+
+        assert!(!state.store_browser_checkpoint(stale, epoch, Bytes::from_static(b"old")));
+        assert!(!state.store_browser_checkpoint(current + 1, epoch, Bytes::from_static(b"ahead")));
+        assert!(state.store_browser_checkpoint(current, epoch, Bytes::from_static(b"now")));
+    }
+
+    #[test]
+    fn scrollback_pages_never_split_a_sequence_between_reads() {
+        let terminal_id = Uuid::from_u128(10);
+        let mut state = TerminalOutputState::new(256 * 1024, 4, 20);
+        state.publish(Bytes::from_static(b"first line\r\n\x1b[38;5;"));
+        state.publish(Bytes::from_static(b"196mred\x1b[0m\r\nsecond line\r\n"));
+
+        // The budget ends inside the split escape, so the page grows to the
+        // next parser-safe sequence instead of emitting `196m` as text.
+        let page = state.scrollback_page(terminal_id, None, 12);
+        assert_eq!(page.text, "first line\nred\nsecond line\n");
+        assert!(!page.text.contains("196m"));
+        assert!(!page.has_more);
+    }
+
+    #[test]
+    fn scrollback_pages_never_split_a_scalar_between_reads() {
+        let terminal_id = Uuid::from_u128(11);
+        let mut state = TerminalOutputState::new(256 * 1024, 4, 20);
+        state.publish(Bytes::from_static(b"line\r\n\xe2\x9d"));
+        state.publish(Bytes::from_static(b"\xaf prompt\r\n"));
+
+        let page = state.scrollback_page(terminal_id, None, 8);
+        assert_eq!(page.text, "line\n\u{276f} prompt\n");
+        assert!(!page.text.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn scrollback_paging_terminates_and_covers_every_retained_byte() {
+        let terminal_id = Uuid::from_u128(12);
+        let mut state = TerminalOutputState::new(256 * 1024, 4, 20);
+        for line in 0..200 {
+            state.publish(Bytes::from(format!("\x1b[32mline-{line:03}\x1b[0m\r\n")));
+        }
+
+        let mut cursor = None;
+        let mut text = String::new();
+        let mut pages = 0;
+        loop {
+            let page = state.scrollback_page(terminal_id, cursor, 64);
+            assert!(!page.truncated);
+            text.push_str(&page.text);
+            pages += 1;
+            assert!(pages < 1_000, "paging did not terminate");
+            if !page.has_more {
+                assert_eq!(page.end_sequence, page.latest_sequence);
+                break;
+            }
+            assert!(cursor != Some(page.end_sequence), "paging made no progress");
+            cursor = Some(page.end_sequence);
+        }
+
+        assert!(pages > 1);
+        assert!(!text.contains('\u{1b}'));
+        assert!(!text.contains("32m"));
+        for line in 0..200 {
+            assert!(
+                text.contains(&format!("line-{line:03}")),
+                "lost line {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_tail_starts_at_a_parser_safe_sequence() {
+        let mut state = TerminalOutputState::new(256 * 1024, 4, 20);
+        state.publish(Bytes::from_static(
+            b"before\x1b]0;a secret title\x07visible\r\n",
+        ));
+        state.publish(Bytes::from_static(b"tail\r\n"));
+
+        // A byte-offset start lands inside the OSC title, whose remainder a
+        // stateless cleaner emits verbatim.
+        let tail = state.text_tail(24);
+        assert!(!tail.contains("title"), "leaked title: {tail:?}");
+        assert!(tail.contains("tail"));
     }
 
     #[test]

@@ -713,6 +713,17 @@ const CLAUDE_REAL_SCREENS: &[RealScreen] = &[
         expected_state: DetectedState::Idle,
         expected_rule: "live_prompt_box",
     },
+    // Derived from the capture above by restoring the streaming spinner line
+    // Claude draws in that position while a turn is in flight; everything else
+    // is the same v2.1.220 screen, prompt box included.
+    RealScreen {
+        description: "claude streaming a turn with the prompt box drawn",
+        agent: "claude",
+        screen: include_str!("fixtures/claude-working.txt"),
+        osc_title: "",
+        expected_state: DetectedState::Working,
+        expected_rule: "screen_working_stream",
+    },
     RealScreen {
         description: "codex command approval",
         agent: "codex",
@@ -765,6 +776,63 @@ fn classifies_real_agent_screens() {
             "{}",
             capture.description
         );
+    }
+}
+
+#[test]
+fn claude_streaming_a_turn_is_working_without_the_window_title() {
+    // Claude keeps its input box drawn while it streams, and tmux does not
+    // forward the inner OSC title unless `set-titles on`. Without a
+    // screen-based working rule, `live_prompt_box` matched mid-turn and the
+    // terminal flipped to idle: the task was marked complete, a summary was
+    // requested, and the session read as needing attention while the agent was
+    // still working.
+    let detection = classify(
+        "claude",
+        screen(include_str!("fixtures/claude-working.txt")),
+    );
+    assert_eq!(detection.state, DetectedState::Working);
+    assert_eq!(matched_rule_id(&detection), Some("screen_working_stream"));
+    assert!(
+        detection.visible_working,
+        "working has to be visible evidence to apply"
+    );
+    assert_eq!(
+        crate::terminal::screen_detection_outcome(Some(&detection)),
+        crate::terminal::DetectionOutcome::Status(crate::terminal::AgentStatus::Working),
+    );
+
+    // The window title still wins when it is available.
+    let titled = classify(
+        "claude",
+        DetectionInput {
+            screen: include_str!("fixtures/claude-working.txt"),
+            osc_title: "\u{2800} project",
+            osc_progress: "",
+        },
+    );
+    assert_eq!(matched_rule_id(&titled), Some("osc_title_working"));
+
+    // The same screen once the turn ends is idle again, from the screen alone.
+    let finished = classify(
+        "claude",
+        screen(include_str!("fixtures/claude-after-interrupt.txt")),
+    );
+    assert_eq!(finished.state, DetectedState::Idle);
+    assert_eq!(matched_rule_id(&finished), Some("live_prompt_box"));
+}
+
+#[test]
+fn a_claude_permission_dialog_still_outranks_the_streaming_rule() {
+    // The interrupt hint is replaced by the dialog, so a blocked screen must
+    // not start reading as working.
+    for fixture in [
+        include_str!("fixtures/claude-bash-permission.txt"),
+        include_str!("fixtures/claude-trust-folder.txt"),
+    ] {
+        let detection = classify("claude", screen(fixture));
+        assert_eq!(detection.state, DetectedState::Blocked);
+        assert!(detection.visible_blocker);
     }
 }
 

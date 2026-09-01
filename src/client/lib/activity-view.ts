@@ -5,6 +5,7 @@ import type {
 } from "../../shared/types";
 import type { ViewedAgentRevisions } from "./agent-attention";
 import { commandCompletionEvent, type ViewedCommandCompletions } from "./command-status";
+import { structurallyEqual } from "./structural-equality";
 
 const EMPTY_ACTIVITY_VIEW: ActivityView = {
   agentCompletedAt: 0,
@@ -41,16 +42,28 @@ export function withActivityView(
   };
 }
 
+/**
+ * Merge the locally observed activity watermarks into a freshly polled list.
+ *
+ * The poll runs every 1.5 s and almost always reports identical terminals, so
+ * unchanged entries keep their previous object and an entirely unchanged list
+ * keeps the previous array. That lets the workspace state update bail out
+ * instead of re-rendering every mounted pane on each tick.
+ */
 export function mergeTerminalActivityViews(
   next: TerminalInfo[],
   current: TerminalInfo[],
 ): TerminalInfo[] {
   const currentById = new Map(current.map((terminal) => [terminal.id, terminal]));
-  return next.map((terminal) => {
+  let changed = next.length !== current.length;
+  const merged = next.map((terminal, index) => {
     const previous = currentById.get(terminal.id);
-    if (!previous) return terminal;
-    return withActivityView(terminal, activityView(previous));
+    const updated = previous ? withActivityView(terminal, activityView(previous)) : terminal;
+    const stable = previous && structurallyEqual(previous, updated) ? previous : updated;
+    if (stable !== current[index]) changed = true;
+    return stable;
   });
+  return changed ? merged : current;
 }
 
 export function currentActivityViewUpdate(

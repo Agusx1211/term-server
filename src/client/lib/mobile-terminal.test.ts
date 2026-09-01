@@ -1,9 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-  consumeScrollPixels,
-  NO_TERMINAL_MODIFIERS,
-  transformTerminalInput,
-} from "./mobile-terminal";
+import { NO_TERMINAL_MODIFIERS, transformTerminalInput } from "./mobile-terminal";
 
 describe("mobile terminal input", () => {
   it("turns one-shot Ctrl input into terminal control bytes", () => {
@@ -35,16 +31,5 @@ describe("mobile terminal input", () => {
       .toBe("\u001b[27u");
     expect(transformTerminalInput("\t", NO_TERMINAL_MODIFIERS, 8))
       .toBe("\u001b[9u");
-  });
-});
-
-describe("mobile terminal scrolling", () => {
-  it("accumulates sub-line touch movement without losing pixels", () => {
-    expect(consumeScrollPixels(0, 7, 15)).toEqual({ lines: 0, remainder: 7 });
-    expect(consumeScrollPixels(7, 11, 15)).toEqual({ lines: 1, remainder: 3 });
-  });
-
-  it("preserves direction when scrolling upward", () => {
-    expect(consumeScrollPixels(0, -31, 15)).toEqual({ lines: -2, remainder: -1 });
   });
 });

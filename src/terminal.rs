@@ -3,8 +3,8 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Weak,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -55,7 +55,17 @@ const REPORTED_WORKING_FRESH_MILLIS: u64 = 5_000;
 const NATIVE_EVENT_FRESH_MILLIS: u64 = 15_000;
 const LONG_RUNNING_COMMAND_MILLIS: u64 = 5_000;
 const MAX_CAPTURED_PROMPT_CHARS: usize = 16_000;
+/// How much of the terminal tail a generated summary is written from.
+const SUMMARY_TAIL_BYTES: usize = 12 * 1024;
 const OSC_PAYLOAD_MAX_CHARS: usize = 256;
+/// Tail of undecoded pty output kept so an escape sequence split across two
+/// reads is still recognized.
+const SIGNAL_TAIL_BYTES: usize = 1024;
+/// An OSC introducer whose terminator has not arrived within this many bytes is
+/// abandoned. Titles and progress reports are two orders of magnitude smaller;
+/// anything longer is a binary payload (`imgcat` writes a whole image as one
+/// OSC 1337) that would otherwise be buffered and rescanned per pty chunk.
+const MAX_PENDING_OSC_BYTES: usize = 4 * 1024;
 const MAX_TERMINAL_INPUT_BYTES: usize = 64 * 1024;
 const TERMINAL_INPUT_QUEUE_BYTES: usize = 1024 * 1024;
 const TERMINAL_INPUT_QUEUE_MESSAGES: usize = 64;
@@ -72,6 +82,14 @@ const TERMINAL_EVENT_CAPACITY: usize = 1024;
 /// Keep exited terminals available for history/reconnect without retaining an
 /// unbounded PTY, input queue, and replay buffer for every session ever run.
 const MAX_RETAINED_EXITED_SESSIONS: usize = 32;
+/// How long the exit of a shell waits for the read loop to reach EOF before the
+/// exit is published anyway. The master only reports EOF once every handle on
+/// the slave is closed, and a background job the shell left running holds one
+/// for as long as it runs.
+const EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a deleted terminal's leftovers are given to act on the hangup
+/// before they are killed outright.
+const RECLAIM_KILL_GRACE: Duration = Duration::from_secs(2);
 /// Unacknowledged output bytes before the pty read loop stops draining the
 /// master. The master's buffer then fills and the process writing to it blocks,
 /// which is the only backpressure that reaches a TUI. Matches VS Code's
@@ -830,11 +848,15 @@ impl SessionActivity {
     }
 }
 
+/// A prompt submitted to a program the process monitor has not sampled yet.
+///
+/// The agent is deliberately not named here. Identifying it at submission time
+/// means walking every entry in `/proc`, which the input path cannot afford:
+/// the terminal's foreground process group is one file read, and the monitor
+/// tick that discovers the agent already knows which group it belongs to.
 #[derive(Debug)]
 struct PendingAgentSubmission {
-    agent_pid: u32,
-    agent_start_ticks: u64,
-    agent_kind: String,
+    foreground_group: i32,
     submitted_at: u64,
     prompt: String,
 }
@@ -849,6 +871,11 @@ enum ReportedAgentState {
 #[derive(Debug, Default)]
 struct TerminalSignals {
     pending: Vec<u8>,
+    /// Offset of an OSC introducer in `pending` whose terminator has not
+    /// arrived yet, and how far the terminator search already got. Without
+    /// them every pty chunk would rescan the whole accumulated sequence.
+    pending_osc: Option<usize>,
+    scanned: usize,
     agent_state: Option<(ReportedAgentState, u64)>,
     active_title_seen: bool,
     osc_title: Option<String>,
@@ -859,28 +886,55 @@ impl TerminalSignals {
     fn observe(&mut self, bytes: &[u8], now: u64) {
         self.pending.extend_from_slice(bytes);
         let mut consumed = 0;
-        while let Some(relative_start) = self.pending[consumed..]
-            .windows(2)
-            .position(|window| window == b"\x1b]")
-        {
-            let start = consumed + relative_start;
-            let payload_start = start + 2;
-            let Some((payload_end, sequence_end)) = osc_end(&self.pending, payload_start) else {
-                if start > 0 {
-                    self.pending.drain(..start);
+        loop {
+            let start = match self.pending_osc {
+                Some(start) => start,
+                None => {
+                    let Some(relative_start) = self.pending[consumed..]
+                        .windows(2)
+                        .position(|window| window == b"\x1b]")
+                    else {
+                        break;
+                    };
+                    consumed + relative_start
                 }
-                return;
+            };
+            let payload_start = start + 2;
+            // Bytes already searched for a terminator are never searched again.
+            // The last byte is retried because a two-byte ST can straddle the
+            // chunk boundary.
+            let scan_from = self.scanned.max(payload_start);
+            let Some((payload_end, sequence_end)) = osc_end(&self.pending, scan_from) else {
+                if self.pending.len() - start > MAX_PENDING_OSC_BYTES {
+                    // Longer than any title or progress report: this is a
+                    // binary payload (an image written with OSC 1337) whose
+                    // terminator is still chunks away. Abandon it rather than
+                    // hold megabytes of it and rescan them per chunk.
+                    consumed = self.pending.len();
+                    self.pending_osc = None;
+                    self.scanned = 0;
+                } else {
+                    consumed = start;
+                    self.pending_osc = Some(start);
+                    self.scanned = self.pending.len().saturating_sub(1);
+                }
+                break;
             };
             let payload = self.pending[payload_start..payload_end].to_vec();
             self.observe_osc(&payload, now);
             consumed = sequence_end;
+            self.pending_osc = None;
+            self.scanned = 0;
         }
         if consumed > 0 {
             self.pending.drain(..consumed);
+            self.pending_osc = self.pending_osc.map(|start| start - consumed);
+            self.scanned = self.scanned.saturating_sub(consumed);
         }
-        if self.pending.len() > 1024 {
-            let keep_from = self.pending.len() - 1024;
+        if self.pending_osc.is_none() && self.pending.len() > SIGNAL_TAIL_BYTES {
+            let keep_from = self.pending.len() - SIGNAL_TAIL_BYTES;
             self.pending.drain(..keep_from);
+            self.scanned = 0;
         }
     }
 
@@ -1634,6 +1688,54 @@ fn flow_wait_until_resumed(flow: &FlowControl, deadline: Duration) {
     }
 }
 
+/// Signals that the read loop has reached EOF on the pty master.
+///
+/// The exit of the shell is reported by the child itself, but its final output
+/// is still in the master. Waiting on this keeps the exit event behind the
+/// bytes the process wrote before it, without making the exit depend on an EOF
+/// that a surviving background job can withhold indefinitely.
+#[derive(Debug, Default)]
+struct OutputDrain {
+    finished: Mutex<bool>,
+    done: Condvar,
+}
+
+impl OutputDrain {
+    fn finish(&self) {
+        *self.finished.lock() = true;
+        self.done.notify_all();
+    }
+
+    fn finished(&self) -> bool {
+        *self.finished.lock()
+    }
+
+    fn wait_for_finish(&self, timeout: Duration) {
+        let mut finished = self.finished.lock();
+        if !*finished {
+            self.done.wait_for(&mut finished, timeout);
+        }
+    }
+}
+
+/// # Lock order
+///
+/// A thread that needs more than one of this session's locks takes them in this
+/// order and never the reverse:
+///
+/// ```text
+/// input queue -> flow.state -> viewports -> activity -> info -> output -> signals
+/// ```
+///
+/// The input queue is at the head only because accepted input is accounted for
+/// under its lock, so the queue cannot hand the writer a line before the
+/// bookkeeping for it exists. `transcript`, `process_tracker` and `master` are
+/// leaves: nothing else is acquired while one of them is held.
+///
+/// The rule that matters in practice is that nothing holding `output` may then
+/// take `info`, `activity`, `viewports` or `flow`. `info` is a fair `RwLock`, so
+/// an `output -> info` path deadlocks against the `info -> output` path the
+/// agent refresh would otherwise take while a summary is generated.
 pub struct TerminalSession {
     info: RwLock<TerminalInfo>,
     master: Mutex<Box<dyn MasterPty + Send>>,
@@ -1649,6 +1751,14 @@ pub struct TerminalSession {
     process_tracker: Mutex<ProcessTracker>,
     flow: FlowControl,
     exit_order: AtomicU64,
+    output_drain: Arc<OutputDrain>,
+    /// Set once the shell has been waited for. Its pid may be reused from that
+    /// moment on, so nothing may signal it again.
+    reaped: AtomicBool,
+    /// The shell's pid and start time, recorded while it was alive. The pty
+    /// session it leads is named by its pid, and the start time is what proves
+    /// that pid still means this session and has not been recycled.
+    shell_process: Option<ProcessIdentity>,
     home_directory: PathBuf,
 }
 
@@ -1720,9 +1830,13 @@ impl TerminalSession {
         from_sequence: Option<u64>,
         limit_bytes: usize,
     ) -> TerminalScrollbackPage {
+        // The identifier is read before `output` is locked. Evaluated as an
+        // argument it would take `info` while `output` is already held, which
+        // is the reverse of the order every agent-state path uses.
+        let terminal_id = self.info.read().id;
         self.output
             .lock()
-            .scrollback_page(self.info.read().id, from_sequence, limit_bytes)
+            .scrollback_page(terminal_id, from_sequence, limit_bytes)
     }
 
     pub fn transcript(
@@ -1817,17 +1931,32 @@ impl TerminalSession {
     }
 
     pub async fn write_confirmed(&self, data: &[u8]) -> Result<(), TerminalError> {
+        /// A foreground process that never reads its stdin fills the line
+        /// discipline buffer, and the writer thread then blocks in `write_all`
+        /// for as long as that process runs. Callers hold a socket, a broker
+        /// request, and a supervisor invocation open behind this wait, so it is
+        /// bounded and reported instead of parking forever. It stays well under
+        /// the supervisor control response budget so the caller is told why the
+        /// input was refused rather than that its own read timed out.
+        const CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(5);
+
         if self.info.read().status != TerminalStatus::Running {
             return Err(TerminalError::NotRunning);
         }
         let confirmation = self
             .input
             .enqueue_confirmed(data, || self.observe_accepted_input(data))?;
-        match confirmation.await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(TerminalError::Io(error)),
-            Err(_) => Err(TerminalError::Io(
+        // Dropping the receiver on a timeout is safe: the writer thread ignores
+        // the result of its confirmation send, so a late delivery is a no-op.
+        match tokio::time::timeout(CONFIRMATION_TIMEOUT, confirmation).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(error))) => Err(TerminalError::Io(error)),
+            Ok(Err(_)) => Err(TerminalError::Io(
                 "terminal input writer stopped before delivery".to_owned(),
+            )),
+            Err(_) => Err(TerminalError::Io(
+                "terminal is not accepting input; the program running in it is not reading its input"
+                    .to_owned(),
             )),
         }
     }
@@ -1928,37 +2057,26 @@ impl TerminalSession {
                     activity.begin_submission(agent, now, input.prompt);
                 }
             } else if let Some(prompt) = input.prompt
-                && let Some(agent) = self.live_agent_observation()
+                && let Some(foreground_group) = self.foreground_group()
             {
-                let mut activity = self.activity.lock();
-                let mut info = self.info.write();
-                if activity.agent_pid == Some(agent.pid)
-                    && let Some(current) = info.agent.as_mut()
-                    && current.kind == agent.kind
-                    && current.status != AgentStatus::Closed
-                {
-                    activity.begin_submission(current, now, Some(prompt));
-                } else {
-                    activity.pending_agent_submission = Some(PendingAgentSubmission {
-                        agent_pid: agent.pid,
-                        agent_start_ticks: agent.start_ticks,
-                        agent_kind: agent.kind,
-                        submitted_at: now,
-                        prompt,
-                    });
-                }
+                // Something other than the shell is reading this line. It may
+                // be an agent the 1.5 s monitor has not sampled yet, so hold
+                // the prompt for the tick that discovers it; a line the shell
+                // itself runs is not a prompt and is not recorded at all.
+                self.activity.lock().pending_agent_submission = Some(PendingAgentSubmission {
+                    foreground_group,
+                    submitted_at: now,
+                    prompt,
+                });
             }
         }
     }
 
-    fn live_agent_observation(&self) -> Option<AgentObservation> {
-        let info = self.info.read();
-        let shell_pid = info.pid?;
-        let shell_name = executable_name(&info.shell);
-        drop(info);
-        ProcessSnapshot::read(&[shell_pid])
-            .observe(shell_pid, &shell_name)
-            .agent
+    /// The process group currently reading from the terminal, or `None` when
+    /// that is the shell itself.
+    fn foreground_group(&self) -> Option<i32> {
+        let shell_pid = self.info.read().pid?;
+        terminal_foreground_group(shell_pid)
     }
 
     fn update_viewports(
@@ -2023,8 +2141,47 @@ impl TerminalSession {
         // Open the gate first: a parked read loop would otherwise wait on
         // acknowledgements for a pty that is about to close.
         self.flow_release();
-        if self.info.read().status == TerminalStatus::Running {
+        // `reaped` closes the window between waiting for the shell and
+        // publishing its exit. Signalling a pid that has already been waited
+        // for can reach whatever process the kernel gave that number to next.
+        if self.info.read().status == TerminalStatus::Running
+            && !self.reaped.load(Ordering::Acquire)
+        {
             let _ = self.killer.lock().kill();
+        }
+    }
+
+    /// Frees a deleted terminal for good.
+    ///
+    /// `kill` only reaches the shell. Job control gives every background job
+    /// its own process group, and one that outlives the shell keeps a handle on
+    /// the pty slave: the master never reports EOF, the read loop stays parked
+    /// on it, and the session it belongs to is never released. Nothing else
+    /// collects that, so deleting a terminal hangs its pty session up and then
+    /// insists.
+    fn reclaim(self: Arc<Self>) {
+        if self.output_drain.finished() {
+            // EOF has already been seen, so no handle on the slave is left.
+            return;
+        }
+        let Some(shell) = self.shell_process else {
+            return;
+        };
+        signal_pty_session(shell, PtySessionSignal::Hangup);
+        let escalation = thread::Builder::new()
+            .name("terminal-reclaim".to_owned())
+            .spawn(move || {
+                thread::sleep(RECLAIM_KILL_GRACE);
+                if self.output_drain.finished() {
+                    return;
+                }
+                // The session Arc is still held here, so the pty master is
+                // still open and this terminal's slave cannot have been handed
+                // to anything else in the meantime.
+                signal_pty_session(shell, PtySessionSignal::Kill);
+            });
+        if let Err(error) = escalation {
+            tracing::debug!(%error, "terminal reclaim thread could not be started");
         }
     }
 
@@ -2063,10 +2220,30 @@ impl TerminalSession {
         // oldest retained entry (the default order is zero).
         self.exit_order.store(exit_order, Ordering::Release);
         {
+            let now = current_millis();
+            // `activity` before `info`, per the session's lock order.
+            let mut activity = self.activity.lock();
             let mut info = self.info.write();
             info.status = TerminalStatus::Exited;
             info.exit_code = Some(exit_code);
             info.pid = None;
+            // The agent died with the shell. This is the last chance to say so:
+            // `refresh_process_metadata` returns as soon as it sees no pid, so
+            // the branch that retires an agent never runs for an exited
+            // terminal and the status would stay frozen mid-task forever.
+            if let Some(agent) = info.agent.as_mut()
+                && agent.status != AgentStatus::Closed
+            {
+                agent.status = AgentStatus::Closed;
+                agent.status_changed_at = now;
+                agent.revision = agent.revision.saturating_add(1);
+                agent.activity = None;
+                if activity.input_submitted_at > 0 {
+                    agent.completed_at = Some(now);
+                    agent.summary = None;
+                }
+            }
+            activity.input_submitted_at = 0;
         }
         // Serialize exit with output and subscriptions. A subscriber that
         // attaches after the broadcast can observe the stored exit code
@@ -2166,6 +2343,13 @@ impl TerminalSession {
         );
         let shell_name = executable_name(&self.info.read().shell);
         let observation = processes.observe(shell_pid, &shell_name);
+        // The group an agent is discovered in is the one the shell handed the
+        // terminal to, which is what a prompt submitted before this sample
+        // recorded as its destination.
+        let foreground_group = observation
+            .foreground
+            .as_ref()
+            .map(|foreground| foreground.group);
         let alternate_screen = self.output.lock().alternate_screen();
         let output_bytes = self.output_bytes.load(Ordering::Relaxed);
         let reported_state = self.signals.lock().agent_state;
@@ -2221,15 +2405,10 @@ impl TerminalSession {
                         .agent
                         .as_ref()
                         .is_some_and(|current| current.kind == agent.kind);
-                let pending_submission =
-                    activity
-                        .pending_agent_submission
-                        .take()
-                        .filter(|submission| {
-                            submission.agent_pid == agent.pid
-                                && submission.agent_start_ticks == agent.start_ticks
-                                && submission.agent_kind == agent.kind
-                        });
+                let pending_submission = activity
+                    .pending_agent_submission
+                    .take()
+                    .filter(|submission| foreground_group == Some(submission.foreground_group));
                 activity.agent_pid = Some(agent.pid);
                 activity.agent_start_ticks = Some(agent.start_ticks);
                 activity.last_cpu_ticks = agent.cpu_ticks;
@@ -2290,7 +2469,7 @@ impl TerminalSession {
                         activity.summary_in_flight_revision = Some(initial_state.revision);
                         outcome.summary = Some((
                             initial_state.revision,
-                            self.pi_request(PiTaskKind::Summary, &info, &agent.kind, None),
+                            Self::pi_request(PiTaskKind::Summary, &info, &agent.kind, None),
                         ));
                     }
                 }
@@ -2358,7 +2537,7 @@ impl TerminalSession {
                             activity.summary_in_flight_revision = Some(revision);
                             outcome.summary = Some((
                                 revision,
-                                self.pi_request(PiTaskKind::Summary, &info, &agent.kind, None),
+                                Self::pi_request(PiTaskKind::Summary, &info, &agent.kind, None),
                             ));
                         }
                     }
@@ -2376,7 +2555,7 @@ impl TerminalSession {
                 activity.title_in_flight_revision = Some(revision);
                 outcome.title = Some((
                     revision,
-                    self.pi_request(PiTaskKind::Title, &info, &agent.kind, Some(prompt)),
+                    Self::pi_request(PiTaskKind::Title, &info, &agent.kind, Some(prompt)),
                 ));
             }
         } else {
@@ -2397,7 +2576,7 @@ impl TerminalSession {
                         activity.summary_in_flight_revision = Some(revision);
                         outcome.summary = Some((
                             revision,
-                            self.pi_request(PiTaskKind::Summary, &info, &kind, None),
+                            Self::pi_request(PiTaskKind::Summary, &info, &kind, None),
                         ));
                     }
                 }
@@ -2436,6 +2615,9 @@ impl TerminalSession {
         {
             info.path = terminal_path(&info.workspace, &info.name);
         }
+        drop(info);
+        drop(activity);
+        self.attach_recent_output(&mut outcome);
         outcome
     }
 
@@ -2531,7 +2713,7 @@ impl TerminalSession {
             activity.summary_in_flight_revision = Some(revision);
             outcome.summary = Some((
                 revision,
-                self.pi_request(PiTaskKind::Summary, &info, &agent_kind, None),
+                Self::pi_request(PiTaskKind::Summary, &info, &agent_kind, None),
             ));
         }
         if let Some(title) = event.title
@@ -2545,11 +2727,17 @@ impl TerminalSession {
             info.name = title;
             info.path = terminal_path(&info.workspace, &info.name);
         }
+        drop(info);
+        drop(activity);
+        self.attach_recent_output(&mut outcome);
         outcome
     }
 
+    /// Builds a Pi request from state the caller already holds. It deliberately
+    /// touches no lock of its own: every caller holds `activity` and `info`
+    /// while it runs, and reaching for `output` here is the `info -> output`
+    /// half of a deadlock with any path that holds `output`.
     fn pi_request(
-        &self,
         kind: PiTaskKind,
         info: &TerminalInfo,
         agent: &str,
@@ -2561,12 +2749,18 @@ impl TerminalSession {
             program: info.program.clone(),
             agent: agent.to_owned(),
             user_prompt,
-            recent_output: if kind == PiTaskKind::Summary {
-                self.output.lock().text_tail(12 * 1024)
-            } else {
-                String::new()
-            },
+            recent_output: String::new(),
         }
+    }
+
+    /// Reads the terminal tail a summary is written from. Called only once the
+    /// caller has released `activity` and `info`, so `output` stays the
+    /// innermost lock.
+    fn attach_recent_output(&self, outcome: &mut RefreshOutcome) {
+        let Some((_, request)) = outcome.summary.as_mut() else {
+            return;
+        };
+        request.recent_output = self.output.lock().text_tail(SUMMARY_TAIL_BYTES);
     }
 
     fn finish_title(&self, revision: u64, result: Result<String, String>) {
@@ -2706,7 +2900,17 @@ impl TerminalManager {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                manager.refresh_processes(pi.clone());
+                let manager = manager.clone();
+                let pi = pi.clone();
+                // Sampling reads every entry in /proc. That is filesystem work
+                // measured in milliseconds, and a runtime worker parked in it
+                // is a worker not serving terminal sockets. Awaiting the handle
+                // also keeps samples from overlapping when one runs long.
+                if let Err(error) =
+                    tokio::task::spawn_blocking(move || manager.refresh_processes(pi)).await
+                {
+                    tracing::warn!(%error, "terminal process sample failed");
+                }
             }
         });
     }
@@ -2861,6 +3065,10 @@ impl TerminalManager {
         drop(pair.slave);
 
         let pid = child.process_id();
+        // Recorded while the shell is certain to be alive. Once it has been
+        // waited for, its pid alone no longer identifies it.
+        let shell_process = pid.and_then(read_process_identity);
+        let output_drain = Arc::new(OutputDrain::default());
         let reader = pair
             .master
             .try_clone_reader()
@@ -2918,20 +3126,45 @@ impl TerminalManager {
             process_tracker: Mutex::new(ProcessTracker::default()),
             flow: FlowControl::default(),
             exit_order: AtomicU64::new(0),
+            output_drain: output_drain.clone(),
+            reaped: AtomicBool::new(false),
+            shell_process,
             home_directory: self.home_directory.clone(),
         });
         sessions.insert(id, session.clone());
         drop(sessions);
 
-        let output_session = session.clone();
-        let next_exit_order = self.next_exit_order.clone();
+        let output_session = Arc::downgrade(&session);
+        let reader_drain = output_drain.clone();
         thread::Builder::new()
             .name(format!("terminal-output-{id}"))
             .spawn(move || {
-                read_output(reader, output_session.clone());
+                read_output(reader, output_session);
+                reader_drain.finish();
+            })
+            .map_err(|error| TerminalError::Io(error.to_string()))?;
+
+        let exit_session = session.clone();
+        let next_exit_order = self.next_exit_order.clone();
+        thread::Builder::new()
+            .name(format!("terminal-exit-{id}"))
+            .spawn(move || {
+                // The exit is taken from the child, not from EOF on the master.
+                // Linux does not hang a pty slave up when its session leader
+                // dies, so a shell that left `npm run dev &` running produces no
+                // EOF at all: waiting for one leaves a terminal with no shell
+                // reporting Running forever.
                 let exit_code = child.wait().map(|status| status.exit_code()).unwrap_or(1);
+                exit_session.reaped.store(true, Ordering::Release);
+                // Nothing can acknowledge the dead process's output any more, so
+                // the read loop must not stay parked on flow control while the
+                // last of it is drained.
+                exit_session.flow_release();
+                exit_session
+                    .output_drain
+                    .wait_for_finish(EXIT_DRAIN_TIMEOUT);
                 let exit_order = next_exit_order.fetch_add(1, Ordering::Relaxed);
-                output_session.exited(exit_code, exit_order);
+                exit_session.exited(exit_code, exit_order);
             })
             .map_err(|error| TerminalError::Io(error.to_string()))?;
 
@@ -2971,6 +3204,10 @@ impl TerminalManager {
             return false;
         };
         session.kill();
+        // Deleting a terminal has to reclaim it. The shell may already be gone
+        // with a background job still holding the pty open, and `kill` has
+        // nothing left to signal in that case.
+        session.reclaim();
         true
     }
 
@@ -3018,11 +3255,27 @@ pub(crate) fn terminate_descendant_process(
     }
 }
 
-fn read_output(mut reader: Box<dyn Read + Send>, session: Arc<TerminalSession>) {
+/// Drains a terminal's pty master until EOF.
+///
+/// The session is held weakly on purpose. EOF arrives only when every handle on
+/// the slave is closed, which a background job the shell left behind can
+/// withhold for as long as it runs; a strong reference would pin the session's
+/// replay buffer for exactly that long, long after the terminal was deleted.
+/// Once the session is gone the loop keeps draining so the writer is never
+/// blocked by a pty nobody reads.
+fn read_output(mut reader: Box<dyn Read + Send>, session: Weak<TerminalSession>) {
     read_output_chunks(
         reader.as_mut(),
-        || session.flow_wait_until_resumed(),
-        |bytes| session.publish(bytes),
+        || {
+            if let Some(session) = session.upgrade() {
+                session.flow_wait_until_resumed();
+            }
+        },
+        |bytes| {
+            if let Some(session) = session.upgrade() {
+                session.publish(bytes);
+            }
+        },
     );
 }
 
@@ -3352,6 +3605,112 @@ fn parse_process_parent(stat: &str) -> Option<u32> {
     stat[close + 1..].split_whitespace().nth(1)?.parse().ok()
 }
 
+/// Reads a live process's pid and start time, which together identify it across
+/// pid reuse.
+#[cfg(target_os = "linux")]
+fn read_process_identity(pid: u32) -> Option<ProcessIdentity> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_process_identity(pid, &stat)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_process_identity(pid: u32) -> Option<ProcessIdentity> {
+    let _ = pid;
+    None
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PtySessionSignal {
+    Hangup,
+    Kill,
+}
+
+/// Signals every process still attached to a terminal's pty.
+///
+/// The shell was started with `setsid`, so it leads the pty's session and every
+/// process the terminal still holds — background jobs in their own process
+/// groups included — carries `sid == shell.pid`. Signalling the shell's process
+/// group alone would miss exactly the jobs that keep the pty alive.
+///
+/// A reaped pid can be handed to an unrelated process, so the shell's recorded
+/// start time is checked first: if that pid now names a different process, this
+/// terminal's session is gone and nothing is signalled.
+#[cfg(target_os = "linux")]
+fn signal_pty_session(shell: ProcessIdentity, signal: PtySessionSignal) {
+    use rustix::process::{Pid, Signal, kill_process};
+
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{}/stat", shell.pid))
+        && parse_process_identity(shell.pid, &stat) != Some(shell)
+    {
+        return;
+    }
+    let signal = match signal {
+        PtySessionSignal::Hangup => Signal::HUP,
+        PtySessionSignal::Kill => Signal::KILL,
+    };
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        if parse_process_session(&stat) != Some(shell.pid) {
+            continue;
+        }
+        if let Some(target) = i32::try_from(pid).ok().and_then(Pid::from_raw) {
+            let _ = kill_process(target, signal);
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn signal_pty_session(shell: ProcessIdentity, signal: PtySessionSignal) {
+    let _ = (shell, signal);
+}
+
+/// The process group the terminal's shell has handed the tty to, or `None` when
+/// the shell itself is in the foreground.
+///
+/// One `/proc` file, not a scan: this runs on the input path for every line a
+/// browser submits, and walking every process there would put a full `/proc`
+/// traversal inside the input queue's lock on a runtime worker.
+#[cfg(target_os = "linux")]
+fn terminal_foreground_group(shell_pid: u32) -> Option<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{shell_pid}/stat")).ok()?;
+    parse_foreground_group(&stat)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn terminal_foreground_group(shell_pid: u32) -> Option<i32> {
+    let _ = shell_pid;
+    None
+}
+
+/// Reads the foreground process group out of a `/proc/<pid>/stat` line, or
+/// `None` when the process is its own foreground group or has no tty.
+fn parse_foreground_group(stat: &str) -> Option<i32> {
+    let close = stat.rfind(')')?;
+    let fields = stat[close + 1..].split_whitespace().collect::<Vec<_>>();
+    let group = fields.get(2)?.parse::<i32>().ok()?;
+    let foreground_group = fields.get(5)?.parse::<i32>().ok()?;
+    (foreground_group > 0 && foreground_group != group).then_some(foreground_group)
+}
+
+/// Reads the session identifier out of a `/proc/<pid>/stat` line.
+#[cfg(target_os = "linux")]
+fn parse_process_session(stat: &str) -> Option<u32> {
+    let close = stat.rfind(')')?;
+    stat[close + 1..].split_whitespace().nth(3)?.parse().ok()
+}
+
 #[cfg(target_os = "linux")]
 fn parse_process_identity(pid: u32, stat: &str) -> Option<ProcessIdentity> {
     let close = stat.rfind(')')?;
@@ -3631,41 +3990,69 @@ fn current_millis() -> u64 {
 }
 
 pub(crate) fn sanitize_terminal_text(input: &str) -> String {
+    #[derive(Clone, Copy)]
+    enum State {
+        Text,
+        Escape,
+        EscapeIntermediate,
+        Csi,
+        String,
+        StringEscape,
+    }
+
+    let mut state = State::Text;
     let mut output = String::with_capacity(input.len());
-    let mut characters = input.chars().peekable();
-    while let Some(character) = characters.next() {
-        if character == '\u{1b}' {
-            match characters.peek().copied() {
-                Some('[') => {
-                    characters.next();
-                    for next in characters.by_ref() {
-                        if ('@'..='~').contains(&next) {
-                            break;
-                        }
+    for character in input.chars() {
+        state = match state {
+            State::Text => match character {
+                '\u{1b}' => State::Escape,
+                '\r' => {
+                    output.push('\n');
+                    State::Text
+                }
+                '\n' | '\t' => {
+                    output.push(character);
+                    State::Text
+                }
+                _ => {
+                    if !character.is_control() {
+                        output.push(character);
                     }
+                    State::Text
                 }
-                Some(']') => {
-                    characters.next();
-                    let mut escaped = false;
-                    for next in characters.by_ref() {
-                        if next == '\u{7}' || escaped && next == '\\' {
-                            break;
-                        }
-                        escaped = next == '\u{1b}';
-                    }
-                }
-                Some(_) => {
-                    characters.next();
-                }
-                None => {}
-            }
-            continue;
-        }
-        if character == '\r' {
-            output.push('\n');
-        } else if character == '\n' || character == '\t' || !character.is_control() {
-            output.push(character);
-        }
+            },
+            State::Escape => match character {
+                '[' => State::Csi,
+                // Device control, privacy message and APC payloads run to a
+                // string terminator exactly like an OSC title does.
+                ']' | 'P' | 'X' | '^' | '_' => State::String,
+                // `ESC ( B` (what `tput sgr0` emits) ends on its final byte,
+                // so consuming a single character here would emit that final.
+                '\u{20}'..='\u{2f}' => State::EscapeIntermediate,
+                '\u{1b}' => State::Escape,
+                _ => State::Text,
+            },
+            State::EscapeIntermediate => match character {
+                '\u{20}'..='\u{2f}' => State::EscapeIntermediate,
+                '\u{1b}' => State::Escape,
+                _ => State::Text,
+            },
+            State::Csi => match character {
+                '\u{1b}' => State::Escape,
+                '\u{40}'..='\u{7e}' => State::Text,
+                _ => State::Csi,
+            },
+            State::String => match character {
+                '\u{7}' => State::Text,
+                '\u{1b}' => State::StringEscape,
+                _ => State::String,
+            },
+            State::StringEscape => match character {
+                '\\' => State::Text,
+                '\u{1b}' => State::StringEscape,
+                _ => State::String,
+            },
+        };
     }
     output
 }
@@ -4962,6 +5349,319 @@ mod tests {
         assert!(manager.list().is_empty());
     }
 
+    fn test_manager(home: &Path) -> TerminalManager {
+        TerminalManager {
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            default_shell: RwLock::new(Some("/bin/sh".into())),
+            replay_bytes: AtomicUsize::new(1024 * 1024),
+            next_exit_order: Arc::new(AtomicU64::new(0)),
+            home_directory: home.to_path_buf(),
+            agent_event_socket: None,
+            executable: None,
+        }
+    }
+
+    fn new_terminal() -> CreateTerminal {
+        CreateTerminal {
+            path: None,
+            cwd: None,
+            shell: None,
+            clone_from: None,
+        }
+    }
+
+    fn wait_until(condition: impl Fn() -> bool) -> bool {
+        (0..1_500).any(|_| {
+            if condition() {
+                true
+            } else {
+                thread::sleep(Duration::from_millis(10));
+                false
+            }
+        })
+    }
+
+    #[test]
+    fn a_shell_that_leaves_a_job_holding_the_pty_still_exits_and_is_reclaimed() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = test_manager(directory.path());
+        let info = manager.create(new_terminal()).unwrap();
+        let session = manager.get(info.id).unwrap();
+
+        // The background job inherits the pty slave, so the master never
+        // reports EOF once the shell is gone. The exit has to come from the
+        // child's own status instead.
+        session.write(b"sleep 30 &\nexit 7\n").unwrap();
+        assert!(
+            wait_until(|| session.info().status == TerminalStatus::Exited),
+            "a shell with a surviving background job never reported its exit"
+        );
+        assert_eq!(session.info().exit_code, Some(7));
+        assert!(
+            !session.output_drain.finished(),
+            "the pty reported EOF, so this run did not exercise the held slave"
+        );
+
+        // Deleting has to reclaim the terminal: nothing else ever releases the
+        // read loop parked on the job's handle to the slave.
+        assert!(manager.remove(info.id));
+        assert!(
+            wait_until(|| session.output_drain.finished()),
+            "deleting the terminal left the read loop parked on the pty"
+        );
+    }
+
+    #[test]
+    fn an_exiting_terminal_closes_the_agent_it_was_running() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = test_manager(directory.path());
+        let info = manager.create(new_terminal()).unwrap();
+        let session = manager.get(info.id).unwrap();
+        {
+            let mut activity = session.activity.lock();
+            activity.input_submitted_at = 1_000;
+            let mut current = session.info.write();
+            current.agent = Some(AgentInfo {
+                kind: "codex".to_owned(),
+                status: AgentStatus::Working,
+                status_changed_at: 1_000,
+                started_at: 1_000,
+                revision: 4,
+                completed_at: None,
+                summary: None,
+                activity: Some(AgentActivity {
+                    label: "thinking".to_owned(),
+                    updated_at: 1_000,
+                }),
+            });
+        }
+
+        session.exited(7, 1);
+
+        let exited = session.info();
+        assert_eq!(exited.status, TerminalStatus::Exited);
+        assert_eq!(exited.exit_code, Some(7));
+        let agent = exited.agent.expect("the agent was dropped by the exit");
+        assert_eq!(agent.status, AgentStatus::Closed);
+        assert_eq!(agent.revision, 5);
+        assert!(agent.activity.is_none());
+        assert!(agent.completed_at.is_some());
+        assert!(manager.remove(info.id));
+    }
+
+    #[test]
+    fn concurrent_scrollback_and_agent_summaries_cannot_deadlock() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = test_manager(directory.path());
+        let info = manager.create(new_terminal()).unwrap();
+        let session = manager.get(info.id).unwrap();
+
+        let (finished, completed) = std::sync::mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let paging = {
+            let session = session.clone();
+            let stop = stop.clone();
+            thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = session.scrollback(None, 4 * 1024);
+                }
+            })
+        };
+        let transitions = {
+            let session = session.clone();
+            thread::spawn(move || {
+                for index in 0..2_000_u64 {
+                    let kind = if index % 2 == 0 {
+                        AgentEventKind::Thinking
+                    } else {
+                        AgentEventKind::Completed
+                    };
+                    session.apply_agent_event(
+                        AgentEvent {
+                            provider: "codex".to_owned(),
+                            kind,
+                            sequence: None,
+                            title: None,
+                            transcript_only: false,
+                            transcript_reset: false,
+                            transcript: Vec::new(),
+                        },
+                        true,
+                        index,
+                    );
+                }
+                let _ = finished.send(());
+            })
+        };
+
+        // Paging scrollback locked output and then read the terminal record,
+        // while completing a task locked the record and then read output for
+        // the summary. Overlapping them wedged the server for good.
+        let progressed = completed.recv_timeout(Duration::from_secs(60)).is_ok();
+        stop.store(true, Ordering::Relaxed);
+        assert!(
+            progressed,
+            "scrollback and agent summaries deadlocked against each other"
+        );
+        transitions.join().unwrap();
+        paging.join().unwrap();
+        assert!(manager.remove(info.id));
+    }
+
+    fn sampled_process(
+        pid: u32,
+        parent: u32,
+        group: i32,
+        foreground_group: i32,
+        command: &str,
+    ) -> ProcessInfo {
+        ProcessInfo {
+            pid,
+            parent,
+            group,
+            foreground_group,
+            command: command.to_owned(),
+            arguments: Vec::new(),
+            cwd: None,
+            start_ticks: u64::from(pid),
+            cpu_ticks: 0,
+            memory_bytes: 0,
+        }
+    }
+
+    fn process_sample(processes: Vec<ProcessInfo>) -> ProcessSnapshot {
+        let mut children = HashMap::<u32, Vec<u32>>::new();
+        for process in &processes {
+            children
+                .entry(process.parent)
+                .or_default()
+                .push(process.pid);
+        }
+        ProcessSnapshot {
+            processes: processes
+                .into_iter()
+                .map(|process| (process.pid, process))
+                .collect(),
+            children,
+            cpu_sample: None,
+        }
+    }
+
+    #[test]
+    fn a_submitted_prompt_binds_to_the_job_it_was_typed_into() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = test_manager(directory.path());
+        let info = manager.create(new_terminal()).unwrap();
+        let session = manager.get(info.id).unwrap();
+        session.info.write().pid = Some(900_001);
+
+        // A line submitted to some earlier job is not a prompt for the agent
+        // that happens to start next.
+        session.activity.lock().pending_agent_submission = Some(PendingAgentSubmission {
+            foreground_group: 900_050,
+            submitted_at: 1_000,
+            prompt: "an earlier command".to_owned(),
+        });
+        let outcome = session.refresh_process_metadata(
+            &process_sample(vec![
+                sampled_process(900_001, 1, 900_001, 900_100, "sh"),
+                sampled_process(900_100, 900_001, 900_100, 900_100, "codex"),
+            ]),
+            true,
+            false,
+            2_000,
+        );
+        assert!(outcome.title.is_none());
+        assert_eq!(session.activity.lock().input_submitted_at, 0);
+        assert_eq!(
+            session.info().agent.map(|agent| agent.status),
+            Some(AgentStatus::Idle)
+        );
+
+        // A line submitted to the job the agent turns out to be running is the
+        // task that agent started with.
+        session.activity.lock().pending_agent_submission = Some(PendingAgentSubmission {
+            foreground_group: 900_200,
+            submitted_at: 3_000,
+            prompt: "add payment retries".to_owned(),
+        });
+        let outcome = session.refresh_process_metadata(
+            &process_sample(vec![
+                sampled_process(900_001, 1, 900_001, 900_200, "sh"),
+                sampled_process(900_200, 900_001, 900_200, 900_200, "codex"),
+            ]),
+            true,
+            false,
+            4_000,
+        );
+        let (_, request) = outcome.title.expect("the submitted task was not restored");
+        assert_eq!(request.user_prompt.as_deref(), Some("add payment retries"));
+        assert_eq!(session.activity.lock().input_submitted_at, 3_000);
+        assert_eq!(
+            session.info().agent.map(|agent| agent.status),
+            Some(AgentStatus::Working)
+        );
+        assert!(manager.remove(info.id));
+    }
+
+    #[test]
+    fn reads_the_foreground_group_from_a_single_process_record() {
+        // pid (comm) state ppid pgrp session tty_nr tpgid ...
+        let running_a_job = "42 (sh) S 1 42 42 34816 4242 4194304 0 0 0 0 0 0 0 0 0 0 1 0 99 0 0";
+        assert_eq!(parse_foreground_group(running_a_job), Some(4_242));
+        assert_eq!(parse_process_session(running_a_job), Some(42));
+
+        let shell_in_front = "42 (sh) S 1 42 42 34816 42 4194304 0 0 0 0 0 0 0 0 0 0 1 0 99 0 0";
+        assert_eq!(parse_foreground_group(shell_in_front), None);
+
+        let no_terminal = "42 (sh) S 1 42 42 0 -1 4194304 0 0 0 0 0 0 0 0 0 0 1 0 99 0 0";
+        assert_eq!(parse_foreground_group(no_terminal), None);
+
+        // A command name may contain spaces and parentheses.
+        let awkward_name =
+            "42 (we ird) x) S 1 42 7 34816 4242 4194304 0 0 0 0 0 0 0 0 0 0 1 0 99 0 0";
+        assert_eq!(parse_foreground_group(awkward_name), Some(4_242));
+        assert_eq!(parse_process_session(awkward_name), Some(7));
+    }
+
+    #[test]
+    fn an_unterminated_osc_stays_bounded_and_leaves_later_titles_readable() {
+        let mut signals = TerminalSignals::default();
+        // `imgcat` writes a whole image as one OSC 1337 whose terminator is
+        // megabytes away.
+        signals.observe(b"\x1b]1337;File=inline=1:", 0);
+        let chunk = vec![b'A'; 4 * 1024];
+        for _ in 0..25 {
+            signals.observe(&chunk, 0);
+            assert!(
+                signals.pending.len() <= MAX_PENDING_OSC_BYTES + chunk.len(),
+                "the signal buffer grew to {} bytes",
+                signals.pending.len()
+            );
+        }
+
+        signals.observe(b"\x1b]0;codex ready\x07", 1_000);
+        assert_eq!(signals.osc_title(), "codex ready");
+        assert_eq!(signals.agent_state, Some((ReportedAgentState::Idle, 1_000)));
+    }
+
+    #[test]
+    fn an_osc_split_across_reads_is_still_parsed_once_the_terminator_arrives() {
+        let mut signals = TerminalSignals::default();
+        signals.observe(b"\x1b]0;codex", 0);
+        signals.observe(b" working", 0);
+        assert_eq!(signals.osc_title(), "");
+        signals.observe(b"\x07", 500);
+        assert_eq!(signals.osc_title(), "codex working");
+
+        // A two byte string terminator may straddle the read boundary.
+        let mut signals = TerminalSignals::default();
+        signals.observe(b"\x1b]2;codex ready\x1b", 0);
+        signals.observe(b"\\", 900);
+        assert_eq!(signals.osc_title(), "codex ready");
+        assert_eq!(signals.agent_state, Some((ReportedAgentState::Idle, 900)));
+    }
+
     #[test]
     fn native_events_feed_existing_agent_transitions_without_extra_revisions() {
         let directory = tempfile::tempdir().unwrap();
@@ -5358,6 +6058,15 @@ mod tests {
             sanitize_terminal_text("\u{1b}[31mred\u{1b}[0m\rnext"),
             "red\nnext"
         );
+    }
+
+    #[test]
+    fn sanitize_terminal_text_drops_whole_escape_sequences() {
+        // `\x1b(B` is what `tput sgr0` emits on xterm-256color; consuming a
+        // single character after the escape used to leak its final byte.
+        assert_eq!(sanitize_terminal_text("\u{1b}(Bplain\u{1b})0"), "plain");
+        assert_eq!(sanitize_terminal_text("a\u{1b}P0;1|payload\u{1b}\\b"), "ab");
+        assert_eq!(sanitize_terminal_text("\u{1b}]8;;url\u{7}link"), "link");
     }
 
     #[test]

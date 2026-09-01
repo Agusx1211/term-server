@@ -64,21 +64,28 @@ export function FileExplorer({ initialRoot, onOpen }: FileExplorerProps) {
       setSearchLoading(false);
       return;
     }
+    // Aborting a superseded search matters on the server too: it drops the
+    // request future, which stops the (potentially huge) directory walk instead
+    // of leaving one running per keystroke.
+    const controller = new AbortController();
     const timer = window.setTimeout(() => {
       setSearchLoading(true);
       setError("");
-      void api.searchFiles(location, needle).then((next) => {
+      void api.searchFiles(location, needle, undefined, controller.signal).then((next) => {
         if (sequence !== searchRequest.current) return;
         setResults(next.entries);
         setTruncated(next.truncated);
         setSearchLoading(false);
       }).catch((reason) => {
-        if (sequence !== searchRequest.current) return;
+        if (controller.signal.aborted || sequence !== searchRequest.current) return;
         setError(reason instanceof Error ? reason.message : "Unable to search files");
         setSearchLoading(false);
       });
     }, 180);
-    return () => clearTimeout(timer);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
   }, [query, location]);
 
   const loading = directoryLoading || searchLoading;

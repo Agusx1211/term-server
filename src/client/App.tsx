@@ -675,7 +675,9 @@ export function App() {
             ? `term-server v${status.latest.version} is available`
             : status.state === "current"
               ? "term-server is up to date"
-              : "Automatic updates are unavailable for this installation",
+              : status.state === "older" && status.latest
+                ? `This build is newer than ${status.channel} (v${status.latest.version})`
+                : "Automatic updates are unavailable for this installation",
         );
       }
     } catch (error) {
@@ -935,10 +937,11 @@ export function App() {
           if (disposed || generation !== authGeneration.current) return;
           const workspaceTerminals = next;
           setTerminals((current) => mergeTerminalActivityViews(workspaceTerminals, current));
-          setConfig((current) => ({
-            ...current,
-            broker: current.broker ? withBrokerSessions(current.broker, workspaceTerminals) : null,
-          }));
+          setConfig((current) => {
+            if (!current.broker) return current;
+            const broker = withBrokerSessions(current.broker, workspaceTerminals);
+            return broker === current.broker ? current : { ...current, broker };
+          });
           const available = new Set(workspaceTerminals.map((terminal) => terminal.id));
           setLayout((current) => pruneLayout(current, available));
           syncArtifacts(artifacts, activeIdRef.current, workspaceTerminals);
@@ -1169,6 +1172,13 @@ export function App() {
     ],
   );
   browserSnapshotRef.current = browserTabSnapshot;
+  // The snapshot object is rebuilt whenever one of its inputs changes identity.
+  // Heartbeat on its contents so an identical snapshot does not add a PUT on top
+  // of the 1 s interval.
+  const browserSnapshotKey = useMemo(
+    () => JSON.stringify(browserTabSnapshot),
+    [browserTabSnapshot],
+  );
   const renderedIds = [...mountedIds, ...paneIds.filter((id) => !mountedIds.includes(id))];
   const mountedTerminals = renderedIds.map((id) => terminalById.get(id)).filter(Boolean) as TerminalInfo[];
   const rectangles = useMemo(() => paneRects(layout), [layout]);
@@ -1499,7 +1509,7 @@ export function App() {
 
   useEffect(() => {
     browserHeartbeatRef.current?.();
-  }, [browserTabSnapshot]);
+  }, [browserSnapshotKey]);
 
   const forgetTerminal = (id: string) => {
     setTerminals((current) => current.filter((terminal) => terminal.id !== id));

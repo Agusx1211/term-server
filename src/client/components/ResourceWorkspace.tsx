@@ -20,7 +20,12 @@ import {
 import type { FileDocument } from "../../shared/types";
 import { api } from "../lib/api";
 import type { ArtifactDeleteTarget } from "../lib/artifacts";
-import type { ResourceTab } from "../lib/resources";
+import {
+  resourceRevision,
+  shouldReloadResource,
+  type ResourceRevisionsHeld,
+  type ResourceTab,
+} from "../lib/resources";
 import type { ThemeName } from "../lib/terminal-theme";
 
 const LINE_WRAPPING_STORAGE_KEY = "term-server:editor-line-wrapping";
@@ -201,6 +206,7 @@ function TextDocument({
   const savedContent = useRef("");
   const version = useRef("");
   const saveCurrent = useRef<() => Promise<void>>(async () => undefined);
+  const held = useRef<ResourceRevisionsHeld>({ loaded: "", saved: "" });
   const [document, setDocument] = useState<FileDocument>();
   const [language, setLanguage] = useState("Plain Text");
   const [loading, setLoading] = useState(true);
@@ -208,16 +214,39 @@ function TextDocument({
   const [error, setError] = useState("");
   const isArtifact = Boolean(tab.artifact);
 
+  // Reload the buffer when the tab points at a revision it does not hold yet.
+  // The content is pushed into the live editor rather than remounting it: the
+  // host element stays in the DOM for the lifetime of the tab, so a reload can
+  // never leave the pane showing an empty editor.
   useEffect(() => {
-    if (tab.dirty) return;
+    if (!shouldReloadResource(tab, held.current)) {
+      if (!tab.dirty) held.current.loaded = resourceRevision(tab);
+      return;
+    }
+    const revision = resourceRevision(tab);
     let cancelled = false;
     setLoading(true);
     setError("");
     void api.readFile({ path: tab.path }).then((next) => {
       if (cancelled) return;
+      const view = editor.current;
+      if (content.current !== savedContent.current) {
+        // Editing started while the read was in flight. Keep the user's buffer
+        // and let the next save resolve the conflict against the stored version;
+        // the revision stays unheld so it is picked up once the buffer is clean.
+        setLoading(false);
+        return;
+      }
+      held.current.loaded = revision;
+      const changed = content.current !== next.content;
       content.current = next.content;
       savedContent.current = next.content;
       version.current = next.version;
+      if (view && changed) {
+        view.dispatch({
+          changes: { from: 0, to: view.state.doc.length, insert: next.content },
+        });
+      }
       setDocument(next);
       setLoading(false);
     }).catch((reason) => {
@@ -242,6 +271,9 @@ function TextDocument({
       });
       version.current = saved.version;
       savedContent.current = content.current;
+      // The save already returned the stored content, and the artifact poll
+      // reports this modification time moments later; neither is worth a reload.
+      held.current.saved = resourceRevision({ path: tab.path, modifiedAt: saved.modifiedAt });
       setDocument(saved);
       onDirty(tab.path, false);
       onNotice(`Saved ${tab.name}`);
@@ -370,10 +402,11 @@ function TextDocument({
       </header>
       <div class="text-document-body">
         {error && <div key="error" class="resource-error">{error}</div>}
-        {loading ? (
-          <div key="loading" class="resource-loading"><LoaderCircle class="spin" size={16} /> Loading {tab.name}…</div>
-        ) : (
-          <div key="editor" ref={host} class="code-editor" />
+        <div key="editor" ref={host} class="code-editor" />
+        {loading && (
+          <div key="loading" class="resource-loading loading-overlay">
+            <LoaderCircle class="spin" size={16} /> Loading {tab.name}…
+          </div>
         )}
       </div>
     </section>

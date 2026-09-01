@@ -739,7 +739,7 @@ body.pane-resizing .layout-divider.horizontal { cursor: row-resize; }
   background: var(--artifact-surface);
   box-shadow: inset 5px 0 var(--artifact), inset -5px 0 var(--artifact);
 }
-.text-document-body { min-width: 0; min-height: 0; display: grid; grid-template-rows: auto minmax(0, 1fr); }
+.text-document-body { position: relative; min-width: 0; min-height: 0; display: grid; grid-template-rows: auto minmax(0, 1fr); }
 .artifact-document .text-document-body, .artifact-document .image-canvas { margin: 0 5px; }
 .text-document-body > .code-editor:first-child, .text-document-body > .resource-loading:first-child { grid-row: 1 / 3; }
 .resource-document-header { min-width: 0; display: flex; align-items: center; gap: 7px; padding: 0 7px 0 10px; border-bottom: 1px solid var(--border); background: var(--panel); color: var(--muted); font-size: 10px; }
@@ -786,6 +786,10 @@ body.pane-resizing .layout-divider.horizontal { cursor: row-resize; }
 .resource-editor-action:disabled { opacity: .45; cursor: default; }
 .resource-error { padding: 7px 10px; border-bottom: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border)); background: color-mix(in srgb, var(--danger) 8%, var(--panel)); color: var(--danger); font-size: 10px; }
 .resource-loading { min-height: 0; display: flex; align-items: center; justify-content: center; gap: 7px; color: var(--muted); }
+/* Cover the editor while it reloads instead of unmounting its host, which would
+   detach the live CodeMirror view and leave the pane blank. */
+.resource-loading.loading-overlay { position: absolute; inset: 0; z-index: 1; background: var(--editor); }
+.artifact-document .resource-loading.loading-overlay { background: var(--artifact-surface); }
 .code-editor { min-width: 0; min-height: 0; overflow: hidden; }
 .code-editor .cm-editor { height: 100%; }
 .code-editor .cm-scroller { overflow: auto; }

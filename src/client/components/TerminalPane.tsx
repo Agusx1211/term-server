@@ -50,7 +50,6 @@ import { configureTerminalDrag } from "../lib/layout";
 import { api } from "../lib/api";
 import { createHoverPreviewController, findFileLinks, imagePreviewPosition } from "../lib/file-links";
 import {
-  installTerminalTouchScroll,
   NO_TERMINAL_MODIFIERS,
   transformTerminalInput,
   type TerminalModifiers,
@@ -62,7 +61,18 @@ import {
   terminalZoomPercent,
 } from "../lib/terminal-zoom";
 import { supervisorContextActive } from "../lib/supervisor-context";
-import { addTerminalStreamProtocol, closeTerminalSocket, TerminalSocketFailureTracker } from "../lib/terminal-socket";
+import {
+  addTerminalStreamProtocol,
+  closeTerminalSocket,
+  isTerminalProtocolMismatch,
+  probeTerminalServerReachability,
+  TERMINAL_SOCKET_PROTOCOL_PROBE_INTERVAL_MS,
+  TerminalSocketFailureTracker,
+} from "../lib/terminal-socket";
+import {
+  TERMINAL_KEEPALIVE_INTERVAL_MS,
+  terminalKeepaliveAction,
+} from "../lib/terminal-keepalive";
 import {
   encodeBytesBase64,
   encodeTextBase64,
@@ -87,10 +97,12 @@ import {
 import {
   TERMINAL_FRAME_OUTPUT,
   TERMINAL_FRAME_SNAPSHOT,
+  TERMINAL_RESET_SEQUENCE,
   TerminalOutputAck,
   TerminalRenderBacklog,
   TerminalStreamState,
   decodeTerminalFrame,
+  requiresSnapshotRecovery,
   type TerminalBacklogKind,
   type TerminalFrame,
   type TerminalStreamIssue,
@@ -172,11 +184,6 @@ export interface PasteRequest {
   nonce: number;
 }
 const TERMINAL_PROTOCOL_MISMATCH_MESSAGE = "terminal client is out of date; reload the page";
-// How long a foreground pane may hold outstanding writes with no parse
-// progress before its xterm write pump is considered dead and the stream is
-// rebuilt. Generous: a healthy parser settles each frame within milliseconds,
-// and a burst still reports progress per frame.
-const TERMINAL_PARSER_STALL_MS = 30_000;
 
 const searchOptions = (theme: ThemeName, incremental = false): ISearchOptions => ({
   incremental,
@@ -711,19 +718,25 @@ export function TerminalPane({
     // leaves `pendingWrites` permanently unsettled, and every recovery path
     // that waited on it unconditionally hung forever: a closed socket was
     // never cleaned up or reconnected, leaving a frozen pane that still looked
-    // connected. After the deadline the caller proceeds; whatever was still
-    // queued is superseded by the resynchronization that follows.
+    // connected. After the deadline the caller proceeds — but it is told that
+    // it did, because writes still queued behind a merely slow pump will land
+    // later and a plain resume would then duplicate them.
     const settledStreamWithDeadline = (
       generation = messageQueueGeneration,
       deadlineMs = 3_000,
-    ): Promise<void> =>
+    ): Promise<boolean> =>
       Promise.race([
-        settledStream(generation).then(() => undefined),
-        new Promise<void>((resolve) => {
-          window.setTimeout(resolve, deadlineMs);
+        settledStream(generation).then(() => true),
+        new Promise<boolean>((resolve) => {
+          window.setTimeout(() => resolve(false), deadlineMs);
         }),
       ]);
-    let lastServerMessage = Date.now();
+    // When the oldest ping this pane is still waiting on was sent. Liveness is
+    // measured from that rather than from the last message received: a hidden
+    // tab's timers are throttled to about once a minute, so an idle shell's
+    // newest message is routinely older than any fixed budget even though the
+    // connection is perfectly healthy.
+    let pendingPingSince: number | undefined;
     let hasSynced = false;
     let recoveringOutput = false;
     let reportedIssue = "";
@@ -862,10 +875,13 @@ export function TerminalPane({
         if (term.hasSelection()) term.element?.ownerDocument.execCommand("copy");
       },
     ));
-    const disposeTouchScroll = installTerminalTouchScroll(host, term, () => {
-      const screen = host.querySelector<HTMLElement>(".xterm-screen");
-      return screen && term.rows ? screen.getBoundingClientRect().height / term.rows : 15;
-    });
+    // Touch scrolling belongs to xterm. Since the 6.x upgrade the terminal
+    // registers VS Code's Gesture on its screen element and scrolls its own
+    // viewport (with inertia, arrow keys on the alternate screen, and wheel
+    // reports for mouse-tracking applications). The pane used to run a
+    // pointer-based scroller of its own over the top of it: pointer events fire
+    // for the same finger, `touch-action: none` only suppresses the browser's
+    // native scrolling, and one row of drag moved the buffer by two.
 
     // Frames are handed to xterm as they arrive rather than one per settled
     // parse. xterm's write buffer already slices parsing into ~12ms budgets and
@@ -1069,10 +1085,37 @@ export function TerminalPane({
       if (reconnectTimer.current !== undefined) clearTimeout(reconnectTimer.current);
       reconnectTimer.current = undefined;
     };
+    // Every close before `synced` looks the same from a browser: the server
+    // rejects a stale stream protocol with 426 *before* the upgrade, so a real
+    // version mismatch arrives as the same 1006-with-no-`open` a stopped server,
+    // a suspended laptop or a wifi-to-LTE hop produces. Four of those take about
+    // seven seconds of backoff, and the pane used to declare itself out of date
+    // and stop reconnecting for good. Ask the server which it is instead — and
+    // keep retrying either way, so the pane comes back on its own.
+    let protocolProbeDueAt = 0;
+    const probeProtocolMismatch = () => {
+      const now = Date.now();
+      if (now < protocolProbeDueAt) return;
+      protocolProbeDueAt = now + TERMINAL_SOCKET_PROTOCOL_PROBE_INTERVAL_MS;
+      void probeTerminalServerReachability(() => api.session(), navigator.onLine !== false)
+        .then((reachability) => {
+          if (disposed) return;
+          const mismatch = isTerminalProtocolMismatch(reachability);
+          if (mismatch === reloadRequiredState.current) return;
+          reloadRequiredState.current = mismatch;
+          setReloadRequired(mismatch);
+          if (!mismatch) return;
+          diagnosticsHandle?.record("error", {
+            kind: "protocol-version",
+            message: TERMINAL_PROTOCOL_MISMATCH_MESSAGE,
+          });
+          onNotice(TERMINAL_PROTOCOL_MISMATCH_MESSAGE);
+        });
+    };
 
     const connect = () => {
       const current = socket.current;
-      if (disposed || exited.current || !visibleState.current || reloadRequiredState.current) return;
+      if (disposed || exited.current || !visibleState.current) return;
       if (current && current.readyState !== WebSocket.CLOSED) return;
       if (current) socket.current = undefined;
       clearReconnectTimer();
@@ -1082,6 +1125,7 @@ export function TerminalPane({
       pendingWrites = Promise.resolve();
       unparsedWrites = 0;
       lastParseProgressAt = Date.now();
+      pendingPingSince = undefined;
       parsingOutput = false;
       backlog.reset();
       suspendSocket = undefined;
@@ -1195,14 +1239,15 @@ export function TerminalPane({
       next.addEventListener("open", () => {
         if (!isCurrentSocket(generation, next)) return;
         diagnosticsHandle?.socketOpened(next);
-        lastServerMessage = Date.now();
+        pendingPingSince = undefined;
         reportViewport();
       });
 
       next.addEventListener("message", (event) => {
         if (!isCurrentSocket(generation, next) || protocolFailed || abandoned) return;
         diagnosticsHandle?.socketMessage(next, event.data);
-        lastServerMessage = Date.now();
+        // Any message answers whatever ping is outstanding: the server is alive.
+        pendingPingSince = undefined;
         let eagerFrame: TerminalFrame | undefined;
         let queuedBytes = 0;
         if (event.data instanceof ArrayBuffer) {
@@ -1360,7 +1405,12 @@ export function TerminalPane({
               if (hasSynced || recoveringOutput) {
                 setConnection("recovering");
               }
-              if (stream.begin(message.mode, message.sequence)) term.reset();
+              // Reset through the write queue, not around it: `term.reset()`
+              // runs immediately and leaves chunks queued by the previous
+              // connection in xterm's write buffer, where they would parse
+              // AFTER the reset and land on top of the snapshot — and then be
+              // serialized into the next checkpoint as authoritative state.
+              if (stream.begin(message.mode, message.sequence)) term.write(TERMINAL_RESET_SEQUENCE);
               diagnosticsHandle?.streamState({
                 gridEpoch: terminalEpoch,
                 receivedSequence: stream.received,
@@ -1454,14 +1504,27 @@ export function TerminalPane({
         // otherwise the close callback races the queue and drops the exit. The
         // wait is bounded: recovery must run even when a wedged write pump
         // keeps the queue from ever settling.
-        void settledStreamWithDeadline(generation).then(() => {
-          if (!isCurrentSocket(generation, next) || exited.current) return;
+        void settledStreamWithDeadline(generation).then((settled) => {
+          if (!isCurrentSocket(generation, next)) return;
+          // The terminal exited: the pane keeps its final buffer and its exit
+          // banner, and nothing reconnects. The socket reference still has to
+          // go, or the keepalive would find a closed socket two ticks later and
+          // "recover" a terminal that is never coming back.
+          if (exited.current) {
+            socket.current = undefined;
+            if (suspendSocket === suspend) suspendSocket = undefined;
+            return;
+          }
           acceptingInput = false;
           term.options.disableStdin = true;
           socket.current = undefined;
           if (suspendSocket === suspend) suspendSocket = undefined;
           diagnosticsHandle?.update({ acceptingInput: false, focused: false });
           setTerminalSize({ focused: false, controller: false });
+          // Writes handed to a merely slow pump are still going to land. Only a
+          // snapshot can absorb them: resuming would ask the server to resend
+          // exactly the bytes that are queued, and print them twice.
+          if (requiresSnapshotRecovery(settled, unparsedWrites)) recoveringOutput = true;
           if (!visibleState.current) {
             reportStreamIssue();
             diagnosticsHandle?.socketState("connecting");
@@ -1470,19 +1533,7 @@ export function TerminalPane({
             if (recoveringOutput) stream.restart();
             return;
           }
-          if (!socketSynced && preSyncFailures.recordBeforeReady()) {
-            reloadRequiredState.current = true;
-            setReloadRequired(true);
-            reportStreamIssue();
-            setConnection("disconnected");
-            diagnosticsHandle?.socketState("disconnected");
-            diagnosticsHandle?.record("error", {
-              kind: "protocol-version",
-              message: TERMINAL_PROTOCOL_MISMATCH_MESSAGE,
-            });
-            onNotice(TERMINAL_PROTOCOL_MISMATCH_MESSAGE);
-            return;
-          }
+          if (!socketSynced && preSyncFailures.recordBeforeReady()) probeProtocolMismatch();
           if (!recoveringOutput) {
             reportStreamIssue({ kind: "reconnecting" });
             setConnection("disconnected");
@@ -1492,7 +1543,13 @@ export function TerminalPane({
           backlog.reset();
           if (recoveringOutput) stream.restart();
           clearReconnectTimer();
-          const delay = recoveringOutput ? 0 : Math.min(5000, 250 * 2 ** attempts);
+          // Recovery reconnects at once, but only when this socket had actually
+          // synchronized. A stream that never got that far is failing for a
+          // reason immediate retries cannot fix, and hammering an unreachable
+          // server is exactly what the backoff is for.
+          const delay = recoveringOutput && socketSynced
+            ? 0
+            : Math.min(5000, 250 * 2 ** attempts);
           reconnectTimer.current = window.setTimeout(() => {
             reconnectTimer.current = undefined;
             if (!isCurrentGeneration(generation) || exited.current || !visibleState.current) return;
@@ -1545,21 +1602,30 @@ export function TerminalPane({
     let deadSocketTicks = 0;
     const keepaliveTimer = window.setInterval(() => {
       const current = socket.current;
-      if (!current) {
-        deadSocketTicks = 0;
+      const decision = terminalKeepaliveAction({
+        now: Date.now(),
+        exited: exited.current,
+        readyState: current?.readyState,
+        deadSocketTicks,
+        hidden: document.hidden,
+        visible: visibleState.current,
+        unparsedWrites,
+        lastParseProgressAt,
+        pendingPingSince,
+      });
+      deadSocketTicks = decision.deadSocketTicks;
+      if (decision.action === "idle") return;
+      if (decision.action === "release") {
+        // The terminal exited and the server closed the socket behind it. Let
+        // go of the closed socket rather than "recovering" a dead terminal.
+        socket.current = undefined;
         return;
       }
-      if (
-        current.readyState === WebSocket.CLOSING
-        || current.readyState === WebSocket.CLOSED
-      ) {
+      if (decision.action === "rebuild") {
         // The socket closed but the close handler's cleanup never ran, so no
         // reconnect was ever scheduled — the pane would sit frozen while still
         // looking connected. The bounded quiescence wait makes this rare, but
-        // any path that misses it lands here. Two ticks of grace, then rebuild.
-        deadSocketTicks += 1;
-        if (deadSocketTicks < 2) return;
-        deadSocketTicks = 0;
+        // any path that misses it lands here.
         recordDebugEvent(terminal.id, {
           type: "notice",
           message: "terminal socket closed without recovery; resynchronizing",
@@ -1574,14 +1640,8 @@ export function TerminalPane({
         if (visibleState.current) connect();
         return;
       }
-      deadSocketTicks = 0;
-      if (current.readyState !== WebSocket.OPEN) return;
-      if (
-        !document.hidden
-        && visibleState.current
-        && unparsedWrites > 0
-        && Date.now() - lastParseProgressAt > TERMINAL_PARSER_STALL_MS
-      ) {
+      if (!current) return;
+      if (decision.action === "recover-stall") {
         // xterm's write pump died (an exception in its chunked parse loop stops
         // every queued callback, silently). The pane would otherwise freeze at
         // its current bottom forever: pongs keep the keepalive satisfied, and
@@ -1607,12 +1667,13 @@ export function TerminalPane({
         connect();
         return;
       }
-      if (Date.now() - lastServerMessage > 45_000) {
+      if (decision.action === "timeout") {
         closeTerminalSocket(current, "timeout");
         return;
       }
+      if (pendingPingSince === undefined) pendingPingSince = Date.now();
       current.send(JSON.stringify({ type: "ping" } satisfies ClientTerminalMessage));
-    }, 15_000);
+    }, TERMINAL_KEEPALIVE_INTERVAL_MS);
 
     const observer = new ResizeObserver(reportViewport);
     observer.observe(host);
@@ -1672,7 +1733,6 @@ export function TerminalPane({
       stopCapture();
       observer.disconnect();
       imagePreviews.clear();
-      disposeTouchScroll();
       dataDisposable.dispose();
       inputSource.dispose();
       binaryDisposable.dispose();
@@ -2281,10 +2341,13 @@ export function TerminalPane({
         onNotice={onNotice}
       />
       {processesOpen && <ProcessInspector terminalId={terminal.id} onClose={() => setProcessesOpen(false)} />}
-      {connection === "disconnected" && (
-        <div class="pane-banner">
-          {reloadRequired ? TERMINAL_PROTOCOL_MISMATCH_MESSAGE : <><WifiOff size={13} /> Reconnecting…</>}
-        </div>
+      {/* The pane keeps retrying behind the out-of-date hint, so the hint has to
+          survive the connecting half of that cycle rather than blink with it. */}
+      {reloadRequired && connection !== "connected" && connection !== "exited" && (
+        <div class="pane-banner">{TERMINAL_PROTOCOL_MISMATCH_MESSAGE}</div>
+      )}
+      {!reloadRequired && connection === "disconnected" && (
+        <div class="pane-banner"><WifiOff size={13} /> Reconnecting…</div>
       )}
       {connection === "exited" && <div class="pane-banner exited">Process exited with code {terminal.exitCode ?? 0}</div>}
     </section>

@@ -3,6 +3,7 @@ import type {
   SessionBrokerInfo,
   TerminalInfo,
 } from "../../shared/types";
+import { structurallyEqual } from "./structural-equality";
 
 const buildKey = ({ version, commit }: { version: string; commit: string }) =>
   `${version}\u0000${commit}`;
@@ -35,7 +36,7 @@ export function withBrokerSessions(
     known.add(buildKey(generation));
   }
 
-  return {
+  const updated: SessionBrokerInfo = {
     ...broker,
     sessions: terminals.length,
     restartRequired: generations.some(
@@ -43,4 +44,8 @@ export function withBrokerSessions(
     ),
     generations,
   };
+  // The workspace poll recomputes this every 1.5 s; keeping the previous object
+  // when nothing moved lets the config state update bail out instead of
+  // re-rendering the whole workbench.
+  return structurallyEqual(broker, updated) ? broker : updated;
 }
