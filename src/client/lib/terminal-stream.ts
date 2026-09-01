@@ -57,6 +57,29 @@ export interface TerminalFrame {
 
 export type TerminalSyncMode = "snapshot" | "resume";
 
+/**
+ * A full reset (RIS), written THROUGH xterm's write queue rather than called on
+ * the terminal. `Terminal.reset()` runs immediately and leaves whatever is
+ * already queued in the write buffer untouched, so chunks handed over before a
+ * resynchronization still parse afterwards — on top of the snapshot that was
+ * supposed to replace them.
+ */
+export const TERMINAL_RESET_SEQUENCE = "\u001bc";
+
+/**
+ * Whether a stream that stopped waiting for xterm must resynchronize from a
+ * snapshot instead of resuming.
+ *
+ * Resuming asks the server to continue from the last committed sequence, which
+ * is only safe when the writes that were never committed are also never going
+ * to be parsed. That holds for a dead write pump, but not for a merely slow one
+ * (a hidden tab parses in ~12 ms slices): those chunks still land, and the
+ * server would resend the very same bytes.
+ */
+export function requiresSnapshotRecovery(settled: boolean, unparsedWrites: number): boolean {
+  return !settled && unparsedWrites > 0;
+}
+
 export interface TerminalStreamIssue {
   kind: "recovering" | "reconnecting";
   pendingBytes?: number;

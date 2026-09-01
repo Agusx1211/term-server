@@ -76,7 +76,7 @@ async function waitForProtocolFailureState(
     const api = (window as E2EWindow).__TERM_SERVER_E2E__;
     if (!api) throw new Error("term-server E2E diagnostics are unavailable");
     return api.waitForTerminal(id, (snapshot) => (
-      snapshot.socketGeneration === generation
+      snapshot.socketGeneration >= generation
       && snapshot.socketState === "disconnected"
       && snapshot.activeSocketCount === 0
       && !snapshot.acceptingInput
@@ -229,6 +229,7 @@ test("C-09 Protocol-version mismatch @p1 @nightly @connection @protocol", async 
   expect(protocolError.data.message).toBe(PROTOCOL_MISMATCH_MESSAGE);
 
   const failed = await waitForProtocolFailureState(page, terminalId, baseline.socketGeneration + 4);
+  expect(failed.socketGeneration).toBeGreaterThanOrEqual(baseline.socketGeneration + 4);
   expect(failed.socketState).toBe("disconnected");
   expect(failed.socketReadyState).toBe(WebSocket.CLOSED);
   expect(failed.activeSocketCount).toBe(0);
@@ -245,11 +246,26 @@ test("C-09 Protocol-version mismatch @p1 @nightly @connection @protocol", async 
   await expect(reloadNotice).toBeVisible({ timeout: WAIT_TIMEOUT_MS });
   await expect(reloadNotice).toHaveText(PROTOCOL_MISMATCH_MESSAGE);
 
+  // A rejected handshake is indistinguishable from a dead server or a dropped
+  // network in the browser, so the pane no longer treats it as terminal: it
+  // shows the hint and keeps reconnecting at the capped delay. Anything that
+  // heals — a restart, a wifi hop, a reload of the far end — therefore brings
+  // the pane back on its own.
+  const retryUpgrade = await faultController.waitFor(
+    (event) => event.type === "upgrade-request"
+      && event.terminalId === terminalId
+      && event.generation > initialProxyGeneration + 4,
+    { timeoutMs: WAIT_TIMEOUT_MS },
+  );
+  expect(retryUpgrade.generation).toBeGreaterThan(initialProxyGeneration + 4);
+  await expect(reloadNotice).toBeVisible();
+
   const mismatchEvents = await terminalEvents(page, terminalId);
   const mismatchSockets = mismatchEvents.filter((event) => event.type === "socket-created");
-  expect(mismatchSockets).toHaveLength(5);
+  expect(mismatchSockets.length).toBeGreaterThanOrEqual(6);
   expect(mismatchEvents.filter((event) => event.type === "socket-open")).toHaveLength(1);
   expect(mismatchEvents.filter((event) => event.type === "socket-stale")).toHaveLength(0);
+  // The reload hint is raised once, not once per retry.
   expect(mismatchEvents.filter((event) => event.type === "error")).toHaveLength(1);
   for (const event of mismatchSockets.slice(1)) {
     const url = event.data.url;
@@ -259,8 +275,8 @@ test("C-09 Protocol-version mismatch @p1 @nightly @connection @protocol", async 
   const proxyUpgradeRequests = faultController.events.filter(
     (event) => event.type === "upgrade-request" && event.terminalId === terminalId,
   );
-  expect(proxyUpgradeRequests).toHaveLength(5);
-  expect(proxyUpgradeRequests.slice(1).map((event) => event.generation)).toEqual([
+  expect(proxyUpgradeRequests.length).toBeGreaterThanOrEqual(6);
+  expect(proxyUpgradeRequests.slice(1, 5).map((event) => event.generation)).toEqual([
     initialProxyGeneration + 1,
     initialProxyGeneration + 2,
     initialProxyGeneration + 3,
@@ -387,6 +403,9 @@ test("C-09 Protocol-version mismatch @p1 @nightly @connection @protocol", async 
   expect(mismatchUrl.pathname).toBe(`/api/terminals/${terminalId}/socket`);
   expect(mismatchUrl.searchParams.get("stream")).toBe("2");
   const expectedHandshakeError = `WebSocket connection to '${mismatchSocketUrl}' failed: Error during WebSocket handshake: Unexpected response code: 426`;
-  expect(browserErrors.filter((message) => message === expectedHandshakeError)).toHaveLength(4);
+  // One per rejected attempt, and the pane keeps attempting until it is told a
+  // protocol it can speak, so the count is a floor rather than an exact number.
+  expect(browserErrors.filter((message) => message === expectedHandshakeError).length)
+    .toBeGreaterThanOrEqual(4);
   expect(browserErrors.filter((message) => message !== expectedHandshakeError)).toEqual([]);
 });

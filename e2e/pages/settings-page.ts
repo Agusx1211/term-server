@@ -101,7 +101,11 @@ export class SettingsPage {
 
   async setTerminalScrollback(lines: number): Promise<void> {
     await this.openSection("Workspace");
-    await this.root.getByRole("spinbutton", { name: "Terminal scrollback lines", exact: true }).fill(String(lines));
+    const field = this.root.getByRole("spinbutton", { name: "Terminal scrollback lines", exact: true });
+    // The field applies on Enter or blur rather than per keystroke: clamping
+    // every keystroke rewrote the box mid-number and rebuilt every terminal.
+    await field.fill(String(lines));
+    await field.press("Enter");
   }
 
   async useServerScrollbackDefault(): Promise<void> {
