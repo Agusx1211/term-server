@@ -675,7 +675,9 @@ export function App() {
             ? `term-server v${status.latest.version} is available`
             : status.state === "current"
               ? "term-server is up to date"
-              : "Automatic updates are unavailable for this installation",
+              : status.state === "older" && status.latest
+                ? `This build is newer than ${status.channel} (v${status.latest.version})`
+                : "Automatic updates are unavailable for this installation",
         );
       }
     } catch (error) {
