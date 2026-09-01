@@ -321,6 +321,7 @@ pub fn clean_terminal_text(bytes: &[u8]) -> String {
     enum State {
         Text,
         Escape,
+        EscapeIntermediate,
         Csi,
         String,
         StringEscape,
@@ -328,50 +329,77 @@ pub fn clean_terminal_text(bytes: &[u8]) -> String {
 
     let mut state = State::Text;
     let mut clean = Vec::with_capacity(bytes.len());
+    // C1 controls share their byte range with UTF-8 continuation bytes, so a
+    // byte may only be read as a control while no multibyte scalar is open.
+    // Without this every `\u{276f}`, emoji, Cyrillic or box-drawing character
+    // starts a phantom control string and swallows the rest of the output.
+    let mut continuation_expected = 0_u8;
     let mut index = 0;
     while index < bytes.len() {
         let byte = bytes[index];
         index += 1;
         state = match state {
-            State::Text => match byte {
-                0x1b => State::Escape,
-                0x9b => State::Csi,
-                0x9d | 0x90 | 0x98 | 0x9e | 0x9f => State::String,
-                b'\r' => {
-                    if bytes.get(index) != Some(&b'\n') {
-                        clean.push(b'\n');
+            State::Text if continuation_expected > 0 && byte & 0xc0 == 0x80 => {
+                clean.push(byte);
+                continuation_expected -= 1;
+                State::Text
+            }
+            State::Text => {
+                continuation_expected = 0;
+                match byte {
+                    0x1b => State::Escape,
+                    0x9b => State::Csi,
+                    0x9d | 0x90 | 0x98 | 0x9e | 0x9f => State::String,
+                    b'\r' => {
+                        if bytes.get(index) != Some(&b'\n') {
+                            clean.push(b'\n');
+                        }
+                        State::Text
                     }
-                    State::Text
-                }
-                b'\n' | b'\t' => {
-                    clean.push(byte);
-                    State::Text
-                }
-                0x08 => {
-                    clean.pop();
-                    while clean.last().is_some_and(|value| value & 0xc0 == 0x80) {
+                    b'\n' | b'\t' => {
+                        clean.push(byte);
+                        State::Text
+                    }
+                    0x08 => {
+                        // Erase the whole scalar, not its last byte.
+                        while clean.last().is_some_and(|value| value & 0xc0 == 0x80) {
+                            clean.pop();
+                        }
                         clean.pop();
+                        State::Text
                     }
-                    State::Text
+                    0x20..=0x7e | 0x80..=0xff => {
+                        continuation_expected = match byte {
+                            0xc2..=0xdf => 1,
+                            0xe0..=0xef => 2,
+                            0xf0..=0xf4 => 3,
+                            _ => 0,
+                        };
+                        clean.push(byte);
+                        State::Text
+                    }
+                    _ => State::Text,
                 }
-                0x20..=0x7e | 0x80..=0xff => {
-                    clean.push(byte);
-                    State::Text
-                }
-                _ => State::Text,
-            },
+            }
             State::Escape => match byte {
                 b'[' => State::Csi,
                 b']' | b'P' | b'X' | b'^' | b'_' => State::String,
+                // `ESC ( B`, `ESC # 8` and friends end on their final byte, so
+                // consuming a single byte here would emit that final as text.
+                0x20..=0x2f => State::EscapeIntermediate,
+                0x1b => State::Escape,
                 _ => State::Text,
             },
-            State::Csi => {
-                if (0x40..=0x7e).contains(&byte) {
-                    State::Text
-                } else {
-                    State::Csi
-                }
-            }
+            State::EscapeIntermediate => match byte {
+                0x20..=0x2f => State::EscapeIntermediate,
+                0x1b => State::Escape,
+                _ => State::Text,
+            },
+            State::Csi => match byte {
+                0x1b => State::Escape,
+                0x40..=0x7e => State::Text,
+                _ => State::Csi,
+            },
             State::String => match byte {
                 0x07 => State::Text,
                 0x1b => State::StringEscape,
@@ -402,6 +430,45 @@ mod tests {
         );
         assert_eq!(clean, "plain\nred\nprogress\tend\n");
         assert!(!clean.contains("secret title"));
+    }
+
+    #[test]
+    fn cleans_terminal_text_keeps_output_after_multibyte_prompt_scalars() {
+        // `\u{276f}` is E2 9D AF: its continuation bytes collide with the C1
+        // OSC and APC introducers, which used to swallow every later byte.
+        let clean = clean_terminal_text("\u{276f} cargo test\r\nrunning 1 test\r\n".as_bytes());
+        assert_eq!(clean, "\u{276f} cargo test\nrunning 1 test\n");
+    }
+
+    #[test]
+    fn cleans_terminal_text_round_trips_scalars_that_contain_c1_bytes() {
+        for text in [
+            "\u{276f}",
+            "\u{1f642}",
+            "\u{410}\u{418}\u{41b}\u{41d}\u{41e}\u{41f}",
+            "\u{15b}",
+            "\u{2550}\u{255d}\u{2590}",
+        ] {
+            assert_eq!(clean_terminal_text(text.as_bytes()), text);
+        }
+    }
+
+    #[test]
+    fn cleans_terminal_text_still_strips_single_byte_c1_controls() {
+        assert_eq!(clean_terminal_text(b"before\x9b31mafter"), "beforeafter");
+        assert_eq!(clean_terminal_text(b"a\x9dtitle\x07b"), "ab");
+    }
+
+    #[test]
+    fn cleans_terminal_text_backspaces_a_whole_scalar() {
+        assert_eq!(clean_terminal_text("caf\u{e9}\x08o".as_bytes()), "cafo");
+    }
+
+    #[test]
+    fn cleans_terminal_text_drops_escape_finals_and_control_strings() {
+        // `\x1b(B` is what `tput sgr0` emits on xterm-256color.
+        assert_eq!(clean_terminal_text(b"\x1b(Bplain\x1b)0\x1b#8"), "plain");
+        assert_eq!(clean_terminal_text(b"a\x1bP0;1|payload\x1b\\b"), "ab");
     }
 
     fn transcript_input(
