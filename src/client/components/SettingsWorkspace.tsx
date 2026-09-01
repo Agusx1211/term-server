@@ -1,4 +1,4 @@
-import { useEffect, useState } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import {
   Activity,
   Bell,
@@ -60,7 +60,7 @@ import {
   describeCachedTerminals,
 } from "../lib/cached-terminals";
 import {
-  clampTerminalScrollback,
+  commitTerminalScrollbackDraft,
   TERMINAL_SCROLLBACK_LIMITS,
 } from "../lib/terminal-scrollback";
 import {
@@ -307,6 +307,29 @@ export function SettingsWorkspace({
     setPushoverAppKey(pushover.appKey);
   }, [pushover.userKey, pushover.appKey]);
   const pushoverKeysDirty = pushoverUserKey !== pushover.userKey || pushoverAppKey !== pushover.appKey;
+  // The scrollback field holds what was typed, not the clamped setting.
+  // Clamping every keystroke rewrote the box mid-number — an emptied field
+  // reads as `Number("") === 0` and snaps to the 1,000 minimum, so digits
+  // appended to "1000" and 5,000 could not be typed at all — and every one of
+  // those writes closed and rebuilt every mounted terminal, because the applied
+  // line count is what sizes each pane's xterm.
+  const [scrollbackDraft, setScrollbackDraft] = useState(String(scrollbackLines));
+  const committedScrollbackLines = useRef(scrollbackLines);
+  useEffect(() => {
+    setScrollbackDraft(String(scrollbackLines));
+    committedScrollbackLines.current = scrollbackLines;
+  }, [scrollbackLines]);
+  const commitScrollbackDraft = (text: string) => {
+    const lines = commitTerminalScrollbackDraft(text);
+    if (lines === undefined) {
+      setScrollbackDraft(String(scrollbackLines));
+      return;
+    }
+    setScrollbackDraft(String(lines));
+    if (lines === committedScrollbackLines.current) return;
+    committedScrollbackLines.current = lines;
+    onScrollbackLinesChange(lines);
+  };
   const [activeSection, setActiveSection] = useState<SettingsSection>("workspace");
   const activeSectionDetails = settingsSections.find(({ id }) => id === activeSection)
     ?? settingsSections[0];
@@ -575,10 +598,17 @@ export function SettingsWorkspace({
                   min={TERMINAL_SCROLLBACK_LIMITS.min}
                   max={TERMINAL_SCROLLBACK_LIMITS.max}
                   step={TERMINAL_SCROLLBACK_LIMITS.step}
-                  value={scrollbackLines}
-                  onInput={(event) => onScrollbackLinesChange(
-                    clampTerminalScrollback(Number(event.currentTarget.value)),
-                  )}
+                  value={scrollbackDraft}
+                  onInput={(event) => setScrollbackDraft(event.currentTarget.value)}
+                  // Commit on blur, and on Enter by blurring. Not `onChange`:
+                  // preact/compat is loaded (App and Sidebar import it) and its
+                  // global vnode hook rewrites onChange on a text-like input to
+                  // an input listener, which is exactly the per-keystroke commit
+                  // this field is avoiding.
+                  onBlur={(event) => commitScrollbackDraft(event.currentTarget.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") event.currentTarget.blur();
+                  }}
                 />
                 <small>
                   Server default: {serverScrollbackLines.toLocaleString()} lines.

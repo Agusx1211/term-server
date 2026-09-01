@@ -5,10 +5,12 @@ import {
   TERMINAL_ACK_BYTES,
   TERMINAL_FRAME_OUTPUT,
   TERMINAL_FRAME_SNAPSHOT,
+  TERMINAL_RESET_SEQUENCE,
   TerminalOutputAck,
   TerminalRenderBacklog,
   TerminalStreamState,
   decodeTerminalFrame,
+  requiresSnapshotRecovery,
 } from "./terminal-stream";
 
 function frame(kind: number, sequence: bigint, data: number[]): ArrayBuffer {
@@ -194,5 +196,26 @@ describe("terminal output acknowledgements", () => {
     expect(ack.parsed(-5)).toBeUndefined();
     expect(ack.parsed(Number.NaN)).toBeUndefined();
     expect(ack.parsed(TERMINAL_ACK_BYTES)).toBe(TERMINAL_ACK_BYTES);
+  });
+});
+
+describe("recovery after an unsettled write queue", () => {
+  it("resumes only when nothing is still queued for the parser", () => {
+    expect(requiresSnapshotRecovery(true, 0)).toBe(false);
+    // A dead pump never lands its chunks, so a resume is still safe.
+    expect(requiresSnapshotRecovery(true, 4)).toBe(false);
+    expect(requiresSnapshotRecovery(false, 0)).toBe(false);
+  });
+
+  it("forces a snapshot when a slow parser still owes writes at the deadline", () => {
+    // Those chunks will land after the reconnect. Resuming from the last
+    // committed sequence would have the server resend exactly them.
+    expect(requiresSnapshotRecovery(false, 1)).toBe(true);
+  });
+
+  it("resets through the write queue rather than around it", () => {
+    // RIS: xterm parses it in order, so nothing queued before it can land
+    // after. `Terminal.reset()` runs immediately and leaves the queue alone.
+    expect(TERMINAL_RESET_SEQUENCE).toBe("\u001bc");
   });
 });
