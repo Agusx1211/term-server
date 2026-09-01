@@ -229,14 +229,15 @@ function TextDocument({
     setError("");
     void api.readFile({ path: tab.path }).then((next) => {
       if (cancelled) return;
-      held.current.loaded = revision;
       const view = editor.current;
       if (content.current !== savedContent.current) {
         // Editing started while the read was in flight. Keep the user's buffer
-        // and let the next save resolve the conflict against the stored version.
+        // and let the next save resolve the conflict against the stored version;
+        // the revision stays unheld so it is picked up once the buffer is clean.
         setLoading(false);
         return;
       }
+      held.current.loaded = revision;
       const changed = content.current !== next.content;
       content.current = next.content;
       savedContent.current = next.content;
