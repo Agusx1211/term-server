@@ -7,23 +7,27 @@
 # licenses/APACHE-2.0.txt and is available at
 # http://www.apache.org/licenses/LICENSE-2.0
 #
-# Modified by the term-server contributors: this header was added, and the
-# `screen_working_stream` rule below was added downstream. The rest of the
-# manifest body is unchanged from the upstream file.
+# Modified by the term-server contributors: this header was added; the
+# `osc_title_working` glyph set, the `screen_working_stream` rule and the
+# `screen_working_spinner` rule were changed or added downstream. The rest of
+# the manifest body is unchanged from the upstream file.
 
 id = "claude"
-version = "2026.09.01.1"
+version = "2026.09.01.2"
 min_engine_version = 2
 updated_at = "2026-09-01T00:00:00Z"
 aliases = ["claude-code"]
 
+# Claude Code cycles a spinner glyph at the start of the window title while a
+# turn is in flight: braille (U+2800-U+28FF) in older builds, the circle
+# quadrants ◐ ◓ ◑ ◒ (U+25D0-U+25D3) since 2.1. An idle title starts with ✳.
 [[rules]]
 id = "osc_title_working"
 state = "working"
 priority = 1100
 region = "osc_title"
 visible_working = true
-regex = ['^[\x{2800}-\x{28FF}] ']
+regex = ['^[\x{2800}-\x{28FF}\x{25D0}-\x{25D3}] ']
 
 [[rules]]
 id = "btw_overlay_working"
@@ -83,14 +87,40 @@ contains = ["run a dynamic workflow?", "esc to cancel"]
 # terminal to idle, complete a task that was still running, and ask for a
 # summary of it. The interrupt hint is only drawn while a turn is in flight, so
 # it outranks the prompt box, and stays below the blocked forms, which replace
-# the hint with a dialog.
+# the hint with a dialog. Where the hint sits depends on the build: 2.1.220
+# puts it inside the spinner line's parentheses, 2.1.257 moves it to the
+# footer under the prompt box, so it is matched anywhere in the bottom lines.
+# A permission dialog can share those lines, and its own rules sit lower, so
+# the dialog's markers veto this rule.
 [[rules]]
 id = "screen_working_stream"
 state = "working"
 priority = 960
-region = "bottom_non_empty_lines(6)"
+region = "bottom_non_empty_lines(8)"
 visible_working = true
-line_regex = ['\([^()]*esc to interrupt[^()]*\)']
+contains = ["esc to interrupt"]
+not = [
+  { contains = ["esc to cancel"] },
+  { contains = ["do you want to proceed?"] },
+]
+
+# The live spinner line itself: a spinner glyph, a present-participle verb with
+# an ellipsis, and the elapsed-time group in parentheses (`✢ Transmuting… (3m
+# 4s · ↓ 12.6k tokens)`). Once the turn ends the line is rewritten in the past
+# tense with no parentheses (`✻ Crunched for 34s · done 9:58 PM`), so this only
+# matches while Claude is still working, even in a build that draws no
+# interrupt hint at all.
+[[rules]]
+id = "screen_working_spinner"
+state = "working"
+priority = 955
+region = "bottom_non_empty_lines(8)"
+visible_working = true
+line_regex = ['^\s*[·✢✳✶✻✽*][ \t]+\S+(?:…|\.\.\.)[ \t]+\(']
+not = [
+  { contains = ["esc to cancel"] },
+  { contains = ["do you want to proceed?"] },
+]
 
 [[rules]]
 id = "live_prompt_box"

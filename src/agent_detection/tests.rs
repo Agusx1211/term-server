@@ -724,6 +724,28 @@ const CLAUDE_REAL_SCREENS: &[RealScreen] = &[
         expected_state: DetectedState::Working,
         expected_rule: "screen_working_stream",
     },
+    // Captured structure of Claude Code 2.1.257 while a Bash tool runs: the
+    // spinner line keeps its elapsed-time group but the interrupt hint has
+    // moved to the footer under the prompt box, and the window title cycles
+    // ◐ ◓ ◑ ◒ instead of braille.
+    RealScreen {
+        description: "claude 2.1.257 running a command with the hint in the footer",
+        agent: "claude",
+        screen: include_str!("fixtures/claude-2-1-running-command.txt"),
+        osc_title: "",
+        expected_state: DetectedState::Working,
+        expected_rule: "screen_working_stream",
+    },
+    // The same build once the turn has ended: past-tense spinner line, a
+    // background monitor still counted in the footer, and no interrupt hint.
+    RealScreen {
+        description: "claude 2.1.257 idle after a turn with a monitor running",
+        agent: "claude",
+        screen: include_str!("fixtures/claude-2-1-idle-after-turn.txt"),
+        osc_title: "",
+        expected_state: DetectedState::Idle,
+        expected_rule: "live_prompt_box",
+    },
     RealScreen {
         description: "codex command approval",
         agent: "codex",
@@ -817,6 +839,76 @@ fn claude_streaming_a_turn_is_working_without_the_window_title() {
     let finished = classify(
         "claude",
         screen(include_str!("fixtures/claude-after-interrupt.txt")),
+    );
+    assert_eq!(finished.state, DetectedState::Idle);
+    assert_eq!(matched_rule_id(&finished), Some("live_prompt_box"));
+}
+
+#[test]
+fn claude_2_1_title_spinner_glyphs_read_as_working() {
+    // Claude Code 2.1 cycles ◐ ◓ ◑ ◒ at the start of the window title while a
+    // turn is in flight. The title rule only knew the braille spinner of older
+    // builds, so every 2.1 terminal fell through to the prompt box and read as
+    // idle as soon as its hook events went stale.
+    for glyph in ['\u{25d0}', '\u{25d1}', '\u{25d2}', '\u{25d3}', '\u{2800}'] {
+        let title = format!("{glyph} Bug hunting pass");
+        let detection = classify(
+            "claude",
+            DetectionInput {
+                screen: include_str!("fixtures/claude-2-1-idle-after-turn.txt"),
+                osc_title: &title,
+                osc_progress: "",
+            },
+        );
+        assert_eq!(detection.state, DetectedState::Working, "{title}");
+        assert_eq!(
+            matched_rule_id(&detection),
+            Some("osc_title_working"),
+            "{title}"
+        );
+    }
+
+    // An idle title starts with ✳ and leaves the screen to decide.
+    let idle = classify(
+        "claude",
+        DetectionInput {
+            screen: include_str!("fixtures/claude-2-1-idle-after-turn.txt"),
+            osc_title: "\u{2733} Bug hunting pass",
+            osc_progress: "",
+        },
+    );
+    assert_eq!(idle.state, DetectedState::Idle);
+    assert_eq!(matched_rule_id(&idle), Some("live_prompt_box"));
+}
+
+#[test]
+fn claude_2_1_live_spinner_line_is_working_without_any_interrupt_hint() {
+    // A build that draws no interrupt hint at all still rewrites the spinner
+    // line while a turn runs: glyph, verb with an ellipsis, elapsed time in
+    // parentheses. Strip the footer hint from the 2.1.257 capture and the
+    // spinner line alone has to carry the state.
+    let without_hint = include_str!("fixtures/claude-2-1-running-command.txt")
+        .replace("esc to interrupt", "? for shortcuts");
+    assert!(!without_hint.contains("esc to interrupt"));
+    let detection = classify("claude", screen(&without_hint));
+    assert_eq!(detection.state, DetectedState::Working);
+    assert_eq!(matched_rule_id(&detection), Some("screen_working_spinner"));
+    assert!(detection.visible_working);
+
+    // The subagent variant uses the middle-dot glyph and a long elapsed time.
+    let subagents = without_hint.replace(
+        "\u{2722} Transmuting\u{2026} (3m 4s \u{b7} \u{2193} 12.6k tokens)",
+        "\u{b7} Sketching\u{2026} (3h 6m 18s \u{b7} \u{2193} 393.6k tokens)",
+    );
+    assert_ne!(subagents, without_hint);
+    let detection = classify("claude", screen(&subagents));
+    assert_eq!(detection.state, DetectedState::Working);
+    assert_eq!(matched_rule_id(&detection), Some("screen_working_spinner"));
+
+    // The past-tense line after the turn does not match the spinner rule.
+    let finished = classify(
+        "claude",
+        screen(include_str!("fixtures/claude-2-1-idle-after-turn.txt")),
     );
     assert_eq!(finished.state, DetectedState::Idle);
     assert_eq!(matched_rule_id(&finished), Some("live_prompt_box"));
