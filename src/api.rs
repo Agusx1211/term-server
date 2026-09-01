@@ -1706,7 +1706,9 @@ async fn proxy_audio_socket(socket: WebSocket, broker: BrokerWebSocket) {
                 let Some(Ok(message)) = message else { break; };
                 let outgoing = match message {
                     BrokerMessage::Text(text) => Message::Text(text.to_string().into()),
-                    BrokerMessage::Binary(bytes) => Message::Binary(bytes.to_vec().into()),
+                    // Both stacks back binary payloads with `bytes::Bytes`, so the
+                    // audio frame moves across without a copy.
+                    BrokerMessage::Binary(bytes) => Message::Binary(bytes),
                     BrokerMessage::Close(_) => Message::Close(None),
                     BrokerMessage::Ping(payload) => {
                         if proxy_send(&mut broker_sender, BrokerMessage::Pong(payload)).await.is_err() { break; }
@@ -1720,7 +1722,7 @@ async fn proxy_audio_socket(socket: WebSocket, broker: BrokerWebSocket) {
                 let Some(Ok(message)) = message else { break; };
                 let outgoing = match message {
                     Message::Text(text) => BrokerMessage::Text(text.to_string().into()),
-                    Message::Binary(bytes) => BrokerMessage::Binary(bytes.to_vec().into()),
+                    Message::Binary(bytes) => BrokerMessage::Binary(bytes),
                     Message::Close(_) => BrokerMessage::Close(None),
                     Message::Ping(payload) => {
                         if proxy_send(&mut browser_sender, Message::Pong(payload)).await.is_err() { break; }
