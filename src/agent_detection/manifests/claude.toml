@@ -7,13 +7,14 @@
 # licenses/APACHE-2.0.txt and is available at
 # http://www.apache.org/licenses/LICENSE-2.0
 #
-# Modified by the term-server contributors: this header was added. The manifest
-# body below is unchanged from the upstream file.
+# Modified by the term-server contributors: this header was added, and the
+# `screen_working_stream` rule below was added downstream. The rest of the
+# manifest body is unchanged from the upstream file.
 
 id = "claude"
-version = "2026.08.04.1"
+version = "2026.09.01.1"
 min_engine_version = 2
-updated_at = "2026-08-04T00:00:00Z"
+updated_at = "2026-09-01T00:00:00Z"
 aliases = ["claude-code"]
 
 [[rules]]
@@ -75,6 +76,21 @@ priority = 980
 region = "whole_recent"
 visible_blocker = true
 contains = ["run a dynamic workflow?", "esc to cancel"]
+
+# Claude keeps the input box drawn while it streams, so `live_prompt_box`
+# matches mid-turn. With no window title - tmux does not forward the inner OSC
+# title unless `set-titles on` - that visible-idle match used to flip a working
+# terminal to idle, complete a task that was still running, and ask for a
+# summary of it. The interrupt hint is only drawn while a turn is in flight, so
+# it outranks the prompt box, and stays below the blocked forms, which replace
+# the hint with a dialog.
+[[rules]]
+id = "screen_working_stream"
+state = "working"
+priority = 960
+region = "bottom_non_empty_lines(6)"
+visible_working = true
+line_regex = ['\([^()]*esc to interrupt[^()]*\)']
 
 [[rules]]
 id = "live_prompt_box"
