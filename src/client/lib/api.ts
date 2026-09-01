@@ -203,10 +203,13 @@ export const api = {
     request<void>(`/api/artifacts/${sessionId}/${artifactId}`, { method: "DELETE" }),
   fileMetadata: (target: FileTarget) => request<FileEntry>(`/api/files/meta?${fileQuery(target)}`),
   listFiles: (target: FileTarget) => request<DirectoryListing>(`/api/files/list?${fileQuery(target)}`),
-  searchFiles: (root: string, query: string, cwd?: string) => {
+  // `signal` lets a caller abort a superseded search. The server stops the
+  // filesystem walk when the request is dropped, so aborting is what keeps a
+  // fast typist from stacking up full-tree walks.
+  searchFiles: (root: string, query: string, cwd?: string, signal?: AbortSignal) => {
     const params = new URLSearchParams({ root, query });
     if (cwd) params.set("cwd", cwd);
-    return request<FileSearchResults>(`/api/files/search?${params}`);
+    return request<FileSearchResults>(`/api/files/search?${params}`, { signal });
   },
   readFile: (target: FileTarget) => request<FileDocument>(`/api/files/content?${fileQuery(target)}`),
   saveFile: (file: SaveFileRequest) =>

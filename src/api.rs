@@ -1335,14 +1335,34 @@ async fn list_files(
     Ok(Json(listing))
 }
 
+/// Flips a search's cancellation flag when the request future is dropped. The
+/// blocking task the walk runs in is not cancelled with the future, so without
+/// this a client that types another character (or closes the tab) leaves a full
+/// tree walk running.
+struct CancelOnDrop(files::SearchCancel);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 async fn search_files(
     State(state): State<AppState>,
     Query(query): Query<FileSearchQuery>,
     jar: CookieJar,
 ) -> Result<Json<files::FileSearchResults>, ApiError> {
     require_auth(&jar, &state)?;
+    let cancel = files::SearchCancel::new();
+    let _guard = CancelOnDrop(cancel.clone());
     let results = tokio::task::spawn_blocking(move || {
-        files::search(&query.root, query.cwd.as_deref(), &query.query, query.limit)
+        files::search_cancellable(
+            &query.root,
+            query.cwd.as_deref(),
+            &query.query,
+            query.limit,
+            &cancel,
+        )
     })
     .await
     .map_err(|error| {
@@ -1428,9 +1448,22 @@ async fn stream_file(
         HeaderValue::from_static("private, no-store"),
     );
     if !download && asset.mime == "application/pdf" {
+        // The in-app preview iframes this response, so it keeps the framing
+        // policy the viewer needs and nothing more.
         response.headers_mut().insert(
             header::CONTENT_SECURITY_POLICY,
             HeaderValue::from_static("frame-ancestors 'self'"),
+        );
+    } else {
+        // Everything else is user-controlled file content served from the app
+        // origin. Opened top-level (an SVG via "open image in new tab", say) it
+        // would otherwise run script with the session cookie against the
+        // terminal API, so it is forced into an opaque origin with no script.
+        // Subresource loads such as `<img>` ignore this header, so the in-app
+        // image preview is unaffected.
+        response.headers_mut().insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("sandbox"),
         );
     }
     Ok(response)
@@ -3382,6 +3415,68 @@ mod tests {
         assert!(disposition.contains("filename*=UTF-8''notes%20r%C3%A9sum%C3%A9%2Etxt"));
         let body = to_bytes(response.into_body(), 1024).await.unwrap();
         assert_eq!(&body[..], b"download me");
+    }
+
+    #[tokio::test]
+    async fn inline_svg_preview_is_sandboxed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("logo.svg");
+        std::fs::write(&path, b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>").unwrap();
+        let (app, cookie) = authenticated_app().await;
+        let encoded_path = utf8_percent_encode(path.to_str().unwrap(), NON_ALPHANUMERIC);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/files/raw?path={encoded_path}"))
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/svg+xml"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_SECURITY_POLICY)
+                .unwrap(),
+            "sandbox"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_download_is_sandboxed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("payload.js");
+        std::fs::write(&path, b"console.log(1)").unwrap();
+        let (app, cookie) = authenticated_app().await;
+        let encoded_path = utf8_percent_encode(path.to_str().unwrap(), NON_ALPHANUMERIC);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/files/download?path={encoded_path}"))
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_SECURITY_POLICY)
+                .unwrap(),
+            "sandbox"
+        );
     }
 
     #[tokio::test]

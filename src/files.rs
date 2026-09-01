@@ -2,7 +2,11 @@ use std::{
     env, fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use ignore::WalkBuilder;
@@ -20,6 +24,15 @@ pub const MAX_UPLOAD_BYTES: usize = 8 * 1024 * 1024 * 1024;
 const MAX_DIRECTORY_ENTRIES: usize = 1_000;
 const DEFAULT_SEARCH_RESULTS: usize = 100;
 const MAX_SEARCH_RESULTS: usize = 250;
+/// Hard ceiling on how many filesystem entries a single search visits. A query
+/// with few matches would otherwise walk every entry under the root, which on a
+/// large `$HOME` is millions of gitignore-parsing stats per keystroke.
+const SEARCH_ENTRY_BUDGET: usize = 200_000;
+/// Wall-clock ceiling for a single search walk.
+const SEARCH_TIME_BUDGET: Duration = Duration::from_secs(2);
+/// How many times an upload retries a fresh ` (N)` name when the one it
+/// reserved was taken by something else while the bytes were streaming in.
+const MAX_UPLOAD_NAME_ATTEMPTS: usize = 32;
 
 #[derive(Debug, Error)]
 pub enum FileError {
@@ -264,11 +277,76 @@ fn skipped_directory(path: &Path) -> bool {
         .is_some_and(|name| matches!(name, ".git" | "node_modules" | "target" | ".cache"))
 }
 
+/// Cooperative cancellation for [`search_cancellable`]. `search` runs inside a
+/// blocking task, which keeps running after the HTTP request future is dropped,
+/// so the handler flips this flag on drop to stop an abandoned walk instead of
+/// letting several of them pile up behind a debounced search box.
+#[derive(Clone, Default)]
+pub struct SearchCancel(Arc<AtomicBool>);
+
+impl SearchCancel {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    fn cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// Work budget for a single search walk.
+#[derive(Clone, Copy)]
+struct SearchBudget {
+    max_entries: usize,
+    time_budget: Duration,
+}
+
+impl Default for SearchBudget {
+    fn default() -> Self {
+        Self {
+            max_entries: SEARCH_ENTRY_BUDGET,
+            time_budget: SEARCH_TIME_BUDGET,
+        }
+    }
+}
+
 pub fn search(
     raw_root: &str,
     cwd: Option<&str>,
     query: &str,
     requested_limit: Option<usize>,
+) -> Result<FileSearchResults, FileError> {
+    search_cancellable(raw_root, cwd, query, requested_limit, &SearchCancel::new())
+}
+
+pub fn search_cancellable(
+    raw_root: &str,
+    cwd: Option<&str>,
+    query: &str,
+    requested_limit: Option<usize>,
+    cancel: &SearchCancel,
+) -> Result<FileSearchResults, FileError> {
+    search_within(
+        raw_root,
+        cwd,
+        query,
+        requested_limit,
+        SearchBudget::default(),
+        cancel,
+    )
+}
+
+fn search_within(
+    raw_root: &str,
+    cwd: Option<&str>,
+    query: &str,
+    requested_limit: Option<usize>,
+    budget: SearchBudget,
+    cancel: &SearchCancel,
 ) -> Result<FileSearchResults, FileError> {
     let root = resolve_existing(raw_root, cwd)?;
     if !root.is_dir() {
@@ -283,14 +361,31 @@ pub fn search(
         .clamp(1, MAX_SEARCH_RESULTS);
     let mut matches = Vec::new();
     let mut truncated = false;
+    let started = Instant::now();
+    let mut visited = 0usize;
+    let pruner = cancel.clone();
     let walker = WalkBuilder::new(&root)
         .hidden(false)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
-        .filter_entry(|candidate| candidate.depth() == 0 || !skipped_directory(candidate.path()))
+        .filter_entry(move |candidate| {
+            if pruner.cancelled() {
+                return false;
+            }
+            candidate.depth() == 0 || !skipped_directory(candidate.path())
+        })
         .build();
     for candidate in walker.filter_map(Result::ok).skip(1) {
+        if cancel.cancelled() {
+            truncated = true;
+            break;
+        }
+        visited += 1;
+        if visited > budget.max_entries || started.elapsed() >= budget.time_budget {
+            truncated = true;
+            break;
+        }
         let name = candidate.file_name().to_string_lossy();
         if !name.to_lowercase().contains(&needle) {
             continue;
@@ -450,6 +545,13 @@ fn safe_file_name(raw: &str) -> Result<String, FileError> {
 /// Finds a non-colliding sibling path for `target`, appending ` (N)` before the
 /// extension when the name is already taken, so an upload never silently
 /// overwrites an existing file.
+fn file_name_of(path: &Path, fallback: &str) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(fallback)
+        .to_owned()
+}
+
 fn unique_path(target: &Path) -> PathBuf {
     if !target.exists() {
         return target.to_owned();
@@ -478,6 +580,10 @@ fn unique_path(target: &Path) -> PathBuf {
 pub struct PendingUpload {
     temporary: NamedTempFile,
     hasher: Sha256,
+    /// The name the request asked for, resolved inside the target directory.
+    /// Kept so a collision detected at persist time can pick the next free
+    /// ` (N)` variant from the original name instead of stacking suffixes.
+    requested: PathBuf,
     target: PathBuf,
     name: String,
     written: u64,
@@ -486,16 +592,14 @@ pub struct PendingUpload {
 impl PendingUpload {
     pub fn start(directory: &Path, raw_name: &str) -> Result<Self, FileError> {
         let name = safe_file_name(raw_name)?;
-        let target = unique_path(&directory.join(&name));
-        let stored_name = target
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(&name)
-            .to_owned();
+        let requested = directory.join(&name);
+        let target = unique_path(&requested);
+        let stored_name = file_name_of(&target, &name);
         let temporary = NamedTempFile::new_in(directory)?;
         Ok(Self {
             temporary,
             hasher: Sha256::new(),
+            requested,
             target,
             name: stored_name,
             written: 0,
@@ -509,19 +613,44 @@ impl PendingUpload {
         Ok(())
     }
 
-    /// Flushes and atomically renames the temporary file into place.
+    /// Flushes and atomically links the temporary file into place without ever
+    /// replacing an existing file. The name reserved by [`Self::start`] can be
+    /// taken while the bytes stream in (a concurrent upload, or a command
+    /// running in a pane), so a collision here picks the next free ` (N)` name
+    /// and retries. The stored name is reported back in [`UploadedFile`].
     pub fn finish(self) -> Result<UploadedFile, FileError> {
         self.temporary.as_file().sync_all()?;
-        let digest = format!("{:x}", self.hasher.finalize());
-        self.temporary
-            .persist(&self.target)
-            .map_err(|error| FileError::Io(error.error))?;
-        Ok(UploadedFile {
-            path: self.target.to_string_lossy().into_owned(),
-            name: self.name,
-            size: self.written,
-            sha256: digest,
-        })
+        let Self {
+            mut temporary,
+            hasher,
+            requested,
+            mut target,
+            mut name,
+            written,
+        } = self;
+        let digest = format!("{:x}", hasher.finalize());
+        for _ in 0..MAX_UPLOAD_NAME_ATTEMPTS {
+            match temporary.persist_noclobber(&target) {
+                Ok(_) => {
+                    return Ok(UploadedFile {
+                        path: target.to_string_lossy().into_owned(),
+                        name,
+                        size: written,
+                        sha256: digest,
+                    });
+                }
+                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    temporary = error.file;
+                    target = unique_path(&requested);
+                    name = file_name_of(&target, &name);
+                }
+                Err(error) => return Err(FileError::Io(error.error)),
+            }
+        }
+        Err(FileError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "upload destination kept being taken",
+        )))
     }
 }
 
@@ -651,6 +780,121 @@ mod tests {
             fs::read(directory.path().join("note (2).txt")).unwrap(),
             b"newer"
         );
+    }
+
+    #[test]
+    fn upload_does_not_clobber_a_file_created_while_it_streams() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("results.csv");
+
+        // The name is free when the upload starts, so it reserves "results.csv".
+        let mut pending = PendingUpload::start(directory.path(), "results.csv").unwrap();
+        pending.write(b"uploaded").unwrap();
+        // Something else takes the name before the last byte arrives.
+        fs::write(&target, "written by a pane").unwrap();
+        let uploaded = pending.finish().unwrap();
+
+        assert!(uploaded.path.ends_with("results (1).csv"));
+        assert_eq!(uploaded.name, "results (1).csv");
+        assert_eq!(fs::read(&target).unwrap(), b"written by a pane");
+        assert_eq!(
+            fs::read(directory.path().join("results (1).csv")).unwrap(),
+            b"uploaded"
+        );
+    }
+
+    #[test]
+    fn upload_retries_past_several_names_taken_while_it_streams() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut pending = PendingUpload::start(directory.path(), "notes.txt").unwrap();
+        pending.write(b"uploaded").unwrap();
+        for name in ["notes.txt", "notes (1).txt", "notes (2).txt"] {
+            fs::write(directory.path().join(name), "taken").unwrap();
+        }
+        let uploaded = pending.finish().unwrap();
+
+        assert!(uploaded.path.ends_with("notes (3).txt"));
+        for name in ["notes.txt", "notes (1).txt", "notes (2).txt"] {
+            assert_eq!(fs::read(directory.path().join(name)).unwrap(), b"taken");
+        }
+    }
+
+    #[test]
+    fn search_stops_at_the_entry_budget_and_reports_truncation() {
+        let directory = tempfile::tempdir().unwrap();
+        for index in 0..40 {
+            fs::write(directory.path().join(format!("file-{index}.txt")), "").unwrap();
+        }
+        let budget = SearchBudget {
+            max_entries: 10,
+            time_budget: Duration::from_secs(60),
+        };
+        let result = search_within(
+            directory.path().to_str().unwrap(),
+            None,
+            "no-such-name",
+            None,
+            budget,
+            &SearchCancel::new(),
+        )
+        .unwrap();
+        assert!(result.entries.is_empty());
+        assert!(result.truncated);
+
+        // The same walk finishes without truncation when the budget allows it.
+        let complete = search(
+            directory.path().to_str().unwrap(),
+            None,
+            "no-such-name",
+            None,
+        )
+        .unwrap();
+        assert!(!complete.truncated);
+    }
+
+    #[test]
+    fn search_stops_when_the_time_budget_is_exhausted() {
+        let directory = tempfile::tempdir().unwrap();
+        for index in 0..8 {
+            fs::write(directory.path().join(format!("needle-{index}.txt")), "").unwrap();
+        }
+        let budget = SearchBudget {
+            max_entries: usize::MAX,
+            time_budget: Duration::ZERO,
+        };
+        let result = search_within(
+            directory.path().to_str().unwrap(),
+            None,
+            "needle",
+            None,
+            budget,
+            &SearchCancel::new(),
+        )
+        .unwrap();
+        assert!(result.entries.is_empty());
+        assert!(result.truncated);
+    }
+
+    #[test]
+    fn search_stops_early_once_cancelled() {
+        let directory = tempfile::tempdir().unwrap();
+        for index in 0..8 {
+            fs::write(directory.path().join(format!("needle-{index}.txt")), "").unwrap();
+        }
+        let cancel = SearchCancel::new();
+        cancel.cancel();
+        let result = search_cancellable(
+            directory.path().to_str().unwrap(),
+            None,
+            "needle",
+            None,
+            &cancel,
+        )
+        .unwrap();
+        assert!(result.entries.is_empty());
+
+        let uncancelled = search(directory.path().to_str().unwrap(), None, "needle", None).unwrap();
+        assert_eq!(uncancelled.entries.len(), 8);
     }
 
     #[test]
