@@ -61,4 +61,14 @@ describe("broker generation session counts", () => {
       current: false,
     });
   });
+
+  it("keeps the previous broker when the poll reports no change", () => {
+    const terminals = [
+      terminal("current", "0.8.0", "current"),
+      terminal("old", "0.7.3", "old"),
+    ];
+    const settled = withBrokerSessions(broker, terminals);
+
+    expect(withBrokerSessions(settled, terminals)).toBe(settled);
+  });
 });
