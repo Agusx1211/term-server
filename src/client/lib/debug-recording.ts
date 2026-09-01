@@ -59,7 +59,12 @@ export interface RecordedFrontendEvent {
 }
 
 let active = false;
+// Ring buffer: once the cap is reached, `head` marks the oldest retained event
+// and new events overwrite it in place. Splicing the oldest entry off instead
+// would shift all 50k entries per event, exactly while a misbehaving terminal
+// is producing the output the recording exists to capture.
 let events: RecordedFrontendEvent[] = [];
+let head = 0;
 let truncated = false;
 
 const listeners = new Set<(active: boolean) => void>();
@@ -85,6 +90,7 @@ export function isDebugRecordingActive(): boolean {
 
 export function startDebugRecording(): void {
   events = [];
+  head = 0;
   truncated = false;
   setActive(true);
 }
@@ -96,6 +102,7 @@ export function stopDebugRecording(): void {
 export function resetDebugRecording(): void {
   setActive(false);
   events = [];
+  head = 0;
   truncated = false;
 }
 
@@ -110,20 +117,27 @@ export function debugRecordingTruncated(): boolean {
 /** Record a client-side event, dropping the oldest once the cap is reached. */
 export function recordDebugEvent(terminal: string, event: FrontendRecordEvent): void {
   if (!active) return;
-  events.push({ ts: Date.now(), terminal, event });
-  if (events.length > MAX_FRONTEND_RECORDING_EVENTS) {
-    events.splice(0, events.length - MAX_FRONTEND_RECORDING_EVENTS);
-    truncated = true;
+  const entry: RecordedFrontendEvent = { ts: Date.now(), terminal, event };
+  if (events.length < MAX_FRONTEND_RECORDING_EVENTS) {
+    events.push(entry);
+    return;
   }
+  events[head] = entry;
+  head = head + 1 === MAX_FRONTEND_RECORDING_EVENTS ? 0 : head + 1;
+  truncated = true;
 }
 
-/** Take (and clear) the captured client events. */
+/** Take (and clear) the captured client events, oldest first. */
 export function takeFrontendRecording(): {
   truncated: boolean;
   events: RecordedFrontendEvent[];
 } {
-  const snapshot = { truncated, events };
+  const snapshot = {
+    truncated,
+    events: head === 0 ? events : [...events.slice(head), ...events.slice(0, head)],
+  };
   events = [];
+  head = 0;
   truncated = false;
   return snapshot;
 }
