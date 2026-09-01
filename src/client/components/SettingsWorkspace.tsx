@@ -999,18 +999,28 @@ export function SettingsWorkspace({
                   </button>
                 </>
               ) : (
-                <button
-                  class="settings-update-action"
-                  onClick={onCheckForUpdate}
-                  disabled={!updateConfig.enabled || checkingForUpdate}
-                >
-                  <RefreshCw class={checkingForUpdate ? "spin" : ""} size={14} />
-                  {checkingForUpdate
-                    ? "Checking…"
-                    : updateStatus?.state === "current"
-                      ? "Up to date · Check again"
-                      : "Check for updates"}
-                </button>
+                <>
+                  {updateStatus?.state === "older" && updateStatus.latest && (
+                    <p class="settings-update-available">
+                      This build is newer than {updateConfig.channel} (v{updateStatus.latest.version})
+                      <code title={updateStatus.latest.commit}>
+                        {updateStatus.latest.commit.slice(0, 12)}
+                      </code>
+                    </p>
+                  )}
+                  <button
+                    class="settings-update-action"
+                    onClick={onCheckForUpdate}
+                    disabled={!updateConfig.enabled || checkingForUpdate}
+                  >
+                    <RefreshCw class={checkingForUpdate ? "spin" : ""} size={14} />
+                    {checkingForUpdate
+                      ? "Checking…"
+                      : updateStatus?.state === "current"
+                        ? "Up to date · Check again"
+                        : "Check for updates"}
+                  </button>
+                </>
               )}
               {!updateConfig.enabled && (
                 <p class="settings-hint">{updateConfig.reason ?? "Automatic updates are unavailable."}</p>

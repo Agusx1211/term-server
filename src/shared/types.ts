@@ -275,7 +275,8 @@ export interface ReleaseInfo extends BuildInfo {
 export interface UpdateStatus {
   channel: string;
   current: BuildInfo;
-  state: "current" | "available" | "unavailable";
+  /** `older` means the channel publishes a release behind the running build. */
+  state: "current" | "available" | "older" | "unavailable";
   latest: ReleaseInfo | null;
 }
 
