@@ -1931,17 +1931,32 @@ impl TerminalSession {
     }
 
     pub async fn write_confirmed(&self, data: &[u8]) -> Result<(), TerminalError> {
+        /// A foreground process that never reads its stdin fills the line
+        /// discipline buffer, and the writer thread then blocks in `write_all`
+        /// for as long as that process runs. Callers hold a socket, a broker
+        /// request, and a supervisor invocation open behind this wait, so it is
+        /// bounded and reported instead of parking forever. It stays well under
+        /// the supervisor control response budget so the caller is told why the
+        /// input was refused rather than that its own read timed out.
+        const CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(5);
+
         if self.info.read().status != TerminalStatus::Running {
             return Err(TerminalError::NotRunning);
         }
         let confirmation = self
             .input
             .enqueue_confirmed(data, || self.observe_accepted_input(data))?;
-        match confirmation.await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(TerminalError::Io(error)),
-            Err(_) => Err(TerminalError::Io(
+        // Dropping the receiver on a timeout is safe: the writer thread ignores
+        // the result of its confirmation send, so a late delivery is a no-op.
+        match tokio::time::timeout(CONFIRMATION_TIMEOUT, confirmation).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(error))) => Err(TerminalError::Io(error)),
+            Ok(Err(_)) => Err(TerminalError::Io(
                 "terminal input writer stopped before delivery".to_owned(),
+            )),
+            Err(_) => Err(TerminalError::Io(
+                "terminal is not accepting input; the program running in it is not reading its input"
+                    .to_owned(),
             )),
         }
     }

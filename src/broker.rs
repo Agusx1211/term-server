@@ -67,6 +67,23 @@ const BROKER_CONTROL_TOKEN_FILE: &str = "session-broker-control.token";
 const BROKER_CONTROL_TOKEN_ENV: &str = "TERM_SERVER_BROKER_CONTROL_TOKEN";
 const BROKER_CONTROL_HEADER: &str = "x-term-server-broker-control";
 const DRAIN_INTERVAL: Duration = Duration::from_secs(2);
+/// Every server to broker request is bounded. A broker that accepts the
+/// connection but never answers must not park the caller forever: the same
+/// request holds a supervisor connection, a browser request, or the startup
+/// path behind it, and each retry would leak another stuck task.
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+/// Creating a terminal opens a pty and spawns a shell.
+const CREATE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Confirmed input waits for the broker's writer thread to reach the pty. The
+/// broker bounds that wait itself, so this only has to outlast its bound.
+const INPUT_TIMEOUT: Duration = Duration::from_secs(20);
+/// Stopping a broker closes every session it still owns.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+/// A freshly spawned broker has to bind its socket and answer `/health`.
+const START_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long a stopped broker is given to leave the process table.
+const REAP_TIMEOUT: Duration = Duration::from_secs(1);
+const REAP_INTERVAL: Duration = Duration::from_millis(40);
 
 pub type BrokerWebSocket = WebSocketStream<UnixStream>;
 
@@ -83,6 +100,9 @@ struct HealthResponse {
     protocol_version: u32,
     build: BuildIdentity,
     sessions: usize,
+    /// Brokers older than process reaping do not report their process id.
+    #[serde(default)]
+    pid: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -153,29 +173,34 @@ impl BrokerClient {
         cli: &Cli,
         executable: &Path,
     ) -> Result<HealthResponse, BrokerError> {
-        spawn_broker(
+        let pid = spawn_broker(
             cli,
             executable,
             self.socket_path.as_ref(),
             self.control_token.as_deref().map(String::as_str),
         )?;
-        let mut last_error = None;
-        for _ in 0..50 {
+        let deadline = tokio::time::Instant::now() + START_TIMEOUT;
+        let mut last_error;
+        loop {
             match self.health().await {
                 Ok(health) if health.protocol_version == PROTOCOL_VERSION => return Ok(health),
                 Ok(health) => {
-                    last_error = Some(BrokerError::Protocol {
+                    last_error = BrokerError::Protocol {
                         expected: PROTOCOL_VERSION,
                         actual: health.protocol_version,
-                    });
+                    };
                 }
-                Err(error) => last_error = Some(error),
+                Err(error) => last_error = error,
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        Err(last_error.unwrap_or_else(|| {
-            BrokerError::Unavailable("session broker did not become ready".to_owned())
-        }))
+        // The broker never came up. Wait for it now instead of leaving a zombie
+        // behind a server process that lives for weeks.
+        reap_broker_process(pid).await;
+        Err(last_error)
     }
 
     async fn health(&self) -> Result<HealthResponse, BrokerError> {
@@ -203,7 +228,7 @@ impl BrokerClient {
     }
 
     pub async fn create(&self, request: CreateTerminal) -> Result<TerminalInfo, BrokerError> {
-        self.send_json(Method::POST, "/terminals", Some(&request))
+        self.send_json_within(Method::POST, "/terminals", Some(&request), CREATE_TIMEOUT)
             .await
     }
 
@@ -211,7 +236,7 @@ impl BrokerClient {
         &self,
         request: CreateSupervisorTerminal,
     ) -> Result<TerminalInfo, BrokerError> {
-        self.send_json(Method::POST, "/supervisor", Some(&request))
+        self.send_json_within(Method::POST, "/supervisor", Some(&request), CREATE_TIMEOUT)
             .await
     }
 
@@ -291,10 +316,11 @@ impl BrokerClient {
     }
 
     pub async fn write(&self, id: Uuid, data: String) -> Result<(), BrokerError> {
-        self.send_empty(
+        self.send_empty_within(
             Method::POST,
             &format!("/terminals/{id}/input"),
             Some(&WriteTerminalInput { data }),
+            INPUT_TIMEOUT,
         )
         .await
     }
@@ -495,7 +521,7 @@ impl BrokerClient {
     }
 
     pub async fn shutdown(&self) -> Result<(), BrokerError> {
-        self.send_empty::<()>(Method::POST, "/shutdown", None)
+        self.send_empty_within::<()>(Method::POST, "/shutdown", None, SHUTDOWN_TIMEOUT)
             .await?;
         for _ in 0..100 {
             if UnixStream::connect(self.socket_path.as_ref())
@@ -521,7 +547,18 @@ impl BrokerClient {
         path: &str,
         body: Option<&B>,
     ) -> Result<R, BrokerError> {
-        let (status, bytes) = self.request(method, path, body).await?;
+        self.send_json_within(method, path, body, CONTROL_TIMEOUT)
+            .await
+    }
+
+    async fn send_json_within<B: Serialize + ?Sized, R: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&B>,
+        budget: Duration,
+    ) -> Result<R, BrokerError> {
+        let (status, bytes) = self.request(method, path, body, budget).await?;
         if !status.is_success() {
             return Err(remote_error(status, &bytes));
         }
@@ -535,7 +572,18 @@ impl BrokerClient {
         path: &str,
         body: Option<&B>,
     ) -> Result<(), BrokerError> {
-        let (status, bytes) = self.request(method, path, body).await?;
+        self.send_empty_within(method, path, body, CONTROL_TIMEOUT)
+            .await
+    }
+
+    async fn send_empty_within<B: Serialize + ?Sized>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&B>,
+        budget: Duration,
+    ) -> Result<(), BrokerError> {
+        let (status, bytes) = self.request(method, path, body, budget).await?;
         if status.is_success() {
             Ok(())
         } else {
@@ -549,15 +597,21 @@ impl BrokerClient {
         path: &str,
         body: &B,
     ) -> Result<Incoming, BrokerError> {
-        let response = self.request_response(method, path, Some(body)).await?;
+        // Only the response head is bounded here: these endpoints stream access
+        // events for as long as the agent waits for its answer.
+        let response = tokio::time::timeout(
+            CONTROL_TIMEOUT,
+            self.request_response(method, path, Some(body)),
+        )
+        .await
+        .map_err(|_| request_timed_out(path, CONTROL_TIMEOUT))??;
         let status = response.status();
         if status.is_success() {
             Ok(response.into_body())
         } else {
-            let bytes = response
-                .into_body()
-                .collect()
+            let bytes = tokio::time::timeout(CONTROL_TIMEOUT, response.into_body().collect())
                 .await
+                .map_err(|_| request_timed_out(path, CONTROL_TIMEOUT))?
                 .map_err(|error| BrokerError::Unavailable(error.to_string()))?
                 .to_bytes();
             Err(remote_error(status, &bytes))
@@ -569,16 +623,22 @@ impl BrokerClient {
         method: Method,
         path: &str,
         body: Option<&B>,
+        budget: Duration,
     ) -> Result<(StatusCode, Bytes), BrokerError> {
-        let response = self.request_response(method, path, body).await?;
-        let status = response.status();
-        let bytes = response
-            .into_body()
-            .collect()
+        let exchange = async {
+            let response = self.request_response(method, path, body).await?;
+            let status = response.status();
+            let bytes = response
+                .into_body()
+                .collect()
+                .await
+                .map_err(|error| BrokerError::Unavailable(error.to_string()))?
+                .to_bytes();
+            Ok((status, bytes))
+        };
+        tokio::time::timeout(budget, exchange)
             .await
-            .map_err(|error| BrokerError::Unavailable(error.to_string()))?
-            .to_bytes();
-        Ok((status, bytes))
+            .map_err(|_| request_timed_out(path, budget))?
     }
 
     async fn request_response<B: Serialize + ?Sized>(
@@ -628,6 +688,10 @@ impl BrokerClient {
 struct BrokerGeneration {
     client: BrokerClient,
     build: BuildIdentity,
+    /// Process id reported by `/health`, when the broker is new enough to
+    /// report one. Brokers this server started are its children and stay
+    /// zombies until they are waited for.
+    pid: Option<u32>,
     current: bool,
 }
 
@@ -690,11 +754,15 @@ impl BrokerPool {
                     "replacing incompatible session broker; existing terminals will close"
                 );
                 client.shutdown().await?;
+                if let Some(pid) = health.pid {
+                    reap_broker_process(pid).await;
+                }
                 continue;
             }
             compatible.push(BrokerGeneration {
                 client,
                 build: health.build,
+                pid: health.pid,
                 current: false,
             });
         }
@@ -718,6 +786,7 @@ impl BrokerPool {
             BrokerGeneration {
                 client,
                 build: health.build,
+                pid: health.pid,
                 current: false,
             }
         };
@@ -782,23 +851,66 @@ impl BrokerPool {
         generations
     }
 
+    /// Takes a generation out of the draining set, reporting whether this call
+    /// is the one that removed it.
+    async fn forget_draining(&self, generation: &BrokerGeneration) -> bool {
+        let mut draining = self.draining.write().await;
+        let Some(index) = draining
+            .iter()
+            .position(|candidate| candidate.client.socket_path == generation.client.socket_path)
+        else {
+            return false;
+        };
+        draining.remove(index);
+        true
+    }
+
+    async fn forget_owners(&self, generation: &BrokerGeneration) {
+        self.owners
+            .write()
+            .await
+            .retain(|_, owner| owner.client.socket_path != generation.client.socket_path);
+    }
+
     async fn retire_empty_brokers(&self) {
         let candidates = self.draining.read().await.clone();
         for generation in candidates {
-            let Ok(health) = generation.client.health().await else {
-                continue;
-            };
-            if health.sessions != 0 {
-                continue;
-            }
-            {
-                let mut draining = self.draining.write().await;
-                let Some(index) = draining.iter().position(|candidate| {
-                    candidate.client.socket_path == generation.client.socket_path
-                }) else {
+            match generation.client.list().await {
+                // Exited sessions are deliberately retained so their output
+                // stays readable. A draining broker is only done once there is
+                // nothing left to read, not once nothing is still running.
+                Ok(terminals) if terminals.is_empty() => {}
+                Ok(_) => continue,
+                Err(error) => {
+                    if !broker_socket_is_gone(&generation.client.socket_path).await {
+                        tracing::warn!(
+                            %error,
+                            socket = %generation.client.socket_path.display(),
+                            "draining terminal session broker did not report its terminals"
+                        );
+                        continue;
+                    }
+                    if self.forget_draining(&generation).await {
+                        self.forget_owners(&generation).await;
+                        // The broker crashed or was killed: nothing else will
+                        // clean up after it, so its socket file goes too.
+                        let _ =
+                            tokio::fs::remove_file(generation.client.socket_path.as_ref()).await;
+                        if let Some(pid) = generation.pid {
+                            reap_broker_process(pid).await;
+                        }
+                        tracing::warn!(
+                            %error,
+                            broker_version = %generation.build.version,
+                            broker_commit = %generation.build.commit,
+                            "dropped draining terminal session broker that is no longer running"
+                        );
+                    }
                     continue;
-                };
-                draining.remove(index);
+                }
+            }
+            if !self.forget_draining(&generation).await {
+                continue;
             }
             if let Err(error) = generation.client.shutdown().await {
                 self.draining.write().await.push(generation.clone());
@@ -808,10 +920,10 @@ impl BrokerPool {
                     "unable to stop drained terminal session broker"
                 );
             } else {
-                self.owners
-                    .write()
-                    .await
-                    .retain(|_, owner| owner.client.socket_path != generation.client.socket_path);
+                self.forget_owners(&generation).await;
+                if let Some(pid) = generation.pid {
+                    reap_broker_process(pid).await;
+                }
                 tracing::info!(
                     broker_version = %generation.build.version,
                     broker_commit = %generation.build.commit,
@@ -1189,10 +1301,17 @@ impl BrokerPool {
         self.shutting_down.store(true, Ordering::Relaxed);
         let mut first_error = None;
         for generation in self.generations().await {
-            if let Err(error) = generation.client.shutdown().await
-                && first_error.is_none()
-            {
-                first_error = Some(error);
+            match generation.client.shutdown().await {
+                Ok(()) => {
+                    if let Some(pid) = generation.pid {
+                        reap_broker_process(pid).await;
+                    }
+                }
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
             }
         }
         first_error.map_or(Ok(()), Err)
@@ -1259,6 +1378,48 @@ fn legacy_screen_snapshot(screen: String, tail_bytes: usize) -> TerminalScreenSn
     }
 }
 
+fn request_timed_out(path: &str, budget: Duration) -> BrokerError {
+    BrokerError::Unavailable(format!(
+        "session broker did not answer {path} within {} seconds",
+        budget.as_secs()
+    ))
+}
+
+/// A draining broker that refuses connections, or whose socket file is gone,
+/// has died. Its generation is dropped instead of being probed forever.
+async fn broker_socket_is_gone(path: &Path) -> bool {
+    match UnixStream::connect(path).await {
+        Ok(_) => false,
+        Err(error) => matches!(
+            error.kind(),
+            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+        ),
+    }
+}
+
+/// Waits for a broker this server started. Rust does not reap `std::process`
+/// children, and a server process outlives many broker generations, so every
+/// stopped broker would otherwise stay a zombie until the server itself exits.
+/// Only the broker's own process is ever waited for; a broker started by an
+/// unrelated process reports `ECHILD`, which is ignored.
+async fn reap_broker_process(pid: u32) {
+    let Some(pid) = i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    else {
+        return;
+    };
+    let deadline = tokio::time::Instant::now() + REAP_TIMEOUT;
+    loop {
+        match rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG) {
+            Ok(None) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(REAP_INTERVAL).await;
+            }
+            _ => return,
+        }
+    }
+}
+
 fn remote_error(status: StatusCode, bytes: &[u8]) -> BrokerError {
     let message = serde_json::from_slice::<ErrorResponse>(bytes)
         .map(|response| response.error)
@@ -1271,7 +1432,7 @@ fn spawn_broker(
     executable: &Path,
     socket: &Path,
     control_token: Option<&str>,
-) -> Result<(), BrokerError> {
+) -> Result<u32, BrokerError> {
     let mut command = Command::new(executable);
     command
         .arg("--session-broker")
@@ -1291,10 +1452,12 @@ fn spawn_broker(
     if let Some(shell) = &cli.shell {
         command.arg("--shell").arg(shell);
     }
-    command
+    // The child handle is dropped on purpose: a broker outlives the server that
+    // started it, and it is waited for by process id once it stops.
+    let child = command
         .spawn()
         .map_err(|error| BrokerError::Unavailable(format!("unable to start broker: {error}")))?;
-    Ok(())
+    Ok(child.id())
 }
 
 pub fn legacy_socket_path(data_directory: &Path) -> PathBuf {
@@ -1633,6 +1796,7 @@ async fn broker_health(State(state): State<BrokerState>) -> Json<serde_json::Val
         "protocolVersion": PROTOCOL_VERSION,
         "build": build::info(),
         "sessions": state.terminals.running_count(),
+        "pid": std::process::id(),
     }))
 }
 
@@ -2136,7 +2300,10 @@ mod tests {
     use tokio::task::JoinHandle;
     use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 
-    use crate::audio::{AUDIO_FRAME_SAMPLES, AUDIO_SAMPLE_RATE};
+    use crate::{
+        audio::{AUDIO_FRAME_SAMPLES, AUDIO_SAMPLE_RATE},
+        terminal::TerminalStatus,
+    };
 
     use super::*;
 
@@ -3643,5 +3810,230 @@ mod tests {
             .await
             .expect("broker shutdown timeout")
             .unwrap();
+    }
+
+    async fn wait_for_exit(client: &BrokerClient, id: Uuid) -> TerminalInfo {
+        for _ in 0..200 {
+            let terminal = client
+                .list()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|terminal| terminal.id == id)
+                .expect("the broker dropped an exited terminal");
+            if terminal.status == TerminalStatus::Exited {
+                return terminal;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("terminal never exited");
+    }
+
+    #[tokio::test]
+    async fn requests_give_up_on_a_broker_that_accepts_but_never_answers() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("silent.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        // A wedged broker still accepts connections; it just never writes a
+        // response. Holding the streams keeps them open exactly like one.
+        let accepting = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+
+        let client = BrokerClient::new(socket);
+        let started = tokio::time::Instant::now();
+        let error = client.list().await.unwrap_err();
+        let waited = started.elapsed();
+
+        assert!(
+            matches!(&error, BrokerError::Unavailable(message) if message.contains("did not answer")),
+            "unexpected error: {error}"
+        );
+        assert!(
+            waited >= CONTROL_TIMEOUT && waited < CONTROL_TIMEOUT * 3,
+            "request waited {waited:?}, which is not the control budget"
+        );
+        accepting.abort();
+    }
+
+    #[tokio::test]
+    async fn confirmed_input_gives_up_when_the_terminal_stops_reading_it() {
+        let (_directory, server, client) = start_test_broker(1024 * 1024).await;
+        let terminal = client
+            .create(CreateTerminal {
+                path: Some("stalled".to_owned()),
+                cwd: Some(PathBuf::from("/tmp")),
+                shell: Some("/bin/sh".to_owned()),
+                clone_from: None,
+            })
+            .await
+            .unwrap();
+        let pid = rustix::process::Pid::from_raw(terminal.pid.unwrap() as i32).unwrap();
+        // A foreground process that never reads its input fills the line
+        // discipline buffer, and the writer thread then blocks in `write_all`
+        // for as long as that process runs.
+        rustix::process::kill_process(pid, rustix::process::Signal::STOP).unwrap();
+
+        let mut failure = None;
+        for _ in 0..4 {
+            if let Err(error) = client.write(terminal.id, "#stall\n".repeat(9000)).await {
+                failure = Some(error);
+                break;
+            }
+        }
+        let error =
+            failure.expect("a terminal that never reads its input accepted confirmed input");
+        assert!(
+            matches!(
+                &error,
+                BrokerError::Remote { status, message }
+                    if *status == StatusCode::BAD_REQUEST && message.contains("not accepting input")
+            ),
+            "unexpected error: {error}"
+        );
+
+        let _ = rustix::process::kill_process(pid, rustix::process::Signal::CONT);
+        client.remove(terminal.id).await.unwrap();
+        client.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("broker shutdown timeout")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn draining_brokers_keep_terminals_that_have_already_exited() {
+        let directory = tempfile::tempdir().unwrap();
+        let (legacy_server, legacy) = start_test_broker_at(
+            directory.path(),
+            legacy_socket_path(directory.path()),
+            1024 * 1024,
+        )
+        .await;
+        let exited = legacy
+            .create(CreateTerminal {
+                path: Some("already-exited".to_owned()),
+                cwd: Some(PathBuf::from("/tmp")),
+                shell: Some("/bin/true".to_owned()),
+                clone_from: None,
+            })
+            .await
+            .unwrap();
+        wait_for_exit(&legacy, exited.id).await;
+        // Exited sessions are retained so their output stays readable, and they
+        // are deliberately not counted as running sessions.
+        assert_eq!(legacy.health().await.unwrap().sessions, 0);
+
+        let (current_server, _current) = start_test_broker_at(
+            directory.path(),
+            current_socket_path(directory.path()),
+            1024 * 1024,
+        )
+        .await;
+        let cli = Cli::try_parse_from([
+            "term-server",
+            "--data-dir",
+            directory.path().to_str().unwrap(),
+            "--shell",
+            "/bin/sh",
+        ])
+        .unwrap();
+        let pool = BrokerPool::connect_or_start(&cli, Path::new("/unused"))
+            .await
+            .unwrap();
+        pool.retire_empty_brokers().await;
+
+        assert!(
+            legacy.health().await.is_ok(),
+            "the draining broker was stopped while it still held readable output"
+        );
+        let listed = pool.list().await.unwrap();
+        assert!(
+            listed.iter().any(|terminal| terminal.id == exited.id),
+            "the exited terminal was dropped with its broker"
+        );
+
+        // With nothing left to read the generation is retired as before.
+        pool.remove(exited.id).await.unwrap();
+        pool.retire_empty_brokers().await;
+        tokio::time::timeout(Duration::from_secs(5), legacy_server)
+            .await
+            .expect("drained broker shutdown timeout")
+            .unwrap();
+        pool.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), current_server)
+            .await
+            .expect("current broker shutdown timeout")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn draining_generations_that_died_are_dropped_from_the_pool() {
+        let (directory, server, client) = start_test_broker(1024 * 1024).await;
+        let dead_socket = directory.path().join(BROKER_DIRECTORY).join("dead.sock");
+        tokio::fs::create_dir_all(dead_socket.parent().unwrap())
+            .await
+            .unwrap();
+        // A broker that crashed or was killed leaves its socket file behind,
+        // and connecting to it is refused.
+        drop(UnixListener::bind(&dead_socket).unwrap());
+        let pool = BrokerPool {
+            current: BrokerGeneration {
+                client: client.clone(),
+                build: BuildIdentity::current(),
+                pid: None,
+                current: true,
+            },
+            draining: RwLock::new(vec![BrokerGeneration {
+                client: BrokerClient::new(dead_socket.clone()),
+                build: BuildIdentity::current(),
+                pid: None,
+                current: false,
+            }]),
+            owners: RwLock::new(HashMap::new()),
+            create_lock: Mutex::new(()),
+            shutting_down: AtomicBool::new(false),
+        };
+
+        pool.retire_empty_brokers().await;
+
+        assert!(
+            pool.draining.read().await.is_empty(),
+            "a broker that is no longer running stayed in the pool"
+        );
+        assert!(
+            !dead_socket.exists(),
+            "the dead broker's socket file was left behind"
+        );
+        assert!(pool.list().await.unwrap().is_empty());
+
+        pool.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("broker shutdown timeout")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stopped_broker_processes_are_waited_for_instead_of_left_as_zombies() {
+        // `spawn_broker` drops the child handle, so nothing else ever waits for
+        // a broker that stops.
+        let child = Command::new("/bin/true").spawn().unwrap();
+        let pid = child.id();
+        drop(child);
+
+        reap_broker_process(pid).await;
+
+        let raw = rustix::process::Pid::from_raw(pid as i32).unwrap();
+        assert!(
+            matches!(
+                rustix::process::waitpid(Some(raw), rustix::process::WaitOptions::NOHANG),
+                Err(rustix::io::Errno::CHILD)
+            ),
+            "the stopped process is still a child waiting to be reaped"
+        );
     }
 }
