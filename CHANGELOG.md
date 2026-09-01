@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.18.0 - 2026-09-01
+
+A reliability release from a full bug-hunting pass over the server and the browser client: 38 verified defects fixed across the terminal core, session broker, HTTP API, agent integrations, updater, and client, nearly all with a regression test.
+
+### Fixed
+
+- **Terminal core.** A lock-order inversion between scrollback reads and summary generation could deadlock the whole API; the exit of a shell is now taken from the child instead of pty EOF, so a background job no longer leaves a zombie "Running" terminal that cannot be deleted; a submitted line no longer walks all of `/proc` under the input lock, and process sampling runs off the runtime thread; an unterminated OSC (an `imgcat` image, a truncated title) is bounded instead of growing and being rescanned per chunk; exited terminals retire their agent status instead of showing it frozen; browser checkpoints no longer walk the whole replay ring under the output lock, and the ring charges per-chunk overhead so byte-at-a-time output cannot blow past its budget.
+- **Scrollback text for Supervisor agents.** The control-free text cleaner treated UTF-8 continuation bytes as C1 controls, so any `❯` prompt, emoji, Cyrillic, or box-drawing character silently swallowed the output that followed; it also leaked the final byte of `ESC ( B` and friends. Both cleaners are UTF-8 aware, handle intermediate escapes and DCS/PM/APC strings, and scrollback pages and the summary tail now start and end on parser-safe boundaries so an escape or wide character is never split across pages.
+- **Browser panes.** About eight seconds without a server (laptop wake, wifi-to-LTE hop, slow restart) permanently locked every visible pane behind a misleading "client is out of date" banner; panes now keep retrying and only show that hint when the server is reachable and authenticated. A terminal that exited while mounted no longer flips to "Recovering output" thirty seconds later. Idle panes in a throttled background tab no longer reconnect every two minutes. A slow xterm write pump at reconnect no longer duplicates output or corrupts the next checkpoint: recovery snapshots and resets through the write queue. Touch drag scrolled twice on xterm 6; the pane's own scroller is gone.
+- **Editor and settings.** The text editor went blank after every Save and after an artifact was rewritten on disk; the editor host now stays mounted and reloads push content into the live view. The scrollback-lines field clamped on every keystroke, made 5000 unreachable, and rebuilt every terminal per key; it now commits on blur or Enter.
+- **Client polling and requests.** The 1.5 s workspace poll gave every terminal a new identity and fired an extra heartbeat each tick; unchanged terminals keep their objects. JSON API calls have a 30 s default timeout with longer explicit budgets for agent CLIs, release checks, installs, and providers, so a server restart mid-save no longer wedges the Save button. The sidebar no longer re-parses the Pushover bell map per row per render, and the client debug recording buffer is a ring instead of an O(n) splice.
+- **Session broker and Supervisor.** Every server-to-broker request is bounded (5 s control, 30 s create, 20 s input, 15 s shutdown), and confirmed input to a program that is not reading its stdin fails within 5 s instead of parking the caller forever. The Supervisor control socket backs off on transient accept errors instead of dying for the life of the process. A second server started against the same data directory is refused before it can reconfigure the running broker's shell and replay size. Draining broker generations keep their exited terminals readable and retire only once empty, dead generations are dropped with their stale sockets, and stopped broker processes are reaped instead of left as zombies.
+- **Debug recording.** Clearing an active recording could panic a frame recorder and abort the process; the flag now flips under the lock and a missing buffer drops the frame. With recording off, the recorder no longer base64-encodes every output frame and serializes every control message before discarding them, and the terminal and audio proxies forward frames without copying.
+- **Files and login.** Uploads could overwrite a file created while the bytes streamed; they now persist with no-clobber and pick the next free name. File search has a 200k-entry / 2 s budget and is cancelled when the request is dropped, so typing no longer stacks full-tree walks. The login limiter sweeps expired windows and caps tracked clients.
+- **Agent integrations.** Installing the Hermes integration corrupted a flow-style `enabled: [...]` list and replaced the whole `config.yaml` with a stub when the file could not be read; flow lists are rewritten correctly, read errors abort, and the config is written atomically with its mode preserved. Claude Code inside tmux (no window title) is no longer reported Idle while streaming. OMP install and remove now name the failing profile and reason.
+- **AI summaries and updater.** Summary prompts dropped the newest terminal lines instead of the oldest. The Pi training log is created 0600 in a 0700 directory, rotates at 64 MiB, and is written off the runtime thread. The updater compares versions and reports a channel that publishes an older release as **older** instead of offering a silent downgrade, and installed files are fsynced before the swap.
+
+### Security
+
+- **Served files are sandboxed.** `/api/files/raw` and `/api/files/download` responses now carry `Content-Security-Policy: sandbox` (the PDF preview keeps its framing policy), so an SVG opened top-level from the file browser cannot run script against the terminal API with the session cookie.
+
+### Changed
+
+- Deleting a terminal hangs up every process still attached to its pty session and kills leftovers after 2 s; a plain `exit` still leaves deliberately backgrounded jobs alone.
+- Supervisor `scrollback` pages end on parser-safe boundaries and may grow by less than one read to reach one; `truncated` also flags a start that was snapped forward.
+
+### Upgrade notes
+
+- No data migration is required. Reload open browser pages to pick up the reconnect, editor, and keepalive fixes. The release is safe for automatic installation over `0.17.0`; session brokers from earlier generations keep their terminals and are retired once their last terminal is removed.
+
 ## 0.17.0 - 2026-08-31
 
 Browser audio can now act as a shared virtual microphone and speaker for voice-capable tools running on the terminal host.
