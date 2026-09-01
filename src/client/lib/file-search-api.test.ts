@@ -4,21 +4,28 @@ import { api } from "./api";
 afterEach(() => vi.unstubAllGlobals());
 
 describe("file search API", () => {
-  it("forwards an abort signal so a superseded search stops the server-side walk", async () => {
-    const fetch = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
-      new Response(JSON.stringify({ root: "/home/user", entries: [], truncated: false }), {
+  it("sends the request with an abort signal so a superseded search can stop the server-side walk", async () => {
+    let received: AbortSignal | null | undefined;
+    const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      received = init?.signal;
+      return new Response(JSON.stringify({ root: "/home/user", entries: [], truncated: false }), {
         status: 200,
         headers: { "content-type": "application/json" },
-      }));
+      });
+    });
     vi.stubGlobal("fetch", fetch);
     const controller = new AbortController();
 
     await api.searchFiles("/home/user", "needle", undefined, controller.signal);
 
+    // `request()` combines the caller's signal with its own deadline, so fetch
+    // sees a derived signal rather than the caller's instance.
     expect(fetch).toHaveBeenCalledWith(
       "/api/files/search?root=%2Fhome%2Fuser&query=needle",
-      expect.objectContaining({ cache: "no-store", signal: controller.signal }),
+      expect.objectContaining({ cache: "no-store", signal: expect.any(AbortSignal) }),
     );
+    expect(received).toBeInstanceOf(AbortSignal);
+    expect(received?.aborted).toBe(false);
   });
 
   it("rejects with the abort reason when the request is cancelled", async () => {
