@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.18.1 - 2026-09-01
+
+Claude Code 2.1 terminals no longer read as idle while a command or subagent is still running.
+
+### Fixed
+
+- **Claude working detection.** Claude Code 2.1 cycles ◐ ◓ ◑ ◒ at the start of the window title while a turn is in flight instead of the braille spinner the manifest knew, and 2.1.257 moves the "esc to interrupt" hint from the spinner line's parentheses to the footer under the prompt box. Neither working signal matched, so as soon as hook events went stale (15 s into any tool call or subagent run) the always-visible prompt box won and the terminal flipped to idle, completing the task early and asking for a summary of work still in progress. The title rule now accepts the circle glyphs, the interrupt hint is matched anywhere in the bottom lines (permission dialogs still outrank it), and the live spinner line (`✢ Transmuting… (3m 4s · ↓ 12.6k tokens)`) is recognized on its own for builds that draw no hint, while the past-tense line after a turn is not. Validated against live 2.1.257 screens.
+
+### Upgrade notes
+
+- Manifest-only change; no data migration and no browser reload required. Safe for automatic installation over `0.18.0`.
+
 ## 0.18.0 - 2026-09-01
 
 A reliability release from a full bug-hunting pass over the server and the browser client: 38 verified defects fixed across the terminal core, session broker, HTTP API, agent integrations, updater, and client, nearly all with a regression test.
