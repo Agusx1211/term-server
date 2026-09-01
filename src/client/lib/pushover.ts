@@ -2,16 +2,40 @@ import type { AgentInfo, PushoverMode, TerminalInfo } from "../../shared/types";
 
 const BELLS_STORAGE_KEY = "term-server:pushover-bells";
 
+const EMPTY_BELLS: ReadonlyMap<string, boolean> = new Map();
+
+let parsedRaw: string | null = null;
+let parsedBells: ReadonlyMap<string, boolean> = EMPTY_BELLS;
+
+/**
+ * The parsed overrides for the current stored value.
+ *
+ * The sidebar asks for a bell state per terminal row on every render, and it
+ * re-renders on each 1.5 s workspace poll, so the parse is memoized on the raw
+ * stored string and only the cheap `getItem` runs per row.
+ */
+function pushoverBells(): ReadonlyMap<string, boolean> {
+  let raw: string | null = null;
+  try {
+    raw = localStorage.getItem(BELLS_STORAGE_KEY);
+  } catch {
+    return EMPTY_BELLS;
+  }
+  if (raw === parsedRaw) return parsedBells;
+  parsedRaw = raw;
+  try {
+    parsedBells = raw
+      ? new Map(Object.entries(JSON.parse(raw) as Record<string, boolean>))
+      : EMPTY_BELLS;
+  } catch {
+    parsedBells = EMPTY_BELLS;
+  }
+  return parsedBells;
+}
+
 /** Load the per-terminal bell overrides as a map of terminal id -> enabled. */
 export function loadPushoverBells(): Map<string, boolean> {
-  try {
-    const raw = localStorage.getItem(BELLS_STORAGE_KEY);
-    if (!raw) return new Map();
-    const parsed = JSON.parse(raw) as Record<string, boolean>;
-    return new Map(Object.entries(parsed));
-  } catch {
-    return new Map();
-  }
+  return new Map(pushoverBells());
 }
 
 function savePushoverBells(bells: Map<string, boolean>): void {
@@ -24,7 +48,7 @@ function savePushoverBells(bells: Map<string, boolean>): void {
  * default (on for "all", off for "select").
  */
 export function pushoverBellEnabled(terminalId: string, mode: PushoverMode): boolean {
-  const stored = loadPushoverBells().get(terminalId);
+  const stored = pushoverBells().get(terminalId);
   if (stored !== undefined) return stored;
   return mode === "all";
 }

@@ -73,6 +73,23 @@ describe("pushover", () => {
     expect(pushoverBellEnabled("a", "all")).toBe(false);
   });
 
+  it("parses the stored overrides once per stored value", () => {
+    setPushoverBell("a", true);
+    const parse = vi.spyOn(JSON, "parse");
+    try {
+      expect(pushoverBellEnabled("a", "select")).toBe(true);
+      expect(pushoverBellEnabled("a", "select")).toBe(true);
+      expect(pushoverBellEnabled("b", "select")).toBe(false);
+      expect(parse).toHaveBeenCalledTimes(1);
+
+      setPushoverBell("b", true);
+      expect(pushoverBellEnabled("b", "select")).toBe(true);
+      expect(parse).toHaveBeenCalledTimes(2);
+    } finally {
+      parse.mockRestore();
+    }
+  });
+
   it("builds a message with host, directory, kind, and title", () => {
     const message = buildPushoverMessage(
       terminal({ name: "Refactor API" }),
