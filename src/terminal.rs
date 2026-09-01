@@ -3631,41 +3631,69 @@ fn current_millis() -> u64 {
 }
 
 pub(crate) fn sanitize_terminal_text(input: &str) -> String {
+    #[derive(Clone, Copy)]
+    enum State {
+        Text,
+        Escape,
+        EscapeIntermediate,
+        Csi,
+        String,
+        StringEscape,
+    }
+
+    let mut state = State::Text;
     let mut output = String::with_capacity(input.len());
-    let mut characters = input.chars().peekable();
-    while let Some(character) = characters.next() {
-        if character == '\u{1b}' {
-            match characters.peek().copied() {
-                Some('[') => {
-                    characters.next();
-                    for next in characters.by_ref() {
-                        if ('@'..='~').contains(&next) {
-                            break;
-                        }
+    for character in input.chars() {
+        state = match state {
+            State::Text => match character {
+                '\u{1b}' => State::Escape,
+                '\r' => {
+                    output.push('\n');
+                    State::Text
+                }
+                '\n' | '\t' => {
+                    output.push(character);
+                    State::Text
+                }
+                _ => {
+                    if !character.is_control() {
+                        output.push(character);
                     }
+                    State::Text
                 }
-                Some(']') => {
-                    characters.next();
-                    let mut escaped = false;
-                    for next in characters.by_ref() {
-                        if next == '\u{7}' || escaped && next == '\\' {
-                            break;
-                        }
-                        escaped = next == '\u{1b}';
-                    }
-                }
-                Some(_) => {
-                    characters.next();
-                }
-                None => {}
-            }
-            continue;
-        }
-        if character == '\r' {
-            output.push('\n');
-        } else if character == '\n' || character == '\t' || !character.is_control() {
-            output.push(character);
-        }
+            },
+            State::Escape => match character {
+                '[' => State::Csi,
+                // Device control, privacy message and APC payloads run to a
+                // string terminator exactly like an OSC title does.
+                ']' | 'P' | 'X' | '^' | '_' => State::String,
+                // `ESC ( B` (what `tput sgr0` emits) ends on its final byte,
+                // so consuming a single character here would emit that final.
+                '\u{20}'..='\u{2f}' => State::EscapeIntermediate,
+                '\u{1b}' => State::Escape,
+                _ => State::Text,
+            },
+            State::EscapeIntermediate => match character {
+                '\u{20}'..='\u{2f}' => State::EscapeIntermediate,
+                '\u{1b}' => State::Escape,
+                _ => State::Text,
+            },
+            State::Csi => match character {
+                '\u{1b}' => State::Escape,
+                '\u{40}'..='\u{7e}' => State::Text,
+                _ => State::Csi,
+            },
+            State::String => match character {
+                '\u{7}' => State::Text,
+                '\u{1b}' => State::StringEscape,
+                _ => State::String,
+            },
+            State::StringEscape => match character {
+                '\\' => State::Text,
+                '\u{1b}' => State::StringEscape,
+                _ => State::String,
+            },
+        };
     }
     output
 }
@@ -5358,6 +5386,15 @@ mod tests {
             sanitize_terminal_text("\u{1b}[31mred\u{1b}[0m\rnext"),
             "red\nnext"
         );
+    }
+
+    #[test]
+    fn sanitize_terminal_text_drops_whole_escape_sequences() {
+        // `\x1b(B` is what `tput sgr0` emits on xterm-256color; consuming a
+        // single character after the escape used to leak its final byte.
+        assert_eq!(sanitize_terminal_text("\u{1b}(Bplain\u{1b})0"), "plain");
+        assert_eq!(sanitize_terminal_text("a\u{1b}P0;1|payload\u{1b}\\b"), "ab");
+        assert_eq!(sanitize_terminal_text("\u{1b}]8;;url\u{7}link"), "link");
     }
 
     #[test]
