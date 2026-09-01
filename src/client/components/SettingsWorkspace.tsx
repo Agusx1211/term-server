@@ -600,7 +600,11 @@ export function SettingsWorkspace({
                   step={TERMINAL_SCROLLBACK_LIMITS.step}
                   value={scrollbackDraft}
                   onInput={(event) => setScrollbackDraft(event.currentTarget.value)}
-                  onChange={(event) => commitScrollbackDraft(event.currentTarget.value)}
+                  // Commit on blur, and on Enter by blurring. Not `onChange`:
+                  // preact/compat is loaded (App and Sidebar import it) and its
+                  // global vnode hook rewrites onChange on a text-like input to
+                  // an input listener, which is exactly the per-keystroke commit
+                  // this field is avoiding.
                   onBlur={(event) => commitScrollbackDraft(event.currentTarget.value)}
                   onKeyDown={(event) => {
                     if (event.key === "Enter") event.currentTarget.blur();
