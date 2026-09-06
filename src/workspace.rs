@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::{
     access::{
         AccessDecision, AccessError, AccessManager, AccessSnapshot, AddSecretGrant, SecretApproval,
-        SecretGrantView, SudoApproval,
+        SecretGrantView, SecretShareReveal, SudoApproval,
     },
     ai::{PiClientConfig, PiService, UpdatePiSettings},
     debug_recording::DebugRecordingManager,
@@ -519,6 +519,26 @@ impl WorkspaceBackend {
         }
     }
 
+    pub async fn reveal_share(
+        &self,
+        id: Uuid,
+        share_id: Uuid,
+    ) -> Result<SecretShareReveal, WorkspaceError> {
+        match self {
+            Self::Local { access, .. } => access.reveal_share(id, share_id).map_err(access_error),
+            #[cfg(unix)]
+            Self::Broker(client) => client.reveal_share(id, share_id).await,
+        }
+    }
+
+    pub async fn dismiss_share(&self, id: Uuid, share_id: Uuid) -> Result<(), WorkspaceError> {
+        match self {
+            Self::Local { access, .. } => access.dismiss_share(id, share_id).map_err(access_error),
+            #[cfg(unix)]
+            Self::Broker(client) => client.dismiss_share(id, share_id).await,
+        }
+    }
+
     pub async fn pi_config(&self) -> Result<PiClientConfig, WorkspaceError> {
         match self {
             Self::Local { pi, .. } => Ok(pi.client_config()),
@@ -621,6 +641,7 @@ fn access_error(error: AccessError) -> WorkspaceError {
         AccessError::NotFound => StatusCode::NOT_FOUND,
         AccessError::Stale | AccessError::Conflict(_) => StatusCode::CONFLICT,
         AccessError::Invalid(_) => StatusCode::BAD_REQUEST,
+        AccessError::Gone(_) => StatusCode::GONE,
         AccessError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
     };
     WorkspaceError::Remote {
