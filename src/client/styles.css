@@ -1716,6 +1716,11 @@ body.pane-resizing .layout-divider.horizontal { cursor: row-resize; }
   .terminal-pane.artifacts-visible { grid-template-rows: 44px minmax(0, 1fr); }
   .terminal-pane.artifacts-visible .terminal-keybar { display: none; }
   .terminal-keybar-divider { width: 1px; height: 24px; flex: none; margin: 0 1px; background: var(--border-strong); }
+  .terminal-keybar-pinned {
+    position: sticky; left: 0; z-index: 1; flex: none; display: flex; align-items: center; gap: 4px;
+    margin-left: calc(-1 * max(6px, env(safe-area-inset-left))); padding-left: max(6px, env(safe-area-inset-left));
+    background: var(--panel);
+  }
   .terminal-scroll-latest {
     position: absolute; right: 10px; bottom: calc(55px + env(safe-area-inset-bottom)); z-index: 7;
     min-height: 34px; display: flex; align-items: center; gap: 5px; padding: 0 11px;
