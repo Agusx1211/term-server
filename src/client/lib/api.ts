@@ -5,6 +5,7 @@ import type {
   ActivityView,
   AccessSnapshot,
   SecretGrant,
+  SecretShareReveal,
   BrowserTabCommandAck,
   BrowserTabHeartbeat,
   BrowserTabSnapshot,
@@ -272,6 +273,18 @@ export const api = {
     request<void>(
       `/api/terminals/${id}/access/requests/${encodeURIComponent(requestId)}/reject`,
       { method: "POST", body: JSON.stringify({ requestHash, comment: comment || undefined }) },
+    ),
+  // The one call that returns a secret value: the broker hands it over once
+  // and forgets its copy, so the caller must show it immediately.
+  revealTerminalShare: (id: string, shareId: string) =>
+    request<SecretShareReveal>(
+      `/api/terminals/${id}/access/shares/${encodeURIComponent(shareId)}/reveal`,
+      { method: "POST" },
+    ),
+  dismissTerminalShare: (id: string, shareId: string) =>
+    request<void>(
+      `/api/terminals/${id}/access/shares/${encodeURIComponent(shareId)}/dismiss`,
+      { method: "POST" },
     ),
   terminateTerminalProcess: (id: string, processId: string) =>
     request<void>(`/api/terminals/${id}/processes/${encodeURIComponent(processId)}`, {
