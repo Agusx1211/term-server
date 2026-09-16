@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.18.2 - 2026-09-16
+
+Two user-facing features land: a mobile keyboard toggle and one-time agent secret delivery.
+
+### Added
+
+- **Mobile keyboard toggle.** A pinned Show/Hide keyboard button lets phone users open and dismiss the on-screen keyboard. Automatic terminal refocusing respects dismissal until the user taps the terminal or the button again.
+
+- **One-time agent secret delivery.** Agents can generate and share secrets through the Access panel instead of printing them in terminal output. The new "Shared with you" section supports confirmation before a one-time reveal, copying, hiding, dismissal, and expiry. The access skill documents the new commands and their exit codes.
+
+### Upgrade notes
+
+- Safe for automatic installation over `0.18.1`; no data migration and no broker restart required. Reload open browser tabs after updating to load the mobile keyboard toggle and the new Access panel controls.
+
 ## 0.18.1 - 2026-09-01
 
 Claude Code 2.1 terminals no longer read as idle while a command or subagent is still running.

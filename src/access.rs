@@ -12,6 +12,7 @@ use base64::{
     engine::general_purpose::{STANDARD as BASE64, URL_SAFE as BASE64_URL_SAFE},
 };
 use parking_lot::Mutex;
+use rand::Rng as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
 use thiserror::Error;
@@ -31,6 +32,13 @@ const MAX_COMMAND_ARGUMENTS: usize = 256;
 const MAX_PENDING_REQUESTS_PER_TERMINAL: usize = 32;
 const MAX_SECRET_GRANTS_PER_TERMINAL: usize = 64;
 const MAX_SECRET_EXECUTIONS_PER_TERMINAL: usize = 8;
+const MAX_SECRET_SHARES_PER_TERMINAL: usize = 32;
+const MAX_PENDING_SECRET_SHARES_PER_TERMINAL: usize = 8;
+const SECRET_SHARE_TTL_MILLIS: u64 = 60 * 60 * 1000;
+const RESOLVED_SECRET_SHARE_RETENTION_MILLIS: u64 = 6 * 60 * 60 * 1000;
+const MIN_GENERATED_SECRET_CHARS: usize = 8;
+const MAX_GENERATED_SECRET_CHARS: usize = 256;
+pub const DEFAULT_GENERATED_SECRET_CHARS: usize = 32;
 const MAX_COMMAND_BYTES: usize = 64 * 1024;
 const OUTPUT_CHUNK_BYTES: usize = 8 * 1024;
 const REDACTED: &[u8] = b"[REDACTED]";
@@ -76,6 +84,10 @@ pub enum AccessActivityStatus {
     Revoked,
     Failed,
     Canceled,
+    Shared,
+    Viewed,
+    Dismissed,
+    Expired,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -118,6 +130,31 @@ pub struct AccessActivityView {
     pub created_at: u64,
 }
 
+/// Lifecycle of a value an agent handed to the user through the Access panel.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SecretShareState {
+    Pending,
+    Viewed,
+    Dismissed,
+    Expired,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SecretShareView {
+    pub id: Uuid,
+    pub name: String,
+    pub description: Option<String>,
+    pub agent: String,
+    pub state: SecretShareState,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub viewed_at: Option<u64>,
+    pub resolved_at: Option<u64>,
+    pub waiters: usize,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AccessSnapshot {
@@ -125,6 +162,8 @@ pub struct AccessSnapshot {
     pub revision: u64,
     pub requests: Vec<AccessRequestView>,
     pub grants: Vec<SecretGrantView>,
+    #[serde(default)]
+    pub shares: Vec<SecretShareView>,
     pub activity: Vec<AccessActivityView>,
 }
 
@@ -179,6 +218,74 @@ pub struct AgentSecretName {
     #[serde(flatten)]
     pub context: AgentRequestContext,
     pub name: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GeneratedSecretCharset {
+    /// ASCII letters and digits.
+    #[default]
+    Alnum,
+    /// Letters, digits, and shell-safe punctuation (no quotes, backslash, or spaces).
+    Ascii,
+    /// Lowercase hexadecimal digits.
+    Hex,
+    /// Decimal digits only.
+    Digits,
+}
+
+/// Asks the broker to mint a random value and grant it to the terminal. The
+/// agent never receives the value; it can only use it through `execute_secret`
+/// or hand it to the user with `share_secret`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentSecretGenerate {
+    #[serde(flatten)]
+    pub context: AgentRequestContext,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub length: Option<usize>,
+    #[serde(default)]
+    pub charset: GeneratedSecretCharset,
+    #[serde(default)]
+    pub replace: bool,
+}
+
+/// Offers a granted value to the user for a single reveal in the Access panel.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentSecretShare {
+    #[serde(flatten)]
+    pub context: AgentRequestContext,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentSecretShareId {
+    #[serde(flatten)]
+    pub context: AgentRequestContext,
+    pub id: Uuid,
+}
+
+/// The one-time reveal response. It is the only place a shared value leaves
+/// the broker, and only toward an authenticated browser session.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecretShareReveal {
+    pub id: Uuid,
+    pub name: String,
+    pub value: String,
+}
+
+impl Drop for SecretShareReveal {
+    fn drop(&mut self) {
+        self.value.zeroize();
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -238,6 +345,9 @@ pub enum AgentAccessEvent {
     Rejected { comment: Option<String> },
     Completed { return_code: i32 },
     Failed { message: String },
+    Viewed { name: String },
+    Dismissed { name: String },
+    Expired { name: String },
 }
 
 impl AgentAccessEvent {
@@ -254,6 +364,9 @@ impl AgentAccessEvent {
                 | Self::Rejected { .. }
                 | Self::Completed { .. }
                 | Self::Failed { .. }
+                | Self::Viewed { .. }
+                | Self::Dismissed { .. }
+                | Self::Expired { .. }
         )
     }
 }
@@ -270,6 +383,8 @@ pub enum AccessError {
     Stale,
     #[error("{0}")]
     Unavailable(String),
+    #[error("{0}")]
+    Gone(String),
 }
 
 #[derive(Clone)]
@@ -287,6 +402,7 @@ struct AccessState {
     revision: u64,
     requests: HashMap<Uuid, PendingAccessRequest>,
     grants: HashMap<Uuid, SecretGrant>,
+    shares: HashMap<Uuid, SecretShare>,
     secret_executions: HashMap<Uuid, SecretExecution>,
     activity: VecDeque<AccessActivityRecord>,
 }
@@ -333,6 +449,22 @@ struct SecretGrant {
     uses: u64,
     last_used_at: Option<u64>,
     last_command: Option<String>,
+    value: Zeroizing<String>,
+}
+
+struct SecretShare {
+    id: Uuid,
+    terminal_id: Uuid,
+    name: String,
+    description: Option<String>,
+    agent: String,
+    state: SecretShareState,
+    created_at: u64,
+    expires_at: u64,
+    viewed_at: Option<u64>,
+    resolved_at: Option<u64>,
+    waiters: usize,
+    sender: broadcast::Sender<AgentAccessEvent>,
     value: Zeroizing<String>,
 }
 
@@ -446,7 +578,8 @@ impl AccessManager {
     }
 
     pub fn snapshot(&self, terminal_id: Uuid) -> AccessSnapshot {
-        let state = self.inner.state.lock();
+        let mut state = self.inner.state.lock();
+        expire_shares_locked(&mut state, current_millis());
         let mut requests = state
             .requests
             .values()
@@ -461,6 +594,7 @@ impl AccessManager {
             .map(SecretGrant::view)
             .collect::<Vec<_>>();
         grants.sort_by(|left, right| left.name.cmp(&right.name));
+        let shares = shares_for_terminal(&state, terminal_id);
         let activity = state
             .activity
             .iter()
@@ -472,6 +606,7 @@ impl AccessManager {
             revision: state.revision,
             requests,
             grants,
+            shares,
             activity,
         }
     }
@@ -481,14 +616,21 @@ impl AccessManager {
             terminal.pending_access_requests = Some(0);
         }
         let state = self.inner.state.lock();
-        for request in state
+        let now = current_millis();
+        let pending_requests = state
             .requests
             .values()
             .filter(|request| request.state == AccessRequestState::Pending)
-        {
+            .map(|request| request.terminal_id);
+        let pending_shares = state
+            .shares
+            .values()
+            .filter(|share| share.state == SecretShareState::Pending && share.expires_at > now)
+            .map(|share| share.terminal_id);
+        for terminal_id in pending_requests.chain(pending_shares) {
             if let Some(terminal) = terminals
                 .iter_mut()
-                .find(|terminal| terminal.id == request.terminal_id)
+                .find(|terminal| terminal.id == terminal_id)
             {
                 let count = terminal
                     .pending_access_requests
@@ -859,6 +1001,7 @@ impl AccessManager {
             return Err(AccessError::NotFound);
         }
         let grant = state.grants.remove(&grant_id).expect("grant exists");
+        expire_shares_for_grant(&mut state, terminal_id, &grant.name, "revoked");
         push_activity(
             &mut state,
             terminal_id,
@@ -868,6 +1011,355 @@ impl AccessManager {
             &grant.name,
         );
         Ok(())
+    }
+
+    /// Mints a random value inside the broker and grants it to the terminal.
+    /// The returned view never carries the value; the agent can only use it
+    /// through `execute_secret` or offer it to the user with `share_secret`.
+    pub fn generate_secret(
+        &self,
+        terminal_id: Uuid,
+        input: AgentSecretGenerate,
+    ) -> Result<SecretGrantView, AccessError> {
+        let name = validate_secret_name(&input.name)?;
+        let agent = validate_agent(&input.context.agent)?;
+        let description = input
+            .description
+            .as_deref()
+            .map(validate_optional_description)
+            .transpose()?
+            .flatten();
+        let length = input.length.unwrap_or(DEFAULT_GENERATED_SECRET_CHARS);
+        if !(MIN_GENERATED_SECRET_CHARS..=MAX_GENERATED_SECRET_CHARS).contains(&length) {
+            return Err(AccessError::Invalid(format!(
+                "generated secret length must be between {MIN_GENERATED_SECRET_CHARS} and {MAX_GENERATED_SECRET_CHARS} characters"
+            )));
+        }
+        let value = generate_secret_value(input.charset, length);
+        let mut state = self.inner.state.lock();
+        let existing = state
+            .grants
+            .values()
+            .find(|grant| grant.terminal_id == terminal_id && grant.name == name)
+            .map(|grant| grant.id);
+        if let Some(existing) = existing {
+            if !input.replace {
+                return Err(AccessError::Conflict(format!(
+                    "{name} is already granted to this terminal; drop it or pass --replace to regenerate it"
+                )));
+            }
+            state.grants.remove(&existing);
+            expire_shares_for_grant(&mut state, terminal_id, &name, "replaced");
+            push_activity(
+                &mut state,
+                terminal_id,
+                AccessRequestKind::Secret,
+                AccessActivityStatus::Revoked,
+                "Secret grant replaced",
+                &name,
+            );
+        }
+        if state
+            .grants
+            .values()
+            .filter(|grant| grant.terminal_id == terminal_id)
+            .count()
+            >= MAX_SECRET_GRANTS_PER_TERMINAL
+        {
+            return Err(AccessError::Conflict(
+                "this terminal already has too many secret grants".to_owned(),
+            ));
+        }
+        let grant = SecretGrant::new(
+            terminal_id,
+            name.clone(),
+            format!("Generated for {agent}"),
+            value,
+        );
+        let view = grant.view();
+        state.grants.insert(grant.id, grant);
+        let pending = state
+            .requests
+            .extract_if(|_, request| {
+                request.terminal_id == terminal_id
+                    && request.state == AccessRequestState::Pending
+                    && matches!(&request.kind, PendingRequestKind::Secret { name: request_name } if request_name == &name)
+            })
+            .map(|(_, request)| request)
+            .collect::<Vec<_>>();
+        for request in pending {
+            let _ = request
+                .sender
+                .send(AgentAccessEvent::Granted { name: name.clone() });
+        }
+        push_activity(
+            &mut state,
+            terminal_id,
+            AccessRequestKind::Secret,
+            AccessActivityStatus::Approved,
+            "Secret generated and granted",
+            description.as_deref().unwrap_or(&name),
+        );
+        Ok(view)
+    }
+
+    /// Offers the current value of a grant to the user for a single reveal.
+    /// The subscription resolves with `Viewed`, `Dismissed`, or `Expired`;
+    /// dropping it only detaches the waiter, the offer itself stays until the
+    /// user acts on it or it expires.
+    pub fn share_secret(
+        &self,
+        terminal_id: Uuid,
+        input: AgentSecretShare,
+    ) -> Result<AccessSubscription, AccessError> {
+        self.share_secret_with_ttl(terminal_id, input, SECRET_SHARE_TTL_MILLIS)
+    }
+
+    fn share_secret_with_ttl(
+        &self,
+        terminal_id: Uuid,
+        input: AgentSecretShare,
+        ttl_millis: u64,
+    ) -> Result<AccessSubscription, AccessError> {
+        let name = validate_secret_name(&input.name)?;
+        let agent = validate_agent(&input.context.agent)?;
+        let description = input
+            .description
+            .as_deref()
+            .map(validate_optional_description)
+            .transpose()?
+            .flatten();
+        let mut state = self.inner.state.lock();
+        let now = current_millis();
+        expire_shares_locked(&mut state, now);
+        let value = state
+            .grants
+            .values()
+            .find(|grant| grant.terminal_id == terminal_id && grant.name == name)
+            .map(|grant| Zeroizing::new(grant.value.to_string()))
+            .ok_or_else(|| {
+                AccessError::Conflict(format!(
+                    "{name} is not granted to this terminal; generate or request it first"
+                ))
+            })?;
+        if let Some(existing) = state.shares.values_mut().find(|share| {
+            share.terminal_id == terminal_id
+                && share.state == SecretShareState::Pending
+                && share.name == name
+        }) {
+            if existing.agent != agent || existing.description != description {
+                return Err(AccessError::Conflict(format!(
+                    "{name} is already shared with a different purpose or agent"
+                )));
+            }
+            existing.waiters += 1;
+            let subscription =
+                AccessSubscription::request(self.clone(), existing.id, existing.sender.subscribe());
+            state.revision = state.revision.wrapping_add(1);
+            return Ok(subscription);
+        }
+        if state
+            .shares
+            .values()
+            .filter(|share| {
+                share.terminal_id == terminal_id && share.state == SecretShareState::Pending
+            })
+            .count()
+            >= MAX_PENDING_SECRET_SHARES_PER_TERMINAL
+        {
+            return Err(AccessError::Conflict(
+                "this terminal already has too many secrets waiting to be viewed".to_owned(),
+            ));
+        }
+        if state
+            .shares
+            .values()
+            .filter(|share| share.terminal_id == terminal_id)
+            .count()
+            >= MAX_SECRET_SHARES_PER_TERMINAL
+        {
+            let oldest_resolved = state
+                .shares
+                .values()
+                .filter(|share| {
+                    share.terminal_id == terminal_id && share.state != SecretShareState::Pending
+                })
+                .min_by_key(|share| share.resolved_at.unwrap_or(share.created_at))
+                .map(|share| share.id);
+            match oldest_resolved {
+                Some(id) => {
+                    state.shares.remove(&id);
+                }
+                None => {
+                    return Err(AccessError::Conflict(
+                        "this terminal already has too many shared secrets".to_owned(),
+                    ));
+                }
+            }
+        }
+        let id = Uuid::new_v4();
+        let (sender, receiver) = broadcast::channel(ACCESS_EVENT_CAPACITY);
+        state.shares.insert(
+            id,
+            SecretShare {
+                id,
+                terminal_id,
+                name: name.clone(),
+                description: description.clone(),
+                agent,
+                state: SecretShareState::Pending,
+                created_at: now,
+                expires_at: now.saturating_add(ttl_millis),
+                viewed_at: None,
+                resolved_at: None,
+                waiters: 1,
+                sender,
+                value,
+            },
+        );
+        push_activity(
+            &mut state,
+            terminal_id,
+            AccessRequestKind::Secret,
+            AccessActivityStatus::Shared,
+            "Secret shared with you",
+            description.as_deref().unwrap_or(&name),
+        );
+        Ok(AccessSubscription::request(self.clone(), id, receiver))
+    }
+
+    /// Re-attaches an agent to an existing share, resolving immediately when
+    /// the user already acted on it.
+    pub fn wait_share(
+        &self,
+        terminal_id: Uuid,
+        share_id: Uuid,
+    ) -> Result<AccessSubscription, AccessError> {
+        let mut state = self.inner.state.lock();
+        expire_shares_locked(&mut state, current_millis());
+        let share = state
+            .shares
+            .get_mut(&share_id)
+            .filter(|share| share.terminal_id == terminal_id)
+            .ok_or(AccessError::NotFound)?;
+        let name = share.name.clone();
+        let subscription = match share.state {
+            SecretShareState::Pending => {
+                share.waiters += 1;
+                AccessSubscription::request(self.clone(), share_id, share.sender.subscribe())
+            }
+            SecretShareState::Viewed => {
+                AccessSubscription::immediate(AgentAccessEvent::Viewed { name })
+            }
+            SecretShareState::Dismissed => {
+                AccessSubscription::immediate(AgentAccessEvent::Dismissed { name })
+            }
+            SecretShareState::Expired => {
+                AccessSubscription::immediate(AgentAccessEvent::Expired { name })
+            }
+        };
+        state.revision = state.revision.wrapping_add(1);
+        Ok(subscription)
+    }
+
+    pub fn list_shares(&self, terminal_id: Uuid) -> Vec<SecretShareView> {
+        let mut state = self.inner.state.lock();
+        expire_shares_locked(&mut state, current_millis());
+        shares_for_terminal(&state, terminal_id)
+    }
+
+    /// Hands the shared value to the user exactly once. The broker copy is
+    /// zeroized before the lock is released, so a second call can only fail.
+    pub fn reveal_share(
+        &self,
+        terminal_id: Uuid,
+        share_id: Uuid,
+    ) -> Result<SecretShareReveal, AccessError> {
+        let mut state = self.inner.state.lock();
+        let now = current_millis();
+        expire_shares_locked(&mut state, now);
+        let share = state
+            .shares
+            .get_mut(&share_id)
+            .filter(|share| share.terminal_id == terminal_id)
+            .ok_or(AccessError::NotFound)?;
+        match share.state {
+            SecretShareState::Pending => {}
+            SecretShareState::Viewed => {
+                return Err(AccessError::Gone(format!(
+                    "{} was already revealed and is no longer available",
+                    share.name
+                )));
+            }
+            SecretShareState::Dismissed => {
+                return Err(AccessError::Gone(format!("{} was dismissed", share.name)));
+            }
+            SecretShareState::Expired => {
+                return Err(AccessError::Gone(format!(
+                    "{} expired before it was revealed",
+                    share.name
+                )));
+            }
+        }
+        let value = std::mem::take(&mut *share.value);
+        share.state = SecretShareState::Viewed;
+        share.viewed_at = Some(now);
+        share.resolved_at = Some(now);
+        let name = share.name.clone();
+        let _ = share
+            .sender
+            .send(AgentAccessEvent::Viewed { name: name.clone() });
+        push_activity(
+            &mut state,
+            terminal_id,
+            AccessRequestKind::Secret,
+            AccessActivityStatus::Viewed,
+            "Shared secret revealed",
+            &name,
+        );
+        Ok(SecretShareReveal {
+            id: share_id,
+            name,
+            value,
+        })
+    }
+
+    pub fn dismiss_share(&self, terminal_id: Uuid, share_id: Uuid) -> Result<(), AccessError> {
+        let mut state = self.inner.state.lock();
+        let now = current_millis();
+        expire_shares_locked(&mut state, now);
+        let share = state
+            .shares
+            .get_mut(&share_id)
+            .filter(|share| share.terminal_id == terminal_id)
+            .ok_or(AccessError::NotFound)?;
+        if share.state != SecretShareState::Pending {
+            return Err(AccessError::Conflict(
+                "this shared secret is no longer pending".to_owned(),
+            ));
+        }
+        resolve_share(share, SecretShareState::Dismissed, now);
+        let name = share.name.clone();
+        let _ = share
+            .sender
+            .send(AgentAccessEvent::Dismissed { name: name.clone() });
+        push_activity(
+            &mut state,
+            terminal_id,
+            AccessRequestKind::Secret,
+            AccessActivityStatus::Dismissed,
+            "Shared secret dismissed",
+            &name,
+        );
+        Ok(())
+    }
+
+    /// Resolves shares past their deadline and forgets old resolved ones.
+    /// Called by the broker reaper so waiting agents learn about expiry even
+    /// when nobody opens the Access panel.
+    pub fn expire_shares(&self) {
+        let mut state = self.inner.state.lock();
+        expire_shares_locked(&mut state, current_millis());
     }
 
     pub fn drop_grant_by_name(&self, terminal_id: Uuid, name: &str) -> Result<(), AccessError> {
@@ -1057,11 +1549,25 @@ impl AccessManager {
             .extract_if(|_, execution| execution.terminal_id == terminal_id)
             .map(|(_, execution)| execution.cancel)
             .collect::<Vec<_>>();
+        let shares = state
+            .shares
+            .extract_if(|_, share| share.terminal_id == terminal_id)
+            .map(|(_, share)| share)
+            .collect::<Vec<_>>();
         for request in requests {
             let _ = request.sender.send(AgentAccessEvent::Failed {
                 message: "terminal closed".to_owned(),
             });
         }
+        for share in shares
+            .iter()
+            .filter(|share| share.state == SecretShareState::Pending)
+        {
+            let _ = share.sender.send(AgentAccessEvent::Failed {
+                message: "terminal closed".to_owned(),
+            });
+        }
+        drop(shares);
         for cancel in executions {
             let _ = cancel.send(true);
         }
@@ -1085,8 +1591,14 @@ impl AccessManager {
             .extract_if(|_, execution| !active.contains(&execution.terminal_id))
             .map(|(_, execution)| execution.cancel)
             .collect::<Vec<_>>();
+        let shares = state
+            .shares
+            .extract_if(|_, share| !active.contains(&share.terminal_id))
+            .map(|(_, share)| share)
+            .collect::<Vec<_>>();
         let changed = !requests.is_empty()
             || !executions.is_empty()
+            || !shares.is_empty()
             || state
                 .grants
                 .values()
@@ -1096,6 +1608,15 @@ impl AccessManager {
                 message: "terminal exited".to_owned(),
             });
         }
+        for share in shares
+            .iter()
+            .filter(|share| share.state == SecretShareState::Pending)
+        {
+            let _ = share.sender.send(AgentAccessEvent::Failed {
+                message: "terminal exited".to_owned(),
+            });
+        }
+        drop(shares);
         for cancel in executions {
             let _ = cancel.send(true);
         }
@@ -1117,6 +1638,14 @@ impl AccessManager {
 
     fn detach_waiter(&self, request_id: Uuid) {
         let mut state = self.inner.state.lock();
+        if let Some(share) = state.shares.get_mut(&request_id) {
+            // A share outlives its waiters: the agent may return immediately
+            // and check on it later, so losing the last waiter changes nothing
+            // but the count shown to the user.
+            share.waiters = share.waiters.saturating_sub(1);
+            state.revision = state.revision.wrapping_add(1);
+            return;
+        }
         let remove = if let Some(request) = state.requests.get_mut(&request_id) {
             request.waiters = request.waiters.saturating_sub(1);
             request.waiters == 0 && request.state == AccessRequestState::Pending
@@ -1333,6 +1862,127 @@ impl SecretGrant {
             last_command: self.last_command.clone(),
         }
     }
+}
+
+impl SecretShare {
+    fn view(&self) -> SecretShareView {
+        SecretShareView {
+            id: self.id,
+            name: self.name.clone(),
+            description: self.description.clone(),
+            agent: self.agent.clone(),
+            state: self.state,
+            created_at: self.created_at,
+            expires_at: self.expires_at,
+            viewed_at: self.viewed_at,
+            resolved_at: self.resolved_at,
+            waiters: self.waiters,
+        }
+    }
+}
+
+fn shares_for_terminal(state: &AccessState, terminal_id: Uuid) -> Vec<SecretShareView> {
+    let mut shares = state
+        .shares
+        .values()
+        .filter(|share| share.terminal_id == terminal_id)
+        .map(SecretShare::view)
+        .collect::<Vec<_>>();
+    shares.sort_by_key(|share| share.created_at);
+    shares
+}
+
+/// Moves a share out of `Pending` and drops the broker's copy of the value.
+fn resolve_share(share: &mut SecretShare, state: SecretShareState, now: u64) {
+    share.state = state;
+    share.resolved_at = Some(now);
+    let value = std::mem::replace(&mut share.value, Zeroizing::new(String::new()));
+    drop(value);
+}
+
+fn expire_shares_locked(state: &mut AccessState, now: u64) {
+    let mut expired = Vec::new();
+    for share in state
+        .shares
+        .values_mut()
+        .filter(|share| share.state == SecretShareState::Pending && share.expires_at <= now)
+    {
+        resolve_share(share, SecretShareState::Expired, now);
+        let _ = share.sender.send(AgentAccessEvent::Expired {
+            name: share.name.clone(),
+        });
+        expired.push((share.terminal_id, share.name.clone()));
+    }
+    for (terminal_id, name) in expired {
+        push_activity(
+            state,
+            terminal_id,
+            AccessRequestKind::Secret,
+            AccessActivityStatus::Expired,
+            "Shared secret expired unviewed",
+            &name,
+        );
+    }
+    let before = state.shares.len();
+    state.shares.retain(|_, share| {
+        share.state == SecretShareState::Pending
+            || share.resolved_at.is_none_or(|resolved_at| {
+                now < resolved_at.saturating_add(RESOLVED_SECRET_SHARE_RETENTION_MILLIS)
+            })
+    });
+    if state.shares.len() != before {
+        state.revision = state.revision.wrapping_add(1);
+    }
+}
+
+/// A share is a snapshot of a grant; once that grant is gone the offer no
+/// longer describes anything the agent can use, so waiting agents are told
+/// it expired.
+fn expire_shares_for_grant(state: &mut AccessState, terminal_id: Uuid, name: &str, reason: &str) {
+    let now = current_millis();
+    let mut expired = Vec::new();
+    for share in state.shares.values_mut().filter(|share| {
+        share.terminal_id == terminal_id
+            && share.state == SecretShareState::Pending
+            && share.name == name
+    }) {
+        resolve_share(share, SecretShareState::Expired, now);
+        let _ = share.sender.send(AgentAccessEvent::Expired {
+            name: share.name.clone(),
+        });
+        expired.push(share.name.clone());
+    }
+    for name in expired {
+        push_activity(
+            state,
+            terminal_id,
+            AccessRequestKind::Secret,
+            AccessActivityStatus::Expired,
+            "Shared secret withdrawn",
+            &format!("{name} was {reason} before it was viewed"),
+        );
+    }
+}
+
+fn generate_secret_value(charset: GeneratedSecretCharset, length: usize) -> Zeroizing<String> {
+    const ALNUM: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    const ASCII: &[u8] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$%&()*+,-./:;<=>?@[]^_{|}~";
+    const HEX: &[u8] = b"0123456789abcdef";
+    const DIGITS: &[u8] = b"0123456789";
+    let alphabet = match charset {
+        GeneratedSecretCharset::Alnum => ALNUM,
+        GeneratedSecretCharset::Ascii => ASCII,
+        GeneratedSecretCharset::Hex => HEX,
+        GeneratedSecretCharset::Digits => DIGITS,
+    };
+    let mut rng = rand::rng();
+    let mut value = Zeroizing::new(String::with_capacity(length));
+    for _ in 0..length {
+        let index = rng.random_range(0..alphabet.len());
+        value.push(alphabet[index] as char);
+    }
+    value
 }
 
 fn push_activity(
@@ -2649,5 +3299,442 @@ exit 2
         let snapshot = manager.snapshot(terminal);
         assert!(snapshot.requests.is_empty());
         assert_eq!(snapshot.activity[0].status, AccessActivityStatus::Approved);
+    }
+
+    fn generate(name: &str, charset: GeneratedSecretCharset, length: usize) -> AgentSecretGenerate {
+        AgentSecretGenerate {
+            context: context(),
+            name: name.to_owned(),
+            description: Some("Database role for the app".to_owned()),
+            length: Some(length),
+            charset,
+            replace: false,
+        }
+    }
+
+    fn share(name: &str) -> AgentSecretShare {
+        AgentSecretShare {
+            context: context(),
+            name: name.to_owned(),
+            description: Some("Keep this in your password manager".to_owned()),
+        }
+    }
+
+    async fn run_with_secret(manager: &AccessManager, terminal: Uuid, name: &str) -> String {
+        let mut subscription = manager
+            .execute_secret(
+                terminal,
+                AgentSecretExecute {
+                    context: context(),
+                    name: name.to_owned(),
+                    cwd: std::env::current_dir().unwrap(),
+                    command: vec![
+                        "/bin/sh".to_owned(),
+                        "-c".to_owned(),
+                        format!("printf '%s' \"${name}\""),
+                    ],
+                    delivery: SecretDelivery::Env {
+                        name: name.to_owned(),
+                    },
+                },
+            )
+            .unwrap();
+        let mut output = Vec::new();
+        while let Some(event) = subscription.next().await {
+            match event {
+                AgentAccessEvent::Output { data } => output.extend(BASE64.decode(data).unwrap()),
+                AgentAccessEvent::Completed { return_code } => {
+                    assert_eq!(return_code, 0);
+                    break;
+                }
+                AgentAccessEvent::Failed { message } => panic!("{message}"),
+                _ => {}
+            }
+        }
+        String::from_utf8(output).unwrap()
+    }
+
+    #[tokio::test]
+    async fn generated_secret_is_usable_and_only_leaves_through_a_single_reveal() {
+        let manager = AccessManager::default();
+        let terminal = Uuid::new_v4();
+        let grant = manager
+            .generate_secret(
+                terminal,
+                generate("db_password", GeneratedSecretCharset::Hex, 40),
+            )
+            .unwrap();
+        assert_eq!(grant.name, "DB_PASSWORD");
+        assert_eq!(grant.source, "Generated for omp");
+        let encoded = serde_json::to_string(&grant).unwrap();
+        assert!(!encoded.contains("value"));
+
+        // The agent can use the value without seeing it.
+        assert_eq!(
+            run_with_secret(&manager, terminal, "DB_PASSWORD").await,
+            "[REDACTED: DB_PASSWORD]"
+        );
+
+        // The only way out is the user's one-time reveal.
+        let mut waiter = manager
+            .share_secret(terminal, share("DB_PASSWORD"))
+            .unwrap();
+        assert!(matches!(
+            waiter.next().await,
+            Some(AgentAccessEvent::Waiting { .. })
+        ));
+        let snapshot = manager.snapshot(terminal);
+        assert_eq!(snapshot.shares.len(), 1);
+        assert_eq!(snapshot.shares[0].state, SecretShareState::Pending);
+        assert_eq!(snapshot.shares[0].waiters, 1);
+        let share_id = snapshot.shares[0].id;
+        let reveal = manager.reveal_share(terminal, share_id).unwrap();
+        assert_eq!(reveal.value.len(), 40);
+        assert!(reveal.value.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(matches!(
+            waiter.next().await,
+            Some(AgentAccessEvent::Viewed { ref name }) if name == "DB_PASSWORD"
+        ));
+        assert!(matches!(
+            manager.reveal_share(terminal, share_id),
+            Err(AccessError::Gone(_))
+        ));
+        let snapshot = manager.snapshot(terminal);
+        assert_eq!(snapshot.shares[0].state, SecretShareState::Viewed);
+        assert!(snapshot.shares[0].viewed_at.is_some());
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        assert!(!encoded.contains(&reveal.value));
+        let listed = serde_json::to_string(&manager.list_shares(terminal)).unwrap();
+        assert!(!listed.contains(&reveal.value));
+        // The grant itself keeps working for the agent after the reveal.
+        assert_eq!(
+            run_with_secret(&manager, terminal, "DB_PASSWORD").await,
+            "[REDACTED: DB_PASSWORD]"
+        );
+    }
+
+    #[test]
+    fn generated_secrets_validate_length_and_respect_replace() {
+        let manager = AccessManager::default();
+        let terminal = Uuid::new_v4();
+        assert!(matches!(
+            manager.generate_secret(
+                terminal,
+                generate("SHORT", GeneratedSecretCharset::Alnum, 7)
+            ),
+            Err(AccessError::Invalid(_))
+        ));
+        assert!(matches!(
+            manager.generate_secret(
+                terminal,
+                generate("LONG", GeneratedSecretCharset::Alnum, 257)
+            ),
+            Err(AccessError::Invalid(_))
+        ));
+        let first = manager
+            .generate_secret(
+                terminal,
+                generate("TOKEN", GeneratedSecretCharset::Digits, 12),
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.generate_secret(
+                terminal,
+                generate("TOKEN", GeneratedSecretCharset::Digits, 12)
+            ),
+            Err(AccessError::Conflict(_))
+        ));
+        let mut replacement = generate("TOKEN", GeneratedSecretCharset::Digits, 12);
+        replacement.replace = true;
+        let second = manager.generate_secret(terminal, replacement).unwrap();
+        assert_ne!(first.id, second.id);
+        assert_eq!(manager.snapshot(terminal).grants.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn generated_secret_resolves_a_pending_request_for_the_same_name() {
+        let manager = AccessManager::default();
+        let terminal = Uuid::new_v4();
+        let mut waiter = pending_secret(&manager, terminal, "API_KEY");
+        assert!(matches!(
+            waiter.next().await,
+            Some(AgentAccessEvent::Waiting { .. })
+        ));
+        manager
+            .generate_secret(
+                terminal,
+                generate("API_KEY", GeneratedSecretCharset::Alnum, 32),
+            )
+            .unwrap();
+        assert!(matches!(
+            waiter.next().await,
+            Some(AgentAccessEvent::Granted { .. })
+        ));
+        assert!(manager.snapshot(terminal).requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dismissed_share_resolves_waiters_without_exposing_the_value() {
+        let manager = AccessManager::default();
+        let terminal = Uuid::new_v4();
+        manager
+            .add_secret(
+                terminal,
+                AddSecretGrant {
+                    name: "TOKEN".to_owned(),
+                    value: "never-serialize-this".to_owned(),
+                    description: None,
+                },
+            )
+            .unwrap();
+        let mut first = manager.share_secret(terminal, share("TOKEN")).unwrap();
+        let mut second = manager.share_secret(terminal, share("TOKEN")).unwrap();
+        let snapshot = manager.snapshot(terminal);
+        assert_eq!(
+            snapshot.shares.len(),
+            1,
+            "same offer attaches a second waiter"
+        );
+        assert_eq!(snapshot.shares[0].waiters, 2);
+        assert!(matches!(
+            manager.share_secret(
+                terminal,
+                AgentSecretShare {
+                    context: context(),
+                    name: "TOKEN".to_owned(),
+                    description: Some("Different reason".to_owned()),
+                }
+            ),
+            Err(AccessError::Conflict(_))
+        ));
+        let share_id = snapshot.shares[0].id;
+        manager.dismiss_share(terminal, share_id).unwrap();
+        for waiter in [&mut first, &mut second] {
+            assert!(matches!(
+                waiter.next().await,
+                Some(AgentAccessEvent::Waiting { .. })
+            ));
+            assert!(matches!(
+                waiter.next().await,
+                Some(AgentAccessEvent::Dismissed { .. })
+            ));
+        }
+        assert!(matches!(
+            manager.reveal_share(terminal, share_id),
+            Err(AccessError::Gone(_))
+        ));
+        assert!(matches!(
+            manager.dismiss_share(terminal, share_id),
+            Err(AccessError::Conflict(_))
+        ));
+        let encoded = serde_json::to_string(&manager.snapshot(terminal)).unwrap();
+        assert!(!encoded.contains("never-serialize-this"));
+        assert!(encoded.contains("\"dismissed\""));
+        // Late arrivals learn the outcome immediately.
+        let mut late = manager.wait_share(terminal, share_id).unwrap();
+        assert!(matches!(
+            late.next().await,
+            Some(AgentAccessEvent::Dismissed { .. })
+        ));
+        assert!(matches!(
+            manager.wait_share(terminal, Uuid::new_v4()),
+            Err(AccessError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn expired_share_resolves_waiters_and_can_no_longer_be_revealed() {
+        let manager = AccessManager::default();
+        let terminal = Uuid::new_v4();
+        manager
+            .add_secret(
+                terminal,
+                AddSecretGrant {
+                    name: "TOKEN".to_owned(),
+                    value: "never-serialize-this".to_owned(),
+                    description: None,
+                },
+            )
+            .unwrap();
+        let mut waiter = manager
+            .share_secret_with_ttl(terminal, share("TOKEN"), 0)
+            .unwrap();
+        let share_id = manager.snapshot(terminal).shares[0].id;
+        manager.expire_shares();
+        assert!(matches!(
+            waiter.next().await,
+            Some(AgentAccessEvent::Waiting { .. })
+        ));
+        assert!(matches!(
+            waiter.next().await,
+            Some(AgentAccessEvent::Expired { .. })
+        ));
+        assert!(matches!(
+            manager.reveal_share(terminal, share_id),
+            Err(AccessError::Gone(_))
+        ));
+        let snapshot = manager.snapshot(terminal);
+        assert_eq!(snapshot.shares[0].state, SecretShareState::Expired);
+        assert!(
+            snapshot
+                .activity
+                .iter()
+                .any(|entry| entry.status == AccessActivityStatus::Expired)
+        );
+        // A fresh offer for the same name is a new share, not the expired one.
+        let _again = manager.share_secret(terminal, share("TOKEN")).unwrap();
+        assert_eq!(manager.snapshot(terminal).shares.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn revoking_or_replacing_a_grant_withdraws_its_pending_share() {
+        let manager = AccessManager::default();
+        let terminal = Uuid::new_v4();
+        manager
+            .generate_secret(
+                terminal,
+                generate("TOKEN", GeneratedSecretCharset::Alnum, 16),
+            )
+            .unwrap();
+        let mut waiter = manager.share_secret(terminal, share("TOKEN")).unwrap();
+        let mut replacement = generate("TOKEN", GeneratedSecretCharset::Alnum, 16);
+        replacement.replace = true;
+        manager.generate_secret(terminal, replacement).unwrap();
+        assert!(matches!(
+            waiter.next().await,
+            Some(AgentAccessEvent::Waiting { .. })
+        ));
+        assert!(matches!(
+            waiter.next().await,
+            Some(AgentAccessEvent::Expired { .. })
+        ));
+        let mut waiter = manager.share_secret(terminal, share("TOKEN")).unwrap();
+        manager.drop_grant_by_name(terminal, "TOKEN").unwrap();
+        assert!(matches!(
+            waiter.next().await,
+            Some(AgentAccessEvent::Waiting { .. })
+        ));
+        assert!(matches!(
+            waiter.next().await,
+            Some(AgentAccessEvent::Expired { .. })
+        ));
+        assert!(matches!(
+            manager.share_secret(terminal, share("TOKEN")),
+            Err(AccessError::Conflict(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn closing_a_terminal_fails_pending_share_waiters() {
+        let manager = AccessManager::default();
+        let terminal = Uuid::new_v4();
+        manager
+            .generate_secret(
+                terminal,
+                generate("TOKEN", GeneratedSecretCharset::Alnum, 16),
+            )
+            .unwrap();
+        let mut closed = manager.share_secret(terminal, share("TOKEN")).unwrap();
+        manager.clear_terminal(terminal);
+        assert!(matches!(
+            closed.next().await,
+            Some(AgentAccessEvent::Waiting { .. })
+        ));
+        assert!(matches!(
+            closed.next().await,
+            Some(AgentAccessEvent::Failed { .. })
+        ));
+        assert!(manager.snapshot(terminal).shares.is_empty());
+
+        let exited = Uuid::new_v4();
+        manager
+            .generate_secret(exited, generate("TOKEN", GeneratedSecretCharset::Alnum, 16))
+            .unwrap();
+        let mut gone = manager.share_secret(exited, share("TOKEN")).unwrap();
+        manager.clear_inactive_terminals(&HashSet::new());
+        assert!(matches!(
+            gone.next().await,
+            Some(AgentAccessEvent::Waiting { .. })
+        ));
+        assert!(matches!(
+            gone.next().await,
+            Some(AgentAccessEvent::Failed { .. })
+        ));
+    }
+
+    #[test]
+    fn pending_shares_count_toward_pending_access_and_are_bounded() {
+        let manager = AccessManager::default();
+        let terminal = Uuid::new_v4();
+        let mut waiters = Vec::new();
+        for index in 0..MAX_PENDING_SECRET_SHARES_PER_TERMINAL {
+            let name = format!("TOKEN_{index}");
+            manager
+                .generate_secret(terminal, generate(&name, GeneratedSecretCharset::Alnum, 16))
+                .unwrap();
+            waiters.push(manager.share_secret(terminal, share(&name)).unwrap());
+        }
+        manager
+            .generate_secret(
+                terminal,
+                generate("EXTRA", GeneratedSecretCharset::Alnum, 16),
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.share_secret(terminal, share("EXTRA")),
+            Err(AccessError::Conflict(_))
+        ));
+        let mut terminals = [terminal_info(terminal)];
+        manager.populate_pending_request_counts(&mut terminals);
+        assert_eq!(
+            terminals[0].pending_access_requests,
+            Some(MAX_PENDING_SECRET_SHARES_PER_TERMINAL)
+        );
+        // Dropping every waiter keeps the offer for the user.
+        drop(waiters);
+        let snapshot = manager.snapshot(terminal);
+        assert_eq!(
+            snapshot.shares.len(),
+            MAX_PENDING_SECRET_SHARES_PER_TERMINAL
+        );
+        assert!(snapshot.shares.iter().all(|share| share.waiters == 0));
+        assert!(
+            snapshot
+                .shares
+                .iter()
+                .all(|share| share.state == SecretShareState::Pending)
+        );
+        let share_id = snapshot.shares[0].id;
+        manager.dismiss_share(terminal, share_id).unwrap();
+        manager.populate_pending_request_counts(&mut terminals);
+        assert_eq!(
+            terminals[0].pending_access_requests,
+            Some(MAX_PENDING_SECRET_SHARES_PER_TERMINAL - 1)
+        );
+    }
+
+    #[test]
+    fn generated_values_use_the_requested_alphabet() {
+        for (charset, check) in [
+            (
+                GeneratedSecretCharset::Alnum,
+                (|byte: u8| byte.is_ascii_alphanumeric()) as fn(u8) -> bool,
+            ),
+            (GeneratedSecretCharset::Ascii, |byte| {
+                byte.is_ascii_graphic() && !matches!(byte, b'"' | b'\'' | b'\\' | b'`')
+            }),
+            (GeneratedSecretCharset::Hex, |byte| {
+                byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+            }),
+            (GeneratedSecretCharset::Digits, |byte| byte.is_ascii_digit()),
+        ] {
+            let value = generate_secret_value(charset, 64);
+            assert_eq!(value.len(), 64);
+            assert!(value.bytes().all(check), "{charset:?}: {}", value.as_str());
+        }
+        assert_ne!(
+            generate_secret_value(GeneratedSecretCharset::Alnum, 32).as_str(),
+            generate_secret_value(GeneratedSecretCharset::Alnum, 32).as_str()
+        );
     }
 }

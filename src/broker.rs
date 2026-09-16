@@ -36,8 +36,9 @@ use crate::{
     access::{
         AccessDecision, AccessError, AccessManager, AccessRequestState, AccessSnapshot,
         AccessSubscription, AddSecretGrant, AgentAccessEvent, AgentRequestContext,
-        AgentSecretExecute, AgentSecretName, AgentSecretRequest, AgentSudoRequest, SecretApproval,
-        SecretGrantView, SudoApproval,
+        AgentSecretExecute, AgentSecretGenerate, AgentSecretName, AgentSecretRequest,
+        AgentSecretShare, AgentSecretShareId, AgentSudoRequest, SecretApproval, SecretGrantView,
+        SecretShareReveal, SecretShareState, SecretShareView, SudoApproval,
     },
     agent_events::AgentEvent,
     ai::{PiClientConfig, PiService, UpdatePiSettings},
@@ -413,6 +414,80 @@ impl BrokerClient {
         .await
     }
 
+    pub async fn reveal_share(
+        &self,
+        id: Uuid,
+        share_id: Uuid,
+    ) -> Result<SecretShareReveal, BrokerError> {
+        self.send_json::<(), _>(
+            Method::POST,
+            &format!("/terminals/{id}/access/shares/{share_id}/reveal"),
+            None,
+        )
+        .await
+    }
+
+    pub async fn dismiss_share(&self, id: Uuid, share_id: Uuid) -> Result<(), BrokerError> {
+        self.send_empty::<()>(
+            Method::POST,
+            &format!("/terminals/{id}/access/shares/{share_id}/dismiss"),
+            None,
+        )
+        .await
+    }
+
+    pub async fn agent_secret_generate(
+        &self,
+        id: Uuid,
+        request: &AgentSecretGenerate,
+    ) -> Result<SecretGrantView, BrokerError> {
+        self.send_json(
+            Method::POST,
+            &format!("/terminals/{id}/access/agent/secret/generate"),
+            Some(request),
+        )
+        .await
+    }
+
+    pub async fn agent_secret_share(
+        &self,
+        id: Uuid,
+        request: &AgentSecretShare,
+    ) -> Result<Incoming, BrokerError> {
+        self.request_stream(
+            Method::POST,
+            &format!("/terminals/{id}/access/agent/secret/share"),
+            request,
+        )
+        .await
+    }
+
+    pub async fn agent_secret_share_wait(
+        &self,
+        id: Uuid,
+        request: &AgentSecretShareId,
+    ) -> Result<Incoming, BrokerError> {
+        self.request_stream(
+            Method::POST,
+            &format!("/terminals/{id}/access/agent/secret/share/wait"),
+            request,
+        )
+        .await
+    }
+
+    pub async fn agent_secret_share_list(
+        &self,
+        id: Uuid,
+        request: &AgentRequestContext,
+    ) -> Result<Vec<SecretShareView>, BrokerError> {
+        self.send_json(
+            Method::POST,
+            &format!("/terminals/{id}/access/agent/secret/share/list"),
+            Some(request),
+        )
+        .await
+    }
+
     pub async fn agent_secret_request(
         &self,
         id: Uuid,
@@ -708,11 +783,18 @@ impl BrokerGeneration {
             .filter(|terminal| terminal.pending_access_requests.is_none())
         {
             let pending = match self.client.access_snapshot(terminal.id).await {
-                Ok(snapshot) => snapshot
-                    .requests
-                    .iter()
-                    .filter(|request| request.state == AccessRequestState::Pending)
-                    .count(),
+                Ok(snapshot) => {
+                    snapshot
+                        .requests
+                        .iter()
+                        .filter(|request| request.state == AccessRequestState::Pending)
+                        .count()
+                        + snapshot
+                            .shares
+                            .iter()
+                            .filter(|share| share.state == SecretShareState::Pending)
+                            .count()
+                }
                 // Brokers from before integrated access have no snapshot route
                 // and cannot have requests to report.
                 Err(BrokerError::Remote { status, .. }) if status == StatusCode::NOT_FOUND => 0,
@@ -1130,6 +1212,26 @@ impl BrokerPool {
             .await?
             .client
             .reject_access(id, request_id, request)
+            .await
+    }
+
+    pub async fn reveal_share(
+        &self,
+        id: Uuid,
+        share_id: Uuid,
+    ) -> Result<SecretShareReveal, BrokerError> {
+        self.access_owner(id)
+            .await?
+            .client
+            .reveal_share(id, share_id)
+            .await
+    }
+
+    pub async fn dismiss_share(&self, id: Uuid, share_id: Uuid) -> Result<(), BrokerError> {
+        self.access_owner(id)
+            .await?
+            .client
+            .dismiss_share(id, share_id)
             .await
     }
 
@@ -1603,6 +1705,7 @@ fn start_access_reaper(state: BrokerState) {
                         .map(|terminal| terminal.id)
                         .collect::<HashSet<_>>();
                     state.access.clear_inactive_terminals(&active);
+                    state.access.expire_shares();
                 }
                 _ = state.shutdown.notified() => return,
             }
@@ -1620,6 +1723,8 @@ enum BrokerApiError {
     BadRequest(String),
     #[error("{0}")]
     Conflict(String),
+    #[error("{0}")]
+    Gone(String),
     #[error("internal broker error")]
     Internal,
 }
@@ -1630,6 +1735,7 @@ impl From<AccessError> for BrokerApiError {
             AccessError::NotFound => Self::NotFound,
             AccessError::Stale => Self::Conflict(error.to_string()),
             AccessError::Conflict(message) => Self::Conflict(message),
+            AccessError::Gone(message) => Self::Gone(message),
             AccessError::Invalid(message) | AccessError::Unavailable(message) => {
                 Self::BadRequest(message)
             }
@@ -1644,6 +1750,7 @@ impl IntoResponse for BrokerApiError {
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::Gone(_) => StatusCode::GONE,
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (
@@ -1728,6 +1835,30 @@ pub async fn run_session_broker(
         .route(
             "/terminals/{id}/access/requests/{request_id}/reject",
             post(broker_reject_access),
+        )
+        .route(
+            "/terminals/{id}/access/shares/{share_id}/reveal",
+            post(broker_reveal_share),
+        )
+        .route(
+            "/terminals/{id}/access/shares/{share_id}/dismiss",
+            post(broker_dismiss_share),
+        )
+        .route(
+            "/terminals/{id}/access/agent/secret/generate",
+            post(broker_agent_secret_generate),
+        )
+        .route(
+            "/terminals/{id}/access/agent/secret/share",
+            post(broker_agent_secret_share),
+        )
+        .route(
+            "/terminals/{id}/access/agent/secret/share/wait",
+            post(broker_agent_secret_share_wait),
+        )
+        .route(
+            "/terminals/{id}/access/agent/secret/share/list",
+            post(broker_agent_secret_share_list),
         )
         .route(
             "/terminals/{id}/access/agent/secret/request",
@@ -1986,6 +2117,84 @@ async fn broker_reject_access(
         .reject(id, request_id, request)
         .map(|()| StatusCode::NO_CONTENT)
         .map_err(Into::into)
+}
+
+async fn broker_reveal_share(
+    State(state): State<BrokerState>,
+    headers: HeaderMap,
+    AxumPath((id, share_id)): AxumPath<(Uuid, Uuid)>,
+) -> Result<Json<SecretShareReveal>, BrokerApiError> {
+    authorize_broker_history(&state, &headers)?;
+    state
+        .access
+        .reveal_share(id, share_id)
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn broker_dismiss_share(
+    State(state): State<BrokerState>,
+    headers: HeaderMap,
+    AxumPath((id, share_id)): AxumPath<(Uuid, Uuid)>,
+) -> Result<StatusCode, BrokerApiError> {
+    authorize_broker_history(&state, &headers)?;
+    state
+        .access
+        .dismiss_share(id, share_id)
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(Into::into)
+}
+
+async fn broker_agent_secret_generate(
+    State(state): State<BrokerState>,
+    ConnectInfo(peer): ConnectInfo<BrokerPeerCredentials>,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(request): Json<AgentSecretGenerate>,
+) -> Result<(StatusCode, Json<SecretGrantView>), BrokerApiError> {
+    authorize_agent_request(&state, &peer, id, &request.context)?;
+    state
+        .access
+        .generate_secret(id, request)
+        .map(|grant| (StatusCode::CREATED, Json(grant)))
+        .map_err(Into::into)
+}
+
+async fn broker_agent_secret_share(
+    State(state): State<BrokerState>,
+    ConnectInfo(peer): ConnectInfo<BrokerPeerCredentials>,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(request): Json<AgentSecretShare>,
+) -> Result<Response, BrokerApiError> {
+    authorize_agent_request(&state, &peer, id, &request.context)?;
+    state
+        .access
+        .share_secret(id, request)
+        .map(subscription_response)
+        .map_err(Into::into)
+}
+
+async fn broker_agent_secret_share_wait(
+    State(state): State<BrokerState>,
+    ConnectInfo(peer): ConnectInfo<BrokerPeerCredentials>,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(request): Json<AgentSecretShareId>,
+) -> Result<Response, BrokerApiError> {
+    authorize_agent_request(&state, &peer, id, &request.context)?;
+    state
+        .access
+        .wait_share(id, request.id)
+        .map(subscription_response)
+        .map_err(Into::into)
+}
+
+async fn broker_agent_secret_share_list(
+    State(state): State<BrokerState>,
+    ConnectInfo(peer): ConnectInfo<BrokerPeerCredentials>,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(request): Json<AgentRequestContext>,
+) -> Result<Json<Vec<SecretShareView>>, BrokerApiError> {
+    authorize_agent_request(&state, &peer, id, &request)?;
+    Ok(Json(state.access.list_shares(id)))
 }
 
 async fn broker_agent_secret_request(

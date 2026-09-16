@@ -5,10 +5,16 @@ import {
   CircleCheck,
   CircleX,
   Clock3,
+  Copy,
+  Eye,
+  EyeOff,
+  Gift,
+  Hourglass,
   KeyRound,
   LoaderCircle,
   LockKeyhole,
   Plus,
+  ShieldAlert,
   ShieldCheck,
   TerminalSquare,
   Trash2,
@@ -21,8 +27,10 @@ import type {
   AccessRequest,
   AccessSnapshot,
   SecretGrant,
+  SecretShare,
   TerminalInfo,
 } from "../../shared/types";
+import { orderShares, shareOutcome, untilTime } from "../lib/access-shares";
 import { api } from "../lib/api";
 
 interface AccessPanelProps {
@@ -37,8 +45,15 @@ const emptySnapshot = (terminalId: string): AccessSnapshot => ({
   revision: 0,
   requests: [],
   grants: [],
+  shares: [],
   activity: [],
 });
+
+interface RevealedShare {
+  id: string;
+  name: string;
+  value: string;
+}
 
 export function AccessPanel({
   open,
@@ -53,7 +68,11 @@ export function AccessPanel({
   const [sudoRequestId, setSudoRequestId] = useState<string | null>(null);
   const [addingSecret, setAddingSecret] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
-  const pendingCount = snapshot.requests.filter((request) => request.state === "pending").length;
+  // Held only while the panel is open so a revealed value never outlives the view.
+  const [revealed, setRevealed] = useState<RevealedShare | null>(null);
+  const pendingShares = snapshot.shares.filter((share) => share.state === "pending").length;
+  const pendingCount = snapshot.requests.filter((request) => request.state === "pending").length
+    + pendingShares;
 
   const refresh = useCallback(async (signal?: AbortSignal) => {
     const next = await api.terminalAccess(terminal.id, signal);
@@ -67,6 +86,7 @@ export function AccessPanel({
     const controller = new AbortController();
     let timer = 0;
     setSnapshot(emptySnapshot(terminal.id));
+    setRevealed(null);
     setLoading(true);
     setError("");
     const poll = async () => {
@@ -85,6 +105,7 @@ export function AccessPanel({
     return () => {
       controller.abort();
       clearTimeout(timer);
+      setRevealed(null);
     };
   }, [open, refresh, terminal.id]);
 
@@ -167,6 +188,49 @@ export function AccessPanel({
     }
   };
 
+  const revealShare = async (share: SecretShare) => {
+    const confirmed = window.confirm(
+      `Reveal ${share.name} now?\n\nIt is shown once and never again. Make sure nobody else can see your screen.`,
+    );
+    if (!confirmed) return;
+    setBusy(share.id);
+    setError("");
+    try {
+      const reveal = await api.revealTerminalShare(terminal.id, share.id);
+      setRevealed({ id: share.id, name: reveal.name, value: reveal.value });
+      onNotice(`${reveal.name} revealed once; it will not be shown again`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Unable to reveal the shared secret");
+    } finally {
+      setBusy(null);
+      await refresh().catch(() => undefined);
+    }
+  };
+
+  const dismissShare = async (share: SecretShare) => {
+    if (!window.confirm(`Dismiss ${share.name} without viewing it? The agent will be told you did not see it.`)) return;
+    await perform(
+      share.id,
+      () => api.dismissTerminalShare(terminal.id, share.id),
+      `${share.name} dismissed without viewing`,
+    );
+  };
+
+  const copyRevealed = async () => {
+    if (!revealed) return;
+    const clipboard = typeof navigator === "undefined" ? undefined : navigator.clipboard;
+    if (!clipboard?.writeText) {
+      onNotice("Clipboard is unavailable here; select the value and copy it manually");
+      return;
+    }
+    try {
+      await clipboard.writeText(revealed.value);
+      onNotice(`Copied ${revealed.name}`);
+    } catch {
+      onNotice("Clipboard permission was denied; select the value and copy it manually");
+    }
+  };
+
   const revokeGrant = async (grant: SecretGrant) => {
     if (!window.confirm(`Revoke ${grant.name} from ${terminal.name}?`)) return;
     await perform(
@@ -190,10 +254,29 @@ export function AccessPanel({
         </button>
       </header>
       <div class="process-inspector-note access-panel-note">
-        Values are sent once to the local broker and never returned to the browser or agent. Access is scoped to <strong>{terminal.name}</strong>.
+        Values you provide go once to the local broker and never back to the agent. Values an agent shares with you are shown once, here only. Access is scoped to <strong>{terminal.name}</strong>.
       </div>
       <div class="process-inspector-scroll access-panel-scroll">
         {error && <div class="process-inspector-error" role="alert">{error}</div>}
+        {snapshot.shares.length > 0 && (
+          <section class="process-section access-section" data-access-shares={String(pendingShares)}>
+            <div class="process-section-heading">
+              <span>Shared with you</span><span>{pendingShares}</span>
+            </div>
+            {orderShares(snapshot.shares).map((share) => (
+              <SecretShareCard
+                key={share.id}
+                share={share}
+                busy={busy === share.id}
+                revealed={revealed?.id === share.id ? revealed.value : null}
+                onReveal={() => void revealShare(share)}
+                onDismiss={() => void dismissShare(share)}
+                onCopy={() => void copyRevealed()}
+                onHide={() => setRevealed(null)}
+              />
+            ))}
+          </section>
+        )}
         <section class="process-section access-section">
           <div class="process-section-heading">
             <span>Needs your approval</span><span>{snapshot.requests.length}</span>
@@ -268,7 +351,7 @@ export function AccessPanel({
         </section>
 
         <footer class="access-panel-footer">
-          <span><LockKeyhole size={11} /> Secret values are never displayed or persisted</span>
+          <span><LockKeyhole size={11} /> Your values are never displayed; shared values show once</span>
           <span>{terminal.path}</span>
         </footer>
       </div>
@@ -368,6 +451,69 @@ function AccessRequestCard({
   );
 }
 
+function SecretShareCard({
+  share,
+  busy,
+  revealed,
+  onReveal,
+  onDismiss,
+  onCopy,
+  onHide,
+}: {
+  share: SecretShare;
+  busy: boolean;
+  revealed: string | null;
+  onReveal: () => void;
+  onDismiss: () => void;
+  onCopy: () => void;
+  onHide: () => void;
+}) {
+  const pending = share.state === "pending";
+  return (
+    <article class={`access-request share ${share.state}`} data-share-id={share.id} data-share-state={share.state}>
+      <div class="access-request-icon share"><Gift size={15} /></div>
+      <div class="access-request-main">
+        <div class="access-request-heading">
+          <strong>{share.name}</strong>
+          <span class="access-kind share">shared</span>
+          {!pending && <span class={`access-share-state ${share.state}`}>{share.state}</span>}
+        </div>
+        {share.description && <p>{share.description}</p>}
+        <div class="access-request-meta">
+          <span><Clock3 size={10} /> {relativeTime(share.createdAt)}</span>
+          {pending && <span><Hourglass size={10} /> expires {untilTime(share.expiresAt)}</span>}
+          {share.state === "viewed" && share.viewedAt !== null && (
+            <span><Eye size={10} /> viewed {relativeTime(share.viewedAt)}</span>
+          )}
+          {pending && (
+            <span><Users size={10} /> {share.waiters ? `${share.waiters} waiting` : "agent not waiting"}</span>
+          )}
+          <span>{share.agent}</span>
+        </div>
+        {revealed !== null ? (
+          <div class="access-share-reveal">
+            <code class="access-share-value" data-share-value>{revealed}</code>
+            <small><ShieldAlert size={10} /> Shown once. Save it now; it will not be displayed again.</small>
+            <div class="access-actions">
+              <button type="button" class="access-button" onClick={onHide}><EyeOff size={12} /> Hide</button>
+              <button type="button" class="access-button primary" onClick={onCopy}><Copy size={12} /> Copy</button>
+            </div>
+          </div>
+        ) : pending ? (
+          <div class="access-actions">
+            <button class="access-button danger" disabled={busy} onClick={onDismiss}><Ban size={12} /> Dismiss</button>
+            <button class="access-button primary" disabled={busy} onClick={onReveal}>
+              {busy ? <LoaderCircle class="spin" size={12} /> : <Eye size={12} />} Reveal once
+            </button>
+          </div>
+        ) : (
+          <div class="access-share-outcome">{shareOutcome(share)}</div>
+        )}
+      </div>
+    </article>
+  );
+}
+
 function SecretGrantRow({ grant, busy, onRevoke }: { grant: SecretGrant; busy: boolean; onRevoke: () => void }) {
   return (
     <div class="access-grant">
@@ -388,7 +534,11 @@ function ActivityRow({ entry }: { entry: AccessActivity }) {
   return (
     <div class={`access-activity ${entry.status}`}>
       <span class="access-activity-icon">
-        {entry.status === "approved" ? <CircleCheck size={13} /> : entry.status === "rejected" ? <CircleX size={13} /> : <Trash2 size={13} />}
+        {entry.status === "approved" || entry.status === "viewed" ? <CircleCheck size={13} />
+          : entry.status === "rejected" || entry.status === "dismissed" ? <CircleX size={13} />
+          : entry.status === "shared" ? <Gift size={13} />
+          : entry.status === "expired" ? <Hourglass size={13} />
+          : <Trash2 size={13} />}
       </span>
       <span class="access-activity-copy"><strong>{entry.title}</strong><small>{entry.detail}</small></span>
       <time>{relativeTime(entry.createdAt)}</time>

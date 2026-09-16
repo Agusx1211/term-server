@@ -169,6 +169,8 @@ pub enum ApiError {
     #[error("{0}")]
     Conflict(String),
     #[error("{0}")]
+    Gone(String),
+    #[error("{0}")]
     PayloadTooLarge(String),
     #[error("{0}")]
     BadGateway(String),
@@ -194,6 +196,7 @@ impl IntoResponse for ApiError {
             Self::BadRequest(_) => (StatusCode::BAD_REQUEST, None),
             Self::UpgradeRequired(_) => (StatusCode::UPGRADE_REQUIRED, None),
             Self::Conflict(_) => (StatusCode::CONFLICT, None),
+            Self::Gone(_) => (StatusCode::GONE, None),
             Self::PayloadTooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, None),
             Self::BadGateway(_) => (StatusCode::BAD_GATEWAY, None),
             Self::RateLimited(seconds) => (StatusCode::TOO_MANY_REQUESTS, Some(seconds)),
@@ -222,6 +225,7 @@ impl From<WorkspaceError> for ApiError {
             Some(StatusCode::NOT_FOUND) => Self::NotFound,
             Some(StatusCode::BAD_REQUEST) => Self::BadRequest(error.to_string()),
             Some(StatusCode::CONFLICT) => Self::Conflict(error.to_string()),
+            Some(StatusCode::GONE) => Self::Gone(error.to_string()),
             _ => Self::BadGateway(error.to_string()),
         }
     }
@@ -1224,6 +1228,38 @@ async fn reject_terminal_access(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Hands a shared secret value to the signed-in user exactly once. It sits
+/// behind the same origin, session, and HTTPS checks as secret approval
+/// because it is the only route that ever returns a secret value; the API
+/// layer's `no-store` cache policy keeps it out of browser caches.
+async fn reveal_terminal_share(
+    State(state): State<AppState>,
+    Path((id, share_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+) -> Result<Json<crate::access::SecretShareReveal>, ApiError> {
+    require_sensitive_access(&headers, &uri, &jar, &state)?;
+    state
+        .workspace
+        .reveal_share(id, share_id)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn dismiss_terminal_share(
+    State(state): State<AppState>,
+    Path((id, share_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+) -> Result<StatusCode, ApiError> {
+    require_sensitive_access(&headers, &uri, &jar, &state)?;
+    state.workspace.dismiss_share(id, share_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Reports what screen detection saw for a terminal and which rule decided its
 /// agent status, for diagnosing an agent stuck in the wrong state.
 async fn terminal_agent_explain(
@@ -2117,6 +2153,14 @@ pub fn build_router(state: AppState, client_directory: Option<PathBuf>) -> Route
             "/terminals/{id}/access/requests/{request_id}/reject",
             post(reject_terminal_access).layer(DefaultBodyLimit::max(4 * 1024)),
         )
+        .route(
+            "/terminals/{id}/access/shares/{share_id}/reveal",
+            post(reveal_terminal_share),
+        )
+        .route(
+            "/terminals/{id}/access/shares/{share_id}/dismiss",
+            post(dismiss_terminal_share),
+        )
         .route("/terminals/{id}/agent/explain", get(terminal_agent_explain))
         .route(
             "/terminals/{id}/processes/{process_id}",
@@ -2574,6 +2618,260 @@ mod tests {
         let snapshot_text = String::from_utf8_lossy(&snapshot_body);
         assert!(snapshot_text.contains("TOKEN"));
         assert!(!snapshot_text.contains("browser-secret"));
+    }
+
+    fn local_access_manager(state: &AppState) -> crate::access::AccessManager {
+        match &state.workspace {
+            WorkspaceBackend::Local { access, .. } => access.clone(),
+            #[cfg(unix)]
+            WorkspaceBackend::Broker(_) => panic!("tests use the local workspace"),
+        }
+    }
+
+    fn share_from_agent(
+        access: &crate::access::AccessManager,
+        terminal: Uuid,
+        name: &str,
+    ) -> (crate::access::AccessSubscription, Uuid) {
+        let subscription = access
+            .share_secret(
+                terminal,
+                crate::access::AgentSecretShare {
+                    context: crate::access::AgentRequestContext {
+                        pid: std::process::id(),
+                        start_ticks: 0,
+                        agent: "omp".to_owned(),
+                    },
+                    name: name.to_owned(),
+                    description: Some("Store it in your password manager".to_owned()),
+                },
+            )
+            .unwrap();
+        let share_id = access
+            .snapshot(terminal)
+            .shares
+            .into_iter()
+            .find(|share| {
+                share.name == name && share.state == crate::access::SecretShareState::Pending
+            })
+            .map(|share| share.id)
+            .unwrap();
+        (subscription, share_id)
+    }
+
+    #[tokio::test]
+    async fn share_reveal_requires_https() {
+        let state = test_state().await;
+        let access = local_access_manager(&state);
+        let (app, cookie) = authenticated_app_with_state(state).await;
+        let terminal = create_test_terminal(&app, &cookie).await;
+        access
+            .generate_secret(
+                terminal,
+                crate::access::AgentSecretGenerate {
+                    context: crate::access::AgentRequestContext {
+                        pid: std::process::id(),
+                        start_ticks: 0,
+                        agent: "omp".to_owned(),
+                    },
+                    name: "DB_PASSWORD".to_owned(),
+                    description: None,
+                    length: None,
+                    charset: Default::default(),
+                    replace: false,
+                },
+            )
+            .unwrap();
+        let (_waiter, share_id) = share_from_agent(&access, terminal, "DB_PASSWORD");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/terminals/{terminal}/access/shares/{share_id}/reveal"
+                    ))
+                    .header(header::HOST, "localhost")
+                    .header(header::ORIGIN, "http://localhost")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+        assert_eq!(
+            access.snapshot(terminal).shares[0].state,
+            crate::access::SecretShareState::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_secret_is_revealed_exactly_once_to_a_same_origin_session() {
+        let mut state = test_state().await;
+        state.secure = true;
+        let access = local_access_manager(&state);
+        let (app, cookie) = authenticated_app_with_state(state).await;
+        let terminal = create_test_terminal(&app, &cookie).await;
+        access
+            .add_secret(
+                terminal,
+                AddSecretGrant {
+                    name: "DB_PASSWORD".to_owned(),
+                    value: "generated-for-the-user".to_owned(),
+                    description: None,
+                },
+            )
+            .unwrap();
+        let (mut waiter, share_id) = share_from_agent(&access, terminal, "DB_PASSWORD");
+        assert!(matches!(
+            waiter.next().await,
+            Some(crate::access::AgentAccessEvent::Waiting { .. })
+        ));
+
+        let reveal_path = format!("/api/terminals/{terminal}/access/shares/{share_id}/reveal");
+        let anonymous = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&reveal_path)
+                    .header(header::HOST, "localhost")
+                    .header(header::ORIGIN, "https://localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+        let missing_origin = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&reveal_path)
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_origin.status(), StatusCode::FORBIDDEN);
+
+        // Until the user reveals it, the snapshot lists the offer without the value.
+        let snapshot = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/terminals/{terminal}/access"))
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let snapshot_text =
+            String::from_utf8_lossy(&to_bytes(snapshot.into_body(), 64 * 1024).await.unwrap())
+                .into_owned();
+        assert!(snapshot_text.contains("\"shares\""));
+        assert!(snapshot_text.contains("\"pending\""));
+        assert!(!snapshot_text.contains("generated-for-the-user"));
+
+        let revealed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&reveal_path)
+                    .header(header::HOST, "localhost")
+                    .header(header::ORIGIN, "https://localhost")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revealed.status(), StatusCode::OK);
+        assert_eq!(
+            revealed.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(revealed.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(body["name"], "DB_PASSWORD");
+        assert_eq!(body["value"], "generated-for-the-user");
+        assert!(matches!(
+            waiter.next().await,
+            Some(crate::access::AgentAccessEvent::Viewed { .. })
+        ));
+
+        let again = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&reveal_path)
+                    .header(header::HOST, "localhost")
+                    .header(header::ORIGIN, "https://localhost")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(again.status(), StatusCode::GONE);
+        let again_text =
+            String::from_utf8_lossy(&to_bytes(again.into_body(), 64 * 1024).await.unwrap())
+                .into_owned();
+        assert!(!again_text.contains("generated-for-the-user"));
+
+        let snapshot = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/terminals/{terminal}/access"))
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let snapshot_text =
+            String::from_utf8_lossy(&to_bytes(snapshot.into_body(), 64 * 1024).await.unwrap())
+                .into_owned();
+        assert!(snapshot_text.contains("\"viewed\""));
+        assert!(!snapshot_text.contains("generated-for-the-user"));
+
+        // Dismissing tells the agent the value was not seen and drops it.
+        let (mut second_waiter, second_share) = share_from_agent(&access, terminal, "DB_PASSWORD");
+        let dismissed = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/terminals/{terminal}/access/shares/{second_share}/dismiss"
+                    ))
+                    .header(header::HOST, "localhost")
+                    .header(header::ORIGIN, "https://localhost")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dismissed.status(), StatusCode::NO_CONTENT);
+        assert!(matches!(
+            second_waiter.next().await,
+            Some(crate::access::AgentAccessEvent::Waiting { .. })
+        ));
+        assert!(matches!(
+            second_waiter.next().await,
+            Some(crate::access::AgentAccessEvent::Dismissed { .. })
+        ));
+        assert!(matches!(
+            access.reveal_share(terminal, second_share),
+            Err(crate::access::AccessError::Gone(_))
+        ));
     }
 
     #[tokio::test]

@@ -215,6 +215,7 @@ test("P0-09 Cached pane remains live and restores visibly @p0 @smoke", async ({ 
   await controlWorkbench.openTerminal({ id: terminalAId, name: terminalAName });
   const controlPaneA = controlWorkbench.terminal(terminalAId);
   await controlPaneA.expectVisible();
+  await waitForFontSettledViewport(controlPage, terminalAId, { timeout: 15_000 });
   const controlA = await expectTerminalSynchronized(controlPage, terminalAId);
   expect(controlA.serverViewport?.cols).toBe(wideServerViewport.cols);
   expect(controlA.serverViewport?.rows).toBe(wideServerViewport.rows);

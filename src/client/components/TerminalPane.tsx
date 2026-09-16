@@ -15,6 +15,8 @@ import {
   EllipsisVertical,
   GripVertical,
   Hand,
+  Keyboard,
+  KeyboardOff,
   ListTree,
   Maximize2,
   PackageOpen,
@@ -54,6 +56,13 @@ import {
   transformTerminalInput,
   type TerminalModifiers,
 } from "../lib/mobile-terminal";
+import {
+  TouchTapTracker,
+  keyboardVisible,
+  sharedKeyboardDismissal,
+  sharedKeyboardViewport,
+  type PointerSample,
+} from "../lib/terminal-keyboard";
 import {
   DEFAULT_TERMINAL_FONT_SIZE,
   MAX_TERMINAL_FONT_SIZE,
@@ -288,6 +297,8 @@ export function TerminalPane({
   const [searchRevision, setSearchRevision] = useState(0);
   const [searchResults, setSearchResults] = useState({ index: -1, count: 0 });
   const [mobileModifiers, setMobileModifiers] = useState(NO_TERMINAL_MODIFIERS);
+  const [keyboardOpen, setKeyboardOpen] = useState(false);
+  const keyboardOpenState = useRef(false);
   const [scrolledBack, setScrolledBack] = useState(false);
   const [imagePreview, setImagePreview] = useState<{ file: FileEntry; left: number; top: number }>();
   const [terminalSize, setTerminalSize] = useState({ focused: false, controller: false });
@@ -343,6 +354,31 @@ export function TerminalPane({
   const updateMobileModifiers = (next: TerminalModifiers) => {
     modifiers.current = next;
     setMobileModifiers(next);
+  };
+
+  // Focus asked for by the user: the keyboard button or a tap on the terminal.
+  const showKeyboard = () => {
+    const term = xterm.current;
+    if (!term) return;
+    sharedKeyboardDismissal.dismissed = false;
+    // A textarea focused from code (pane activation on iOS) or left focused
+    // after Android's back button lowered the keyboard does not raise the
+    // keyboard on another focus(); drop and retake focus inside this gesture.
+    if (!keyboardOpenState.current && document.activeElement === term.textarea) term.blur();
+    term.focus();
+  };
+  const hideKeyboard = () => {
+    sharedKeyboardDismissal.dismissed = true;
+    xterm.current?.blur();
+  };
+  const toggleKeyboard = () => {
+    if (keyboardOpenState.current) hideKeyboard();
+    else showKeyboard();
+  };
+  // Focus taken by the pane itself after an action or a lifecycle event,
+  // honoured only while the user has not hidden the keyboard.
+  const refocusTerminal = () => {
+    if (!sharedKeyboardDismissal.dismissed) xterm.current?.focus();
   };
 
   useEffect(() => {
@@ -423,6 +459,64 @@ export function TerminalPane({
     );
     term.open(host);
     throttleTerminalScrollbarHide(term);
+    // Keyboard state (see terminal-keyboard.ts): textarea focus combined with
+    // the visual viewport, since focus alone misreads both platforms.
+    const textarea = term.textarea;
+    const visualViewport = window.visualViewport;
+    let textareaFocused = textarea !== undefined && document.activeElement === textarea;
+    let viewportCovered = false;
+    const publishKeyboardState = () => {
+      const open = keyboardVisible({
+        focused: textareaFocused,
+        viewportKnown: Boolean(visualViewport),
+        viewportCovered,
+      });
+      keyboardOpenState.current = open;
+      setKeyboardOpen(open);
+    };
+    const sampleViewport = () => {
+      if (!visualViewport) return;
+      viewportCovered = sharedKeyboardViewport.observe({
+        width: visualViewport.width,
+        height: visualViewport.height,
+      });
+      publishKeyboardState();
+    };
+    const handleTextareaFocus = () => {
+      textareaFocused = true;
+      // Whatever focused the terminal, the keyboard is no longer dismissed.
+      sharedKeyboardDismissal.dismissed = false;
+      publishKeyboardState();
+    };
+    const handleTextareaBlur = () => {
+      textareaFocused = false;
+      publishKeyboardState();
+    };
+    textarea?.addEventListener("focus", handleTextareaFocus);
+    textarea?.addEventListener("blur", handleTextareaBlur);
+    visualViewport?.addEventListener("resize", sampleViewport);
+    window.addEventListener("resize", sampleViewport);
+    sampleViewport();
+    // xterm 6 hands touches to its gesture handler, which cancels the tap's
+    // compatibility mouse events, so the mousedown that focuses the terminal
+    // for a mouse never fires for a finger. Recognise the tap here instead;
+    // pointerup is a user gesture, so the keyboard follows the focus.
+    const tapTracker = new TouchTapTracker();
+    const pointerSample = (event: PointerEvent): PointerSample => ({
+      id: event.pointerId,
+      type: event.pointerType,
+      x: event.clientX,
+      y: event.clientY,
+      time: event.timeStamp,
+    });
+    const handleHostPointerDown = (event: PointerEvent) => tapTracker.down(pointerSample(event));
+    const handleHostPointerUp = (event: PointerEvent) => {
+      if (tapTracker.up(pointerSample(event))) showKeyboard();
+    };
+    const handleHostPointerCancel = (event: PointerEvent) => tapTracker.cancel(pointerSample(event));
+    host.addEventListener("pointerdown", handleHostPointerDown);
+    host.addEventListener("pointerup", handleHostPointerUp);
+    host.addEventListener("pointercancel", handleHostPointerCancel);
     // A remounting pane replays a multi-megabyte snapshot through xterm's
     // write pump, which paces parsing one ~12ms slice per `setTimeout(0)`
     // tick. A page whose timers are throttled (occluded window, embedded
@@ -1460,7 +1554,7 @@ export function TerminalPane({
               // range; without a re-sync the new bottom is unreachable.
               resyncScrollArea();
               reportViewport();
-              if (activeState.current && visibleState.current) term.focus();
+              if (activeState.current && visibleState.current && !sharedKeyboardDismissal.dismissed) term.focus();
               captureRenderState(true);
               scheduleCheckpoint();
             }
@@ -1595,7 +1689,7 @@ export function TerminalPane({
         // it was away however much output it parsed. Repaint from the buffer.
         term.refresh(0, term.rows - 1);
         resyncScrollArea();
-        if (hasSynced && activeState.current) term.focus();
+        if (hasSynced && activeState.current && !sharedKeyboardDismissal.dismissed) term.focus();
       });
     };
 
@@ -1720,6 +1814,13 @@ export function TerminalPane({
       unregisterCheckpointControl = undefined;
       writeCheckpoint();
       disposed = true;
+      textarea?.removeEventListener("focus", handleTextareaFocus);
+      textarea?.removeEventListener("blur", handleTextareaBlur);
+      visualViewport?.removeEventListener("resize", sampleViewport);
+      window.removeEventListener("resize", sampleViewport);
+      host.removeEventListener("pointerdown", handleHostPointerDown);
+      host.removeEventListener("pointerup", handleHostPointerUp);
+      host.removeEventListener("pointercancel", handleHostPointerCancel);
       scrollAreaRenderResync?.dispose();
       scrollAreaRenderResync = undefined;
       streamGeneration += 1;
@@ -1771,7 +1872,9 @@ export function TerminalPane({
     // output kept arriving. Coming back to the pane must repaint and re-sync
     // the same way a cached pane's visibility restore does.
     repaintAndResyncScrollArea.current?.();
-    const frame = requestAnimationFrame(() => term.focus());
+    const frame = requestAnimationFrame(() => {
+      if (!sharedKeyboardDismissal.dismissed) term.focus();
+    });
     return () => cancelAnimationFrame(frame);
   }, [active, visible]);
 
@@ -1848,7 +1951,7 @@ export function TerminalPane({
         event.stopPropagation();
         setSearchOpen(false);
         searchAddon.current?.clearDecorations();
-        requestAnimationFrame(() => xterm.current?.focus());
+        requestAnimationFrame(refocusTerminal);
         return;
       }
       if (
@@ -1886,7 +1989,7 @@ export function TerminalPane({
   const closeSearch = () => {
     setSearchOpen(false);
     searchAddon.current?.clearDecorations();
-    requestAnimationFrame(() => xterm.current?.focus());
+    requestAnimationFrame(refocusTerminal);
   };
 
   const copy = async () => {
@@ -1900,7 +2003,7 @@ export function TerminalPane({
     await pasteTerminalClipboard(
       navigator.clipboard,
       (text) => xterm.current?.paste(text),
-      () => xterm.current?.focus(),
+      refocusTerminal,
       onNotice,
     );
   };
@@ -1922,17 +2025,17 @@ export function TerminalPane({
       ...modifiers.current,
       [modifier]: !modifiers.current[modifier],
     });
-    xterm.current?.focus();
+    refocusTerminal();
   };
   const inputKey = (data: string) => {
     const terminal = xterm.current;
     if (!terminal || terminal.options.disableStdin) return;
     terminal.input(data, true);
-    terminal.focus();
+    refocusTerminal();
   };
   const changeFontSize = (next: number) => {
     onFontSizeChange(next);
-    xterm.current?.focus();
+    refocusTerminal();
   };
   const keepTerminalFocused = (event: PointerEvent) => event.preventDefault();
   const zoomPercent = terminalZoomPercent(fontSize);
@@ -2203,6 +2306,19 @@ export function TerminalPane({
           if ((event.target as HTMLElement).closest("button")) keepTerminalFocused(event);
         }}
       >
+        <span class="terminal-keybar-pinned">
+          <button
+            class={`terminal-keyboard-toggle ${keyboardOpen ? "active" : ""}`}
+            aria-pressed={keyboardOpen}
+            aria-label={keyboardOpen ? "Hide keyboard" : "Show keyboard"}
+            title={keyboardOpen ? "Hide keyboard" : "Show keyboard"}
+            data-keyboard={keyboardOpen ? "open" : "closed"}
+            onClick={toggleKeyboard}
+          >
+            {keyboardOpen ? <KeyboardOff size={18} /> : <Keyboard size={18} />}
+          </button>
+          <span class="terminal-keybar-divider" aria-hidden="true" />
+        </span>
         <button
           onClick={() => changeFontSize(fontSize - 1)}
           disabled={fontSize <= MIN_TERMINAL_FONT_SIZE}
@@ -2275,7 +2391,7 @@ export function TerminalPane({
                 current.scrollToBottom();
               });
             }
-            term.focus();
+            refocusTerminal();
           }}
         >
           <ChevronDown size={14} /> Latest
