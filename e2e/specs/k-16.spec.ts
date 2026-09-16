@@ -16,6 +16,7 @@ import {
   terminalEvents,
   terminalSnapshot,
   waitForTerminalState,
+  waitForFontSettledViewport,
 } from "../assertions/terminal-state.js";
 import {
   assertNoPendingSynchronization,
@@ -141,6 +142,7 @@ test("K-16 Checkpoint inside escape sequence cannot corrupt snapshot recovery @p
   await pane.expectVisible();
   const terminalId = created.id;
 
+  await waitForFontSettledViewport(page, terminalId, { timeout: WAIT_TIMEOUT_MS });
   const initial = await expectTerminalSynchronized(page, terminalId, { timeout: WAIT_TIMEOUT_MS });
   if (initial.committedSequence === undefined) {
     throw new Error("initial diagnostics omitted the committed output sequence");
@@ -172,6 +174,10 @@ test("K-16 Checkpoint inside escape sequence cannot corrupt snapshot recovery @p
       && entry.split === 1,
     { timeoutMs: WAIT_TIMEOUT_MS },
   );
+  await waitForTerminalState(page, terminalId, {
+    committedSequence: unsafeSequence,
+    pendingParserWrites: 0,
+  }, { timeout: WAIT_TIMEOUT_MS });
 
   // The browser timer is intentionally throttled by the runtime under load.
   // Force the same production checkpoint callback after the parser boundary so
