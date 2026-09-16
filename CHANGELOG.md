@@ -12,7 +12,7 @@ Two user-facing features land: a mobile keyboard toggle and one-time agent secre
 
 ### Upgrade notes
 
-- Reload open browser tabs after updating to load the mobile keyboard toggle and the new Access panel controls.
+- Safe for automatic installation over `0.18.1`; no data migration and no broker restart required. Reload open browser tabs after updating to load the mobile keyboard toggle and the new Access panel controls.
 
 ## 0.18.1 - 2026-09-01
 
