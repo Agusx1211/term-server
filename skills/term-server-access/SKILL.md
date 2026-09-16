@@ -42,6 +42,30 @@ Revoke a grant only when the user asks or the capability is intentionally retire
 "$TERM_SERVER_EXECUTABLE" access secret drop --name SERVICE_API_KEY --agent omp
 ```
 
+## Generating and handing secrets to the user
+
+When a task needs a new password, token, or key (a database role, a service account, an admin login), do not invent one yourself: have the broker generate it. The value is granted to this terminal for `secret run` and you never see it.
+
+```bash
+"$TERM_SERVER_EXECUTABLE" access secret generate \
+  --name APP_DB_PASSWORD \
+  --description "Password for the app's Postgres role" \
+  --agent omp
+```
+
+Defaults are 32 characters from letters and digits. `--length N` accepts 8-256 and `--charset alnum|ascii|hex|digits` picks the alphabet (`ascii` adds shell-safe punctuation). An existing grant of the same name is an error unless you pass `--replace`, which also withdraws any unviewed share of the old value.
+
+To give the user a value they need to keep (the password you just generated, an API token the broker holds), share the grant. The user gets a card in the terminal's Access panel and can reveal the value exactly once; the broker forgets its copy for the panel after that reveal, and the grant keeps working for `secret run`.
+
+```bash
+"$TERM_SERVER_EXECUTABLE" access secret share \
+  --name APP_DB_PASSWORD \
+  --description "Store this in your password manager; the app already uses it" \
+  --agent omp
+```
+
+`generate --share` does both in one call. `share` waits for the user: it prints `viewed` and exits `0` when they revealed the value, prints `dismissed` or `expired` and exits `126` when they did not (shares expire after one hour), and exits `125` on broker or protocol failures. Pass `--no-wait` to print the share id and return immediately; the offer stays in the panel until the user acts or it expires. Check on it later with `share-status --id ID` (prints `pending`, `viewed`, `dismissed`, or `expired`; add `--wait` to block with the exit codes above) or `share-list`. The value is never printed by any of these commands. Tell the user in chat that a value is waiting in the Access panel, and never repeat or guess it.
+
 ## Sudo
 
 Submit one exact local command without a leading `sudo`:

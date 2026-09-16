@@ -50,4 +50,54 @@ describe("terminal access API", () => {
     );
     expect(fetch.mock.calls[0]?.[0]).not.toContain("secret-value");
   });
+
+  it("reveals a shared secret with a same-origin POST and returns the value once", async () => {
+    const fetch = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => new Response(JSON.stringify({
+      id: "share/1",
+      name: "DB_PASSWORD",
+      value: "shown-once",
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json", "cache-control": "no-store" },
+    }));
+    vi.stubGlobal("fetch", fetch);
+
+    await expect(api.revealTerminalShare("terminal-1", "share/1")).resolves.toEqual({
+      id: "share/1",
+      name: "DB_PASSWORD",
+      value: "shown-once",
+    });
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/terminals/terminal-1/access/shares/share%2F1/reveal",
+      expect.objectContaining({ method: "POST", cache: "no-store" }),
+    );
+    expect(fetch.mock.calls[0]?.[1]).not.toHaveProperty("body");
+  });
+
+  it("surfaces the gone status when a share was already revealed", async () => {
+    const fetch = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => new Response(JSON.stringify({
+      error: "DB_PASSWORD was already revealed and is no longer available",
+    }), {
+      status: 410,
+      headers: { "content-type": "application/json" },
+    }));
+    vi.stubGlobal("fetch", fetch);
+
+    await expect(api.revealTerminalShare("terminal-1", "share-1")).rejects.toMatchObject({
+      status: 410,
+      message: "DB_PASSWORD was already revealed and is no longer available",
+    });
+  });
+
+  it("dismisses a shared secret without touching the value", async () => {
+    const fetch = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetch);
+
+    await expect(api.dismissTerminalShare("terminal-1", "share-1")).resolves.toBeUndefined();
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/terminals/terminal-1/access/shares/share-1/dismiss",
+      expect.objectContaining({ method: "POST", cache: "no-store" }),
+    );
+  });
 });

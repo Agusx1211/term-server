@@ -65,7 +65,7 @@ On first boot, open `https://127.0.0.1:8090`. term-server prints a random passwo
 - **Agent-connected artifacts:** multiline handoffs stay attached to the terminal and agent that created them, with inline text, image, and PDF previews plus an optional full editor.
 - **Virtual audio devices:** a browser microphone can become the host's default **Term Server Microphone**, while host audio sent to **Term Server Speaker** plays through a selected browser output. Multiple tabs mix into the same microphone and listen to the same speaker with bounded jitter buffers in both directions.
 - **Process visibility and control:** a lightweight Linux `/proc` sampler shows the complete live descendant process tree, foreground job, CPU and memory usage, and lets you send SIGTERM to a selected process. Command lines are secret-aware and redacted; input, output, and exited processes are not retained.
-- **Terminal-scoped access approvals:** each terminal has one Access panel for secret requests, proactive in-memory secret grants, revocation, activity, and reviewed local sudo commands. Secret values never return to the browser or agent; sudo requires the user's password for the immutable command shown in the panel.
+- **Terminal-scoped access approvals:** each terminal has one Access panel for secret requests, proactive in-memory secret grants, revocation, activity, and reviewed local sudo commands. Secret values never return to the agent; sudo requires the user's password for the immutable command shown in the panel. Agents can also have the broker generate a secret they never see and hand it to the user for a single reveal in the panel.
 - **Agent awareness:** Codex, Claude, Pi, OMP, and Hermes sessions show working, blocked, idle, and closed states. An agent waiting on an approval or a question is marked **Needs you** for as long as it waits, so a stalled agent is visible without opening it. An unseen return to idle gets a distinct bell until you focus that terminal. Alerts can appear in-app, as desktop notifications, in both places, or remain off. In-app cards inherit their terminal color and can be placed in any corner with a configurable dismissal time.
 - **Supervisor terminal:** one visibly marked, singleton terminal can inspect and control the other term-server sessions without embedding an AI provider into the server. Run OMP, Pi, Codex, Claude, or an ordinary shell command yourself; only descendants of that supervisor receive the embedded skill and scoped control tools. The tools expose terminal screens, input, names, process trees, creation and termination, plus open-tab listing and closure. They deliberately provide no project organizer, pane arranger, scheduler, or job system.
 - **Secure defaults:** loopback binding, HTTPS, Argon2 password hashing, signed HTTP-only SameSite cookies, origin enforcement, CSP, HSTS, login throttling, and bounded memory use.
@@ -182,6 +182,25 @@ environment. Output redaction replaces raw values and common Base64, Base32, hex
 octal/hex/Unicode, binary, SHA-256, and SHA-512 forms with `[REDACTED: SECRET_NAME]` across stream
 boundaries. Derived forms are generated only for 4–1024-byte secrets to bound memory and false
 positives; arbitrary transformations remain best-effort.
+
+An agent can also have the broker mint a value it never sees and hand it to the user. `generate`
+creates a random grant (32 alphanumeric characters by default; `--length` 8–256 and `--charset
+alnum|ascii|hex|digits` adjust it) that the agent can only use through `secret run`. `share` offers
+a granted value to the user: a card appears in the terminal's Access panel, the user reveals it
+exactly once over a same-origin HTTPS request, and the broker drops its copy for the panel while
+the grant keeps working. The agent learns the outcome (`viewed`, `dismissed`, or `expired` after
+one hour) through the command's output and exit code, never the value:
+
+```bash
+"$TERM_SERVER_EXECUTABLE" access secret generate \
+  --name APP_DB_PASSWORD --description "Password for the app's Postgres role" --agent omp
+"$TERM_SERVER_EXECUTABLE" access secret share \
+  --name APP_DB_PASSWORD --description "Store it in your password manager" --agent omp
+```
+
+`share --no-wait` returns the share id immediately; `share-status --id ID [--wait]` and `share-list`
+report on it later. Pending shares count toward the terminal's "needs you" badge, and closing the
+terminal or revoking the grant withdraws unviewed shares.
 
 A local root command is submitted without a leading `sudo`:
 

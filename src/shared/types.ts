@@ -132,7 +132,17 @@ export interface ProcessInspectorSnapshot {
 
 export type AccessRequestKind = "secret" | "sudo";
 export type AccessRequestState = "pending" | "authenticating" | "running";
-export type AccessActivityStatus = "approved" | "rejected" | "revoked" | "failed" | "canceled";
+export type AccessActivityStatus =
+  | "approved"
+  | "rejected"
+  | "revoked"
+  | "failed"
+  | "canceled"
+  | "shared"
+  | "viewed"
+  | "dismissed"
+  | "expired";
+export type SecretShareState = "pending" | "viewed" | "dismissed" | "expired";
 
 export interface AccessRequest {
   id: string;
@@ -159,6 +169,26 @@ export interface SecretGrant {
   lastCommand: string | null;
 }
 
+/** A value an agent offered to the user; the value itself only travels through the one-time reveal. */
+export interface SecretShare {
+  id: string;
+  name: string;
+  description: string | null;
+  agent: string;
+  state: SecretShareState;
+  createdAt: number;
+  expiresAt: number;
+  viewedAt: number | null;
+  resolvedAt: number | null;
+  waiters: number;
+}
+
+export interface SecretShareReveal {
+  id: string;
+  name: string;
+  value: string;
+}
+
 export interface AccessActivity {
   id: string;
   kind: AccessRequestKind;
@@ -173,6 +203,7 @@ export interface AccessSnapshot {
   revision: number;
   requests: AccessRequest[];
   grants: SecretGrant[];
+  shares: SecretShare[];
   activity: AccessActivity[];
 }
 

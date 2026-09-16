@@ -1019,6 +1019,7 @@ body.pane-resizing .layout-divider.horizontal { cursor: row-resize; }
   width: min(460px, calc(100% - 12px));
   --access-secret: #a78bfa;
   --access-sudo: #e3b341;
+  --access-share: #34d399;
 }
 .access-panel-header { gap: 6px; }
 .access-waiting-label {
@@ -1037,6 +1038,8 @@ body.pane-resizing .layout-divider.horizontal { cursor: row-resize; }
 }
 .access-request.secret { border-color: color-mix(in srgb, var(--access-secret) 31%, var(--border)); }
 .access-request.sudo { border-color: color-mix(in srgb, var(--access-sudo) 34%, var(--border)); }
+.access-request.share { border-color: color-mix(in srgb, var(--access-share) 34%, var(--border)); }
+.access-request.share.viewed, .access-request.share.dismissed, .access-request.share.expired { opacity: .72; }
 .access-request-icon {
   width: 27px; height: 27px; flex: none; display: grid; place-items: center; border: 1px solid var(--border); border-radius: 5px;
 }
@@ -1048,15 +1051,36 @@ body.pane-resizing .layout-divider.horizontal { cursor: row-resize; }
   border-color: color-mix(in srgb, var(--access-sudo) 44%, var(--border));
   background: color-mix(in srgb, var(--access-sudo) 9%, var(--panel)); color: var(--access-sudo);
 }
+.access-request-icon.share {
+  border-color: color-mix(in srgb, var(--access-share) 44%, var(--border));
+  background: color-mix(in srgb, var(--access-share) 9%, var(--panel)); color: var(--access-share);
+}
 .access-request-main { min-width: 0; flex: 1; }
 .access-request-heading { min-width: 0; display: flex; align-items: center; gap: 6px; }
 .access-request-heading strong {
   min-width: 0; overflow: hidden; flex: 1; font: 650 10.5px/14px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   text-overflow: ellipsis; white-space: nowrap;
 }
-.access-kind, .access-request-state {
+.access-kind, .access-request-state, .access-share-state {
   flex: none; padding: 1px 5px; border-radius: 7px; font-size: 7px; font-weight: 800; letter-spacing: .045em; text-transform: uppercase;
 }
+.access-kind.share { background: color-mix(in srgb, var(--access-share) 12%, transparent); color: var(--access-share); }
+.access-share-state { background: color-mix(in srgb, var(--muted) 14%, transparent); color: var(--muted); }
+.access-share-state.viewed { background: color-mix(in srgb, var(--status-ok) 12%, transparent); color: var(--status-ok); }
+.access-share-state.dismissed { background: color-mix(in srgb, var(--status-warn) 12%, transparent); color: var(--status-warn); }
+.access-share-reveal {
+  margin-top: 8px; padding: 8px; border: 1px solid color-mix(in srgb, var(--access-share) 40%, var(--border));
+  border-radius: 4px; background: color-mix(in srgb, var(--access-share) 5%, var(--panel));
+}
+.access-share-value {
+  display: block; max-width: 100%; padding: 8px 9px; border: 1px solid var(--border-strong); border-radius: 4px;
+  background: var(--input); color: var(--foreground); font: 600 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  overflow-wrap: anywhere; word-break: break-all; white-space: pre-wrap; user-select: all; -webkit-user-select: all;
+}
+.access-share-reveal small {
+  display: flex; align-items: center; gap: 4px; margin-top: 5px; color: var(--status-warn); font-size: 7.5px; line-height: 1.35;
+}
+.access-share-outcome { margin-top: 7px; color: var(--muted); font-size: 8.5px; line-height: 1.4; }
 .access-kind.secret { background: color-mix(in srgb, var(--access-secret) 12%, transparent); color: var(--access-secret); }
 .access-kind.sudo { background: color-mix(in srgb, var(--access-sudo) 12%, transparent); color: var(--access-sudo); }
 .access-request-state { background: color-mix(in srgb, var(--accent) 11%, transparent); color: var(--accent); }
@@ -1147,6 +1171,10 @@ body.pane-resizing .layout-divider.horizontal { cursor: row-resize; }
 .access-activity.rejected .access-activity-icon { color: var(--danger); }
 .access-activity.revoked .access-activity-icon, .access-activity.canceled .access-activity-icon { color: var(--status-warn); }
 .access-activity.failed .access-activity-icon { color: var(--status-error); }
+.access-activity.shared .access-activity-icon { color: var(--access-share); }
+.access-activity.viewed .access-activity-icon { color: var(--status-ok); }
+.access-activity.dismissed .access-activity-icon { color: var(--status-warn); }
+.access-activity.expired .access-activity-icon { color: var(--subtle); }
 .access-activity-copy { min-width: 0; flex: 1; display: grid; gap: 1px; }
 .access-activity-copy strong { overflow: hidden; font-size: 9px; font-weight: 620; text-overflow: ellipsis; white-space: nowrap; }
 .access-activity-copy small { overflow: hidden; color: var(--subtle); font-size: 7.5px; text-overflow: ellipsis; white-space: nowrap; }
@@ -1740,6 +1768,7 @@ body.pane-resizing .layout-divider.horizontal { cursor: row-resize; }
   .access-icon-button { width: 36px; height: 36px; }
   .access-grant { min-height: 52px; }
   .access-secret-entry input, .access-add-secret input { height: 38px; font-size: 16px; }
+  .access-share-value { padding: 10px; font-size: 16px; }
   .access-section-controls button { min-height: 32px; padding: 0 9px; }
   .artifact-drawer {
     width: 100%; max-width: none; border-left: 0; box-shadow: none;
