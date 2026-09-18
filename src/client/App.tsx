@@ -185,7 +185,7 @@ const defaultConfig: ClientConfig = {
   hostname: "",
   passwordManagedExternally: true,
   virtualAudioAvailable: false,
-  pi: {
+  fili: {
     available: false,
     enabled: false,
     titlesEnabled: false,
@@ -1034,14 +1034,14 @@ export function App() {
       if (pending) clearTimeout(pending.timer);
       // A block is announced immediately; waiting on a summary would delay the
       // one state that is already waiting on the person being told.
-      if (notification.kind === "completion" && config.pi.summariesEnabled && !agent.summary) {
+      if (notification.kind === "completion" && config.fili.summariesEnabled && !agent.summary) {
         const timer = window.setTimeout(() => deliver(terminal.id, event), 12_000);
         pendingAgentNotifications.current.set(terminal.id, { event, timer });
       } else {
         deliver(terminal.id, event);
       }
     }
-  }, [authenticated, workspaceLoaded, terminals, config.pi.summariesEnabled]);
+  }, [authenticated, workspaceLoaded, terminals, config.fili.summariesEnabled]);
 
   useEffect(() => {
     if (!authenticated) {
@@ -1701,13 +1701,13 @@ export function App() {
     )));
   };
 
-  const updatePiConfig = async (titlesEnabled: boolean, summariesEnabled: boolean, model: string) => {
+  const updateFiliConfig = async (titlesEnabled: boolean, summariesEnabled: boolean, model: string) => {
     try {
-      const pi = await api.updatePiConfig({ titlesEnabled, summariesEnabled, model });
-      setConfig((current) => ({ ...current, pi }));
-      showNotice("Pi settings updated");
+      const fili = await api.updateFiliConfig({ titlesEnabled, summariesEnabled, model });
+      setConfig((current) => ({ ...current, fili }));
+      showNotice("Fili settings updated");
     } catch (error) {
-      showNotice(error instanceof Error ? error.message : "Unable to update Pi settings");
+      showNotice(error instanceof Error ? error.message : "Unable to update fili settings");
     }
   };
 
@@ -2380,7 +2380,7 @@ export function App() {
               <SettingsWorkspace
                 active={settingsActive}
                 theme={theme}
-                pi={config.pi}
+                fili={config.fili}
                 agentIntegrations={config.agentIntegrations}
                 updatingAgentIntegration={updatingAgentIntegration}
                 artifactSkill={config.artifactSkill}
@@ -2412,8 +2412,8 @@ export function App() {
                 pushover={config.pushover}
                 statusModules={config.statusModules}
                 onTheme={setTheme}
-                onPiChange={(titlesEnabled, summariesEnabled, model) => (
-                  void updatePiConfig(titlesEnabled, summariesEnabled, model)
+                onFiliChange={(titlesEnabled, summariesEnabled, model) => (
+                  void updateFiliConfig(titlesEnabled, summariesEnabled, model)
                 )}
                 onAgentIntegration={(provider, action) => (
                   void updateAgentIntegration(provider, action)

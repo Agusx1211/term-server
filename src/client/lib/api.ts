@@ -16,9 +16,10 @@ import type {
   CreateTerminalRequest,
   RenameTerminalRequest,
   TerminalInfo,
-  PiConfig,
+  FiliConfig,
+  FiliStream,
   ProcessInspectorSnapshot,
-  UpdatePiConfig,
+  UpdateFiliConfig,
   UpdateActivityView,
   DirectoryListing,
   FileDocument,
@@ -190,8 +191,10 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ closeTerminals }),
     }),
-  updatePiConfig: (config: UpdatePiConfig) =>
-    request<PiConfig>("/api/config/pi", { method: "PATCH", body: JSON.stringify(config) }),
+  updateFiliConfig: (config: UpdateFiliConfig) =>
+    request<FiliConfig>("/api/config/fili", { method: "PATCH", body: JSON.stringify(config) }),
+  filiStream: (after: number, signal?: AbortSignal) =>
+    request<FiliStream>(`/api/fili/stream?after=${after}`, { signal }),
   agentIntegrations: (signal?: AbortSignal) =>
     request<AgentIntegrationsConfig>("/api/config/agent-integrations", {
       signal,

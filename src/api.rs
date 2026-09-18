@@ -54,7 +54,6 @@ use crate::{
         AgentIntegrationAction, AgentIntegrationProvider, AgentIntegrationService,
         AgentIntegrationsConfig,
     },
-    ai::{PiClientConfig, UpdatePiSettings},
     artifact_skill::{ArtifactSkillAction, ArtifactSkillConfig, ArtifactSkillService},
     artifacts,
     auth::{AuthError, AuthService, LoginLimiter, SESSION_LIFETIME_DAYS},
@@ -64,6 +63,7 @@ use crate::{
         DebugRecordingStatus,
     },
     files::{self, FileError},
+    fili::{FiliClientConfig, FiliStream, UpdateFiliSettings},
     pushover::{PushoverConfig, PushoverNotification, PushoverService, UpdatePushoverConfig},
     status::{StatusPayload, StatusService, StatusSettings, UpdateStatusSettings},
     terminal::{CreateTerminal, RenameTerminal, TerminalError, TerminalInfo},
@@ -304,7 +304,7 @@ struct ClientConfig {
     hostname: String,
     password_managed_externally: bool,
     virtual_audio_available: bool,
-    pi: PiClientConfig,
+    fili: FiliClientConfig,
     agent_integrations: AgentIntegrationsConfig,
     artifact_skill: ArtifactSkillConfig,
     pushover: PushoverConfig,
@@ -679,8 +679,8 @@ async fn config(
 ) -> Result<Json<ClientConfig>, ApiError> {
     require_auth(&jar, &state)?;
     let workspace_config =
-        tokio::try_join!(state.workspace.pi_config(), state.workspace.broker_info());
-    let (pi, broker) = workspace_config?;
+        tokio::try_join!(state.workspace.fili_config(), state.workspace.broker_info());
+    let (fili, broker) = workspace_config?;
     let agent_integrations = if query.agent_integrations.as_deref() == Some("lazy") {
         AgentIntegrationsConfig {
             providers: Vec::new(),
@@ -697,7 +697,7 @@ async fn config(
         hostname: state.hostname.clone(),
         password_managed_externally: state.auth.password_is_externally_managed(),
         virtual_audio_available: cfg!(unix) && broker.is_some(),
-        pi,
+        fili,
         agent_integrations,
         artifact_skill: state.artifact_skill.status(),
         pushover: state.pushover.client_config(),
@@ -875,21 +875,41 @@ async fn e2e_auth_expire(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-async fn update_pi_config(
+async fn update_fili_config(
     State(state): State<AppState>,
     headers: HeaderMap,
     uri: Uri,
     jar: CookieJar,
-    Json(body): Json<UpdatePiSettings>,
-) -> Result<Json<PiClientConfig>, ApiError> {
+    Json(body): Json<UpdateFiliSettings>,
+) -> Result<Json<FiliClientConfig>, ApiError> {
     require_origin(&headers, &uri, &state)?;
     require_auth(&jar, &state)?;
     state
         .workspace
-        .update_pi(body)
+        .update_fili(body)
         .await
         .map(Json)
         .map_err(Into::into)
+}
+
+async fn fili_stream_config(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Query(query): Query<FiliStreamQuery>,
+) -> Result<Json<FiliStream>, ApiError> {
+    require_auth(&jar, &state)?;
+    state
+        .workspace
+        .fili_stream(query.after)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+#[derive(Deserialize)]
+struct FiliStreamQuery {
+    #[serde(default)]
+    after: u64,
 }
 
 async fn status_modules_config(
@@ -2099,7 +2119,8 @@ pub fn build_router(state: AppState, client_directory: Option<PathBuf>) -> Route
             get(status_modules_config).patch(update_status_modules_config),
         )
         .route("/config/updates", patch(update_channel))
-        .route("/config/pi", patch(update_pi_config))
+        .route("/config/fili", patch(update_fili_config))
+        .route("/fili/stream", get(fili_stream_config))
         .route(
             "/config/pushover",
             get(pushover_config).patch(update_pushover_config),
@@ -2263,7 +2284,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        ai::PiService, artifact_skill::ArtifactSkillService, auth::load_auth,
+        artifact_skill::ArtifactSkillService, auth::load_auth, fili::FiliService,
         terminal::TerminalManager,
     };
 
@@ -2274,8 +2295,8 @@ mod tests {
             .unwrap();
         let auth = load_auth(&directory, None, None).await.unwrap().service;
         let terminals = Arc::new(TerminalManager::new(Some("/bin/sh".into()), 1024 * 1024));
-        let pi = Arc::new(PiService::new(&directory));
-        let workspace = WorkspaceBackend::local(terminals, pi);
+        let fili = Arc::new(FiliService::new(&directory));
+        let workspace = WorkspaceBackend::local(terminals, fili);
         #[cfg(unix)]
         let supervisor = SupervisorService::new(
             workspace.clone(),

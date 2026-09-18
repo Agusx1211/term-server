@@ -14,7 +14,7 @@ const HOW_TO_USE_STEPS = [
   { icon: "📂", text: "Sessions appear in the sidebar — click to open them" },
   { icon: "✂️", text: "Use a session's **split action** or drag it to build a pane layout" },
   { icon: "✏️", text: "Use the **rename action** beside a session to give it a custom name" },
-  { icon: "🧠", text: "Enable Pi in settings for AI-powered terminal intelligence" },
+  { icon: "🧠", text: "Pick a Fili model in settings for AI-powered tab titles" },
   { icon: "🔔", text: "Choose in-app, desktop, or both completion alerts in Settings" },
 ];
 
