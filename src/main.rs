@@ -33,7 +33,7 @@ use term_server::{
     workspace::WorkspaceBackend,
 };
 #[cfg(not(unix))]
-use term_server::{ai::PiService, terminal::TerminalManager};
+use term_server::{fili::FiliService, terminal::TerminalManager};
 use tracing_subscriber::EnvFilter;
 
 #[cfg(unix)]
@@ -230,9 +230,10 @@ async fn load_workspace(
     _executable: &Path,
 ) -> Result<WorkspaceBackend, Box<dyn std::error::Error>> {
     let terminals = Arc::new(TerminalManager::new(cli.shell.clone(), cli.replay_bytes()));
-    let pi = Arc::new(PiService::new(&cli.data_dir));
-    terminals.start_monitor(pi.clone());
-    Ok(WorkspaceBackend::local(terminals, pi))
+    terminals.start_monitor();
+    let fili = Arc::new(FiliService::new(&cli.data_dir));
+    fili.start(terminals.clone());
+    Ok(WorkspaceBackend::local(terminals, fili))
 }
 
 async fn shutdown_signal(server_control: ServerControl) {

@@ -99,7 +99,7 @@ export const dailyTexts: { title: string; body: string }[] = [
   },
   {
     title: "Neural net activated",
-    body: "Enabling Pi in settings lets an AI assistant work inside your terminal. It's like having a very paid intern.",
+    body: "Pick a Fili model in settings and an AI assistant names your tabs and wraps up finished tasks. It's like having a very cheap intern.",
   },
   {
     title: "Breaking news",

@@ -8,8 +8,8 @@ const toggleSections: Record<string, SettingsSectionName> = {
   "Live terminal hover previews": "Workspace",
   "Show limits in the status bar": "Workspace",
   "Also show on mobile": "Workspace",
-  "Pi-generated titles": "Agents",
-  "Pi notification summaries": "Agents",
+  "Fili-generated titles": "Agents",
+  "Fili notification summaries": "Agents",
   "Receive beta releases": "System",
 };
 

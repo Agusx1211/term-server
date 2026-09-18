@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::process::Command;
 
-use crate::ai::find_executable;
+use crate::fili::find_executable;
 
 const MARKETPLACE_NAME: &str = "term-server-local";
 const PLUGIN_NAME: &str = "term-server-agent-events";

@@ -1574,7 +1574,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::{ai::PiService, terminal::TerminalManager};
+    use crate::{fili::FiliService, terminal::TerminalManager};
 
     async fn test_service() -> (
         TempDir,
@@ -1589,7 +1589,7 @@ mod tests {
         ));
         let workspace = WorkspaceBackend::local(
             terminals.clone(),
-            Arc::new(PiService::new(directory.path())),
+            Arc::new(FiliService::new(directory.path())),
         );
         let service = SupervisorService::new(
             workspace.clone(),
@@ -2254,7 +2254,6 @@ mod tests {
                     },
                 ],
             },
-            Arc::new(PiService::new(directory.path())),
         ));
         workspace
             .write(
