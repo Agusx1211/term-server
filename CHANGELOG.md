@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.19.0 - 2026-09-18
+
+Pi is gone. **Fili**, a built-in labelling agent, now titles your agent tabs and writes a short summary when a task finishes.
+
+### Added
+
+- **Fili, the built-in labelling agent.** An in-process model loop watches the terminal roster: it gives every agent tab a concise title for the current task and posts a one-sentence outcome summary when the task completes. Settings shows a live activity stream of fili's decisions.
+- **Conversation journal.** Every model round — including the model's thinking blocks when the provider emits them — is appended to `<data-dir>/fili/conversations.jsonl` (owner-only permissions), for reviewing or tuning fili's behavior later.
+- **Server-side label guards.** Names set by hand or by the agent itself are never overwritten; titles apply once per task; summaries must match the agent revision they were written for and are never rewritten. A plain shell tab is never labelled.
+
+### Changed
+
+- **Titles and summaries default to on** but stay completely idle until a model is selected: nothing leaves the machine until you pick a model on the Fili card.
+
+### Removed
+
+- **The Pi subprocess auto-labelling feature.** `pi` is no longer spawned for titles and summaries.
+
+### Upgrade notes
+
+- Safe for automatic installation over `0.18.x`. Stored Pi choices migrate on first boot: opting out of Pi (or either half of it) stays opted out in fili. Pi's saved model id is *not* migrated — pick a model on the Fili settings card once (`~/.pi/agent/models.json` providers are discovered automatically). Reload open browser tabs after updating.
+- `fili/conversations.jsonl` in the data directory contains excerpts of terminal output and prompts; treat that file like terminal scrollback when sharing backups.
+
+
 ## 0.18.2 - 2026-09-16
 
 Two user-facing features land: a mobile keyboard toggle and one-time agent secret delivery.
