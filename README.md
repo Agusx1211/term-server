@@ -543,9 +543,9 @@ systemctl --user daemon-reload
 systemctl --user enable --now term-server
 ```
 
-The daemon finds Pi on its inherited `PATH` and in common per-user install locations, including npm, pnpm, Volta, Bun, asdf, mise, and installed NVM Node versions. Restart the service after installing or upgrading Pi.
+Fili is term-server's built-in labelling agent. It runs inside the server, keeps every in-progress agent tab named, and writes a short completion summary once a task finishes. It talks to any OpenAI-compatible provider configured for Pi in `~/.pi/agent/models.json`; if no provider is found, fili stays inactive.
 
-Pi-generated titles and notification summaries have independent settings. A title is generated from the first task submitted to an idle agent and remains stable for that agent session. Follow-up tasks, approvals, and other later input do not replace it.
+Fili-generated titles and notification summaries have independent settings and are enabled by default once a model provider is available. A title is generated for the first task of an agent session and remains stable for it; follow-up tasks, approvals, and other later input do not replace it. A tab renamed by hand, or titled by its own agent (OMP does), is never touched. The Agents settings page shows fili's live activity stream.
 
 ## Build from source
 
@@ -606,7 +606,7 @@ The browser delegates terminal parsing and rendering to xterm.js. It commits res
 
 ## Security and privacy
 
-Read [SECURITY.md](SECURITY.md) before exposing term-server beyond a trusted machine or network. Pi titles and completion summaries are independently disabled by default; enabling either sends a bounded, ANSI-sanitized slice of the relevant prompt or terminal output to the selected Pi model provider.
+Read [SECURITY.md](SECURITY.md) before exposing term-server beyond a trusted machine or network. Fili titles and completion summaries are independently enabled by default once a model provider is configured; either job sends a bounded, ANSI-sanitized slice of the relevant prompt or terminal output to the selected provider.
 
 Please report vulnerabilities privately as described in the security policy. Contributions are welcome—see [CONTRIBUTING.md](CONTRIBUTING.md).
 

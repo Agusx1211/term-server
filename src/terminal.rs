@@ -14,14 +14,14 @@ use bytes::Bytes;
 use parking_lot::{Condvar, Mutex, RwLock};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use thiserror::Error;
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::{Notify, broadcast, oneshot};
 use uuid::Uuid;
 
 use crate::{
     agent_detection,
     agent_events::{AgentActivity, AgentEvent, AgentEventKind},
-    ai::{PiRequest, PiService, PiTaskKind},
     artifacts,
     build::BuildIdentity,
     history::{
@@ -55,8 +55,6 @@ const REPORTED_WORKING_FRESH_MILLIS: u64 = 5_000;
 const NATIVE_EVENT_FRESH_MILLIS: u64 = 15_000;
 const LONG_RUNNING_COMMAND_MILLIS: u64 = 5_000;
 const MAX_CAPTURED_PROMPT_CHARS: usize = 16_000;
-/// How much of the terminal tail a generated summary is written from.
-const SUMMARY_TAIL_BYTES: usize = 12 * 1024;
 const OSC_PAYLOAD_MAX_CHARS: usize = 256;
 /// Tail of undecoded pty output kept so an escape sequence split across two
 /// reads is still recognized.
@@ -685,7 +683,12 @@ fn csi_count(sequence: &str) -> usize {
 struct SessionActivity {
     automatic_name: bool,
     generated_title: Option<String>,
-    initial_title_prompt: Option<String>,
+    /// The current title came from the agent itself (an omp OSC title); fili
+    /// must never overwrite it, unlike titles it generated itself.
+    native_title: bool,
+    /// The first substantive prompt of the current agent task, kept as a
+    /// cheap hint for fili's wake digest.
+    first_prompt: Option<String>,
     agent_pid: Option<u32>,
     agent_start_ticks: Option<u64>,
     last_cpu_ticks: u64,
@@ -695,10 +698,6 @@ struct SessionActivity {
     input_submitted_at: u64,
     prompt_capture: PromptCapture,
     pending_agent_submission: Option<PendingAgentSubmission>,
-    pending_title_prompt: Option<(u64, String)>,
-    title_revision: u64,
-    title_in_flight_revision: Option<u64>,
-    summary_in_flight_revision: Option<u64>,
     native_provider: Option<String>,
     native_status: Option<AgentStatus>,
     native_updated_at: u64,
@@ -712,7 +711,8 @@ impl Default for SessionActivity {
         Self {
             automatic_name: true,
             generated_title: None,
-            initial_title_prompt: None,
+            native_title: false,
+            first_prompt: None,
             agent_pid: None,
             agent_start_ticks: None,
             last_cpu_ticks: 0,
@@ -722,10 +722,6 @@ impl Default for SessionActivity {
             input_submitted_at: 0,
             prompt_capture: PromptCapture::default(),
             pending_agent_submission: None,
-            pending_title_prompt: None,
-            title_revision: 0,
-            title_in_flight_revision: None,
-            summary_in_flight_revision: None,
             native_provider: None,
             native_status: None,
             native_updated_at: 0,
@@ -794,30 +790,17 @@ impl SessionActivity {
         }
     }
 
-    fn queue_title_for_submission(
-        &mut self,
-        agent_status: &AgentStatus,
-        submitted_prompt: Option<String>,
-    ) {
-        if *agent_status != AgentStatus::Idle
-            || !self.automatic_name
-            || self.generated_title.is_some()
-            || self.pending_title_prompt.is_some()
-            || self.title_in_flight_revision.is_some()
-        {
+    /// Keeps the first substantive prompt of the current agent task as a hint
+    /// for fili. Slash commands and empty input never count; the first real
+    /// prompt wins until the task generation is reset.
+    fn note_first_prompt(&mut self, submitted_prompt: Option<String>) {
+        if self.first_prompt.is_some() {
             return;
         }
-        if self.initial_title_prompt.is_none() {
-            self.initial_title_prompt = submitted_prompt.and_then(|prompt| {
-                let prompt = prompt.trim();
-                (!prompt.is_empty() && !prompt.starts_with('/')).then(|| prompt.to_owned())
-            });
-        }
-        let Some(prompt) = self.initial_title_prompt.clone() else {
-            return;
-        };
-        self.title_revision = self.title_revision.saturating_add(1);
-        self.pending_title_prompt = Some((self.title_revision, prompt));
+        self.first_prompt = submitted_prompt.and_then(|prompt| {
+            let prompt = prompt.trim();
+            (!prompt.is_empty() && !prompt.starts_with('/')).then(|| prompt.to_owned())
+        });
     }
 
     fn begin_submission(
@@ -827,7 +810,7 @@ impl SessionActivity {
         prompt: Option<String>,
     ) {
         let has_prompt = prompt.is_some();
-        self.queue_title_for_submission(&agent.status, prompt);
+        self.note_first_prompt(prompt);
         if !has_prompt && self.input_submitted_at == 0 {
             return;
         }
@@ -1381,12 +1364,6 @@ struct ProcessObservation {
     shell_foreground: bool,
     agent: Option<AgentObservation>,
     foreground: Option<ForegroundObservation>,
-}
-
-#[derive(Debug, Default)]
-struct RefreshOutcome {
-    title: Option<(u64, PiRequest)>,
-    summary: Option<(u64, PiRequest)>,
 }
 
 #[derive(Debug)]
@@ -2324,17 +2301,11 @@ impl TerminalSession {
         )
     }
 
-    fn refresh_process_metadata(
-        &self,
-        processes: &ProcessSnapshot,
-        pi_titles_enabled: bool,
-        pi_summaries_enabled: bool,
-        now: u64,
-    ) -> RefreshOutcome {
+    fn refresh_process_metadata(&self, processes: &ProcessSnapshot, now: u64) -> bool {
         self.refresh_working_directory();
         let shell_pid = self.info.read().pid;
         let Some(shell_pid) = shell_pid else {
-            return RefreshOutcome::default();
+            return false;
         };
         self.process_tracker.lock().update(
             shell_pid,
@@ -2367,6 +2338,10 @@ impl TerminalSession {
             agent.activity = None;
         }
         let previous_program = info.program.clone();
+        let previous_agent_signature = info
+            .agent
+            .as_ref()
+            .map(|agent| (agent.kind.clone(), agent.status.clone(), agent.revision));
         info.program = observation.program.clone();
         activity.foreground_command.refresh(
             &mut info.command,
@@ -2376,7 +2351,6 @@ impl TerminalSession {
             now,
         );
 
-        let mut outcome = RefreshOutcome::default();
         if let Some(agent) = observation.agent {
             let process_identity_changed = activity.agent_pid.is_some()
                 && (activity.agent_pid != Some(agent.pid)
@@ -2416,12 +2390,9 @@ impl TerminalSession {
                 activity.active_samples = 0;
                 activity.quiet_samples = 0;
                 activity.prompt_capture = PromptCapture::default();
-                activity.pending_title_prompt = None;
-                activity.title_revision = 0;
-                activity.title_in_flight_revision = None;
                 activity.generated_title = None;
-                activity.initial_title_prompt = None;
-                activity.summary_in_flight_revision = None;
+                activity.native_title = false;
+                activity.first_prompt = None;
                 if preserve_native_state {
                     activity.input_submitted_at =
                         if activity.native_status == Some(AgentStatus::Working) {
@@ -2450,10 +2421,7 @@ impl TerminalSession {
                     );
                     activity.input_submitted_at = initial_state.input_submitted_at;
                     if let Some(submission) = pending_submission {
-                        activity.queue_title_for_submission(
-                            &AgentStatus::Idle,
-                            Some(submission.prompt),
-                        );
+                        activity.note_first_prompt(Some(submission.prompt));
                     }
                     info.agent = Some(AgentInfo {
                         kind: agent.kind.clone(),
@@ -2465,13 +2433,6 @@ impl TerminalSession {
                         summary: None,
                         activity: None,
                     });
-                    if initial_state.completed_at.is_some() && pi_summaries_enabled {
-                        activity.summary_in_flight_revision = Some(initial_state.revision);
-                        outcome.summary = Some((
-                            initial_state.revision,
-                            Self::pi_request(PiTaskKind::Summary, &info, &agent.kind, None),
-                        ));
-                    }
                 }
             } else {
                 let cpu_delta = agent.cpu_ticks.saturating_sub(activity.last_cpu_ticks);
@@ -2530,33 +2491,12 @@ impl TerminalSession {
                         activity.input_submitted_at = 0;
                         current.completed_at = Some(now);
                         current.summary = None;
-                        let revision = current.revision;
-                        if pi_summaries_enabled
-                            && activity.summary_in_flight_revision != Some(revision)
-                        {
-                            activity.summary_in_flight_revision = Some(revision);
-                            outcome.summary = Some((
-                                revision,
-                                Self::pi_request(PiTaskKind::Summary, &info, &agent.kind, None),
-                            ));
-                        }
                     }
                 }
             }
 
             if activity.automatic_name && activity.generated_title.is_none() {
                 info.name = agent.kind.clone();
-            }
-            if !pi_titles_enabled || !activity.automatic_name {
-                activity.pending_title_prompt = None;
-            } else if activity.title_in_flight_revision.is_none()
-                && let Some((revision, prompt)) = activity.pending_title_prompt.take()
-            {
-                activity.title_in_flight_revision = Some(revision);
-                outcome.title = Some((
-                    revision,
-                    Self::pi_request(PiTaskKind::Title, &info, &agent.kind, Some(prompt)),
-                ));
             }
         } else {
             if let Some(current) = info.agent.as_mut()
@@ -2569,16 +2509,6 @@ impl TerminalSession {
                 if completed_task {
                     current.completed_at = Some(now);
                     current.summary = None;
-                    let revision = current.revision;
-                    let kind = current.kind.clone();
-                    if pi_summaries_enabled && activity.summary_in_flight_revision != Some(revision)
-                    {
-                        activity.summary_in_flight_revision = Some(revision);
-                        outcome.summary = Some((
-                            revision,
-                            Self::pi_request(PiTaskKind::Summary, &info, &kind, None),
-                        ));
-                    }
                 }
             }
             activity.agent_pid = None;
@@ -2586,8 +2516,6 @@ impl TerminalSession {
             activity.active_samples = 0;
             activity.quiet_samples = 0;
             activity.input_submitted_at = 0;
-            activity.pending_title_prompt = None;
-            activity.title_in_flight_revision = None;
             activity.native_provider = None;
             activity.native_status = None;
             activity.native_updated_at = 0;
@@ -2595,6 +2523,7 @@ impl TerminalSession {
             *self.signals.lock() = TerminalSignals::default();
             if !observation.shell_foreground {
                 activity.generated_title = None;
+                activity.native_title = false;
                 info.agent = None;
             }
             if activity.automatic_name && activity.generated_title.is_none() {
@@ -2615,18 +2544,16 @@ impl TerminalSession {
         {
             info.path = terminal_path(&info.workspace, &info.name);
         }
+        let next_agent_signature = info
+            .agent
+            .as_ref()
+            .map(|agent| (agent.kind.clone(), agent.status.clone(), agent.revision));
         drop(info);
         drop(activity);
-        self.attach_recent_output(&mut outcome);
-        outcome
+        next_agent_signature != previous_agent_signature
     }
 
-    fn apply_agent_event(
-        &self,
-        mut event: AgentEvent,
-        pi_summaries_enabled: bool,
-        now: u64,
-    ) -> RefreshOutcome {
+    fn apply_agent_event(&self, mut event: AgentEvent, now: u64) -> bool {
         let transcript = std::mem::take(&mut event.transcript);
         if event.transcript_reset {
             self.transcript
@@ -2638,13 +2565,14 @@ impl TerminalSession {
                 .extend(&event.provider, transcript, now);
         }
         if event.transcript_only {
-            return RefreshOutcome::default();
+            return false;
         }
         let mut activity = self.activity.lock();
         let mut info = self.info.write();
         if !activity.accept_native_sequence(&event.provider, event.sequence) {
-            return RefreshOutcome::default();
+            return false;
         }
+        let previous_revision = info.agent.as_ref().map(|agent| agent.revision);
         activity.foreground_command.candidate = None;
         info.command = None;
         let next_status = match event.kind {
@@ -2699,108 +2627,22 @@ impl TerminalSession {
             }
         }
         agent.activity = next_activity;
-        let completed_revision = (previous_status == AgentStatus::Working
-            && next_status != AgentStatus::Working)
-            .then_some(agent.revision);
-        let agent_kind = agent.kind.clone();
         info.agent = Some(agent);
-
-        let mut outcome = RefreshOutcome::default();
-        if let Some(revision) = completed_revision
-            && pi_summaries_enabled
-            && activity.summary_in_flight_revision != Some(revision)
-        {
-            activity.summary_in_flight_revision = Some(revision);
-            outcome.summary = Some((
-                revision,
-                Self::pi_request(PiTaskKind::Summary, &info, &agent_kind, None),
-            ));
-        }
+        let mut changed = previous_revision != info.agent.as_ref().map(|agent| agent.revision);
         if let Some(title) = event.title
             && activity.automatic_name
         {
-            // A provider (omp) already titled this conversation; adopt it and stop
-            // term-server's own generation so a stale Pi result can't overwrite it.
-            activity.pending_title_prompt = None;
-            activity.title_in_flight_revision = None;
+            // A provider (omp) already titled this conversation; adopt it and
+            // mark the tab natively titled so fili never overwrites it.
             activity.generated_title = Some(title.clone());
+            activity.native_title = true;
             info.name = title;
             info.path = terminal_path(&info.workspace, &info.name);
+            changed = true;
         }
         drop(info);
         drop(activity);
-        self.attach_recent_output(&mut outcome);
-        outcome
-    }
-
-    /// Builds a Pi request from state the caller already holds. It deliberately
-    /// touches no lock of its own: every caller holds `activity` and `info`
-    /// while it runs, and reaching for `output` here is the `info -> output`
-    /// half of a deadlock with any path that holds `output`.
-    fn pi_request(
-        kind: PiTaskKind,
-        info: &TerminalInfo,
-        agent: &str,
-        user_prompt: Option<String>,
-    ) -> PiRequest {
-        PiRequest {
-            kind,
-            workspace: info.workspace.clone(),
-            program: info.program.clone(),
-            agent: agent.to_owned(),
-            user_prompt,
-            recent_output: String::new(),
-        }
-    }
-
-    /// Reads the terminal tail a summary is written from. Called only once the
-    /// caller has released `activity` and `info`, so `output` stays the
-    /// innermost lock.
-    fn attach_recent_output(&self, outcome: &mut RefreshOutcome) {
-        let Some((_, request)) = outcome.summary.as_mut() else {
-            return;
-        };
-        request.recent_output = self.output.lock().text_tail(SUMMARY_TAIL_BYTES);
-    }
-
-    fn finish_title(&self, revision: u64, result: Result<String, String>) {
-        let mut activity = self.activity.lock();
-        if activity.title_in_flight_revision != Some(revision) {
-            return;
-        }
-        activity.title_in_flight_revision = None;
-        if activity.title_revision != revision || activity.agent_pid.is_none() {
-            return;
-        }
-        match result {
-            Ok(title) => {
-                activity.generated_title = Some(title.clone());
-                if activity.automatic_name {
-                    let mut info = self.info.write();
-                    info.name = title;
-                    info.path = terminal_path(&info.workspace, &info.name);
-                }
-            }
-            Err(error) => tracing::debug!(%error, "Pi terminal title generation failed"),
-        }
-    }
-
-    fn finish_summary(&self, revision: u64, result: Result<String, String>) {
-        let mut activity = self.activity.lock();
-        if activity.summary_in_flight_revision == Some(revision) {
-            activity.summary_in_flight_revision = None;
-        }
-        match result {
-            Ok(summary) => {
-                let mut info = self.info.write();
-                if let Some(agent) = info.agent.as_mut()
-                    && agent.revision == revision
-                {
-                    agent.summary = Some(summary);
-                }
-            }
-            Err(error) => tracing::debug!(%error, "Pi terminal summary generation failed"),
-        }
+        changed
     }
 }
 
@@ -2812,6 +2654,8 @@ pub struct TerminalManager {
     home_directory: PathBuf,
     agent_event_socket: Option<PathBuf>,
     executable: Option<PathBuf>,
+    /// Set when fili attaches; the monitor pokes it on agent state changes.
+    fili_wake: Mutex<Weak<Notify>>,
 }
 
 impl TerminalManager {
@@ -2827,6 +2671,7 @@ impl TerminalManager {
             home_directory,
             agent_event_socket: None,
             executable: std::env::current_exe().ok(),
+            fili_wake: Mutex::new(Weak::new()),
         }
     }
 
@@ -2893,7 +2738,148 @@ impl TerminalManager {
             .count()
     }
 
-    pub fn start_monitor(self: &Arc<Self>, pi: Arc<PiService>) {
+    /// Registers the notify handle fili wakes on. The monitor only signals
+    /// "an agent state changed"; fili diffs the live roster itself.
+    fn store_fili_wake(&self, wake: Weak<Notify>) {
+        *self.fili_wake.lock() = wake;
+    }
+
+    fn wake_fili(&self) {
+        if let Some(notify) = self.fili_wake.lock().upgrade() {
+            notify.notify_one();
+        }
+    }
+
+    /// The roster fili reads and labels: every retained terminal, exited
+    /// included (a finished task's summary may still be owed), sorted by path.
+    /// Lock order stays `activity` before `info`.
+    fn fili_roster_records(&self) -> Vec<FiliTerminalRecord> {
+        let mut roster = Vec::new();
+        for session in self.sessions.read().values() {
+            let activity = session.activity.lock();
+            let info = session.info.read();
+            roster.push(FiliTerminalRecord {
+                id: info.id,
+                name: info.name.clone(),
+                path: info.path.clone(),
+                workspace: info.workspace.clone(),
+                program: info.program.clone(),
+                status: match info.status {
+                    TerminalStatus::Running => "running",
+                    TerminalStatus::Exited => "exited",
+                }
+                .to_owned(),
+                kind: match info.kind {
+                    TerminalKind::Regular => "regular",
+                    TerminalKind::Supervisor => "supervisor",
+                }
+                .to_owned(),
+                agent_kind: info.agent.as_ref().map(|agent| agent.kind.clone()),
+                agent_status: info.agent.as_ref().map(|agent| {
+                    match agent.status {
+                        AgentStatus::Working => "working",
+                        AgentStatus::Blocked => "blocked",
+                        AgentStatus::Idle => "idle",
+                        AgentStatus::Closed => "closed",
+                    }
+                    .to_owned()
+                }),
+                agent_revision: info.agent.as_ref().map_or(0, |agent| agent.revision),
+                agent_completed_at: info.agent.as_ref().and_then(|agent| agent.completed_at),
+                agent_summary: info.agent.as_ref().and_then(|agent| agent.summary.clone()),
+                automatic_name: activity.automatic_name,
+                claimed: activity.generated_title.is_some(),
+                first_prompt: activity.first_prompt.clone(),
+            });
+        }
+        roster.sort_by(|left, right| left.path.cmp(&right.path));
+        roster
+    }
+
+    /// Applies a fili title. Server-side ownership rules: only a tab whose
+    /// name is still term-server's (`automatic_name`) and that the agent has
+    /// not titled natively may be renamed, and only when the current task
+    /// generation does not already carry a title. Lock order matches
+    /// `rename`: `sessions` before `activity` before `info`.
+    fn apply_fili_name(&self, id: Uuid, name: &str) -> Result<String, String> {
+        let normalized = name.split_whitespace().collect::<Vec<_>>().join(" ");
+        let normalized = normalized.trim().to_lowercase();
+        if normalized.is_empty() {
+            return Err("title is empty".to_owned());
+        }
+        let session = {
+            let sessions = self.sessions.read();
+            if sessions
+                .iter()
+                .any(|(candidate, other)| *candidate != id && other.info.read().name == normalized)
+            {
+                return Err(format!(
+                    "another terminal is already named \"{normalized}\""
+                ));
+            }
+            let session = sessions
+                .get(&id)
+                .cloned()
+                .ok_or("terminal no longer exists")?;
+            if !session.activity.lock().automatic_name {
+                return Err("a person renamed this terminal; its name is fixed".to_owned());
+            }
+            session
+        };
+        let mut activity = session.activity.lock();
+        if activity.native_title {
+            return Err("the agent titled this terminal itself; leave it alone".to_owned());
+        }
+        if activity.generated_title.is_some() {
+            return Err("this task already has a generated title".to_owned());
+        }
+        let final_name = normalized;
+        activity.generated_title = Some(final_name.clone());
+        {
+            let mut info = session.info.write();
+            info.name = final_name.clone();
+            info.path = terminal_path(&info.workspace, &info.name);
+        }
+        Ok(final_name)
+    }
+
+    /// Applies a fili summary, guarded against the agent having moved on
+    /// since the roster the model read.
+    fn apply_fili_summary(
+        &self,
+        id: Uuid,
+        agent_revision: Option<u64>,
+        summary: &str,
+    ) -> Result<(), String> {
+        let Some(session) = self.get(id) else {
+            return Err("terminal no longer exists".to_owned());
+        };
+        let summary = summary.trim();
+        if summary.is_empty() {
+            return Err("summary is empty".to_owned());
+        }
+        let summary = summary.replace(['\r', '\n'], " ");
+        let mut info = session.info.write();
+        let Some(agent) = info.agent.as_mut() else {
+            return Err("no agent is attached to this terminal".to_owned());
+        };
+        if let Some(revision) = agent_revision
+            && agent.revision != revision
+        {
+            return Err(format!(
+                "the agent moved on (revision {}); re-read the roster",
+                agent.revision
+            ));
+        }
+        if agent.completed_at.is_none() {
+            return Err("the current agent task has not finished".to_owned());
+        }
+        agent.summary = Some(summary);
+        drop(info);
+        Ok(())
+    }
+
+    pub fn start_monitor(self: &Arc<Self>) {
         let manager = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(1_500));
@@ -2901,13 +2887,12 @@ impl TerminalManager {
             loop {
                 interval.tick().await;
                 let manager = manager.clone();
-                let pi = pi.clone();
                 // Sampling reads every entry in /proc. That is filesystem work
                 // measured in milliseconds, and a runtime worker parked in it
                 // is a worker not serving terminal sockets. Awaiting the handle
                 // also keeps samples from overlapping when one runs long.
                 if let Err(error) =
-                    tokio::task::spawn_blocking(move || manager.refresh_processes(pi)).await
+                    tokio::task::spawn_blocking(move || manager.refresh_processes()).await
                 {
                     tracing::warn!(%error, "terminal process sample failed");
                 }
@@ -2915,20 +2900,18 @@ impl TerminalManager {
         });
     }
 
-    pub fn apply_agent_event(&self, id: Uuid, event: AgentEvent, pi: Arc<PiService>) -> bool {
+    pub fn apply_agent_event(&self, id: Uuid, event: AgentEvent) -> bool {
         let Some(session) = self.get(id) else {
             return false;
         };
-        let outcome = session.apply_agent_event(event, pi.summaries_enabled(), current_millis());
-        if let Some((revision, request)) = outcome.summary {
-            tokio::spawn(async move {
-                session.finish_summary(revision, pi.generate(request).await);
-            });
+        let changed = session.apply_agent_event(event, current_millis());
+        if changed {
+            self.wake_fili();
         }
         true
     }
 
-    fn refresh_processes(&self, pi: Arc<PiService>) {
+    fn refresh_processes(&self) {
         self.prune_exited_sessions();
         let sessions = self.sessions.read().values().cloned().collect::<Vec<_>>();
         let shell_pids = sessions
@@ -2937,29 +2920,14 @@ impl TerminalManager {
             .collect::<Vec<_>>();
         let processes = ProcessSnapshot::read(&shell_pids);
         let now = current_millis();
-        let pi_titles_enabled = pi.titles_enabled();
-        let pi_summaries_enabled = pi.summaries_enabled();
+        let mut changed = false;
         for session in sessions {
-            let outcome = session.refresh_process_metadata(
-                &processes,
-                pi_titles_enabled,
-                pi_summaries_enabled,
-                now,
-            );
-            if let Some((revision, request)) = outcome.title {
-                let pi = pi.clone();
-                let session = session.clone();
-                tokio::spawn(async move {
-                    session.finish_title(revision, pi.generate(request).await);
-                });
-            }
-            if let Some((revision, request)) = outcome.summary {
-                let pi = pi.clone();
-                let session = session.clone();
-                tokio::spawn(async move {
-                    session.finish_summary(revision, pi.generate(request).await);
-                });
-            }
+            changed |= session.refresh_process_metadata(&processes, now);
+        }
+        if changed {
+            // Coarse trigger only: fili re-reads the live roster and decides
+            // whether any tab actually needs a title or a summary.
+            self.wake_fili();
         }
     }
 
@@ -3192,6 +3160,7 @@ impl TerminalManager {
             let mut activity = session.activity.lock();
             activity.automatic_name = false;
             activity.generated_title = None;
+            activity.native_title = false;
             let mut info = session.info.write();
             info.name = name;
             info.path = terminal_path(&info.workspace, &info.name);
@@ -3216,6 +3185,109 @@ impl TerminalManager {
         for session in sessions.values() {
             session.kill();
         }
+    }
+}
+
+/// One terminal as fili sees it. camelCase because it is handed to the model
+/// as JSON.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FiliTerminalRecord {
+    pub id: Uuid,
+    pub name: String,
+    pub path: String,
+    pub workspace: String,
+    pub program: String,
+    pub status: String,
+    pub kind: String,
+    pub agent_kind: Option<String>,
+    pub agent_status: Option<String>,
+    pub agent_revision: u64,
+    pub agent_completed_at: Option<u64>,
+    pub agent_summary: Option<String>,
+    pub automatic_name: bool,
+    pub claimed: bool,
+    pub first_prompt: Option<String>,
+}
+
+/// The surface fili needs from the terminal layer, kept as a trait so the
+/// service holds the manager behind `Arc<dyn FiliHost>` and never inherits
+/// its concrete type.
+pub trait FiliHost: Send + Sync {
+    fn attach_fili(&self, wake: Weak<Notify>);
+    fn fili_roster(&self) -> Vec<FiliTerminalRecord>;
+    fn fili_roster_json(&self) -> Value {
+        serde_json::to_value(self.fili_roster()).unwrap_or(Value::Null)
+    }
+    fn fili_read_output(&self, id: Uuid, max_chars: usize) -> Option<String>;
+    fn fili_read_transcript(&self, id: Uuid, limit: usize) -> Option<Value>;
+    fn fili_set_name(&self, id: Uuid, name: &str) -> Result<String, String>;
+    fn fili_set_summary(
+        &self,
+        id: Uuid,
+        agent_revision: Option<u64>,
+        summary: &str,
+    ) -> Result<(), String>;
+}
+
+impl FiliHost for TerminalManager {
+    fn attach_fili(&self, wake: Weak<Notify>) {
+        self.store_fili_wake(wake);
+    }
+
+    fn fili_roster(&self) -> Vec<FiliTerminalRecord> {
+        self.fili_roster_records()
+    }
+
+    fn fili_read_output(&self, id: Uuid, max_chars: usize) -> Option<String> {
+        let session = self.get(id)?;
+        let snapshot = session.screen_snapshot(max_chars);
+        let text = if snapshot.screen.trim().is_empty() {
+            snapshot.tail
+        } else {
+            format!("{}\n-- tail --\n{}", snapshot.screen, snapshot.tail)
+        };
+        let characters: Vec<char> = text.chars().collect();
+        Some(
+            characters
+                .iter()
+                .skip(characters.len().saturating_sub(max_chars))
+                .collect(),
+        )
+    }
+
+    fn fili_read_transcript(&self, id: Uuid, limit: usize) -> Option<Value> {
+        let session = self.get(id)?;
+        // Newest page first: fili reads the tail of the agent's story.
+        let page = session.transcript(None, usize::MAX, &[])?;
+        let offset = page.records.len().saturating_sub(limit);
+        let records = &page.records[offset..];
+        serde_json::to_value(
+            records
+                .iter()
+                .map(|record| {
+                    json!({
+                        "kind": record.kind.as_str(),
+                        "role": record.role,
+                        "text": record.text,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .ok()
+    }
+
+    fn fili_set_name(&self, id: Uuid, name: &str) -> Result<String, String> {
+        self.apply_fili_name(id, name)
+    }
+
+    fn fili_set_summary(
+        &self,
+        id: Uuid,
+        agent_revision: Option<u64>,
+        summary: &str,
+    ) -> Result<(), String> {
+        self.apply_fili_summary(id, agent_revision, summary)
     }
 }
 
@@ -5196,6 +5268,7 @@ mod tests {
             home_directory: directory.path().to_path_buf(),
             agent_event_socket: None,
             executable: None,
+            fili_wake: Mutex::new(Weak::new()),
         };
         let running = manager
             .create(CreateTerminal {
@@ -5284,6 +5357,7 @@ mod tests {
             home_directory: directory.path().to_path_buf(),
             agent_event_socket: None,
             executable: None,
+            fili_wake: Mutex::new(Weak::new()),
         };
         let info = manager
             .create(CreateTerminal {
@@ -5358,6 +5432,7 @@ mod tests {
             home_directory: home.to_path_buf(),
             agent_event_socket: None,
             executable: None,
+            fili_wake: Mutex::new(Weak::new()),
         }
     }
 
@@ -5486,7 +5561,6 @@ mod tests {
                             transcript_reset: false,
                             transcript: Vec::new(),
                         },
-                        true,
                         index,
                     );
                 }
@@ -5562,16 +5636,13 @@ mod tests {
             submitted_at: 1_000,
             prompt: "an earlier command".to_owned(),
         });
-        let outcome = session.refresh_process_metadata(
+        let _changed = session.refresh_process_metadata(
             &process_sample(vec![
                 sampled_process(900_001, 1, 900_001, 900_100, "sh"),
                 sampled_process(900_100, 900_001, 900_100, 900_100, "codex"),
             ]),
-            true,
-            false,
             2_000,
         );
-        assert!(outcome.title.is_none());
         assert_eq!(session.activity.lock().input_submitted_at, 0);
         assert_eq!(
             session.info().agent.map(|agent| agent.status),
@@ -5585,17 +5656,17 @@ mod tests {
             submitted_at: 3_000,
             prompt: "add payment retries".to_owned(),
         });
-        let outcome = session.refresh_process_metadata(
+        let _changed = session.refresh_process_metadata(
             &process_sample(vec![
                 sampled_process(900_001, 1, 900_001, 900_200, "sh"),
                 sampled_process(900_200, 900_001, 900_200, 900_200, "codex"),
             ]),
-            true,
-            false,
             4_000,
         );
-        let (_, request) = outcome.title.expect("the submitted task was not restored");
-        assert_eq!(request.user_prompt.as_deref(), Some("add payment retries"));
+        assert_eq!(
+            session.activity.lock().first_prompt.as_deref(),
+            Some("add payment retries")
+        );
         assert_eq!(session.activity.lock().input_submitted_at, 3_000);
         assert_eq!(
             session.info().agent.map(|agent| agent.status),
@@ -5673,6 +5744,7 @@ mod tests {
             home_directory: directory.path().to_path_buf(),
             agent_event_socket: None,
             executable: None,
+            fili_wake: Mutex::new(Weak::new()),
         };
         let info = manager
             .create(CreateTerminal {
@@ -5682,7 +5754,6 @@ mod tests {
                 clone_from: None,
             })
             .unwrap();
-        let pi = Arc::new(PiService::new(directory.path()));
 
         for (kind, label) in [
             (AgentEventKind::Thinking, "thinking"),
@@ -5699,7 +5770,6 @@ mod tests {
                     transcript_reset: false,
                     transcript: Vec::new(),
                 },
-                pi.clone(),
             ));
             let agent = manager.get(info.id).unwrap().info().agent.unwrap();
             assert_eq!(agent.status, AgentStatus::Working);
@@ -5732,7 +5802,6 @@ mod tests {
                 transcript_reset: false,
                 transcript: Vec::new(),
             },
-            pi.clone(),
         ));
         let ready = manager.get(info.id).unwrap().info().agent.unwrap();
         assert_eq!(ready.status, AgentStatus::Idle);
@@ -5751,7 +5820,6 @@ mod tests {
                 transcript_reset: false,
                 transcript: Vec::new(),
             },
-            pi,
         ));
         let closed = manager.get(info.id).unwrap().info().agent.unwrap();
         assert_eq!(closed.status, AgentStatus::Closed);
@@ -5771,6 +5839,7 @@ mod tests {
             home_directory: directory.path().to_path_buf(),
             agent_event_socket: None,
             executable: None,
+            fili_wake: Mutex::new(Weak::new()),
         };
         let info = manager
             .create(CreateTerminal {
@@ -5780,7 +5849,6 @@ mod tests {
                 clone_from: None,
             })
             .unwrap();
-        let pi = Arc::new(PiService::new(directory.path()));
         let event = |provider: &str, kind: AgentEventKind, sequence: Option<u64>| AgentEvent {
             provider: provider.to_owned(),
             kind,
@@ -5791,7 +5859,7 @@ mod tests {
             transcript: Vec::new(),
         };
         let apply = |provider, kind, sequence| {
-            manager.apply_agent_event(info.id, event(provider, kind, sequence), pi.clone())
+            manager.apply_agent_event(info.id, event(provider, kind, sequence))
         };
         let agent = || manager.get(info.id).unwrap().info().agent.unwrap();
 
@@ -5847,6 +5915,7 @@ mod tests {
             home_directory: directory.path().to_path_buf(),
             agent_event_socket: None,
             executable: None,
+            fili_wake: Mutex::new(Weak::new()),
         };
         let info = manager
             .create(CreateTerminal {
@@ -5856,7 +5925,6 @@ mod tests {
                 clone_from: None,
             })
             .unwrap();
-        let pi = Arc::new(PiService::new(directory.path()));
 
         // omp forwards its own conversation title alongside a lifecycle event.
         assert!(manager.apply_agent_event(
@@ -5870,7 +5938,6 @@ mod tests {
                 transcript_reset: false,
                 transcript: Vec::new(),
             },
-            pi,
         ));
 
         let session = manager.get(info.id).unwrap();
@@ -5879,9 +5946,8 @@ mod tests {
             activity.generated_title.as_deref(),
             Some("checkout latency fix")
         );
-        // term-server must not queue or await its own title once omp has supplied one.
-        assert!(activity.pending_title_prompt.is_none());
-        assert!(activity.title_in_flight_revision.is_none());
+        // The adopted title is owned by the agent: fili must not retitle it.
+        assert!(activity.native_title);
         drop(activity);
         assert_eq!(session.info().name, "checkout latency fix");
         assert!(manager.remove(info.id));
@@ -5909,7 +5975,6 @@ mod tests {
             manager.get(info.id).unwrap().info().status,
             TerminalStatus::Exited
         );
-        let pi = Arc::new(PiService::new(directory.path()));
         assert!(manager.apply_agent_event(
             info.id,
             AgentEvent {
@@ -5952,7 +6017,6 @@ mod tests {
                     },
                 ],
             },
-            pi,
         ));
 
         let session = manager.get(info.id).unwrap();
@@ -6286,45 +6350,29 @@ mod tests {
     }
 
     #[test]
-    fn keeps_generated_titles_anchored_to_the_initial_task() {
+    fn records_only_the_first_real_prompt_as_a_title_hint() {
         let mut activity = SessionActivity::default();
-        activity.queue_title_for_submission(
-            &AgentStatus::Working,
-            Some("approve the command".to_owned()),
-        );
-        assert_eq!(activity.pending_title_prompt, None);
-
-        activity.queue_title_for_submission(&AgentStatus::Idle, Some("/model".to_owned()));
-        assert_eq!(activity.pending_title_prompt, None);
-        assert_eq!(activity.initial_title_prompt, None);
-
-        activity.queue_title_for_submission(
-            &AgentStatus::Idle,
-            Some("fix checkout latency".to_owned()),
-        );
+        // Working-state noise and slash commands never seed the hint.
+        activity.note_first_prompt(Some("approve the command".to_owned()));
         assert_eq!(
-            activity.pending_title_prompt,
-            Some((1, "fix checkout latency".to_owned()))
+            activity.first_prompt.as_deref(),
+            Some("approve the command")
         );
 
-        activity.queue_title_for_submission(&AgentStatus::Idle, Some("update".to_owned()));
+        // First non-empty prompt wins; later submissions do not overwrite it.
+        activity.note_first_prompt(Some("update".to_owned()));
         assert_eq!(
-            activity.pending_title_prompt,
-            Some((1, "fix checkout latency".to_owned()))
+            activity.first_prompt.as_deref(),
+            Some("approve the command")
         );
 
-        activity.pending_title_prompt = None;
-        activity.queue_title_for_submission(&AgentStatus::Idle, Some("update".to_owned()));
-        assert_eq!(
-            activity.pending_title_prompt,
-            Some((2, "fix checkout latency".to_owned()))
-        );
-
-        activity.pending_title_prompt = None;
-        activity.generated_title = Some("checkout latency fix".to_owned());
-        activity
-            .queue_title_for_submission(&AgentStatus::Idle, Some("add payment retries".to_owned()));
-        assert_eq!(activity.pending_title_prompt, None);
+        let mut fresh = SessionActivity::default();
+        fresh.note_first_prompt(Some("  /model gpt ".to_owned()));
+        assert_eq!(fresh.first_prompt, None);
+        fresh.note_first_prompt(Some("\n".to_owned()));
+        assert_eq!(fresh.first_prompt, None);
+        fresh.note_first_prompt(Some("  fix checkout latency  ".to_owned()));
+        assert_eq!(fresh.first_prompt.as_deref(), Some("fix checkout latency"));
     }
 
     #[test]
@@ -6671,6 +6719,7 @@ mod tests {
             home_directory: directory.path().to_path_buf(),
             agent_event_socket: None,
             executable: None,
+            fili_wake: Mutex::new(Weak::new()),
         };
         let info = manager
             .create(CreateTerminal {
@@ -6680,7 +6729,6 @@ mod tests {
                 clone_from: None,
             })
             .unwrap();
-        let pi = Arc::new(PiService::new(directory.path()));
 
         let event = |kind| AgentEvent {
             provider: "claude".to_owned(),
@@ -6692,15 +6740,11 @@ mod tests {
             transcript: Vec::new(),
         };
 
-        assert!(manager.apply_agent_event(info.id, event(AgentEventKind::Thinking), pi.clone()));
+        assert!(manager.apply_agent_event(info.id, event(AgentEventKind::Thinking)));
         let working = manager.get(info.id).unwrap().info().agent.unwrap();
         assert_eq!(working.status, AgentStatus::Working);
 
-        assert!(manager.apply_agent_event(
-            info.id,
-            event(AgentEventKind::WaitingForApproval),
-            pi.clone(),
-        ));
+        assert!(manager.apply_agent_event(info.id, event(AgentEventKind::WaitingForApproval),));
         let blocked = manager.get(info.id).unwrap().info().agent.unwrap();
         assert_eq!(blocked.status, AgentStatus::Blocked);
         assert_eq!(
@@ -6720,7 +6764,7 @@ mod tests {
         drop(activity);
         drop(session);
 
-        assert!(manager.apply_agent_event(info.id, event(AgentEventKind::Thinking), pi.clone()));
+        assert!(manager.apply_agent_event(info.id, event(AgentEventKind::Thinking)));
         assert_eq!(
             manager.get(info.id).unwrap().info().agent.unwrap().status,
             AgentStatus::Working

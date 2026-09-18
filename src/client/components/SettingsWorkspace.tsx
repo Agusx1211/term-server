@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "preact/hooks";
+import { api } from "../lib/api";
 import {
   Activity,
   Bell,
@@ -33,7 +34,8 @@ import type {
   ArtifactSkillConfig,
   BuildInfo,
   DebugRecordingStatus,
-  PiConfig,
+  FiliConfig,
+  FiliStreamEvent,
   PushoverConfig,
   PushoverMode,
   SessionBrokerInfo,
@@ -73,7 +75,7 @@ import type { ThemeName } from "../lib/terminal-theme";
 interface SettingsWorkspaceProps {
   active: boolean;
   theme: ThemeName;
-  pi: PiConfig;
+  fili: FiliConfig;
   agentIntegrations: AgentIntegrationsConfig;
   updatingAgentIntegration?: AgentIntegrationProvider;
   artifactSkill: ArtifactSkillConfig;
@@ -105,7 +107,7 @@ interface SettingsWorkspaceProps {
   pushover: PushoverConfig;
   statusModules: StatusModulesSettings;
   onTheme: (theme: ThemeName) => void;
-  onPiChange: (titlesEnabled: boolean, summariesEnabled: boolean, model: string) => void;
+  onFiliChange: (titlesEnabled: boolean, summariesEnabled: boolean, model: string) => void;
   onAgentIntegration: (
     provider: AgentIntegrationProvider,
     action: AgentIntegrationAction,
@@ -220,7 +222,7 @@ const settingsSections = [
   {
     id: "agents",
     label: "Agents",
-    description: "Agent metadata, integrations, and skills",
+    description: "Fili, integrations, and skills",
     Icon: Sparkles,
   },
   {
@@ -236,7 +238,7 @@ type SettingsSection = (typeof settingsSections)[number]["id"];
 export function SettingsWorkspace({
   active,
   theme,
-  pi,
+  fili,
   agentIntegrations,
   updatingAgentIntegration,
   artifactSkill,
@@ -268,7 +270,7 @@ export function SettingsWorkspace({
   pushover,
   statusModules,
   onTheme,
-  onPiChange,
+  onFiliChange,
   onAgentIntegration,
   onArtifactSkill,
   onCheckForUpdate,
@@ -333,6 +335,33 @@ export function SettingsWorkspace({
   const [activeSection, setActiveSection] = useState<SettingsSection>("workspace");
   const activeSectionDetails = settingsSections.find(({ id }) => id === activeSection)
     ?? settingsSections[0];
+
+  // Fili's live activity stream: polled only while its settings card is
+  // visible, newest event first, seeded from the journal on disk.
+  const [filiStream, setFiliStream] = useState<FiliStreamEvent[]>([]);
+  const filiCursor = useRef(0);
+  useEffect(() => {
+    if (!active || activeSection !== "agents") return;
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const page = await api.filiStream(filiCursor.current);
+        if (cancelled) return;
+        if (page.events.length > 0) {
+          filiCursor.current = Math.max(filiCursor.current, page.latest);
+          setFiliStream((current) => [...page.events, ...current].slice(0, 200));
+        }
+      } catch {
+        // Settings polling must never surface a transient error.
+      }
+    };
+    void load();
+    const timer = window.setInterval(() => void load(), 2_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [active, activeSection]);
 
   return (
     <section class={`settings-workspace ${active ? "visible" : ""}`} aria-hidden={!active}>
@@ -894,54 +923,72 @@ export function SettingsWorkspace({
             class="settings-card"
             hidden={activeSection !== "agents"}
           >
-            <header><Sparkles size={16} /><h2>Agent metadata</h2></header>
-            <p>Use Pi to generate concise labels from bounded terminal context.</p>
-            <label class={`settings-toggle ${pi.titlesEnabled ? "active" : ""} ${pi.available ? "" : "disabled"}`}>
+            <header><Sparkles size={16} /><h2>Fili</h2></header>
+            <p>
+              Fili is term-server&apos;s built-in agent. It watches agent sessions and writes a
+              concise tab name for each task plus a short summary when one finishes.
+            </p>
+            <label class={`settings-toggle ${fili.titlesEnabled ? "active" : ""} ${fili.available ? "" : "disabled"}`}>
               <Sparkles size={14} />
-              <span>Pi-generated titles</span>
+              <span>Fili-generated titles</span>
               <input
                 type="checkbox"
-                checked={pi.titlesEnabled}
-                disabled={!pi.available}
-                onChange={(event) => onPiChange(
+                checked={fili.titlesEnabled}
+                disabled={!fili.available}
+                onChange={(event) => onFiliChange(
                   event.currentTarget.checked,
-                  pi.summariesEnabled,
-                  pi.model,
+                  fili.summariesEnabled,
+                  fili.model,
                 )}
               />
             </label>
-            <label class={`settings-toggle ${pi.summariesEnabled ? "active" : ""} ${pi.available ? "" : "disabled"}`}>
+            <label class={`settings-toggle ${fili.summariesEnabled ? "active" : ""} ${fili.available ? "" : "disabled"}`}>
               <MessageSquareText size={14} />
-              <span>Pi notification summaries</span>
+              <span>Fili notification summaries</span>
               <input
                 type="checkbox"
-                checked={pi.summariesEnabled}
-                disabled={!pi.available}
-                onChange={(event) => onPiChange(
-                  pi.titlesEnabled,
+                checked={fili.summariesEnabled}
+                disabled={!fili.available}
+                onChange={(event) => onFiliChange(
+                  fili.titlesEnabled,
                   event.currentTarget.checked,
-                  pi.model,
+                  fili.model,
                 )}
               />
             </label>
-            {pi.available ? (
-              <label class="pi-model-field">
-                <span>Pi model</span>
+            {fili.available ? (
+              <label class="fili-model-field">
+                <span>Fili model</span>
                 <select
-                  value={pi.model}
-                  disabled={!pi.titlesEnabled && !pi.summariesEnabled}
-                  onChange={(event) => onPiChange(
-                    pi.titlesEnabled,
-                    pi.summariesEnabled,
+                  value={fili.model}
+                  disabled={!fili.titlesEnabled && !fili.summariesEnabled}
+                  onChange={(event) => onFiliChange(
+                    fili.titlesEnabled,
+                    fili.summariesEnabled,
                     event.currentTarget.value,
                   )}
                 >
-                  <option value="">Pi configured default</option>
-                  {pi.models.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}
+                  <option value="">Provider default</option>
+                  {fili.models.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}
                 </select>
               </label>
             ) : (
-              <p class="settings-hint">Pi is unavailable. Install it for this user, then restart term-server.</p>
+              <p class="settings-hint">
+                Fili has no model. Configure an OpenAI-compatible provider in
+                <code>~/.pi/agent/models.json</code>, then restart term-server.
+              </p>
+            )}
+            {filiStream.length > 0 && (
+              <ol class="fili-stream" aria-label="Fili activity">
+                {filiStream.slice(0, 12).map((event) => (
+                  <li key={event.seq} class={`fili-stream-event fili-stream-${event.kind}`}>
+                    <time datetime={new Date(event.at).toISOString()}>
+                      {new Date(event.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+                    </time>
+                    <span>{event.detail}</span>
+                  </li>
+                ))}
+              </ol>
             )}
           </section>
 

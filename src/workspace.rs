@@ -16,8 +16,8 @@ use crate::{
         AccessDecision, AccessError, AccessManager, AccessSnapshot, AddSecretGrant, SecretApproval,
         SecretGrantView, SecretShareReveal, SudoApproval,
     },
-    ai::{PiClientConfig, PiService, UpdatePiSettings},
     debug_recording::DebugRecordingManager,
+    fili::{FiliClientConfig, FiliService, FiliStream, UpdateFiliSettings},
     history::{AgentTranscriptKind, AgentTranscriptPage, TerminalScrollbackPage},
     terminal::{
         CreateSupervisorTerminal, CreateTerminal, ProcessInspectorSnapshot, ProcessSignalError,
@@ -151,7 +151,7 @@ impl From<std::io::Error> for WorkspaceError {
 pub enum WorkspaceBackend {
     Local {
         terminals: Arc<TerminalManager>,
-        pi: Arc<PiService>,
+        fili: Arc<FiliService>,
         access: AccessManager,
     },
     #[cfg(unix)]
@@ -165,10 +165,10 @@ pub enum SessionConnection {
 }
 
 impl WorkspaceBackend {
-    pub fn local(terminals: Arc<TerminalManager>, pi: Arc<PiService>) -> Self {
+    pub fn local(terminals: Arc<TerminalManager>, fili: Arc<FiliService>) -> Self {
         Self::Local {
             terminals,
-            pi,
+            fili,
             access: AccessManager::default(),
         }
     }
@@ -539,11 +539,11 @@ impl WorkspaceBackend {
         }
     }
 
-    pub async fn pi_config(&self) -> Result<PiClientConfig, WorkspaceError> {
+    pub async fn fili_config(&self) -> Result<FiliClientConfig, WorkspaceError> {
         match self {
-            Self::Local { pi, .. } => Ok(pi.client_config()),
+            Self::Local { fili, .. } => Ok(fili.client_config()),
             #[cfg(unix)]
-            Self::Broker(client) => client.pi_config().await,
+            Self::Broker(client) => client.fili_config().await,
         }
     }
 
@@ -555,20 +555,28 @@ impl WorkspaceBackend {
         }
     }
 
-    pub async fn update_pi(
+    pub async fn update_fili(
         &self,
-        settings: UpdatePiSettings,
-    ) -> Result<PiClientConfig, WorkspaceError> {
+        settings: UpdateFiliSettings,
+    ) -> Result<FiliClientConfig, WorkspaceError> {
         match self {
-            Self::Local { pi, .. } => {
-                pi.update(settings)
+            Self::Local { fili, .. } => {
+                fili.update(settings)
                     .map_err(|message| WorkspaceError::Remote {
                         status: StatusCode::BAD_REQUEST,
                         message,
                     })
             }
             #[cfg(unix)]
-            Self::Broker(client) => client.update_pi(settings).await,
+            Self::Broker(client) => client.update_fili(settings).await,
+        }
+    }
+
+    pub async fn fili_stream(&self, after: u64) -> Result<FiliStream, WorkspaceError> {
+        match self {
+            Self::Local { fili, .. } => Ok(fili.stream_after(after)),
+            #[cfg(unix)]
+            Self::Broker(client) => client.fili_stream(after).await,
         }
     }
 

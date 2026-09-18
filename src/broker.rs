@@ -41,10 +41,10 @@ use crate::{
         SecretShareReveal, SecretShareState, SecretShareView, SudoApproval,
     },
     agent_events::AgentEvent,
-    ai::{PiClientConfig, PiService, UpdatePiSettings},
     audio::{AudioHub, serve_audio_socket},
     build::{self, BuildIdentity},
     config::Cli,
+    fili::{FiliClientConfig, FiliService, FiliStream, UpdateFiliSettings},
     history::{
         AgentTranscriptKind, AgentTranscriptPage, DEFAULT_SCROLLBACK_BYTES,
         DEFAULT_TRANSCRIPT_RECORDS, TerminalScrollbackPage,
@@ -326,15 +326,20 @@ impl BrokerClient {
         .await
     }
 
-    pub async fn pi_config(&self) -> Result<PiClientConfig, BrokerError> {
-        self.get_json("/pi").await
+    pub async fn fili_config(&self) -> Result<FiliClientConfig, BrokerError> {
+        self.get_json("/fili").await
     }
 
-    pub async fn update_pi(
+    pub async fn update_fili(
         &self,
-        settings: UpdatePiSettings,
-    ) -> Result<PiClientConfig, BrokerError> {
-        self.send_json(Method::PATCH, "/pi", Some(&settings)).await
+        settings: UpdateFiliSettings,
+    ) -> Result<FiliClientConfig, BrokerError> {
+        self.send_json(Method::PATCH, "/fili", Some(&settings))
+            .await
+    }
+
+    pub async fn fili_stream(&self, after: u64) -> Result<FiliStream, BrokerError> {
+        self.get_json(&format!("/fili/stream?after={after}")).await
     }
 
     pub async fn agent_event(&self, id: Uuid, event: &AgentEvent) -> Result<(), BrokerError> {
@@ -1325,17 +1330,17 @@ impl BrokerPool {
         }
     }
 
-    pub async fn pi_config(&self) -> Result<PiClientConfig, BrokerError> {
-        self.current.client.pi_config().await
+    pub async fn fili_config(&self) -> Result<FiliClientConfig, BrokerError> {
+        self.current.client.fili_config().await
     }
 
-    pub async fn update_pi(
+    pub async fn update_fili(
         &self,
-        settings: UpdatePiSettings,
-    ) -> Result<PiClientConfig, BrokerError> {
-        let updated = self.current.client.update_pi(settings.clone()).await?;
+        settings: UpdateFiliSettings,
+    ) -> Result<FiliClientConfig, BrokerError> {
+        let updated = self.current.client.update_fili(settings.clone()).await?;
         for generation in self.draining.read().await.iter() {
-            if let Err(error) = generation.client.update_pi(settings.clone()).await {
+            if let Err(error) = generation.client.update_fili(settings.clone()).await {
                 tracing::warn!(
                     %error,
                     broker_version = %generation.build.version,
@@ -1344,6 +1349,10 @@ impl BrokerPool {
             }
         }
         Ok(updated)
+    }
+
+    pub async fn fili_stream(&self, after: u64) -> Result<FiliStream, BrokerError> {
+        self.current.client.fili_stream(after).await
     }
 
     pub async fn terminal_socket(
@@ -1643,7 +1652,7 @@ struct BrokerState {
     terminals: Arc<TerminalManager>,
     audio: AudioHub,
     access: AccessManager,
-    pi: Arc<PiService>,
+    fili: Arc<FiliService>,
     shutdown: Arc<Notify>,
     control_token: Option<String>,
 }
@@ -1789,8 +1798,9 @@ pub async fn run_session_broker(
     let terminals = Arc::new(
         TerminalManager::new(default_shell, replay_bytes).with_agent_event_socket(path.clone()),
     );
-    let pi = Arc::new(PiService::new(data_directory));
-    terminals.start_monitor(pi.clone());
+    let fili = Arc::new(FiliService::new(data_directory));
+    terminals.start_monitor();
+    fili.start(terminals.clone());
     let shutdown = Arc::new(Notify::new());
     #[cfg(test)]
     let audio = AudioHub::test_available();
@@ -1799,7 +1809,7 @@ pub async fn run_session_broker(
     let state = BrokerState {
         terminals,
         audio: audio.clone(),
-        pi,
+        fili,
         access: broker_access_manager(),
         shutdown: shutdown.clone(),
         control_token,
@@ -1808,7 +1818,8 @@ pub async fn run_session_broker(
     let router = Router::new()
         .route("/health", get(broker_health))
         .route("/config", axum::routing::put(configure_broker))
-        .route("/pi", get(broker_pi_config).patch(update_broker_pi))
+        .route("/fili", get(broker_fili_config).patch(update_broker_fili))
+        .route("/fili/stream", get(broker_fili_stream))
         .route("/supervisor", post(create_broker_supervisor))
         .route(
             "/terminals",
@@ -1941,19 +1952,32 @@ async fn configure_broker(
     StatusCode::NO_CONTENT
 }
 
-async fn broker_pi_config(State(state): State<BrokerState>) -> Json<PiClientConfig> {
-    Json(state.pi.client_config())
+async fn broker_fili_config(State(state): State<BrokerState>) -> Json<FiliClientConfig> {
+    Json(state.fili.client_config())
 }
 
-async fn update_broker_pi(
+async fn update_broker_fili(
     State(state): State<BrokerState>,
-    Json(settings): Json<UpdatePiSettings>,
-) -> Result<Json<PiClientConfig>, BrokerApiError> {
+    Json(settings): Json<UpdateFiliSettings>,
+) -> Result<Json<FiliClientConfig>, BrokerApiError> {
     state
-        .pi
+        .fili
         .update(settings)
         .map(Json)
         .map_err(BrokerApiError::BadRequest)
+}
+
+#[derive(Deserialize)]
+struct FiliStreamQuery {
+    #[serde(default)]
+    after: u64,
+}
+
+async fn broker_fili_stream(
+    State(state): State<BrokerState>,
+    Query(query): Query<FiliStreamQuery>,
+) -> Json<FiliStream> {
+    Json(state.fili.stream_after(query.after))
 }
 
 async fn list_broker_terminals(State(state): State<BrokerState>) -> Json<Vec<TerminalInfo>> {
@@ -1997,7 +2021,7 @@ async fn broker_terminal_agent_event(
 ) -> Result<StatusCode, BrokerApiError> {
     state
         .terminals
-        .apply_agent_event(id, event, state.pi.clone())
+        .apply_agent_event(id, event)
         .then_some(StatusCode::NO_CONTENT)
         .ok_or(BrokerApiError::NotFound)
 }

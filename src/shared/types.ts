@@ -215,7 +215,7 @@ export interface ClientConfig {
   hostname: string;
   passwordManagedExternally: boolean;
   virtualAudioAvailable: boolean;
-  pi: PiConfig;
+  fili: FiliConfig;
   agentIntegrations: AgentIntegrationsConfig;
   artifactSkill: ArtifactSkillConfig;
   pushover: PushoverConfig;
@@ -311,25 +311,37 @@ export interface UpdateStatus {
   latest: ReleaseInfo | null;
 }
 
-export interface PiModel {
+export interface FiliModel {
   id: string;
   label: string;
 }
 
-export interface PiConfig {
+export interface FiliConfig {
   available: boolean;
   /** Compatibility aggregate for older clients. */
   enabled: boolean;
   titlesEnabled: boolean;
   summariesEnabled: boolean;
   model: string;
-  models: PiModel[];
+  models: FiliModel[];
 }
 
-export interface UpdatePiConfig {
+export interface UpdateFiliConfig {
   titlesEnabled: boolean;
   summariesEnabled: boolean;
   model: string;
+}
+
+export interface FiliStreamEvent {
+  seq: number;
+  at: number;
+  kind: string;
+  detail: string;
+}
+
+export interface FiliStream {
+  latest: number;
+  events: FiliStreamEvent[];
 }
 
 export type AgentIntegrationProvider = "codex" | "claude" | "pi" | "omp" | "hermes";
