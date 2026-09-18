@@ -2807,7 +2807,9 @@ impl TerminalManager {
         if normalized.is_empty() {
             return Err("title is empty".to_owned());
         }
-        let session = {
+        // The duplicate-name scan is advisory and read-only; the ownership
+        // decision below is the authoritative one.
+        {
             let sessions = self.sessions.read();
             if sessions
                 .iter()
@@ -2817,16 +2819,15 @@ impl TerminalManager {
                     "another terminal is already named \"{normalized}\""
                 ));
             }
-            let session = sessions
-                .get(&id)
-                .cloned()
-                .ok_or("terminal no longer exists")?;
-            if !session.activity.lock().automatic_name {
-                return Err("a person renamed this terminal; its name is fixed".to_owned());
-            }
-            session
-        };
+        }
+        let session = self.get(id).ok_or("terminal no longer exists")?;
+        // Every ownership check runs under this single mutable lock so a
+        // concurrent person rename (which clears `automatic_name` under the
+        // same lock) can never interleave between the check and the write.
         let mut activity = session.activity.lock();
+        if !activity.automatic_name {
+            return Err("a person renamed this terminal; its name is fixed".to_owned());
+        }
         if activity.native_title {
             return Err("the agent titled this terminal itself; leave it alone".to_owned());
         }
@@ -2834,9 +2835,15 @@ impl TerminalManager {
             return Err("this task already has a generated title".to_owned());
         }
         let final_name = normalized;
-        activity.generated_title = Some(final_name.clone());
         {
+            // Only ever label tabs that actually host an agent — a plain
+            // person-opened shell is never a fili target, even though its name
+            // is technically automatic. Lock order (activity → info) is kept.
             let mut info = session.info.write();
+            if info.agent.is_none() {
+                return Err("no agent is attached to this terminal".to_owned());
+            }
+            activity.generated_title = Some(final_name.clone());
             info.name = final_name.clone();
             info.path = terminal_path(&info.workspace, &info.name);
         }
@@ -2863,13 +2870,23 @@ impl TerminalManager {
         let Some(agent) = info.agent.as_mut() else {
             return Err("no agent is attached to this terminal".to_owned());
         };
-        if let Some(revision) = agent_revision
-            && agent.revision != revision
-        {
+        // The revision is mandatory: without it a summary written for a stale
+        // roster (or an omitted field) would silently overwrite whatever the
+        // current task produced.
+        let Some(revision) = agent_revision else {
+            return Err("agentRevision (copied from the roster) is required".to_owned());
+        };
+        if agent.revision != revision {
             return Err(format!(
                 "the agent moved on (revision {}); re-read the roster",
                 agent.revision
             ));
+        }
+        // One summary per task generation. A new task bumps the revision and
+        // clears the summary, so refusing here only stops the model from
+        // churning wordings it already published for this task.
+        if agent.summary.is_some() {
+            return Err("this task already has a summary".to_owned());
         }
         if agent.completed_at.is_none() {
             return Err("the current agent task has not finished".to_owned());
@@ -6835,5 +6852,130 @@ mod tests {
             }),
             AgentStatus::Idle
         );
+    }
+
+    fn attach_agent(session: &Arc<TerminalSession>, revision: u64, completed: bool) {
+        let mut activity = session.activity.lock();
+        activity.input_submitted_at = 1_000;
+        let mut info = session.info.write();
+        info.agent = Some(AgentInfo {
+            kind: "codex".to_owned(),
+            status: AgentStatus::Closed,
+            status_changed_at: 1_000,
+            started_at: 1_000,
+            revision,
+            completed_at: completed.then_some(2_000),
+            summary: None,
+            activity: None,
+        });
+    }
+
+    #[test]
+    fn fili_never_titles_a_plain_shell_tab() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = test_manager(directory.path());
+        let info = manager.create(new_terminal()).unwrap();
+        // A shell without an agent is technically automatic-named, but it is
+        // not a fili target: only agent tabs get labelled.
+        let error = manager
+            .fili_set_name(info.id, "task title")
+            .expect_err("plain shells must be off limits");
+        assert!(error.contains("no agent"), "{error}");
+        assert_eq!(manager.get(info.id).unwrap().info().name, "sh");
+        assert!(manager.remove(info.id));
+    }
+
+    #[test]
+    fn fili_titles_agent_tabs_once_and_respects_person_renames() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = test_manager(directory.path());
+        let info = manager.create(new_terminal()).unwrap();
+        let session = manager.get(info.id).unwrap();
+        attach_agent(&session, 1, false);
+
+        assert_eq!(
+            manager.fili_set_name(info.id, "  Task   Title ").unwrap(),
+            "task title"
+        );
+        assert_eq!(manager.get(info.id).unwrap().info().name, "task title");
+        // The task is now claimed: a second title attempt must fail rather
+        // than churn a name the model published earlier.
+        let error = manager
+            .fili_set_name(info.id, "better title")
+            .expect_err("claimed tasks keep their title");
+        assert!(error.contains("already has a generated title"), "{error}");
+
+        // A person rename (which clears `automatic_name`) fences fili out
+        // permanently for that tab.
+        session.activity.lock().automatic_name = false;
+        let error = manager
+            .fili_set_name(info.id, "over the person")
+            .expect_err("person-named tabs are fixed");
+        assert!(error.contains("person renamed"), "{error}");
+        assert_eq!(manager.get(info.id).unwrap().info().name, "task title");
+        assert!(manager.remove(info.id));
+    }
+
+    #[test]
+    fn fili_summaries_require_a_matching_agent_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = test_manager(directory.path());
+        let info = manager.create(new_terminal()).unwrap();
+        let session = manager.get(info.id).unwrap();
+        attach_agent(&session, 4, true);
+
+        // Omitting the revision used to skip the staleness check entirely.
+        let error = manager
+            .fili_set_summary(info.id, None, "stale write")
+            .expect_err("revision is mandatory");
+        assert!(error.contains("required"), "{error}");
+        let error = manager
+            .fili_set_summary(info.id, Some(3), "stale write")
+            .expect_err("stale revisions are rejected");
+        assert!(error.contains("moved on"), "{error}");
+        assert!(
+            manager
+                .get(info.id)
+                .unwrap()
+                .info()
+                .agent
+                .unwrap()
+                .summary
+                .is_none()
+        );
+
+        manager
+            .fili_set_summary(info.id, Some(4), "finished cleanly")
+            .unwrap();
+        assert_eq!(
+            manager
+                .get(info.id)
+                .unwrap()
+                .info()
+                .agent
+                .unwrap()
+                .summary
+                .as_deref(),
+            Some("finished cleanly")
+        );
+
+        // The model re-wording its own published summary is refused: one
+        // summary per task generation, mirroring the title claim.
+        let error = manager
+            .fili_set_summary(info.id, Some(4), "finished very cleanly indeed")
+            .expect_err("summaries are not churned");
+        assert!(error.contains("already has a summary"), "{error}");
+        assert_eq!(
+            manager
+                .get(info.id)
+                .unwrap()
+                .info()
+                .agent
+                .unwrap()
+                .summary
+                .as_deref(),
+            Some("finished cleanly")
+        );
+        assert!(manager.remove(info.id));
     }
 }
