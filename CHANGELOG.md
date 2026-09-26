@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.19.1 - 2026-09-26
+
+Claude Code and Codex tabs now take the conversation title the agent itself generated, like omp tabs already did.
+
+### Fixed
+
+- **Agent-native tab titles for Claude Code and Codex.** The hook integration reads Claude Code's generated title (or the name set with `/rename`) from the session transcript, and Codex's thread name from `$CODEX_HOME/session_index.jsonl`. The tab adopts it and fili leaves it alone; later renames in the agent carry over. Previously only omp forwarded its title, so Claude Code and Codex tabs fell back to fili's generated title or the program name.
+
+### Upgrade notes
+
+- Safe for automatic installation over `0.19.0`; no data migration and no broker restart required. Already-open Claude Code and Codex sessions pick up their title on their next hook event.
+
+
 ## 0.19.0 - 2026-09-18
 
 Pi is gone. **Fili**, a built-in labelling agent, now titles your agent tabs and writes a short summary when a task finishes.
