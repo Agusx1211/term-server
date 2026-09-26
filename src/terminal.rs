@@ -2631,9 +2631,12 @@ impl TerminalSession {
         let mut changed = previous_revision != info.agent.as_ref().map(|agent| agent.revision);
         if let Some(title) = event.title
             && activity.automatic_name
+            && !(activity.native_title && activity.generated_title.as_deref() == Some(&title))
         {
-            // A provider (omp) already titled this conversation; adopt it and
-            // mark the tab natively titled so fili never overwrites it.
+            // The agent (omp, Claude Code, Codex) already titled this
+            // conversation; adopt it and mark the tab natively titled so fili
+            // never overwrites it. Claude and Codex resend the same title on
+            // every hook, so an unchanged one is not a change.
             activity.generated_title = Some(title.clone());
             activity.native_title = true;
             info.name = title;
@@ -5967,6 +5970,21 @@ mod tests {
         assert!(activity.native_title);
         drop(activity);
         assert_eq!(session.info().name, "checkout latency fix");
+
+        // Claude Code and Codex resend their title on every hook; an unchanged
+        // one must not wake fili, and a rename is adopted.
+        let titled = |title: &str| AgentEvent {
+            provider: "omp".to_owned(),
+            kind: AgentEventKind::Thinking,
+            sequence: None,
+            title: Some(title.to_owned()),
+            transcript_only: false,
+            transcript_reset: false,
+            transcript: Vec::new(),
+        };
+        assert!(!session.apply_agent_event(titled("checkout latency fix"), 1));
+        assert!(session.apply_agent_event(titled("checkout retries"), 2));
+        assert_eq!(session.info().name, "checkout retries");
         assert!(manager.remove(info.id));
     }
 

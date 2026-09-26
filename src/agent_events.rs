@@ -1,4 +1,5 @@
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -51,9 +52,9 @@ pub struct AgentEvent {
     pub kind: AgentEventKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sequence: Option<u64>,
-    /// A provider-supplied conversation title. omp generates one from the
-    /// first message and forwards it so term-server reuses it instead of
-    /// generating its own; other providers leave this `None`.
+    /// A provider-supplied conversation title, adopted instead of generating
+    /// one. omp forwards its own; for Claude Code and Codex the hook reader
+    /// looks it up in the agent's session files (see `native_title`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -260,7 +261,124 @@ pub fn read_hook_event(
     let Ok(input) = serde_json::from_slice::<Value>(&bytes) else {
         return Ok(None);
     };
-    Ok(AgentEvent::from_hook_input(provider, &input))
+    let mut event = AgentEvent::from_hook_input(provider, &input);
+    if let Some(event) = event.as_mut()
+        && event.title.is_none()
+    {
+        event.title = native_title(&event.provider, &input, &NativeTitleHomes::from_env());
+    }
+    Ok(event)
+}
+
+/// How much of a session file's end is scanned for its title. Claude Code
+/// re-appends its title record as the transcript grows, so the latest one sits
+/// near the end even in transcripts of tens of megabytes; Codex's session index
+/// is one short line per conversation.
+const TITLE_SCAN_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_NATIVE_TITLE_CHARS: usize = 200;
+
+/// Where Codex keeps its state: `$CODEX_HOME`, else `~/.codex`.
+struct NativeTitleHomes {
+    codex: Option<PathBuf>,
+}
+
+impl NativeTitleHomes {
+    fn from_env() -> Self {
+        let codex = std::env::var_os("CODEX_HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .filter(|path| path.is_absolute())
+                    .map(|home| home.join(".codex"))
+            });
+        Self { codex }
+    }
+}
+
+/// Reads the title Claude Code or Codex already generated for the
+/// conversation, so their tabs get the agent's own name for the chat the same
+/// way omp's do. Best-effort: any missing or unreadable file means no title on
+/// this event, and a later hook picks it up once the agent has written one.
+fn native_title(provider: &str, input: &Value, homes: &NativeTitleHomes) -> Option<String> {
+    let title = match provider {
+        // Claude Code appends `{"type":"ai-title","aiTitle":...}` to the
+        // transcript, and `{"type":"custom-title","customTitle":...}` after a
+        // `/rename`, which wins over the generated one.
+        "claude" => {
+            let path = input.get("transcript_path").and_then(Value::as_str)?;
+            let tail = read_tail(Path::new(path))?;
+            let mut generated = None;
+            let mut custom = None;
+            for line in tail.lines().rev() {
+                if custom.is_some() {
+                    break;
+                }
+                if !line.contains("-title\"") {
+                    continue;
+                }
+                let Ok(record) = serde_json::from_str::<Value>(line) else {
+                    continue;
+                };
+                let field = match record.get("type").and_then(Value::as_str) {
+                    Some("custom-title") => "customTitle",
+                    Some("ai-title") if generated.is_none() => "aiTitle",
+                    _ => continue,
+                };
+                let Some(title) = record.get(field).and_then(Value::as_str) else {
+                    continue;
+                };
+                if field == "customTitle" {
+                    custom = Some(title.to_owned());
+                } else {
+                    generated = Some(title.to_owned());
+                }
+            }
+            custom.or(generated)
+        }
+        // Codex appends `{"id":<session>,"thread_name":...}` to
+        // `$CODEX_HOME/session_index.jsonl` whenever it names or renames a
+        // thread; the last entry for the session is current.
+        "codex" => {
+            let session = input.get("session_id").and_then(Value::as_str)?;
+            let tail = read_tail(&homes.codex.as_ref()?.join("session_index.jsonl"))?;
+            tail.lines().rev().find_map(|line| {
+                if !line.contains(session) {
+                    return None;
+                }
+                let record = serde_json::from_str::<Value>(line).ok()?;
+                (record.get("id").and_then(Value::as_str) == Some(session))
+                    .then(|| record.get("thread_name")?.as_str().map(str::to_owned))
+                    .flatten()
+            })
+        }
+        _ => None,
+    }?;
+    let title = title
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(MAX_NATIVE_TITLE_CHARS)
+        .collect::<String>();
+    let title = title.trim();
+    (!title.is_empty()).then(|| title.to_owned())
+}
+
+/// The last `TITLE_SCAN_BYTES` of a file, starting at a line boundary.
+fn read_tail(path: &Path) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    let start = length.saturating_sub(TITLE_SCAN_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::new();
+    file.take(TITLE_SCAN_BYTES).read_to_end(&mut bytes).ok()?;
+    let bytes = if start > 0 {
+        let newline = bytes.iter().position(|byte| *byte == b'\n')?;
+        &bytes[newline + 1..]
+    } else {
+        &bytes[..]
+    };
+    Some(String::from_utf8_lossy(bytes).into_owned())
 }
 
 fn tool_event_kind(tool_name: Option<&str>) -> AgentEventKind {
@@ -378,6 +496,97 @@ mod tests {
             serde_json::to_string(&titled)
                 .unwrap()
                 .contains("\"sequence\":42")
+        );
+    }
+
+    #[test]
+    fn reads_claude_titles_from_the_transcript_preferring_renames() {
+        let directory = tempfile::tempdir().unwrap();
+        let transcript = directory.path().join("session.jsonl");
+        let homes = NativeTitleHomes { codex: None };
+        let input = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "transcript_path": transcript.to_str().unwrap(),
+        });
+        // No transcript yet, then one without a title: no title either way.
+        assert_eq!(native_title("claude", &input, &homes), None);
+        std::fs::write(&transcript, "{\"type\":\"user\",\"message\":\"hi\"}\n").unwrap();
+        assert_eq!(native_title("claude", &input, &homes), None);
+
+        let lines = [
+            r#"{"type":"ai-title","aiTitle":"Old title","sessionId":"s"}"#,
+            r#"{"type":"user","message":{"content":"the word ai-title in a prompt"}}"#,
+            r#"{"type":"ai-title","aiTitle":"  Auto chat topic detection  ","sessionId":"s"}"#,
+        ];
+        std::fs::write(&transcript, lines.join("\n") + "\n").unwrap();
+        assert_eq!(
+            native_title("claude", &input, &homes).as_deref(),
+            Some("Auto chat topic detection")
+        );
+
+        // A `/rename` wins over a later generated title.
+        let lines = [
+            r#"{"type":"custom-title","customTitle":"My rename","sessionId":"s"}"#,
+            r#"{"type":"ai-title","aiTitle":"Generated","sessionId":"s"}"#,
+        ];
+        std::fs::write(&transcript, lines.join("\n") + "\n").unwrap();
+        assert_eq!(
+            native_title("claude", &input, &homes).as_deref(),
+            Some("My rename")
+        );
+    }
+
+    #[test]
+    fn reads_the_latest_codex_thread_name_for_the_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let homes = NativeTitleHomes {
+            codex: Some(directory.path().to_path_buf()),
+        };
+        let input = serde_json::json!({ "hook_event_name": "Stop", "session_id": "abc" });
+        assert_eq!(native_title("codex", &input, &homes), None);
+        let lines = [
+            r#"{"id":"abc","thread_name":"First name","updated_at":"2026-09-25T06:44:40Z"}"#,
+            r#"{"id":"other","thread_name":"Someone else","updated_at":"2026-09-25T06:45:40Z"}"#,
+            r#"{"id":"abc","thread_name":"Renamed thread","updated_at":"2026-09-25T06:46:40Z"}"#,
+            r#"{"id":"xabcx","thread_name":"Lookalike id","updated_at":"2026-09-25T06:47:40Z"}"#,
+        ];
+        std::fs::write(
+            directory.path().join("session_index.jsonl"),
+            lines.join("\n") + "\n",
+        )
+        .unwrap();
+        assert_eq!(
+            native_title("codex", &input, &homes).as_deref(),
+            Some("Renamed thread")
+        );
+        // Other providers never read these files.
+        assert_eq!(native_title("pi", &input, &homes), None);
+    }
+
+    #[test]
+    fn scans_only_the_tail_of_large_session_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let transcript = directory.path().join("session.jsonl");
+        let mut contents = String::from(r#"{"type":"ai-title","aiTitle":"Too far back"}"#);
+        contents.push('\n');
+        let filler = format!(
+            "{{\"type\":\"assistant\",\"text\":\"{}\"}}\n",
+            "x".repeat(1024)
+        );
+        while (contents.len() as u64) < TITLE_SCAN_BYTES + 4096 {
+            contents.push_str(&filler);
+        }
+        std::fs::write(&transcript, &contents).unwrap();
+        let input = serde_json::json!({ "transcript_path": transcript.to_str().unwrap() });
+        let homes = NativeTitleHomes { codex: None };
+        assert_eq!(native_title("claude", &input, &homes), None);
+
+        contents.push_str(r#"{"type":"ai-title","aiTitle":"Recent"}"#);
+        contents.push('\n');
+        std::fs::write(&transcript, &contents).unwrap();
+        assert_eq!(
+            native_title("claude", &input, &homes).as_deref(),
+            Some("Recent")
         );
     }
 
