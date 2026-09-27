@@ -18,6 +18,12 @@ test("Packaged production client PTY smoke @packaged", async ({ page, server, ba
 
   const workbench = new WorkbenchPage(page);
   await workbench.expectVisible();
+  // Load the bundled fallback before xterm measures its grid, so font settling
+  // cannot change the screenshot crop between the baseline and PRINT output.
+  await page.evaluate(async () => {
+    await document.fonts.load('16px "Symbols Nerd Font Mono"', "\ue0b0");
+    await document.fonts.ready;
+  });
   const createResponsePromise = page.waitForResponse((response) => {
     const url = new URL(response.url());
     return response.request().method() === "POST" && url.pathname === "/api/terminals";

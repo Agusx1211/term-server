@@ -16,6 +16,7 @@ import {
   expectTerminalBuffer,
   expectTerminalSynchronized,
   terminalEvents,
+  waitForFontSettledViewport,
   waitForTerminalBuffer,
 } from "../assertions/terminal-state.js";
 import type { BrowserContext, Page } from "@playwright/test";
@@ -332,6 +333,7 @@ test("P0-18 Multi-client viewport election @p0 @smoke", async ({
   const paneA = new TerminalPanePage(page, terminalId);
   await paneA.expectVisible();
   await expectTerminalSynchronized(page, terminalId, { timeout: WAIT_TIMEOUT_MS });
+  await waitForFontSettledViewport(page, terminalId, { timeout: WAIT_TIMEOUT_MS });
   await paneA.sendInput(`READY ${READY_MARKER}`, true);
   await transcriptEntry(server, terminalId, (entry) => entry.event === "ready" && entry.id === READY_MARKER);
 
@@ -359,6 +361,7 @@ test("P0-18 Multi-client viewport election @p0 @smoke", async ({
     const paneB = await workbenchB.openTerminal({ id: terminalId, name: TARGET_NAME });
     await paneB.expectVisible();
     await expectTerminalSynchronized(pageB, terminalId, { timeout: WAIT_TIMEOUT_MS });
+    await waitForFontSettledViewport(pageB, terminalId, { timeout: WAIT_TIMEOUT_MS });
 
     const initialA = await paneA.snapshot();
     const initialB = await paneB.snapshot();

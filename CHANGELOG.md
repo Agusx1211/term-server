@@ -7,11 +7,14 @@
 - **False Codex completion notifications.** Long commands, reasoning, and subagent work no longer become completed tasks when a lifecycle hook is more than 15 seconds old. Codex lifecycle reports stay authoritative until the next event, a process change, or an explicit newer Ready/progress-end signal. Thread-title generation after completion no longer creates another completion notification.
 - **Current Codex activity detection.** Recognize changing activity labels, extra detail and queued-message rows, and word-based Working/Thinking/Waiting titles. A thread-title generation spinner is no longer mistaken for the activity spinner.
 - **Codex cancellation reporting.** The integration now reports Codex's `Interrupt` event so cancelling a turn with Esc clears its working state.
+- **Supervisor tab closing.** Accept generated tab IDs that begin with `-` instead of interpreting them as command-line options.
+- **Fullscreen Codex scrolling after resize or reload.** Preserve mouse reporting, application cursor/keypad, and bracketed-paste modes when terminal state is resized and replayed. The new Codex TUI continues receiving wheel events instead of arrow keys.
 
 ### Upgrade notes
 
-- Safe for automatic installation over `0.19.1`; no data migration or broker restart required. Existing Codex sessions use the updated detection after the server update and refresh their native lifecycle state on their next hook event.
-- To enable cancellation reporting, repair the Codex integration in Settings, start a new Codex session, and review the updated hooks in `/hooks` when prompted. Existing sessions are left running; without the new hook, cancelling an existing turn may leave it marked working until its next lifecycle event or exit.
+- Safe for automatic installation over `0.19.1`; no data migration or forced broker restart required. Existing terminals remain on their original session broker. After updating, create a new term-server terminal and resume Codex there to use the notification and scrolling fixes; restarting Codex inside an old terminal does not update its broker.
+- To enable cancellation reporting, repair the Codex integration in Settings, start Codex in the new terminal, and review the updated hooks in `/hooks` when prompted. Existing sessions are left running; without the new hook, cancelling a turn may leave it marked working until its next lifecycle event or exit.
+- Resuming Codex in a new terminal also re-enables mouse modes lost by already-affected tabs. Keep the new fullscreen TUI; no `--no-alt-screen` workaround is needed. Active sessions are not restarted by this release.
 
 ## 0.19.1 - 2026-09-26
 
