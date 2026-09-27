@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.19.2 - 2026-09-27
+
+### Fixed
+
+- **False Codex completion notifications.** Long commands, reasoning, and subagent work no longer become completed tasks when a lifecycle hook is more than 15 seconds old. Codex lifecycle reports stay authoritative until the next event, a process change, or an explicit newer Ready/progress-end signal. Thread-title generation after completion no longer creates another completion notification.
+- **Current Codex activity detection.** Recognize changing activity labels, extra detail and queued-message rows, and word-based Working/Thinking/Waiting titles. A thread-title generation spinner is no longer mistaken for the activity spinner.
+- **Codex cancellation reporting.** The integration now reports Codex's `Interrupt` event so cancelling a turn with Esc clears its working state.
+
+### Upgrade notes
+
+- Safe for automatic installation over `0.19.1`; no data migration or broker restart required. Existing Codex sessions use the updated detection after the server update and refresh their native lifecycle state on their next hook event.
+- To enable cancellation reporting, repair the Codex integration in Settings, start a new Codex session, and review the updated hooks in `/hooks` when prompted. Existing sessions are left running; without the new hook, cancelling an existing turn may leave it marked working until its next lifecycle event or exit.
+
 ## 0.19.1 - 2026-09-26
 
 Claude Code and Codex tabs now take the conversation title the agent itself generated, like omp tabs already did.

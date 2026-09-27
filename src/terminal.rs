@@ -733,7 +733,12 @@ impl Default for SessionActivity {
 }
 
 impl SessionActivity {
-    fn expire_native_state(&mut self, now: u64) -> bool {
+    fn expire_native_state(
+        &mut self,
+        now: u64,
+        explicit_idle_at: Option<u64>,
+        detection: Option<&agent_detection::Detection>,
+    ) -> bool {
         // A blocked report is not refreshed while it holds: the agent sends one
         // approval request and then nothing until a person answers. Expiring it
         // on the freshness timer would quietly relabel a waiting agent as idle.
@@ -742,6 +747,22 @@ impl SessionActivity {
         }
         if self.native_status.is_none()
             || now.saturating_sub(self.native_updated_at) <= NATIVE_EVENT_FRESH_MILLIS
+        {
+            return false;
+        }
+        // Codex hooks report lifecycle edges, not heartbeats. A quiet tool or
+        // subagent can run for minutes, and title generation can animate after
+        // Stop. Neither silence nor a spinner should replace that lifecycle.
+        // Recover from a missed Stop only when a newer explicit Ready status
+        // or OSC progress end agrees with detection. Losing a title spinner is
+        // not enough: titles can change while the parent turn is still active.
+        if self.native_provider.as_deref() == Some("codex")
+            && !(self.native_status == Some(AgentStatus::Working)
+                && explicit_idle_at.is_some_and(|at| at > self.native_updated_at)
+                && matches!(
+                    screen_detection_outcome(detection),
+                    DetectionOutcome::Status(AgentStatus::Idle)
+                ))
         {
             return false;
         }
@@ -860,6 +881,7 @@ struct TerminalSignals {
     pending_osc: Option<usize>,
     scanned: usize,
     agent_state: Option<(ReportedAgentState, u64)>,
+    explicit_idle_at: Option<u64>,
     active_title_seen: bool,
     osc_title: Option<String>,
     osc_progress: Option<String>,
@@ -926,13 +948,19 @@ impl TerminalSignals {
         self.retain_detection_payload(text.trim());
         let normalized = text.trim().to_ascii_lowercase();
         let state = if normalized == "9;4;3" || normalized.starts_with("9;4;3;") {
+            self.explicit_idle_at = None;
             Some(ReportedAgentState::Working)
         } else if normalized == "9;4;0" || normalized.starts_with("9;4;0;") {
+            self.explicit_idle_at = Some(now);
             Some(ReportedAgentState::Idle)
         } else if let Some(title) = normalized
             .strip_prefix("0;")
             .or_else(|| normalized.strip_prefix("2;"))
         {
+            self.explicit_idle_at = title
+                .split(" | ")
+                .any(|part| part.trim() == "ready")
+                .then_some(now);
             // omp prefixes its titles with a "π" marker; the state glyph is
             // the token after it (busy spinner while running, ">" at the
             // prompt). Strip the marker so the glyph checks below see it.
@@ -1000,6 +1028,7 @@ impl TerminalSignals {
     fn clear_detection_payloads(&mut self) {
         self.osc_title = None;
         self.osc_progress = None;
+        self.explicit_idle_at = None;
     }
 }
 
@@ -1110,10 +1139,10 @@ pub(crate) fn screen_detection_outcome(
 ///    ([`select_agent_status`]).
 ///
 /// Freshness is enforced upstream: [`SessionActivity::expire_native_state`]
-/// clears a non-`Blocked` status once it is older than
-/// `NATIVE_EVENT_FRESH_MILLIS`, so a `native_status` present here is either
-/// fresh or a held `Blocked`. When the connector stops reporting, the field is
-/// `None` and the screen + heuristic tiers take over.
+/// clears stale reports for other providers. Codex lifecycle reports and
+/// blocked states are held until the next event; a missed Codex Stop can
+/// also be recovered from a newer explicit Ready/progress-end signal that
+/// agrees with detection.
 /// Inputs for the fallback tiers (screen detection, then heuristics) of
 /// [`resolve_agent_status`], gathered so the resolver stays readable.
 struct StatusFallback<'a> {
@@ -2323,7 +2352,10 @@ impl TerminalSession {
             .map(|foreground| foreground.group);
         let alternate_screen = self.output.lock().alternate_screen();
         let output_bytes = self.output_bytes.load(Ordering::Relaxed);
-        let reported_state = self.signals.lock().agent_state;
+        let (reported_state, explicit_idle_at) = {
+            let signals = self.signals.lock();
+            (signals.agent_state, signals.explicit_idle_at)
+        };
         // Screen detection only runs for a recognized agent. Rendering the
         // screen for every terminal on every sample would not pay for itself.
         let detection = observation
@@ -2332,7 +2364,7 @@ impl TerminalSession {
             .and_then(|agent| self.detect_agent_state(&agent.kind));
         let mut activity = self.activity.lock();
         let mut info = self.info.write();
-        if activity.expire_native_state(now)
+        if activity.expire_native_state(now, explicit_idle_at, detection.as_ref())
             && let Some(agent) = info.agent.as_mut()
         {
             agent.activity = None;
@@ -2375,6 +2407,7 @@ impl TerminalSession {
                 }
                 let preserve_native_state = activity.native_provider.as_deref()
                     == Some(agent.kind.as_str())
+                    && !process_identity_changed
                     && info
                         .agent
                         .as_ref()
@@ -5800,9 +5833,13 @@ mod tests {
         let session = manager.get(info.id).unwrap();
         let mut activity = session.activity.lock();
         let updated_at = activity.native_updated_at;
-        assert!(!activity.expire_native_state(updated_at + NATIVE_EVENT_FRESH_MILLIS));
-        assert!(activity.expire_native_state(updated_at + NATIVE_EVENT_FRESH_MILLIS + 1));
-        assert!(activity.native_status.is_none());
+        assert!(!activity.expire_native_state(updated_at + NATIVE_EVENT_FRESH_MILLIS, None, None));
+        assert!(!activity.expire_native_state(
+            updated_at + NATIVE_EVENT_FRESH_MILLIS * 10,
+            None,
+            None
+        ));
+        assert_eq!(activity.native_status, Some(AgentStatus::Working));
         drop(activity);
 
         manager.get(info.id).unwrap().write(b"true\n").unwrap();
@@ -5846,6 +5883,133 @@ mod tests {
         assert_eq!(closed.revision, 3);
         assert!(closed.activity.is_none());
         assert!(manager.remove(info.id));
+    }
+
+    #[test]
+    fn codex_lifecycle_survives_quiet_work_and_settles_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = test_manager(directory.path());
+        let info = manager.create(new_terminal()).unwrap();
+        let session = manager.get(info.id).unwrap();
+        session.info.write().pid = Some(900_001);
+        let processes = process_sample(vec![
+            sampled_process(900_001, 1, 900_001, 900_100, "sh"),
+            sampled_process(900_100, 900_001, 900_100, 900_100, "codex"),
+        ]);
+        session.refresh_process_metadata(&processes, 1_000);
+        let event = |kind| AgentEvent {
+            provider: "codex".to_owned(),
+            kind,
+            sequence: None,
+            title: None,
+            transcript_only: false,
+            transcript_reset: false,
+            transcript: Vec::new(),
+        };
+        session
+            .signals
+            .lock()
+            .observe(b"\x1b]0;Fix notifications\x07", 1_000);
+        session.apply_agent_event(event(AgentEventKind::RunningCommand), 2_000);
+        // No heartbeat, output or CPU activity while a command or subagent runs.
+        for now in (20_000..=180_000).step_by(20_000) {
+            session.refresh_process_metadata(&processes, now);
+            let agent = session.info().agent.unwrap();
+            assert_eq!(agent.status, AgentStatus::Working);
+            assert_eq!(agent.completed_at, None);
+        }
+        session.apply_agent_event(event(AgentEventKind::WaitingForApproval), 181_000);
+        session.refresh_process_metadata(&processes, 220_000);
+        assert_eq!(session.info().agent.unwrap().status, AgentStatus::Blocked);
+        session.apply_agent_event(event(AgentEventKind::Thinking), 221_000);
+        session.apply_agent_event(event(AgentEventKind::Completed), 222_000);
+        let completed = session.info().agent.unwrap();
+        assert_eq!(completed.status, AgentStatus::Idle);
+        assert_eq!(completed.completed_at, Some(222_000));
+        // Title generation is allowed to animate after the real Stop event.
+        for (now, title) in [(250_000, "⠹ New title"), (270_000, "New title")] {
+            session
+                .signals
+                .lock()
+                .observe(format!("\x1b]0;{title}\x07").as_bytes(), now);
+            session.refresh_process_metadata(&processes, now);
+            let agent = session.info().agent.unwrap();
+            assert_eq!(agent.status, AgentStatus::Idle);
+            assert_eq!(agent.completed_at, completed.completed_at);
+            assert_eq!(agent.revision, completed.revision);
+        }
+        session.apply_agent_event(event(AgentEventKind::Completed), 280_000);
+        assert_eq!(
+            session.info().agent.unwrap().completed_at,
+            completed.completed_at
+        );
+
+        // A new prompt and explicit lifecycle events still start the next task.
+        session.apply_agent_event(event(AgentEventKind::Thinking), 281_000);
+        assert_eq!(session.info().agent.unwrap().completed_at, None);
+        // Reusing a PID with a different start time must drop the old lifecycle.
+        let mut replacement = sampled_process(900_100, 900_001, 900_100, 900_100, "codex");
+        replacement.start_ticks += 1;
+        session.refresh_process_metadata(
+            &process_sample(vec![
+                sampled_process(900_001, 1, 900_001, 900_100, "sh"),
+                replacement,
+            ]),
+            282_000,
+        );
+        assert!(session.activity.lock().native_status.is_none());
+        assert_eq!(session.info().agent.unwrap().status, AgentStatus::Idle);
+        // Esc ends a turn through Interrupt, independently of the Stop hook.
+        let hooks: serde_json::Value =
+            serde_json::from_str(include_str!("../integrations/codex/hooks/hooks.json")).unwrap();
+        assert!(!hooks["hooks"]["Interrupt"].as_array().unwrap().is_empty());
+        session.apply_agent_event(event(AgentEventKind::Thinking), 283_000);
+        let interrupted = AgentEvent::from_hook_input(
+            "codex",
+            &serde_json::json!({
+                "hook_event_name": "Interrupt", "session_id": "root-session"
+            }),
+        )
+        .unwrap();
+        session.apply_agent_event(interrupted, 284_000);
+        assert_eq!(session.info().agent.unwrap().status, AgentStatus::Idle);
+        assert_eq!(session.info().agent.unwrap().completed_at, Some(284_000));
+        assert!(manager.remove(info.id));
+    }
+
+    #[test]
+    fn codex_missed_stop_requires_new_idle_evidence_without_a_working_footer() {
+        let mut activity = SessionActivity {
+            native_provider: Some("codex".to_owned()),
+            native_status: Some(AgentStatus::Working),
+            native_updated_at: 10_000,
+            ..Default::default()
+        };
+        let idle = agent_detection::detect(
+            "codex",
+            agent_detection::DetectionInput {
+                osc_title: "Fix notifications",
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let working = agent_detection::detect("codex", agent_detection::DetectionInput {
+            screen: "• Mapping the app structure (30s • esc to interrupt)\n›\n  Context 80% left",
+            osc_title: "Fix notifications",
+            ..Default::default()
+        }).unwrap();
+        assert!(!activity.expire_native_state(60_000, None, Some(&idle)));
+        assert!(!activity.expire_native_state(60_000, Some(9_000), Some(&idle)));
+        assert!(!activity.expire_native_state(60_000, Some(50_000), Some(&working)));
+        assert!(activity.expire_native_state(60_000, Some(50_000), Some(&idle)));
+        assert_eq!(activity.native_status, None);
+        assert_eq!(activity.native_provider, None);
+
+        // Other providers retain their existing timeout-based fallback.
+        activity.native_provider = Some("claude".to_owned());
+        activity.native_status = Some(AgentStatus::Working);
+        activity.native_updated_at = 10_000;
+        assert!(activity.expire_native_state(60_000, None, None));
     }
 
     #[test]
@@ -6196,6 +6360,26 @@ mod tests {
         signals.observe("\x1b]0;⠂ Agent probe\x07".as_bytes(), 202);
         signals.observe("\x1b]0;✳ Agent probe\x07".as_bytes(), 203);
         assert_eq!(signals.agent_state, Some((ReportedAgentState::Idle, 203)));
+    }
+
+    #[test]
+    fn explicit_idle_evidence_excludes_plain_titles_and_spinner_removal() {
+        let mut signals = TerminalSignals::default();
+        signals.observe("\x1b]0;⠹ Implement feature\x07".as_bytes(), 100);
+        signals.observe(b"\x1b]0;Implement feature\x07", 200);
+        assert_eq!(signals.agent_state, Some((ReportedAgentState::Idle, 200)));
+        assert_eq!(signals.explicit_idle_at, None);
+        signals.observe(b"\x1b]0;Ready | term-server\x07", 300);
+        assert_eq!(signals.explicit_idle_at, Some(300));
+        signals.observe(b"\x1b]0;Make ready checks work\x07", 400);
+        assert_eq!(signals.explicit_idle_at, None);
+        signals.observe(b"\x1b]9;4;0\x07", 500);
+        assert_eq!(signals.explicit_idle_at, Some(500));
+        signals.observe(b"\x1b]9;4;3\x07", 600);
+        assert_eq!(signals.explicit_idle_at, None);
+        signals.observe(b"\x1b]0;Ready | term-server\x07", 700);
+        signals.clear_detection_payloads();
+        assert_eq!(signals.explicit_idle_at, None);
     }
 
     #[test]
@@ -6792,7 +6976,11 @@ mod tests {
         let session = manager.get(info.id).unwrap();
         let mut activity = session.activity.lock();
         let updated_at = activity.native_updated_at;
-        assert!(!activity.expire_native_state(updated_at + NATIVE_EVENT_FRESH_MILLIS * 10));
+        assert!(!activity.expire_native_state(
+            updated_at + NATIVE_EVENT_FRESH_MILLIS * 10,
+            None,
+            None
+        ));
         assert_eq!(activity.native_status, Some(AgentStatus::Blocked));
         // The turn's submission survives the block.
         assert!(activity.input_submitted_at > 0);

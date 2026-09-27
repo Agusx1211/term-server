@@ -443,6 +443,62 @@ fn codex_working_footer_is_working() {
     assert_eq!(matched_rule_id(&detection), Some("screen_working_fallback"));
 }
 
+#[test]
+fn codex_current_activity_outranks_a_plain_title() {
+    for header in [
+        "• Working",
+        "◦ Mapping the app structure",
+        "Waiting for background terminal",
+        "Reviewing approval request",
+    ] {
+        let content = format!(
+            "■ Conversation interrupted\n{header} (2m 14s • esc to interrupt)\n  Running cargo test\n  Waiting for the command\n› Explain the changes\n  queued message\n  tab to queue\n  gpt-6 · Context 80% left\n"
+        );
+        let detection = classify(
+            "codex",
+            DetectionInput {
+                screen: &content,
+                osc_title: "Fix notifications | term-server",
+                osc_progress: "",
+            },
+        );
+        assert_eq!(detection.state, DetectedState::Working, "{header}");
+        assert_eq!(matched_rule_id(&detection), Some("screen_working_fallback"));
+    }
+}
+
+#[test]
+fn codex_title_status_and_title_generation_are_distinct() {
+    for title in ["Thinking | term-server", "term-server | Waiting", "Working"] {
+        let detection = classify(
+            "codex",
+            DetectionInput {
+                osc_title: title,
+                ..Default::default()
+            },
+        );
+        assert_eq!(detection.state, DetectedState::Working, "{title}");
+    }
+    for title in ["Fix notifications ⠹ | term-server", "Ready | term-server"] {
+        let detection = classify(
+            "codex",
+            DetectionInput {
+                osc_title: title,
+                ..Default::default()
+            },
+        );
+        assert_eq!(detection.state, DetectedState::Idle, "{title}");
+    }
+    let approval = classify(
+        "codex",
+        DetectionInput {
+            screen: "• Working (20s • esc to interrupt)\n›\n  Press enter to confirm or esc to cancel",
+            ..Default::default()
+        },
+    );
+    assert_eq!(approval.state, DetectedState::Blocked);
+}
+
 // ---------------------------------------------------------------------------
 // Pi
 // ---------------------------------------------------------------------------
