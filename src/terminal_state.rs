@@ -837,6 +837,7 @@ impl CanonicalTerminal {
             );
             let plan = reflow_plan(self.parser.screen(), rows, cols);
             output.extend_from_slice(&plan.bytes);
+            write_input_modes(&mut output, self.parser.screen());
             let mut execution = self.execution.clone();
             execution.remap_positions(&plan);
             execution.write_restore_at(&mut output, plan.cursor, plan.pending_wrap.as_ref());
@@ -848,6 +849,7 @@ impl CanonicalTerminal {
         } else {
             let plan = reflow_plan(self.parser.screen(), rows, cols);
             let mut output = plan.bytes.clone();
+            write_input_modes(&mut output, self.parser.screen());
             let mut execution = self.execution.clone();
             execution.remap_positions(&plan);
             execution.write_restore_at(&mut output, plan.cursor, plan.pending_wrap.as_ref());
@@ -905,6 +907,7 @@ impl CanonicalTerminal {
                     .sequence(),
             );
             bytes.extend_from_slice(&self.parser.screen().state_formatted());
+            write_input_modes(&mut bytes, self.parser.screen());
             self.execution
                 .write_restore(&mut bytes, self.parser.screen());
             self.kitty_keyboard
@@ -2058,8 +2061,21 @@ fn snapshot_screen(screen: &vt100::Screen) -> Vec<u8> {
 
 fn snapshot_screen_with_execution(screen: &vt100::Screen, execution: &ExecutionState) -> Vec<u8> {
     let mut snapshot = snapshot_screen(screen);
+    write_input_modes(&mut snapshot, screen);
     execution.write_restore(&mut snapshot, screen);
     snapshot
+}
+
+fn write_input_modes(output: &mut Vec<u8>, screen: &vt100::Screen) {
+    // Input modes are global, not part of either screen's cells. In particular,
+    // panoptes serializes mouse tracking relative to None and emits no reset
+    // when it is disabled. Clear any modes replayed from the hidden normal
+    // screen before restoring the active screen's modes. ExecutionState follows
+    // this to restore encodings that panoptes does not track, such as SGR pixels.
+    for mode in [9, 1000, 1002, 1003] {
+        write_dec_mode(output, mode, false);
+    }
+    output.extend_from_slice(&screen.input_mode_formatted());
 }
 
 #[cfg(test)]
@@ -2860,6 +2876,95 @@ mod tests {
             let mut reconstructed = CanonicalTerminal::new(6, 12, 20);
             reconstructed.process(&terminal.snapshot());
             assert_eq!(reconstructed.execution.mouse_encoding, expected);
+        }
+    }
+
+    #[test]
+    fn resize_and_snapshot_preserve_terminal_input_modes() {
+        for alternate in [false, true] {
+            for protocol in [0, 9, 1000, 1002, 1003] {
+                for encoding in [0, 1006, 1016] {
+                    for keyboard_enabled in [false, true] {
+                        let mut terminal = CanonicalTerminal::new(6, 20, 20);
+                        terminal.process(b"shell");
+                        if alternate {
+                            terminal.process(b"\x1b[?1049h");
+                        }
+                        terminal.process(b"tui");
+                        if protocol != 0 {
+                            terminal.process(format!("\x1b[?{protocol}h").as_bytes());
+                        }
+                        if encoding != 0 {
+                            terminal.process(format!("\x1b[?{encoding}h").as_bytes());
+                        }
+                        if keyboard_enabled {
+                            terminal.process(b"\x1b[?1h\x1b=\x1b[?2004h");
+                        }
+                        let input_modes = terminal.parser.screen().input_mode_formatted();
+                        let mouse_encoding = terminal.execution.mouse_encoding;
+                        let modes = [1, 66, 2004, 9, 1000, 1002, 1003, 1006, 1016];
+                        let query = modes
+                            .iter()
+                            .map(|mode| format!("\x1b[?{mode}$p"))
+                            .collect::<String>();
+                        let expected_replies = modes
+                            .map(|mode| {
+                                let enabled = match mode {
+                                    1 | 66 | 2004 => keyboard_enabled,
+                                    1006 | 1016 => mode == encoding,
+                                    _ => mode == protocol,
+                                };
+                                let status = if enabled { 1 } else { 2 };
+                                format!("\x1b[?{mode};{status}$y").into_bytes()
+                            })
+                            .to_vec();
+
+                        for (rows, cols) in [(7, 25), (4, 12)] {
+                            terminal.resize(rows, cols, 20, 0, 0);
+                            assert_eq!(
+                                terminal.parser.screen().input_mode_formatted(),
+                                input_modes
+                            );
+                            assert_eq!(terminal.execution.mouse_encoding, mouse_encoding);
+                            terminal.process(query.as_bytes());
+                            assert_eq!(terminal.drain_responses(), expected_replies);
+
+                            let mut restored = CanonicalTerminal::new(rows, cols, 20);
+                            restored.process(&terminal.snapshot());
+                            assert_screen_eq(restored.parser.screen(), terminal.parser.screen());
+                            assert_eq!(restored.execution.mouse_encoding, mouse_encoding);
+                            restored.process(query.as_bytes());
+                            assert_eq!(restored.drain_responses(), expected_replies);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn active_input_modes_override_the_hidden_normal_screen_snapshot() {
+        for resize in [false, true] {
+            let mut terminal = CanonicalTerminal::new(6, 20, 20);
+            terminal.process(b"\x1b[?1003h\x1b[?1006h\x1b[?1h\x1b=\x1b[?2004h");
+            terminal.process(b"shell\x1b[?1049h");
+            terminal.process(b"\x1b[?1003l\x1b[?1006l\x1b[?1l\x1b>\x1b[?2004l");
+            terminal.process(b"tui");
+            let expected = terminal.parser.screen().input_mode_formatted();
+            let (rows, cols) = if resize { (8, 25) } else { (6, 20) };
+            if resize {
+                terminal.resize(rows, cols, 20, 0, 0);
+            }
+            let mut restored = CanonicalTerminal::new(rows, cols, 20);
+            restored.process(&terminal.snapshot());
+            assert_eq!(restored.parser.screen().input_mode_formatted(), expected);
+            restored.process(b"\x1b[?1003$p\x1b[?1006$p\x1b[?1$p\x1b[?66$p\x1b[?2004$p");
+            assert_eq!(
+                restored.drain_responses(),
+                [1003, 1006, 1, 66, 2004]
+                    .map(|mode| format!("\x1b[?{mode};2$y").into_bytes())
+                    .to_vec()
+            );
         }
     }
 

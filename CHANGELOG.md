@@ -8,11 +8,13 @@
 - **Current Codex activity detection.** Recognize changing activity labels, extra detail and queued-message rows, and word-based Working/Thinking/Waiting titles. A thread-title generation spinner is no longer mistaken for the activity spinner.
 - **Codex cancellation reporting.** The integration now reports Codex's `Interrupt` event so cancelling a turn with Esc clears its working state.
 - **Supervisor tab closing.** Accept generated tab IDs that begin with `-` instead of interpreting them as command-line options.
+- **Fullscreen Codex scrolling after resize or reload.** Preserve mouse reporting, application cursor/keypad, and bracketed-paste modes when terminal state is resized and replayed. The new Codex TUI continues receiving wheel events instead of arrow keys.
 
 ### Upgrade notes
 
 - Safe for automatic installation over `0.19.1`; no data migration or broker restart required. Existing Codex sessions use the updated detection after the server update and refresh their native lifecycle state on their next hook event.
 - To enable cancellation reporting, repair the Codex integration in Settings, start a new Codex session, and review the updated hooks in `/hooks` when prompted. Existing sessions are left running; without the new hook, cancelling an existing turn may leave it marked working until its next lifecycle event or exit.
+- If an existing Codex tab already scrolls as arrow keys, restart/resume that Codex session after updating so it can re-enable its mouse modes. Keep the new fullscreen TUI; no `--no-alt-screen` workaround is needed. Active sessions are not restarted by this release.
 
 ## 0.19.1 - 2026-09-26
 
