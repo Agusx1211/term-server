@@ -7,13 +7,13 @@
 # licenses/APACHE-2.0.txt and is available at
 # http://www.apache.org/licenses/LICENSE-2.0
 #
-# Modified by the term-server contributors: this header was added. The manifest
-# body below is unchanged from the upstream file.
+# Modified by the term-server contributors: recognize current Codex activity
+# headers and distinguish the activity spinner from thread-title generation.
 
 id = "codex"
-version = "2026.07.18.1"
+version = "2026.09.27.1"
 min_engine_version = 2
-updated_at = "2026-07-18T00:00:00Z"
+updated_at = "2026-09-27T00:00:00Z"
 
 [[rules]]
 id = "osc_title_blocked"
@@ -29,7 +29,15 @@ state = "working"
 priority = 1050
 region = "osc_title"
 visible_working = true
-regex = ['(?:^| )[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏](?: |$)']
+regex = ['^(?:● )?[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏](?: |$)']
+
+[[rules]]
+id = "osc_title_working_status"
+state = "working"
+priority = 1040
+region = "osc_title"
+visible_working = true
+regex = ['(?:^| \| )(?:Working|Thinking|Waiting)(?: \| |$)']
 
 [[rules]]
 id = "transcript_viewer"
@@ -72,10 +80,11 @@ any = [
 id = "screen_working_fallback"
 state = "working"
 priority = 500
-region = "bottom_non_empty_lines(3)"
+region = "bottom_non_empty_lines(12)"
 visible_working = true
-line_regex = ['^[•◦]\s+Working \([^)]*esc to interrupt\)(?: · .*)?$']
-not = [{ contains = ["■ Conversation interrupted"] }]
+# Status text changes with the current operation; wrapped details, queued
+# messages, the composer and the status bar can put it above the last 3 rows.
+line_regex = ['^\s*(?:[•◦]\s+)?[^()\n]+ \([^)]*\besc to interrupt\)(?: · .*)?$']
 
 [[rules]]
 id = "osc_title_idle"
@@ -85,6 +94,6 @@ region = "osc_title"
 visible_idle = true
 regex = ['\S']
 not = [
-  { regex = ['(?:^| )[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏](?: |$)'] },
+  { regex = ['^(?:● )?[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏](?: |$)'] },
   { contains = ["Action Required"] },
 ]
