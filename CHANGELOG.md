@@ -12,9 +12,9 @@
 
 ### Upgrade notes
 
-- Safe for automatic installation over `0.19.1`; no data migration or broker restart required. Existing Codex sessions use the updated detection after the server update and refresh their native lifecycle state on their next hook event.
-- To enable cancellation reporting, repair the Codex integration in Settings, start a new Codex session, and review the updated hooks in `/hooks` when prompted. Existing sessions are left running; without the new hook, cancelling an existing turn may leave it marked working until its next lifecycle event or exit.
-- If an existing Codex tab already scrolls as arrow keys, restart/resume that Codex session after updating so it can re-enable its mouse modes. Keep the new fullscreen TUI; no `--no-alt-screen` workaround is needed. Active sessions are not restarted by this release.
+- Safe for automatic installation over `0.19.1`; no data migration or forced broker restart required. Existing terminals remain on their original session broker. After updating, create a new term-server terminal and resume Codex there to use the notification and scrolling fixes; restarting Codex inside an old terminal does not update its broker.
+- To enable cancellation reporting, repair the Codex integration in Settings, start Codex in the new terminal, and review the updated hooks in `/hooks` when prompted. Existing sessions are left running; without the new hook, cancelling a turn may leave it marked working until its next lifecycle event or exit.
+- Resuming Codex in a new terminal also re-enables mouse modes lost by already-affected tabs. Keep the new fullscreen TUI; no `--no-alt-screen` workaround is needed. Active sessions are not restarted by this release.
 
 ## 0.19.1 - 2026-09-26
 
