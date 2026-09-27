@@ -1271,7 +1271,10 @@ enum SupervisorCliCommand {
     /// List open terminal panes, resources, and Settings tabs.
     Tabs,
     /// Close one open tab without killing its terminal session.
-    CloseTab { tab_id: String },
+    CloseTab {
+        #[arg(allow_hyphen_values = true)]
+        tab_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1661,6 +1664,25 @@ mod tests {
         assert_ne!(
             stable_tab_id(first_view, "terminal", "target"),
             stable_tab_id(first_view, "resource", "target")
+        );
+    }
+
+    #[test]
+    fn close_tab_cli_accepts_opaque_ids_starting_with_hyphens() {
+        for id in ["-nha4I1dPMGadCm3", "--opaque-tab-id", "ordinary-tab-id"] {
+            let cli =
+                SupervisorCli::try_parse_from(["term-server-supervisor", "close-tab", id]).unwrap();
+            let SupervisorRequest::CloseTab { tab_id } = cli.command.into_request().unwrap() else {
+                panic!("expected a close-tab request");
+            };
+            assert_eq!(tab_id, id);
+        }
+        assert!(SupervisorCli::try_parse_from(["term-server-supervisor", "--unknown"]).is_err());
+        assert_eq!(
+            SupervisorCli::try_parse_from(["term-server-supervisor", "close-tab", "--help"])
+                .unwrap_err()
+                .kind(),
+            clap::error::ErrorKind::DisplayHelp,
         );
     }
 
