@@ -7,6 +7,7 @@
 - **False Codex completion notifications.** Long commands, reasoning, and subagent work no longer become completed tasks when a lifecycle hook is more than 15 seconds old. Codex lifecycle reports stay authoritative until the next event, a process change, or an explicit newer Ready/progress-end signal. Thread-title generation after completion no longer creates another completion notification.
 - **Current Codex activity detection.** Recognize changing activity labels, extra detail and queued-message rows, and word-based Working/Thinking/Waiting titles. A thread-title generation spinner is no longer mistaken for the activity spinner.
 - **Codex cancellation reporting.** The integration now reports Codex's `Interrupt` event so cancelling a turn with Esc clears its working state.
+- **Supervisor tab closing.** Accept generated tab IDs that begin with `-` instead of interpreting them as command-line options.
 
 ### Upgrade notes
 
