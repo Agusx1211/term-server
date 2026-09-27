@@ -1,6 +1,6 @@
 {
   "name": "term-server-agent-events",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Reports Codex lifecycle and retained semantic history to its term-server session.",
   "author": {
     "name": "term-server"
