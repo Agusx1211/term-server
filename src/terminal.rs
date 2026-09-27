@@ -5959,6 +5959,21 @@ mod tests {
         );
         assert!(session.activity.lock().native_status.is_none());
         assert_eq!(session.info().agent.unwrap().status, AgentStatus::Idle);
+        // Esc ends a turn through Interrupt, independently of the Stop hook.
+        let hooks: serde_json::Value =
+            serde_json::from_str(include_str!("../integrations/codex/hooks/hooks.json")).unwrap();
+        assert!(!hooks["hooks"]["Interrupt"].as_array().unwrap().is_empty());
+        session.apply_agent_event(event(AgentEventKind::Thinking), 283_000);
+        let interrupted = AgentEvent::from_hook_input(
+            "codex",
+            &serde_json::json!({
+                "hook_event_name": "Interrupt", "session_id": "root-session"
+            }),
+        )
+        .unwrap();
+        session.apply_agent_event(interrupted, 284_000);
+        assert_eq!(session.info().agent.unwrap().status, AgentStatus::Idle);
+        assert_eq!(session.info().agent.unwrap().completed_at, Some(284_000));
         assert!(manager.remove(info.id));
     }
 

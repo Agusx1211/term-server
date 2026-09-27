@@ -99,7 +99,7 @@ impl AgentEvent {
             ),
             "PermissionRequest" | "Notification" => AgentEventKind::WaitingForApproval,
             "PreCompact" | "session_before_compact" => AgentEventKind::Compacting,
-            "Stop" | "StopFailure" | "agent_settled" => AgentEventKind::Completed,
+            "Stop" | "StopFailure" | "Interrupt" | "agent_settled" => AgentEventKind::Completed,
             "SessionEnd" | "session_shutdown" => AgentEventKind::Closed,
             _ => return None,
         };
