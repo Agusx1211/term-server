@@ -11,6 +11,7 @@ import {
   expectTerminalInteractive,
   expectTerminalSynchronized,
   terminalEvents,
+  waitForFontSettledViewport,
 } from "../assertions/terminal-state.js";
 import { expectConnectedTerminalInvariants } from "../assertions/invariants.js";
 import {
@@ -482,6 +483,66 @@ function writeByteCount(entries: readonly TranscriptEntry[]): number {
     entry.event === "write" && typeof entry.bytes === "number" ? total + entry.bytes : total
   ), 0);
 }
+
+test("K-10 Fullscreen mouse wheel survives resize and reload @pr @modes", async ({ page, server }) => {
+  await page.setViewportSize({ width: 1_280, height: 800 });
+  await page.goto("/");
+  await new LoginPage(page).login();
+  const workbench = new WorkbenchPage(page);
+  const created = await createFixtureTerminal(page, "k10-wheel", server.fixturePath);
+  await page.reload();
+  const pane = await workbench.openTerminal(created);
+  const terminalId = pane.terminalId;
+  await pane.expectConnected();
+  await waitForFontSettledViewport(page, terminalId);
+
+  // Focusing the textarea avoids injecting mouse clicks into the fixture's
+  // command input while ANY-motion reporting is enabled.
+  const command = async (text: string) => {
+    await pane.xtermHost.locator("textarea").focus();
+    await page.keyboard.press("Enter");
+    await page.keyboard.type(text);
+    await page.keyboard.press("Enter");
+  };
+  const startup = "\x1b[?1049h\x1b[?1007l\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1003h";
+  await command(`BYTES fullscreen ${hex(startup)}`);
+  await expectTerminalBuffer(page, terminalId, { contains: marker("BYTES", "fullscreen", "EMIT") });
+
+  const wheel = async (id: string) => {
+    const snapshot = await waitForSettledTerminal(page, terminalId);
+    await moveCell(pane, snapshot, MOUSE_CAPTURE_CELL.col, MOUSE_CAPTURE_CELL.row);
+    const expected = `\x1b[<64;${MOUSE_CAPTURE_CELL.col};${MOUSE_CAPTURE_CELL.row}M`;
+    await command(`CAPTURE_INPUT ${id} ${expected.length}`);
+    await server.waitForTranscript(terminalId, (entry) => (
+      entry.event === "capture_input" && entry.id === id && entry.phase === "armed"
+    ));
+    await page.mouse.wheel(0, -120);
+    const complete = await server.waitForTranscript(terminalId, (entry) => (
+      entry.event === "capture_input" && entry.id === id && entry.phase === "complete"
+    ));
+    expect(complete.payload_base64).toBe(base64(expected));
+  };
+
+  await wheel("fresh");
+  const before = await waitForSettledTerminal(page, terminalId);
+  await page.setViewportSize({ width: 1_440, height: 800 });
+  await expect.poll(async () => {
+    const snapshot = await pane.snapshot();
+    if (!snapshot || snapshot.cols === before.cols) return false;
+    return [snapshot.desiredViewport, snapshot.sentViewport, snapshot.serverViewport]
+      .every((viewport) => viewport?.cols === snapshot.cols && viewport.rows === snapshot.rows);
+  }).toBe(true);
+  const resized = await waitForSettledTerminal(page, terminalId);
+  expect(resized.cols).not.toBe(before.cols);
+  await page.reload();
+  await pane.expectConnected();
+  await waitForFontSettledViewport(page, terminalId);
+  await wheel("reloaded");
+  await workbench.openSettings();
+  await workbench.closeSettings();
+  await pane.expectConnected();
+  await wheel("returned");
+});
 
 test("K-10 Modes and private state checkpoint @nightly @p1 @checkpoint @modes @queries", async ({
   page,
