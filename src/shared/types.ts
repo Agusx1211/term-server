@@ -408,6 +408,10 @@ export interface FileEntry {
   mime: string;
   image: boolean;
   pdf: boolean;
+  /** A format the browser's audio player decodes. */
+  audio: boolean;
+  /** A format the browser's video player decodes. */
+  video: boolean;
   editable: boolean;
 }
 

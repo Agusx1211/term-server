@@ -1,5 +1,5 @@
 import type { ArtifactEntry, TerminalInfo } from "../../shared/types";
-import type { ResourceTab } from "./resources";
+import { resourceTypeFor, type ResourceTab } from "./resources";
 
 export interface ArtifactDeleteTarget {
   id: string;
@@ -34,7 +34,7 @@ export function resourceForArtifact(
   return {
     path: artifact.path,
     name: artifact.name,
-    type: artifact.image ? "image" : artifact.pdf ? "pdf" : "text",
+    type: resourceTypeFor(artifact),
     mime: artifact.mime,
     modifiedAt: artifact.modifiedAt,
     dirty: false,
@@ -127,6 +127,8 @@ export function stableArtifactInventory(
       && artifact.mime === candidate.mime
       && artifact.image === candidate.image
       && artifact.pdf === candidate.pdf
+      && artifact.audio === candidate.audio
+      && artifact.video === candidate.video
       && artifact.editable === candidate.editable
       && artifact.producer === candidate.producer;
   });

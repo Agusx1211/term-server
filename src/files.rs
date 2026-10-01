@@ -82,6 +82,8 @@ pub struct FileEntry {
     pub mime: String,
     pub image: bool,
     pub pdf: bool,
+    pub audio: bool,
+    pub video: bool,
     pub editable: bool,
 }
 
@@ -197,10 +199,16 @@ fn display_name(path: &Path) -> String {
 }
 
 fn mime_for(path: &Path) -> String {
-    mime_guess::from_path(path)
+    let mime = mime_guess::from_path(path)
         .first_or_octet_stream()
         .essence_str()
-        .to_owned()
+        .to_owned();
+    match mime.as_str() {
+        // The registered type for AAC in an MP4 container. Browsers sniff the
+        // guessed `audio/m4a`, but Safari refuses to play it when served.
+        "audio/m4a" | "audio/x-m4a" => "audio/mp4".to_owned(),
+        _ => mime,
+    }
 }
 
 fn supported_image(mime: &str) -> bool {
@@ -218,6 +226,46 @@ fn supported_image(mime: &str) -> bool {
     )
 }
 
+/// Audio containers and codecs a browser's `<audio>` element plays natively.
+/// Matched on the mime type, not on the `audio/` prefix, so formats the
+/// browser cannot decode stay ordinary downloads instead of dead players.
+fn supported_audio(mime: &str) -> bool {
+    matches!(
+        mime,
+        "audio/mpeg"
+            | "audio/mp3"
+            | "audio/mp4"
+            | "audio/m4a"
+            | "audio/x-m4a"
+            | "audio/aac"
+            | "audio/aacp"
+            | "audio/wav"
+            | "audio/wave"
+            | "audio/x-wav"
+            | "audio/vnd.wave"
+            | "audio/ogg"
+            | "audio/opus"
+            | "audio/flac"
+            | "audio/x-flac"
+            | "audio/webm"
+    )
+}
+
+/// Video containers a browser's `<video>` element plays natively. Not the whole
+/// `video/` prefix: `.ts` guesses as MPEG transport stream, which would turn
+/// every TypeScript file into a video.
+fn supported_video(mime: &str) -> bool {
+    matches!(
+        mime,
+        "video/mp4"
+            | "video/x-m4v"
+            | "video/webm"
+            | "video/ogg"
+            | "video/quicktime"
+            | "video/x-matroska"
+    )
+}
+
 fn entry(path: &Path) -> Result<FileEntry, FileError> {
     let metadata = fs::metadata(path)?;
     let is_directory = metadata.is_dir();
@@ -228,6 +276,8 @@ fn entry(path: &Path) -> Result<FileEntry, FileError> {
     };
     let image = !is_directory && supported_image(&mime);
     let pdf = !is_directory && mime == "application/pdf";
+    let audio = !is_directory && supported_audio(&mime);
+    let video = !is_directory && supported_video(&mime);
     Ok(FileEntry {
         path: path.to_string_lossy().into_owned(),
         name: display_name(path),
@@ -237,7 +287,14 @@ fn entry(path: &Path) -> Result<FileEntry, FileError> {
         mime,
         image,
         pdf,
-        editable: metadata.is_file() && !image && !pdf && metadata.len() <= MAX_EDIT_BYTES,
+        audio,
+        video,
+        editable: metadata.is_file()
+            && !image
+            && !pdf
+            && !audio
+            && !video
+            && metadata.len() <= MAX_EDIT_BYTES,
     })
 }
 
@@ -469,7 +526,11 @@ pub fn file_asset(raw: &str, cwd: Option<&str>) -> Result<FileAsset, FileError> 
 
 pub fn preview_asset(raw: &str, cwd: Option<&str>) -> Result<FileAsset, FileError> {
     let asset = file_asset(raw, cwd)?;
-    if !supported_image(&asset.mime) && asset.mime != "application/pdf" {
+    let previewable = supported_image(&asset.mime)
+        || supported_audio(&asset.mime)
+        || supported_video(&asset.mime)
+        || asset.mime == "application/pdf";
+    if !previewable {
         return Err(FileError::NotPreviewable);
     }
     Ok(asset)
@@ -727,6 +788,58 @@ mod tests {
             preview_asset(path.to_str().unwrap(), None).unwrap().mime,
             "application/pdf"
         );
+    }
+
+    #[test]
+    fn audio_and_video_files_are_previewable_but_not_editable() {
+        let directory = tempfile::tempdir().unwrap();
+        for (name, mime, audio, video) in [
+            ("song.mp3", "audio/mpeg", true, false),
+            ("take one.wav", "audio/wav", true, false),
+            ("voice.m4a", "audio/mp4", true, false),
+            ("loop.ogg", "audio/ogg", true, false),
+            ("track.flac", "audio/flac", true, false),
+            ("clip.mp4", "video/mp4", false, true),
+            ("clip.webm", "video/webm", false, true),
+            ("screen recording.mov", "video/quicktime", false, true),
+        ] {
+            let path = directory.path().join(name);
+            fs::write(&path, b"media bytes").unwrap();
+
+            let metadata = metadata(path.to_str().unwrap(), None).unwrap();
+            assert_eq!(metadata.audio, audio, "{name} audio flag");
+            assert_eq!(metadata.video, video, "{name} video flag");
+            assert!(
+                !metadata.image && !metadata.pdf,
+                "{name} is neither image nor pdf"
+            );
+            assert!(
+                !metadata.editable,
+                "{name} must not open in the text editor"
+            );
+            let asset = preview_asset(path.to_str().unwrap(), None).unwrap();
+            assert_eq!(asset.mime, mime, "{name} mime");
+        }
+    }
+
+    #[test]
+    fn source_and_unplayable_media_files_stay_out_of_the_players() {
+        let directory = tempfile::tempdir().unwrap();
+        // `.ts` guesses as an MPEG transport stream; it is TypeScript here.
+        for name in ["main.ts", "notes.txt", "movie.avi", "movie.wmv", "tune.mid"] {
+            let path = directory.path().join(name);
+            fs::write(&path, b"plain").unwrap();
+
+            let metadata = metadata(path.to_str().unwrap(), None).unwrap();
+            assert!(!metadata.audio && !metadata.video, "{name} is not playable");
+            assert!(
+                matches!(
+                    preview_asset(path.to_str().unwrap(), None),
+                    Err(FileError::NotPreviewable)
+                ),
+                "{name} has no inline preview"
+            );
+        }
     }
 
     #[test]

@@ -30,7 +30,10 @@ use thiserror::Error;
 use time::Duration;
 use tower_http::{
     catch_panic::CatchPanicLayer,
-    compression::CompressionLayer,
+    compression::{
+        CompressionLayer,
+        predicate::{DefaultPredicate, NotForContentType, Predicate},
+    },
     services::{ServeDir, ServeFile},
     set_header::SetResponseHeaderLayer,
     trace::TraceLayer,
@@ -411,6 +414,21 @@ struct FilePathQuery {
     path: String,
     cwd: Option<String>,
 }
+
+#[derive(Debug, Deserialize)]
+struct ProbeFilesRequest {
+    paths: Vec<String>,
+    cwd: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProbeFilesResponse {
+    entries: Vec<Option<files::FileEntry>>,
+}
+
+/// The most paths one probe answers. The terminal asks about every spelling a
+/// name with spaces could have, which is a few dozen at the very most.
+const MAX_PROBE_PATHS: usize = 64;
 
 #[derive(Debug, Deserialize)]
 struct FileSearchQuery {
@@ -1374,6 +1392,37 @@ async fn file_metadata(
     Ok(Json(metadata))
 }
 
+/// Which of several paths exist, in one round trip. A path that does not
+/// resolve is a `null` entry rather than an error, so asking about a guess does
+/// not fail the request or log a 404 in the browser.
+async fn probe_files(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+    Json(body): Json<ProbeFilesRequest>,
+) -> Result<Json<ProbeFilesResponse>, ApiError> {
+    require_origin(&headers, &uri, &state)?;
+    require_auth(&jar, &state)?;
+    if body.paths.len() > MAX_PROBE_PATHS {
+        return Err(ApiError::BadRequest(format!(
+            "probe at most {MAX_PROBE_PATHS} paths at a time"
+        )));
+    }
+    let entries = tokio::task::spawn_blocking(move || {
+        body.paths
+            .iter()
+            .map(|path| files::metadata(path, body.cwd.as_deref()).ok())
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, "file probe task failed");
+        ApiError::Internal
+    })?;
+    Ok(Json(ProbeFilesResponse { entries }))
+}
+
 async fn list_files(
     State(state): State<AppState>,
     Query(query): Query<FilePathQuery>,
@@ -2195,6 +2244,7 @@ pub fn build_router(state: AppState, client_directory: Option<PathBuf>) -> Route
             delete(remove_artifact),
         )
         .route("/files/meta", get(file_metadata))
+        .route("/files/probe", post(probe_files))
         .route("/files/list", get(list_files))
         .route("/files/search", get(search_files))
         .route("/files/content", get(read_file).put(save_file))
@@ -2248,7 +2298,15 @@ pub fn build_router(state: AppState, client_directory: Option<PathBuf>) -> Route
     router = router
         .layer(DefaultBodyLimit::max(files::MAX_REQUEST_BYTES))
         .layer(CatchPanicLayer::new())
-        .layer(CompressionLayer::new())
+        // Audio and video are already compressed, and gzip turns a seekable
+        // file into a chunked stream that players cannot range into.
+        .layer(
+            CompressionLayer::new().compress_when(
+                DefaultPredicate::new()
+                    .and(NotForContentType::new("audio/"))
+                    .and(NotForContentType::new("video/")),
+            ),
+        )
         .layer(TraceLayer::new_for_http())
         .layer(SetResponseHeaderLayer::if_not_present(
             header::X_CONTENT_TYPE_OPTIONS,
@@ -3834,6 +3892,165 @@ mod tests {
         );
         let body = to_bytes(response.into_body(), 1024).await.unwrap();
         assert_eq!(&body[..], b"%PDF-1.7");
+    }
+
+    #[tokio::test]
+    async fn video_preview_serves_seekable_ranges_without_compression() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("screen recording.mp4");
+        // Larger than the compression layer's minimum size, so only the
+        // content-type exclusion keeps it out of gzip.
+        let content = (0..4096u32).map(|n| (n % 251) as u8).collect::<Vec<_>>();
+        std::fs::write(&path, &content).unwrap();
+        let (app, cookie) = authenticated_app().await;
+        let encoded_path = utf8_percent_encode(path.to_str().unwrap(), NON_ALPHANUMERIC);
+
+        let whole = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/files/raw?path={encoded_path}"))
+                    .header(header::COOKIE, &cookie)
+                    .header(header::ACCEPT_ENCODING, "gzip, br")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(whole.status(), StatusCode::OK);
+        assert_eq!(
+            whole.headers().get(header::CONTENT_TYPE).unwrap(),
+            "video/mp4"
+        );
+        assert!(whole.headers().get(header::CONTENT_ENCODING).is_none());
+        assert_eq!(whole.headers().get(header::ACCEPT_RANGES).unwrap(), "bytes");
+        assert_eq!(whole.headers().get(header::CONTENT_LENGTH).unwrap(), "4096");
+
+        let partial = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/files/raw?path={encoded_path}"))
+                    .header(header::COOKIE, cookie)
+                    .header(header::ACCEPT_ENCODING, "gzip, br")
+                    .header(header::RANGE, "bytes=1000-1099")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(partial.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            partial.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes 1000-1099/4096"
+        );
+        let body = to_bytes(partial.into_body(), 4096).await.unwrap();
+        assert_eq!(&body[..], &content[1000..1100]);
+    }
+
+    #[tokio::test]
+    async fn probe_reports_which_paths_exist_without_failing_for_the_rest() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("My Videos")).unwrap();
+        std::fs::write(directory.path().join("My Videos/clip one.mp4"), b"v").unwrap();
+        let (app, cookie) = authenticated_app().await;
+        let body = serde_json::json!({
+            "cwd": directory.path(),
+            "paths": ["My Videos/clip one.mp4", "clip one.mp4", "My Videos"],
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/files/probe")
+                    .header(header::COOKIE, &cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let entries = json["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0]["name"], "clip one.mp4");
+        assert_eq!(entries[0]["video"], true);
+        assert_eq!(entries[0]["kind"], "file");
+        assert!(entries[1].is_null(), "a path that does not exist is null");
+        assert_eq!(entries[2]["kind"], "directory");
+
+        let too_many = serde_json::json!({ "paths": vec!["a"; 65] });
+        let rejected = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/files/probe")
+                    .header(header::COOKIE, &cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(too_many.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn probe_requires_a_session() {
+        let app = build_router(test_state().await, None);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/files/probe")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"paths":["/etc/hostname"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn audio_preview_is_served_inline_with_its_media_type() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("voice note.mp3");
+        std::fs::write(&path, b"ID3 not really audio").unwrap();
+        let (app, cookie) = authenticated_app().await;
+        let encoded_path = utf8_percent_encode(path.to_str().unwrap(), NON_ALPHANUMERIC);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/files/raw?path={encoded_path}"))
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "audio/mpeg"
+        );
+        assert!(
+            response
+                .headers()
+                .get(header::CONTENT_DISPOSITION)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("inline;")
+        );
     }
 
     #[tokio::test]

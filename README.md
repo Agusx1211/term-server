@@ -61,8 +61,8 @@ On first boot, open `https://127.0.0.1:8090`. term-server prints a random passwo
 - **Phone and tablet support:** touch-sized navigation, a workspace drawer, focused pane switching, safe-area-aware layouts, and terminal actions that do not depend on hover or hardware-keyboard shortcuts.
 - **Directory-aware organization:** terminals move between collapsible workspaces as their shell changes directory. Workspace colors, names, filters, and sidebar sizing stay stable across reconnects.
 - **Resilient sessions:** xterm-authored recovery checkpoints with a bounded server fallback, resize-safe sequenced resumption, in-place slow-client recovery, browser renderer caching, and a separate pane layout in each browser tab. A closed pane detaches the view without killing its process.
-- **Files when needed:** searchable explorer, local image and PDF previews, direct downloads, and a lazy-loaded CodeMirror editor with syntax highlighting, atomic saves, and stale-file conflict detection.
-- **Agent-connected artifacts:** multiline handoffs stay attached to the terminal and agent that created them, with inline text, image, and PDF previews plus an optional full editor.
+- **Files when needed:** searchable explorer, local image, PDF, audio, and video previews with built-in players, direct downloads, and a lazy-loaded CodeMirror editor with syntax highlighting, atomic saves, and stale-file conflict detection.
+- **Agent-connected artifacts:** multiline handoffs stay attached to the terminal and agent that created them, with inline text, image, PDF, audio, and video previews plus an optional full editor.
 - **Virtual audio devices:** a browser microphone can become the host's default **Term Server Microphone**, while host audio sent to **Term Server Speaker** plays through a selected browser output. Multiple tabs mix into the same microphone and listen to the same speaker with bounded jitter buffers in both directions.
 - **Process visibility and control:** a lightweight Linux `/proc` sampler shows the complete live descendant process tree, foreground job, CPU and memory usage, and lets you send SIGTERM to a selected process. Command lines are secret-aware and redacted; input, output, and exited processes are not retained.
 - **Terminal-scoped access approvals:** each terminal has one Access panel for secret requests, proactive in-memory secret grants, revocation, activity, and reviewed local sudo commands. Secret values never return to the agent; sudo requires the user's password for the immutable command shown in the panel. Agents can also have the broker generate a secret they never see and hand it to the user for a single reveal in the panel.
@@ -119,7 +119,9 @@ Useful shortcuts:
 | Paste | `Ctrl+Shift+V` / `Cmd+Shift+V` |
 | Search terminal history | `Ctrl+F` / `Cmd+F` |
 | Save an edited file | `Ctrl+S` / `Cmd+S` |
-| Open a local file link | `Ctrl+click` / `Cmd+click` |
+| Open a local file link in the editor or its built-in image, PDF, audio, or video player | `Ctrl+click` / `Cmd+click` |
+
+Hovering a media path in the terminal previews it: the image, the first frame of a video, or the length of an audio file. Paths are recognised when they contain spaces (`/home/me/My Videos/clip one.mp4`), are quoted (`"clip one.mp4"`) or shell-escaped (`clip\ one.mp4`), or were wrapped over several rows, whether by the terminal or by a program that breaks its own output. A name that needs guessing is only underlined once term-server finds that file on disk.
 
 Filesystem access has the same operating-system permissions as the daemon. Anyone who can sign in can also open a shell, so treat access as equivalent to SSH access for that user.
 
@@ -140,7 +142,7 @@ same path remains usable with normal tools such as `cat`.
 ![Editable session artifact opened in term-server](docs/screenshots/session-artifact.jpg)
 
 The sidebar shows the selected artifact's contents next to the live terminal, including inline
-text, image, and PDF previews. Open an artifact when the full conflict-safe editor, syntax
+text, image, PDF, audio, and video previews. Open an artifact when the full conflict-safe editor, syntax
 highlighting, line wrapping, or a larger canvas is useful. The editor links back to the originating
 agent, and closing its tab leaves the artifact available in the sidebar without reopening it.
 Edits remain visible to the agent at the same path on later turns. Delete actions in the sidebar and

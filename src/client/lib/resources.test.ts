@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   resourceRevision,
+  resourceTypeFor,
   shouldReloadResource,
   type ResourceRevisionsHeld,
   type ResourceTab,
@@ -68,5 +69,21 @@ describe("resource reloads", () => {
 
   it("separates revisions of different paths", () => {
     expect(resourceRevision(tab())).not.toBe(resourceRevision(tab({ path: "/other.md" })));
+  });
+});
+
+describe("resourceTypeFor", () => {
+  const file = { image: false, pdf: false, audio: false, video: false };
+
+  it("picks the viewer a file opens in", () => {
+    expect(resourceTypeFor({ ...file, image: true })).toBe("image");
+    expect(resourceTypeFor({ ...file, pdf: true })).toBe("pdf");
+    expect(resourceTypeFor({ ...file, video: true })).toBe("video");
+    expect(resourceTypeFor({ ...file, audio: true })).toBe("audio");
+    expect(resourceTypeFor(file)).toBe("text");
+  });
+
+  it("treats a server that predates the media players as plain files", () => {
+    expect(resourceTypeFor({ image: false, pdf: false })).toBe("text");
   });
 });
