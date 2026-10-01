@@ -4,8 +4,10 @@ import {
   Copy,
   Download,
   ExternalLink,
+  FileAudio,
   FileCode2,
   FileText,
+  FileVideo,
   Image,
   LoaderCircle,
   PackageOpen,
@@ -26,7 +28,15 @@ interface ArtifactDrawerProps {
 }
 
 const artifactIcon = (artifact: ArtifactEntry) => (
-  artifact.image ? Image : artifact.pdf ? FileText : FileCode2
+  artifact.image
+    ? Image
+    : artifact.pdf
+      ? FileText
+      : artifact.video
+        ? FileVideo
+        : artifact.audio
+          ? FileAudio
+          : FileCode2
 );
 
 const artifactTimeFormatter = new Intl.DateTimeFormat(undefined, {
@@ -241,6 +251,23 @@ function ArtifactInlinePreview({
           <iframe
             src={api.previewFileUrl({ path: artifact.path })}
             title={`Inline preview of ${artifact.name}`}
+          />
+        ) : artifact.video ? (
+          <video
+            src={`${api.previewFileUrl({ path: artifact.path })}&version=${artifact.modifiedAt}`}
+            controls
+            playsInline
+            preload="metadata"
+            aria-label={`Video player for ${artifact.name}`}
+            onError={() => setError("Unable to play this video")}
+          />
+        ) : artifact.audio ? (
+          <audio
+            src={`${api.previewFileUrl({ path: artifact.path })}&version=${artifact.modifiedAt}`}
+            controls
+            preload="metadata"
+            aria-label={`Audio player for ${artifact.name}`}
+            onError={() => setError("Unable to play this audio")}
           />
         ) : document ? (
           <pre>{previewContent || "(Empty artifact)"}{previewTruncated ? "\n\n… Preview truncated. Open the artifact to see the rest." : ""}</pre>

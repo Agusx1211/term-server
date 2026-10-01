@@ -2,8 +2,10 @@ import { useEffect, useRef, useState } from "preact/hooks";
 import {
   ArrowUp,
   File,
+  FileAudio,
   FileCode2,
   FileText,
+  FileVideo,
   Folder,
   Image,
   LoaderCircle,
@@ -158,6 +160,8 @@ function FileIcon({ entry }: { entry: FileEntry }) {
   if (entry.kind === "directory") return <Folder class="directory" size={15} />;
   if (entry.image) return <Image class="image" size={15} />;
   if (entry.pdf) return <FileText class="pdf" size={15} />;
+  if (entry.video) return <FileVideo class="video" size={15} />;
+  if (entry.audio) return <FileAudio class="audio" size={15} />;
   if (entry.editable) return <FileCode2 class="code" size={15} />;
   return <File size={15} />;
 }

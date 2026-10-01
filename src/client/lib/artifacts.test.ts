@@ -25,6 +25,8 @@ const artifact = (overrides: Partial<ArtifactEntry> = {}): ArtifactEntry => ({
   mime: "text/markdown",
   image: false,
   pdf: false,
+  audio: false,
+  video: false,
   editable: true,
   ...overrides,
 });
@@ -58,6 +60,14 @@ const terminal = (overrides: Partial<TerminalInfo> = {}): TerminalInfo => ({
 });
 
 describe("artifact resources", () => {
+  it("opens recorded audio and video artifacts in their players", () => {
+    const song = artifact({ name: "take.wav", mime: "audio/wav", audio: true, editable: false });
+    const clip = artifact({ name: "demo.mp4", mime: "video/mp4", video: true, editable: false });
+
+    expect(resourceForArtifact(song, terminal()).type).toBe("audio");
+    expect(resourceForArtifact(clip, terminal()).type).toBe("video");
+  });
+
   it("keeps the inventory separate from closed resource tabs", () => {
     expect(reconcileArtifactResources([], [artifact()], [terminal()])).toEqual([]);
   });

@@ -1,4 +1,14 @@
-import { FileCode2, FileText, Image, PackageOpen, Settings, TerminalSquare, X } from "lucide-preact";
+import {
+  FileAudio,
+  FileCode2,
+  FileText,
+  FileVideo,
+  Image,
+  PackageOpen,
+  Settings,
+  TerminalSquare,
+  X,
+} from "lucide-preact";
 import type { ResourceTab } from "../lib/resources";
 
 interface ResourceTabBarProps {
@@ -60,7 +70,11 @@ export function ResourceTabBar({
             ? Image
             : tab.type === "pdf"
               ? FileText
-              : FileCode2;
+              : tab.type === "video"
+                ? FileVideo
+                : tab.type === "audio"
+                  ? FileAudio
+                  : FileCode2;
         return (
           <button
             key={tab.path}
