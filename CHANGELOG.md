@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.20.0 - 2026-10-01
+
+Audio and video now open in built-in players, and media paths in the terminal are recognised however they are written: with spaces, quoted, shell-escaped, or wrapped over several rows.
+
+### Added
+
+- **Audio and video players.** Ctrl/Cmd+click a path to an MP3, WAV, Ogg/Opus, FLAC, M4A, AAC, MP4, WebM, MOV, M4V, MKV or Ogv file to open it in a built-in player tab with the browser's native controls. Seeking works on large files, and a tab pauses its player when you switch away. Files the browser cannot decode (AVI, WMV, and codecs it lacks) show a message with the Download button instead of a dead player.
+- **Hover previews for video and audio.** Hovering a media path in the terminal shows the first frame and length of a video, or a card with the length of an audio file, next to the existing image preview.
+- **Audio and video everywhere files appear.** The file explorer shows them with their own icons and opens them in the players, and the agent artifact sidebar plays them inline. They are no longer opened as text in the editor.
+- **`POST /api/files/probe`.** Reports which of up to 64 paths exist, in one request, with `null` for the ones that do not (no 404s). The terminal uses it to check guessed names.
+
+### Fixed
+
+- **Media paths with spaces.** `/home/me/My Videos/clip one.mp4`, quoted names (`"clip one.mp4"`), and shell-escaped names (`clip\ one.mp4`) are now links, and previews work on them. A name that has to be guessed from unquoted text is only underlined once term-server finds that file on disk.
+- **Media paths broken over several rows.** Paths wrapped by the terminal, and paths wrapped with real newlines by a program such as an agent's interface, are joined back together, including a break that falls inside a word, exactly on a directory boundary, or before an indented continuation row. Hovering any row of the path previews it.
+- **Link positions on lines with double-width characters.** Link ranges now come from the terminal's cell buffer, so CJK text or emoji earlier on a line no longer shifts the underline.
+
+### Upgrade notes
+
+- Safe for automatic installation over `0.19.2`; no data migration and no broker restart required. Existing terminals keep working and pick up the new links and players when the page reloads.
+- Playback uses the browser's own decoders, so what plays depends on the browser (for example, H.264 needs a browser build that includes it).
+
 ## 0.19.2 - 2026-09-27
 
 ### Fixed
