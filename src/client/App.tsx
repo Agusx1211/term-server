@@ -159,7 +159,7 @@ import {
 import { TermServerLogo } from "./components/TermServerLogo";
 import { WelcomeSection } from "./components/WelcomeSection";
 import { ResourceTabBar } from "./components/ResourceTabs";
-import type { ResourceTab } from "./lib/resources";
+import { resourceTypeFor, type ResourceTab } from "./lib/resources";
 import type { TerminalStreamIssue } from "./lib/terminal-stream";
 import type { ThemeName } from "./lib/terminal-theme";
 import type { PasteRequest } from "./components/TerminalPane";
@@ -1336,7 +1336,7 @@ export function App() {
       const next: ResourceTab = {
         path: file.path,
         name: file.name,
-        type: file.image ? "image" : file.pdf ? "pdf" : "text",
+        type: resourceTypeFor(file),
         mime: file.mime,
         modifiedAt: file.modifiedAt,
         dirty: false,

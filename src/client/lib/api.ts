@@ -297,6 +297,12 @@ export const api = {
   removeArtifact: (sessionId: string, artifactId: string) =>
     request<void>(`/api/artifacts/${sessionId}/${artifactId}`, { method: "DELETE" }),
   fileMetadata: (target: FileTarget) => request<FileEntry>(`/api/files/meta?${fileQuery(target)}`),
+  // Which of several guessed paths exist, in one request; a miss is a null entry.
+  probeFiles: (cwd: string | undefined, paths: string[]) =>
+    request<{ entries: Array<FileEntry | null> }>("/api/files/probe", {
+      method: "POST",
+      body: JSON.stringify({ cwd, paths }),
+    }).then((response) => response.entries),
   listFiles: (target: FileTarget) => request<DirectoryListing>(`/api/files/list?${fileQuery(target)}`),
   // `signal` lets a caller abort a superseded search. The server stops the
   // filesystem walk when the request is dropped, so aborting is what keeps a

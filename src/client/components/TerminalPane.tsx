@@ -50,7 +50,17 @@ import type {
 } from "../../shared/types";
 import { configureTerminalDrag } from "../lib/layout";
 import { api } from "../lib/api";
-import { createHoverPreviewController, findFileLinks, imagePreviewPosition } from "../lib/file-links";
+import { createHoverPreviewController, imagePreviewPosition } from "../lib/file-links";
+import { mediaKindOf } from "../lib/media";
+import {
+  createFileProbe,
+  mergeFileLinks,
+  planFileLinks,
+  readLinkWindow,
+  verifyFileLinks,
+  type ResolvedFileLink,
+} from "../lib/terminal-file-links";
+import { TerminalMediaPreview, type TerminalMediaPreviewState } from "./TerminalMediaPreview";
 import {
   NO_TERMINAL_MODIFIERS,
   transformTerminalInput,
@@ -215,21 +225,11 @@ const searchOptions = (theme: ThemeName, incremental = false): ISearchOptions =>
       },
 });
 
-function fileLinkWindow(term: XTerm, bufferLineNumber: number) {
-  let top = bufferLineNumber - 1;
-  while (top > 0 && term.buffer.active.getLine(top)?.isWrapped) top -= 1;
-  const parts: string[] = [];
-  let row = top;
-  while (parts.join("").length < 2048) {
-    const line = term.buffer.active.getLine(row);
-    if (!line) break;
-    const continues = term.buffer.active.getLine(row + 1)?.isWrapped ?? false;
-    parts.push(line.translateToString(!continues));
-    if (!continues) break;
-    row += 1;
-  }
-  return { text: parts.join(""), top };
-}
+// What the server said about paths that appeared in terminals, shared by every
+// pane: link detection and the hover preview ask about the same files.
+const fileProbe = createFileProbe(api.probeFiles);
+// A slow lookup must not hold back the links that need none.
+const LINK_VERIFY_TIMEOUT_MS = 800;
 
 export function TerminalPane({
   terminal,
@@ -300,7 +300,7 @@ export function TerminalPane({
   const [keyboardOpen, setKeyboardOpen] = useState(false);
   const keyboardOpenState = useRef(false);
   const [scrolledBack, setScrolledBack] = useState(false);
-  const [imagePreview, setImagePreview] = useState<{ file: FileEntry; left: number; top: number }>();
+  const [mediaPreview, setMediaPreview] = useState<TerminalMediaPreviewState>();
   const [terminalSize, setTerminalSize] = useState({ focused: false, controller: false });
   const [reloadRequired, setReloadRequired] = useState(false);
   const [connection, setConnection] = useState<
@@ -534,53 +534,58 @@ export function TerminalPane({
       diagnosticsHandle?.record("font-load", { result: "settled" });
       reportTerminalViewport.current?.();
     });
-    const imagePreviews = createHoverPreviewController<
+    const mediaPreviews = createHoverPreviewController<
       { key: string; path: string; cwd: string; left: number; top: number },
       FileEntry
     >({
       load: async ({ path, cwd }) => {
-        const file = await api.fileMetadata({ path, cwd });
-        return file.image ? file : undefined;
+        const file = await fileProbe({ path, cwd });
+        return file && mediaKindOf(file) ? file : undefined;
       },
-      show: (file, position) => setImagePreview({ file, left: position.left, top: position.top }),
-      hide: () => setImagePreview(undefined),
+      show: (file, position) => setMediaPreview({ file, left: position.left, top: position.top }),
+      hide: () => setMediaPreview(undefined),
+    });
+    const fileLinkFor = (link: ResolvedFileLink): ILink => ({
+      text: link.path,
+      range: link.range,
+      decorations: { pointerCursor: true, underline: true },
+      activate(event, text) {
+        if (event.ctrlKey || event.metaKey) {
+          mediaPreviews.clear();
+          openFile.current({ path: text, cwd: terminalState.current.cwd });
+        }
+      },
+      hover(event, text) {
+        const position = imagePreviewPosition(event.clientX, event.clientY);
+        const cwd = terminalState.current.cwd;
+        mediaPreviews.hover({ key: `${cwd}\u0000${text}`, path: text, cwd, ...position });
+      },
+      leave() {
+        mediaPreviews.leave();
+      },
     });
     const fileLinksDisposable = term.registerLinkProvider({
       provideLinks(bufferLineNumber, callback) {
-        const line = fileLinkWindow(term, bufferLineNumber);
-        if (!line.text) {
-          callback(undefined);
+        const plan = planFileLinks(
+          readLinkWindow(term.buffer.active, term.cols, bufferLineNumber - 1),
+          bufferLineNumber,
+        );
+        const finish = (links: ResolvedFileLink[]) => callback(links.length ? links.map(fileLinkFor) : undefined);
+        if (!plan.pending.length) {
+          finish(plan.certain);
           return;
         }
-        const links: ILink[] = findFileLinks(line.text).flatMap((match) => {
-          const endIndex = match.end - 1;
-          const startRow = line.top + Math.floor(match.start / term.cols) + 1;
-          const endRow = line.top + Math.floor(endIndex / term.cols) + 1;
-          if (bufferLineNumber < startRow || bufferLineNumber > endRow) return [];
-          return [{
-            text: match.text,
-            range: {
-              start: { x: match.start % term.cols + 1, y: startRow },
-              end: { x: endIndex % term.cols + 1, y: endRow },
-            },
-            decorations: { pointerCursor: true, underline: true },
-            activate(event, text) {
-              if (event.ctrlKey || event.metaKey) {
-                imagePreviews.clear();
-                openFile.current({ path: text, cwd: terminalState.current.cwd });
-              }
-            },
-            hover(event, text) {
-              const position = imagePreviewPosition(event.clientX, event.clientY);
-              const cwd = terminalState.current.cwd;
-              imagePreviews.hover({ key: `${cwd}\u0000${text}`, path: text, cwd, ...position });
-            },
-            leave() {
-              imagePreviews.leave();
-            },
-          }];
+        // Names with spaces, or that a program wrapped across rows, are only
+        // links once the file is found, which takes a round trip.
+        const cwd = terminalState.current.cwd;
+        const verified = verifyFileLinks(plan.pending, (paths) => fileProbe.many(cwd, paths));
+        const timeout = new Promise<ResolvedFileLink[]>((resolve) => {
+          setTimeout(() => resolve([]), LINK_VERIFY_TIMEOUT_MS);
         });
-        callback(links.length ? links : undefined);
+        void Promise.race([verified, timeout]).then(
+          (links) => finish(mergeFileLinks(plan.certain, links)),
+          () => finish(plan.certain),
+        );
       },
     });
     // Renderer state for debug recording. xterm does not expose the active
@@ -1833,7 +1838,7 @@ export function TerminalPane({
       recordingDisposable();
       stopCapture();
       observer.disconnect();
-      imagePreviews.clear();
+      mediaPreviews.clear();
       dataDisposable.dispose();
       inputSource.dispose();
       binaryDisposable.dispose();
@@ -2437,19 +2442,7 @@ export function TerminalPane({
           </button>
         </div>
       )}
-      {imagePreview && (
-        <div
-          class="terminal-image-preview xterm-hover"
-          style={{ left: `${imagePreview.left}px`, top: `${imagePreview.top}px` }}
-          role="tooltip"
-        >
-          <header>
-            <span>{imagePreview.file.name}</span>
-            <small>Ctrl+click to open</small>
-          </header>
-          <img src={api.previewFileUrl({ path: imagePreview.file.path })} alt={imagePreview.file.name} />
-        </div>
-      )}
+      {mediaPreview && <TerminalMediaPreview key={mediaPreview.file.path} {...mediaPreview} />}
       <AccessPanel
         open={accessOpen}
         terminal={terminal}

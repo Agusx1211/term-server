@@ -1,3 +1,5 @@
+import type { FileEntry } from "../../shared/types";
+
 export interface ArtifactOrigin {
   id: string;
   sessionId: string;
@@ -5,10 +7,26 @@ export interface ArtifactOrigin {
   agentKind?: string;
 }
 
+export type ResourceType = "text" | "image" | "pdf" | "audio" | "video";
+
+/**
+ * How a file opens in the workspace. Servers from before the media players
+ * leave `audio` and `video` off, which reads as a plain file there.
+ */
+export function resourceTypeFor(
+  file: Pick<FileEntry, "image" | "pdf"> & Partial<Pick<FileEntry, "audio" | "video">>,
+): ResourceType {
+  if (file.image) return "image";
+  if (file.pdf) return "pdf";
+  if (file.video) return "video";
+  if (file.audio) return "audio";
+  return "text";
+}
+
 export interface ResourceTab {
   path: string;
   name: string;
-  type: "text" | "image" | "pdf";
+  type: ResourceType;
   mime: string;
   modifiedAt: number;
   dirty: boolean;

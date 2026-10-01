@@ -8,8 +8,10 @@ import {
   Bot,
   Copy,
   Download,
+  FileAudio,
   FileCode2,
   FileText,
+  FileVideo,
   Image,
   LoaderCircle,
   PackageOpen,
@@ -73,6 +75,14 @@ export function ResourceDocuments({
           ) : tab.type === "pdf" ? (
             <PdfDocument
               tab={tab}
+              onOpenArtifactSession={onOpenArtifactSession}
+              onDeleteArtifact={onDeleteArtifact}
+            />
+          ) : tab.type === "audio" || tab.type === "video" ? (
+            <MediaDocument
+              tab={tab}
+              kind={tab.type}
+              active={activePath === tab.path}
               onOpenArtifactSession={onOpenArtifactSession}
               onDeleteArtifact={onDeleteArtifact}
             />
@@ -159,6 +169,79 @@ function PdfDocument({
         src={api.previewFileUrl({ path: tab.path })}
         title={`PDF preview of ${tab.name}`}
       />
+    </section>
+  );
+}
+
+/**
+ * The built-in audio and video players. Hidden tabs stay mounted so their
+ * state survives, which would leave a playing file audible behind another
+ * tab, so the player pauses whenever its tab is not the one on screen.
+ */
+function MediaDocument({
+  tab,
+  kind,
+  active,
+  onOpenArtifactSession,
+  onDeleteArtifact,
+}: {
+  tab: ResourceTab;
+  kind: "audio" | "video";
+  active: boolean;
+  onOpenArtifactSession: (sessionId: string) => void;
+  onDeleteArtifact: (artifact: ArtifactDeleteTarget) => Promise<void>;
+}) {
+  const player = useRef<HTMLMediaElement>(null);
+  const [failed, setFailed] = useState(false);
+  const isArtifact = Boolean(tab.artifact);
+  const Icon = isArtifact ? PackageOpen : kind === "video" ? FileVideo : FileAudio;
+  useEffect(() => setFailed(false), [tab.modifiedAt]);
+  useEffect(() => {
+    if (!active) player.current?.pause();
+  }, [active]);
+  const src = `${api.previewFileUrl({ path: tab.path })}&version=${tab.modifiedAt}`;
+  return (
+    <section class={`media-document ${isArtifact ? "artifact-document" : ""}`}>
+      <header class="resource-document-header">
+        <Icon size={14} />
+        <span>{isArtifact ? tab.name : tab.path}</span>
+        <ArtifactOriginAction tab={tab} onOpen={onOpenArtifactSession} />
+        <em>{isArtifact ? `Artifact · ${kind}` : tab.mime}</em>
+        <DownloadAction tab={tab} />
+        <ArtifactDeleteAction tab={tab} onDelete={onDeleteArtifact} />
+      </header>
+      <div class={`media-stage ${kind}`}>
+        {failed ? (
+          <div class="resource-error">
+            This browser cannot play this {kind}. Download it to open it in another player.
+          </div>
+        ) : kind === "video" ? (
+          <video
+            ref={player as { current: HTMLVideoElement | null }}
+            key={src}
+            src={src}
+            controls
+            playsInline
+            preload="metadata"
+            aria-label={`Video player for ${tab.name}`}
+            onError={() => setFailed(true)}
+          />
+        ) : (
+          <div class="audio-player">
+            <FileAudio size={44} strokeWidth={1.25} />
+            <strong>{tab.name}</strong>
+            <audio
+              ref={player as { current: HTMLAudioElement | null }}
+              key={src}
+              src={src}
+              controls
+              preload="metadata"
+              aria-label={`Audio player for ${tab.name}`}
+              onError={() => setFailed(true)}
+            />
+          </div>
+        )}
+      </div>
     </section>
   );
 }
