@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.21.0 - 2026-10-05
+
+Record a voice note from any terminal and its file path is typed straight into that terminal.
+
+### Added
+
+- **Voice notes.** Every terminal header has a microphone button (always visible on phones, no menu needed). Tap it to start recording; the button becomes a red timer. Tap the timer to stop: the note is uploaded to `/tmp/temp-server/files` on the host as `voice-note-YYYY-MM-DD-HH-MM-SS.<ext>` and its path is typed into the terminal it was recorded from, the same way the "Upload & paste into temp" drop zone does. The cross next to the timer discards the note without uploading anything. The microphone is released as soon as recording stops, so the browser's recording indicator goes away.
+- Notes are recorded with the browser's own encoder: WebM/Opus in Chromium and Firefox, WebM or M4A in Safari depending on its version. Browsers without `MediaRecorder` (older iOS, some embedded web views) fall back to an uncompressed WAV. If the microphone is unplugged or revoked mid-note, what was recorded so far is still sent.
+
+### Upgrade notes
+
+- Safe for automatic installation over `0.20.0`; no data migration and no broker restart required. The button appears when the page reloads.
+- Browsers only allow microphone access over HTTPS or on localhost, so a server opened over plain HTTP from another machine shows a message instead of recording. The default HTTPS setup works.
+
 ## 0.20.0 - 2026-10-01
 
 Audio and video now open in built-in players, and media paths in the terminal are recognised however they are written: with spaces, quoted, shell-escaped, or wrapped over several rows.

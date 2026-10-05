@@ -113,7 +113,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 1px s
   width: 25px; height: 25px; flex: none; display: block;
 }
 .brand-mark.large { width: 52px; height: 52px; margin-bottom: 24px; }
-.icon-button, .pane-action, .row-action {
+.icon-button, .pane-action, .row-action, .voice-note-stop {
   border: 0; background: transparent; padding: 0; display: inline-grid; place-items: center; cursor: pointer;
 }
 .icon-button { width: 24px; height: 24px; border-radius: 4px; }
@@ -906,6 +906,17 @@ body.pane-resizing .layout-divider.horizontal { cursor: row-resize; }
 .pane-action.active { background: var(--selected); color: var(--foreground); }
 .pane-action.danger:hover { color: var(--danger); }
 .desktop-pane-actions { display: flex; align-items: center; }
+.voice-note-recording { flex: none; display: inline-flex; align-items: center; gap: 2px; }
+.voice-note-stop {
+  height: 21px; display: inline-flex; align-items: center; gap: 5px; padding: 0 7px; border-radius: 11px;
+  background: color-mix(in srgb, var(--danger) 16%, transparent); color: var(--danger);
+  font-size: 11px; font-weight: 600; font-variant-numeric: tabular-nums;
+}
+.voice-note-stop:hover:not(:disabled) { background: color-mix(in srgb, var(--danger) 26%, transparent); }
+.voice-note-stop:disabled { cursor: default; color: var(--muted); background: var(--hover); }
+.voice-note-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; animation: voice-note-pulse 1.2s ease-in-out infinite; }
+@keyframes voice-note-pulse { 50% { opacity: .3; } }
+@media (prefers-reduced-motion: reduce) { .voice-note-dot { animation: none; } }
 .terminal-body { position: relative; min-width: 0; min-height: 0; display: flex; overflow: hidden; }
 .xterm-host {
   min-width: 0; min-height: 0; overflow: hidden; background: var(--terminal-background);
@@ -1734,6 +1745,8 @@ body.pane-resizing .layout-divider.horizontal { cursor: row-resize; }
   .desktop-pane-actions { display: none; }
   .mobile-pane-actions { position: relative; flex: none; display: block; }
   .mobile-pane-actions > .pane-action { width: 40px; height: 40px; }
+  .pane-header > .voice-note-action, .voice-note-discard { width: 40px; height: 40px; flex: none; }
+  .voice-note-stop { height: 32px; padding: 0 11px; border-radius: 16px; font-size: 13px; }
   .pane-action-menu {
     position: absolute; top: 42px; right: 0; z-index: 30; width: min(260px, calc(100vw - 16px)); overflow: hidden;
     max-height: calc(var(--visual-viewport-height) - 112px - env(safe-area-inset-top) - env(safe-area-inset-bottom)); overflow-y: auto; overscroll-behavior: contain;

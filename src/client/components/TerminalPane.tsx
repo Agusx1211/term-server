@@ -165,6 +165,7 @@ import { ProcessInspector } from "./ProcessInspector";
 import { AccessPanel } from "./AccessPanel";
 import { ArtifactDrawer } from "./ArtifactDrawer";
 import { WorkingDuration } from "./WorkingDuration";
+import { VoiceNoteButton } from "./VoiceNoteButton";
 import { agentStatusPresentation, type AgentStatusTone } from "../lib/agent-status";
 
 interface TerminalPaneProps {
@@ -191,6 +192,8 @@ interface TerminalPaneProps {
   onOpenArtifact: (artifact: ArtifactEntry) => void;
   onDeleteArtifact: (artifact: ArtifactEntry) => Promise<void>;
   onUploadFiles: (files: File[]) => void;
+  /** A finished voice note recorded from this pane's header. */
+  onVoiceNote: (file: File) => void;
   /** A request from the app to inject text (e.g. an uploaded file path) into
    * this terminal, matched by terminal id. */
   pasteRequest?: PasteRequest | null;
@@ -255,6 +258,7 @@ export function TerminalPane({
   onOpenArtifact,
   onDeleteArtifact,
   onUploadFiles,
+  onVoiceNote,
   pasteRequest,
   onPasteHandled,
 }: TerminalPaneProps) {
@@ -2154,6 +2158,7 @@ export function TerminalPane({
             event.currentTarget.value = "";
           }}
         />
+        <VoiceNoteButton onRecorded={onVoiceNote} onNotice={onNotice} />
         <span class="desktop-pane-actions">
           <button
             class="pane-action"
