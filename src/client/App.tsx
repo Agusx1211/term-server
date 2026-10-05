@@ -170,6 +170,7 @@ import {
   fileZoneAt,
   shellQuote,
   type FileDropZone,
+  TEMP_UPLOAD_DIRECTORY,
 } from "./lib/file-drop";
 
 const TerminalPane = lazy(() =>
@@ -618,6 +619,19 @@ export function App() {
     const directory = terminal?.cwd ?? "~";
     startUpload(files, { path: directory }, (result) => {
       showNotice(uploadSummary(result, directory));
+    });
+  };
+
+  // Voice notes always land in the temp drop folder and their path is typed
+  // into the terminal they were recorded from.
+  const sendVoiceNote = (terminalId: string) => (file: File) => {
+    startUpload([file], { path: TEMP_UPLOAD_DIRECTORY }, (result) => {
+      setPasteRequest({
+        id: terminalId,
+        text: result.map((entry) => shellQuote(entry.path)).join(" "),
+        nonce: Date.now(),
+      });
+      showNotice("Voice note uploaded and its path pasted");
     });
   };
 
@@ -2239,6 +2253,7 @@ export function App() {
                     onOpenArtifact={openArtifact}
                     onDeleteArtifact={deleteArtifact}
                     onUploadFiles={uploadToTerminal(terminal.id)}
+                    onVoiceNote={sendVoiceNote(terminal.id)}
                     pasteRequest={pasteRequest}
                     onPasteHandled={(id) => {
                       if (pasteRequest?.id === id) setPasteRequest(null);
