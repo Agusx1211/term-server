@@ -18,7 +18,7 @@ Request a secret and wait for the user to approve it in the terminal's Access pa
   --agent omp
 ```
 
-Replace `omp` with `claude`, `codex`, `pi`, or `hermes`. A user may also proactively grant a secret from the panel. Discover available names without exposing values:
+Replace `omp` with the active agent's name: `claude`, `codex`, `pi`, `hermes`, or `agy` (Google Antigravity). A user may also proactively grant a secret from the panel. Discover available names without exposing values:
 
 ```bash
 "$TERM_SERVER_EXECUTABLE" access secret list --agent omp

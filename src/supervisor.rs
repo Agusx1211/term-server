@@ -1073,6 +1073,12 @@ async fn prepare_environment(root: &Path, executable: &Path) -> Result<(), Super
     )
     .await?;
     write_atomic_file(
+        &root.join("GEMINI.md"),
+        SUPERVISOR_CONTEXT.as_bytes(),
+        0o600,
+    )
+    .await?;
+    write_atomic_file(
         &root.join(".omp/AGENTS.md"),
         SUPERVISOR_CONTEXT.as_bytes(),
         0o600,
@@ -1969,6 +1975,7 @@ mod tests {
         for path in [
             "AGENTS.md",
             "CLAUDE.md",
+            "GEMINI.md",
             ".omp/AGENTS.md",
             ".omp/skills/term-server-supervisor/SKILL.md",
             ".pi/skills/term-server-supervisor/SKILL.md",

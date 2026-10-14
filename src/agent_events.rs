@@ -73,15 +73,20 @@ impl AgentEvent {
             "pi" => "pi",
             "omp" => "omp",
             "hermes" => "hermes",
+            "agy" | "antigravity" => "agy",
             _ => return None,
         };
         let name = input
             .get("hook_event_name")
+            .or_else(|| input.get("hookEventName"))
             .or_else(|| input.get("event"))
             .and_then(Value::as_str)?;
         let transcript_only = matches!(name, "transcript_snapshot" | "message_end");
         let kind = match name {
             "UserPromptSubmit"
+            | "SessionStart"
+            | "PreInvocation"
+            | "PostInvocation"
             | "agent_start"
             | "before_agent_start"
             | "PostCompact"
@@ -95,6 +100,7 @@ impl AgentEvent {
                 input
                     .get("tool_name")
                     .or_else(|| input.get("toolName"))
+                    .or_else(|| input.pointer("/toolCall/name"))
                     .and_then(Value::as_str),
             ),
             "PermissionRequest" | "Notification" => AgentEventKind::WaitingForApproval,
@@ -153,12 +159,20 @@ fn hook_transcript_entries(
             .or_else(|| input.get("event_id"))
             .and_then(Value::as_str)
             .map(|id| format!("{prefix}:{id}"))
+            .or_else(|| {
+                Some(format!(
+                    "{prefix}:{}:{}",
+                    input.get("conversationId")?.as_str()?,
+                    input.get("stepIdx")?.as_u64()?
+                ))
+            })
             .or_else(|| sequence.map(|sequence| format!("{prefix}:{sequence}")))
     };
     let timestamp = input.get("timestamp").and_then(Value::as_u64);
     let tool_name = input
         .get("tool_name")
         .or_else(|| input.get("toolName"))
+        .or_else(|| input.pointer("/toolCall/name"))
         .and_then(Value::as_str)
         .map(str::to_owned);
     let record = match event {
@@ -179,6 +193,7 @@ fn hook_transcript_entries(
             let data = input
                 .get("tool_input")
                 .or_else(|| input.get("args"))
+                .or_else(|| input.pointer("/toolCall/args"))
                 .cloned();
             Some(AgentTranscriptInput {
                 kind: AgentTranscriptKind::ToolStart,
@@ -196,6 +211,7 @@ fn hook_transcript_entries(
                 .get("tool_response")
                 .or_else(|| input.get("tool_output"))
                 .or_else(|| input.get("result"))
+                .or_else(|| input.get("error"))
                 .cloned();
             Some(AgentTranscriptInput {
                 kind: AgentTranscriptKind::ToolResult,
@@ -258,9 +274,31 @@ pub fn read_hook_event(
         std::io::copy(&mut reader, &mut std::io::sink())?;
         return Ok(None);
     }
-    let Ok(input) = serde_json::from_slice::<Value>(&bytes) else {
+    let Ok(mut input) = serde_json::from_slice::<Value>(&bytes) else {
         return Ok(None);
     };
+    // Antigravity's stdin payload has no event name. Its managed hook passes
+    // the event in the CLI selector instead. The parent hook stamps its sequence
+    // before detaching delivery, so an earlier event cannot overwrite Stop.
+    let (provider, hook_name) = provider
+        .split_once(':')
+        .map_or((provider, None), |(provider, event)| {
+            (provider, Some(event))
+        });
+    if let Some(name) = hook_name {
+        let Some(object) = input.as_object_mut() else {
+            return Ok(None);
+        };
+        let (name, sequence) = name
+            .split_once(':')
+            .map_or((name, None), |(name, sequence)| {
+                (name, sequence.parse::<u64>().ok())
+            });
+        object.insert("hook_event_name".to_owned(), Value::String(name.to_owned()));
+        if let Some(sequence) = sequence {
+            object.insert("sequence".to_owned(), Value::from(sequence));
+        }
+    }
     let mut event = AgentEvent::from_hook_input(provider, &input);
     if let Some(event) = event.as_mut()
         && event.title.is_none()
@@ -388,24 +426,47 @@ fn tool_event_kind(tool_name: Option<&str>) -> AgentEventKind {
     let normalized = tool_name.to_ascii_lowercase();
     if matches!(
         normalized.as_str(),
-        "bash" | "exec_command" | "write_stdin" | "shell" | "terminal"
+        "bash"
+            | "exec_command"
+            | "write_stdin"
+            | "shell"
+            | "terminal"
+            | "run_command"
+            | "manage_task"
     ) {
         AgentEventKind::RunningCommand
     } else if matches!(
         normalized.as_str(),
-        "apply_patch" | "edit" | "write" | "write_file" | "patch" | "multiedit" | "notebookedit"
+        "apply_patch"
+            | "edit"
+            | "write"
+            | "write_file"
+            | "patch"
+            | "multiedit"
+            | "notebookedit"
+            | "write_to_file"
+            | "replace_file_content"
+            | "multi_replace_file_content"
     ) {
         AgentEventKind::EditingFiles
     } else if normalized.contains("search")
         || normalized.contains("browser")
         || normalized.starts_with("web__")
+        || matches!(normalized.as_str(), "find_by_name" | "read_url_content")
     {
         AgentEventKind::Searching
     } else if matches!(
         normalized.as_str(),
-        "agent" | "task" | "spawn_agent" | "collaboration.spawn_agent"
+        "agent"
+            | "task"
+            | "spawn_agent"
+            | "collaboration.spawn_agent"
+            | "invoke_subagent"
+            | "manage_subagents"
     ) {
         AgentEventKind::Delegating
+    } else if matches!(normalized.as_str(), "ask_question" | "ask_permission") {
+        AgentEventKind::WaitingForApproval
     } else {
         AgentEventKind::UsingTool
     }
@@ -414,6 +475,80 @@ fn tool_event_kind(tool_name: Option<&str>) -> AgentEventKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agy_hooks_use_explicit_names_and_camel_case_tool_payloads() {
+        let payload = serde_json::json!({
+            "conversationId": "conversation", "stepIdx": 7,
+            "toolCall": { "name": "run_command", "args": { "CommandLine": "npm test", "Cwd": "/workspace" } }
+        }).to_string();
+        let event = read_hook_event("agy:PreToolUse", payload.as_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.provider, "agy");
+        assert_eq!(event.kind, AgentEventKind::RunningCommand);
+        let tool = &event.transcript[0];
+        assert_eq!(tool.kind, AgentTranscriptKind::ToolStart);
+        assert_eq!(tool.name.as_deref(), Some("run_command"));
+        assert_eq!(tool.source_id.as_deref(), Some("tool-start:conversation:7"));
+        assert_eq!(tool.data.as_ref().unwrap()["CommandLine"], "npm test");
+
+        for (name, expected) in [
+            ("SessionStart", AgentEventKind::Thinking),
+            ("PreInvocation", AgentEventKind::Thinking),
+            ("PostInvocation", AgentEventKind::Thinking),
+            ("PostToolUse", AgentEventKind::Thinking),
+            ("Stop", AgentEventKind::Completed),
+        ] {
+            assert_eq!(
+                read_hook_event(&format!("agy:{name}"), payload.as_bytes())
+                    .unwrap()
+                    .unwrap()
+                    .kind,
+                expected
+            );
+        }
+        for (tool, kind) in [
+            ("write_to_file", AgentEventKind::EditingFiles),
+            ("replace_file_content", AgentEventKind::EditingFiles),
+            ("multi_replace_file_content", AgentEventKind::EditingFiles),
+            ("grep_search", AgentEventKind::Searching),
+            ("find_by_name", AgentEventKind::Searching),
+            ("invoke_subagent", AgentEventKind::Delegating),
+            ("ask_question", AgentEventKind::WaitingForApproval),
+            ("ask_permission", AgentEventKind::WaitingForApproval),
+        ] {
+            let payload =
+                serde_json::json!({"hook_event_name":"PreToolUse", "toolCall":{"name":tool}});
+            assert_eq!(
+                AgentEvent::from_hook_input("agy", &payload).unwrap().kind,
+                kind,
+                "{tool}"
+            );
+        }
+        assert!(
+            read_hook_event("agy:PreToolUse", b"[]".as_slice())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn agy_detached_event_sequence_survives_parsing() {
+        let payload = b"{}";
+        let sequenced = read_hook_event("agy:Stop:1791975345000000000", payload.as_slice())
+            .unwrap()
+            .unwrap();
+        assert_eq!(sequenced.kind, AgentEventKind::Completed);
+        assert_eq!(sequenced.sequence, Some(1791975345000000000));
+        assert_eq!(
+            read_hook_event("agy:Stop:unsupported-clock", payload.as_slice())
+                .unwrap()
+                .unwrap()
+                .kind,
+            AgentEventKind::Completed
+        );
+    }
 
     #[test]
     fn retains_semantic_hook_details_for_supervisor_history() {
