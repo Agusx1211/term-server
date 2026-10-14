@@ -2191,7 +2191,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn agy_install_repair_and_remove_preserve_foreign_plugins() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::symlink;
         let directory = tempfile::tempdir().unwrap();
         let installed = directory.path().join("installed");
         let listing = directory.path().join("listing.json");
@@ -2200,27 +2200,12 @@ mod tests {
         let enabled =
             serde_json::json!([{"name": PLUGIN_NAME, "enabled": true, "path": installed}]);
         std::fs::write(&listing, "[]").unwrap();
-        let script = format!(
-            "#!/bin/sh\nset -eu\ncase \"$1 $2\" in\n\
-             'plugin list') cat '{}' ;;\n\
-             'plugin install') printf 'install\\n' >> '{}'; mkdir -p '{}'; cp -R \"$3/.\" '{}'; printf '%s' '{}' > '{}' ;;\n\
-             'plugin enable') printf 'enable\\n' >> '{}'; printf '%s' '{}' > '{}' ;;\n\
-             'plugin uninstall') printf 'uninstall\\n' >> '{}'; printf '[]' > '{}' ;;\n\
-             *) exit 1 ;;\nesac\n",
-            listing.display(),
-            log.display(),
-            installed.display(),
-            installed.display(),
-            enabled,
-            listing.display(),
-            log.display(),
-            enabled,
-            listing.display(),
-            log.display(),
-            listing.display()
-        );
-        std::fs::write(&executable, script).unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(directory.path().join("enabled.json"), enabled.to_string()).unwrap();
+        symlink(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/agy-plugin-cli.sh"),
+            &executable,
+        )
+        .unwrap();
         let service = AgentIntegrationService::new(&directory.path().join("server"));
         assert_eq!(
             service.agy_status(&executable).await.unwrap().state,
@@ -2319,7 +2304,8 @@ mod tests {
                 group
             };
             let command = hook["command"].as_str().unwrap();
-            assert!(command.contains(&format!("--agent-event agy:{name}")));
+            assert!(command.contains(&format!("agy:{name}:$sequence")));
+            assert!(command.contains("sequence=$(date +%s%N 2>/dev/null)"));
             assert!(command.contains("exec 3<&0"));
             assert!(command.contains("<&3 >/dev/null 2>&1 &"));
             let output = StdCommand::new("sh")

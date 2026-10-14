@@ -278,7 +278,8 @@ pub fn read_hook_event(
         return Ok(None);
     };
     // Antigravity's stdin payload has no event name. Its managed hook passes
-    // the event in the CLI selector instead, leaving the payload untouched.
+    // the event in the CLI selector instead. The parent hook stamps its sequence
+    // before detaching delivery, so an earlier event cannot overwrite Stop.
     let (provider, hook_name) = provider
         .split_once(':')
         .map_or((provider, None), |(provider, event)| {
@@ -288,7 +289,15 @@ pub fn read_hook_event(
         let Some(object) = input.as_object_mut() else {
             return Ok(None);
         };
+        let (name, sequence) = name
+            .split_once(':')
+            .map_or((name, None), |(name, sequence)| {
+                (name, sequence.parse::<u64>().ok())
+            });
         object.insert("hook_event_name".to_owned(), Value::String(name.to_owned()));
+        if let Some(sequence) = sequence {
+            object.insert("sequence".to_owned(), Value::from(sequence));
+        }
     }
     let mut event = AgentEvent::from_hook_input(provider, &input);
     if let Some(event) = event.as_mut()
@@ -521,6 +530,23 @@ mod tests {
             read_hook_event("agy:PreToolUse", b"[]".as_slice())
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn agy_detached_event_sequence_survives_parsing() {
+        let payload = b"{}";
+        let sequenced = read_hook_event("agy:Stop:1791975345000000000", payload.as_slice())
+            .unwrap()
+            .unwrap();
+        assert_eq!(sequenced.kind, AgentEventKind::Completed);
+        assert_eq!(sequenced.sequence, Some(1791975345000000000));
+        assert_eq!(
+            read_hook_event("agy:Stop:unsupported-clock", payload.as_slice())
+                .unwrap()
+                .unwrap()
+                .kind,
+            AgentEventKind::Completed
         );
     }
 
