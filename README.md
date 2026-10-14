@@ -67,7 +67,7 @@ On first boot, open `https://127.0.0.1:8090`. term-server prints a random passwo
 - **Virtual audio devices:** a browser microphone can become the host's default **Term Server Microphone**, while host audio sent to **Term Server Speaker** plays through a selected browser output. Multiple tabs mix into the same microphone and listen to the same speaker with bounded jitter buffers in both directions.
 - **Process visibility and control:** a lightweight Linux `/proc` sampler shows the complete live descendant process tree, foreground job, CPU and memory usage, and lets you send SIGTERM to a selected process. Command lines are secret-aware and redacted; input, output, and exited processes are not retained.
 - **Terminal-scoped access approvals:** each terminal has one Access panel for secret requests, proactive in-memory secret grants, revocation, activity, and reviewed local sudo commands. Secret values never return to the agent; sudo requires the user's password for the immutable command shown in the panel. Agents can also have the broker generate a secret they never see and hand it to the user for a single reveal in the panel.
-- **Agent awareness:** Codex, Claude, Pi, OMP, and Hermes sessions show working, blocked, idle, and closed states. An agent waiting on an approval or a question is marked **Needs you** for as long as it waits, so a stalled agent is visible without opening it. An unseen return to idle gets a distinct bell until you focus that terminal. Alerts can appear in-app, as desktop notifications, in both places, or remain off. In-app cards inherit their terminal color and can be placed in any corner with a configurable dismissal time.
+- **Agent awareness:** Codex, Claude, Pi, OMP, Hermes, and Google Antigravity (`agy`) sessions show working, blocked, idle, and closed states. An agent waiting on an approval or a question is marked **Needs you** for as long as it waits, so a stalled agent is visible without opening it. An unseen return to idle gets a distinct bell until you focus that terminal. Alerts can appear in-app, as desktop notifications, in both places, or remain off. In-app cards inherit their terminal color and can be placed in any corner with a configurable dismissal time.
 - **Supervisor terminal:** one visibly marked, singleton terminal can inspect and control the other term-server sessions without embedding an AI provider into the server. Run OMP, Pi, Codex, Claude, or an ordinary shell command yourself; only descendants of that supervisor receive the embedded skill and scoped control tools. The tools expose terminal screens, input, names, process trees, creation and termination, plus open-tab listing and closure. They deliberately provide no project organizer, pane arranger, scheduler, or job system.
 - **Secure defaults:** loopback binding, HTTPS, Argon2 password hashing, signed HTTP-only SameSite cookies, origin enforcement, CSP, HSTS, login throttling, and bounded memory use.
 - **Deployment choices:** one native executable plus static browser assets, with Docker Compose and a systemd user service included.
@@ -130,7 +130,7 @@ Filesystem access has the same operating-system permissions as the daemon. Anyon
 
 Term-server ships the canonical `term-server-artifacts` skill with every release. The installer
 links it into `${CODEX_HOME:-~/.codex}/skills`, and **Settings → Artifact skill** reports whether
-Codex, Claude Code, and Pi use that bundled version, another matching copy, an outdated copy, or a
+Codex, Claude Code, Pi, and Antigravity use that bundled version, another matching copy, an outdated copy, or a
 broken link. Explicit install and repair actions link an agent to the bundled skill; term-server
 never replaces a standalone directory. Managed links automatically follow term-server updates.
 
@@ -226,18 +226,32 @@ wrapper.
 
 ### Live agent activity
 
-Term-server continues to infer Codex, Claude Code, Pi, OMP, and Hermes state from their process trees,
+Term-server continues to infer Codex, Claude Code, Pi, OMP, Hermes, and Antigravity state from their process trees,
 terminal signals, output, and CPU activity. **Settings → Live agent activity** can additionally
 install a small provider-native plugin or extension for more immediate lifecycle updates such as
 thinking, running a command, waiting for approval, and compacting context. These updates appear in
 the existing terminal subtitle; working, blocked, idle, ready, closed, and completion notifications
 keep using the existing state machine.
 
+For **Google Antigravity CLI (`agy`)**, install its integration here and start a new `agy` session.
+Term-server uses `agy plugin install`, `enable`, and `uninstall` to manage a local plugin with
+Antigravity's native hooks and the `term-server-access` skill. It checks the installed path reported
+by `agy plugin list --json`, including disabled plugins and stale copies. It refuses to replace or
+remove a same-name plugin owned by another installation. Commands and subagents remain Working
+until `Stop`; live approval controls and question tools show Needs you. Hooks return valid JSON
+without automatically approving or rejecting tools and are inert outside term-server.
+
+Install the artifact skill separately in **Settings → Artifact skill**; its managed link lives in
+`~/.gemini/antigravity-cli/skills/term-server-artifacts`. Inside the dedicated Supervisor terminal,
+`agy` discovers `.agents/skills/term-server-supervisor` and `GEMINI.md`, and can run the existing
+`term-server-supervisor` control CLI. A normal `agy` terminal can use its own access broker and
+artifact helper; controlling other terminals requires the Supervisor's scoped environment.
+
 ### Supervisor terminal
 
-Use the compact crown action in the workspace header to create or reopen the singleton supervisor. It is a normal persistent terminal: there is no provider chooser and closing its pane does not stop it. Creation requests time out instead of leaving the control busy indefinitely. Run `omp`, `pi`, `codex`, or `claude` as usual, or stay in the shell.
+Use the compact crown action in the workspace header to create or reopen the singleton supervisor. It is a normal persistent terminal: there is no provider chooser and closing its pane does not stop it. Creation requests time out instead of leaving the control busy indefinitely. Run `omp`, `pi`, `codex`, `claude`, or `agy` as usual, or stay in the shell.
 
-The terminal starts in a private managed directory containing provider-local instructions and the `term-server-supervisor` skill. Its `PATH` contains the scoped control CLI, which is the only supervisor control interface. Codex, Claude, Pi, and OMP discover the same skill through their normal project-local paths; term-server does not inject MCP servers or provider-specific tool adapters. Existing `HOME` and provider credential locations are left unchanged. Normal terminals receive none of this environment and cannot authenticate to the control socket.
+The terminal starts in a private managed directory containing provider-local instructions and the `term-server-supervisor` skill. Its `PATH` contains the scoped control CLI, which is the only supervisor control interface. Codex, Claude, Pi, OMP, and Antigravity discover the same skill through their normal project-local paths; term-server does not inject MCP servers or provider-specific tool adapters. Existing `HOME` and provider credential locations are left unchanged. Normal terminals receive none of this environment and cannot authenticate to the control socket.
 
 The sidebar row and pane header turn amber when the shell leaves the managed supervisor directory, and the pane shows the exact root to return to before starting an agent. Subdirectories remain valid because provider skill discovery walks their ancestors.
 

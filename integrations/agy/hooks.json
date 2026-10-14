@@ -1,0 +1,56 @@
+{
+  "term-server-agent-events": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "sh -c 'exec 3<&0; if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event agy:SessionStart <&3 >/dev/null 2>&1 & else cat <&3 >/dev/null; fi; printf \"%s\\n\" \"{}\"'",
+        "timeout": 1
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "sh -c 'exec 3<&0; if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event agy:PreInvocation <&3 >/dev/null 2>&1 & else cat <&3 >/dev/null; fi; printf \"%s\\n\" \"{}\"'",
+        "timeout": 1
+      }
+    ],
+    "PostInvocation": [
+      {
+        "type": "command",
+        "command": "sh -c 'exec 3<&0; if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event agy:PostInvocation <&3 >/dev/null 2>&1 & else cat <&3 >/dev/null; fi; printf \"%s\\n\" \"{}\"'",
+        "timeout": 1
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'exec 3<&0; if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event agy:PreToolUse <&3 >/dev/null 2>&1 & else cat <&3 >/dev/null; fi; printf \"%s\\n\" \"{\\\"decision\\\":\\\"allow\\\"}\"'",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'exec 3<&0; if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event agy:PostToolUse <&3 >/dev/null 2>&1 & else cat <&3 >/dev/null; fi; printf \"%s\\n\" \"{}\"'",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "sh -c 'exec 3<&0; if [ -n \"${TERM_SERVER_EXECUTABLE:-}\" ] && [ -n \"${TERM_SERVER_SESSION:-}\" ] && [ -n \"${TERM_SERVER_BROKER_SOCKET:-}\" ]; then \"$TERM_SERVER_EXECUTABLE\" --agent-event agy:Stop <&3 >/dev/null 2>&1 & else cat <&3 >/dev/null; fi; printf \"%s\\n\" \"{}\"'",
+        "timeout": 1
+      }
+    ]
+  }
+}

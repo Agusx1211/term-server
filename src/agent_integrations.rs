@@ -25,6 +25,9 @@ const CODEX_MANIFEST: &str = include_str!("../integrations/codex/.codex-plugin/p
 const CODEX_HOOKS: &str = include_str!("../integrations/codex/hooks/hooks.json");
 const CLAUDE_MANIFEST: &str = include_str!("../integrations/claude/.claude-plugin/plugin.json");
 const CLAUDE_HOOKS: &str = include_str!("../integrations/claude/hooks/hooks.json");
+const AGY_MANIFEST: &str = include_str!("../integrations/agy/plugin.json");
+const AGY_HOOKS: &str = include_str!("../integrations/agy/hooks.json");
+const AGY_OWNERSHIP_FILE: &str = ".term-server-owner.json";
 const PI_MANIFEST: &str = include_str!("../integrations/pi/package.json");
 const PI_EXTENSION: &str =
     include_str!("../integrations/pi/extensions/term-server-agent-events.ts");
@@ -46,6 +49,7 @@ pub enum AgentIntegrationProvider {
     Pi,
     Omp,
     Hermes,
+    Agy,
 }
 
 impl AgentIntegrationProvider {
@@ -56,6 +60,7 @@ impl AgentIntegrationProvider {
             Self::Pi => "pi",
             Self::Omp => "omp",
             Self::Hermes => "hermes",
+            Self::Agy => "agy",
         }
     }
 
@@ -66,6 +71,7 @@ impl AgentIntegrationProvider {
             Self::Pi => "Pi",
             Self::Omp => "OMP",
             Self::Hermes => "Hermes",
+            Self::Agy => "Google Antigravity",
         }
     }
 }
@@ -164,15 +170,16 @@ impl AgentIntegrationService {
     }
 
     pub async fn status(&self) -> AgentIntegrationsConfig {
-        let (codex, claude, pi, omp, hermes) = tokio::join!(
+        let (codex, claude, pi, omp, hermes, agy) = tokio::join!(
             self.provider_status(AgentIntegrationProvider::Codex),
             self.provider_status(AgentIntegrationProvider::Claude),
             self.provider_status(AgentIntegrationProvider::Pi),
             self.provider_status(AgentIntegrationProvider::Omp),
             self.provider_status(AgentIntegrationProvider::Hermes),
+            self.provider_status(AgentIntegrationProvider::Agy),
         );
         AgentIntegrationsConfig {
-            providers: vec![codex, claude, pi, omp, hermes],
+            providers: vec![codex, claude, pi, omp, hermes, agy],
             fallbacks_enabled: true,
         }
     }
@@ -213,6 +220,7 @@ impl AgentIntegrationService {
             AgentIntegrationProvider::Pi => self.pi_status(&executable).await,
             AgentIntegrationProvider::Omp => self.omp_status(&executable).await,
             AgentIntegrationProvider::Hermes => self.hermes_status().await,
+            AgentIntegrationProvider::Agy => self.agy_status(&executable).await,
         };
         result.unwrap_or_else(|message| {
             status(
@@ -220,6 +228,51 @@ impl AgentIntegrationService {
                 AgentIntegrationState::NeedsRepair,
                 format!("{message} Process/output inference is still active."),
             )
+        })
+    }
+
+    async fn agy_status(&self, executable: &Path) -> Result<AgentIntegrationStatus, String> {
+        let plugins = command_json(executable, ["plugin", "list", "--json"]).await?;
+        let entry = plugin_entry(&plugins, "name", PLUGIN_NAME);
+        if let Some(entry) = entry {
+            let path = self.agy_owned_plugin_path(entry)?;
+            return Ok(classify_status(
+                AgentIntegrationProvider::Agy,
+                true,
+                false,
+                true,
+                entry.get("enabled").and_then(Value::as_bool) == Some(true),
+                self.assets_current(AgentIntegrationProvider::Agy) && agy_assets_current(&path),
+            ));
+        }
+        Ok(classify_status(
+            AgentIntegrationProvider::Agy,
+            false,
+            false,
+            false,
+            false,
+            false,
+        ))
+    }
+
+    fn agy_owned_plugin_path(&self, entry: &Value) -> Result<PathBuf, String> {
+        let path = entry.get("path").and_then(Value::as_str).map(PathBuf::from);
+        match path {
+            Some(path)
+                if path.is_absolute()
+                    && json_file_matches(&path.join(AGY_OWNERSHIP_FILE), &self.agy_ownership()) =>
+            {
+                Ok(path)
+            }
+            _ => Err(format!(
+                "Antigravity already has a {PLUGIN_NAME} plugin that is not owned by this term-server installation; no configuration was changed."
+            )),
+        }
+    }
+
+    fn agy_ownership(&self) -> Value {
+        serde_json::json!({
+            "source": self.provider_root(AgentIntegrationProvider::Agy),
         })
     }
 
@@ -474,6 +527,22 @@ impl AgentIntegrationService {
             self.prepare_package(provider).await?;
         }
         match provider {
+            AgentIntegrationProvider::Agy => {
+                let plugins = command_json(executable, ["plugin", "list", "--json"]).await?;
+                if let Some(entry) = plugin_entry(&plugins, "name", PLUGIN_NAME) {
+                    self.agy_owned_plugin_path(entry)?;
+                }
+                run_command(
+                    executable,
+                    [
+                        OsString::from("plugin"),
+                        OsString::from("install"),
+                        self.provider_root(provider).into_os_string(),
+                    ],
+                )
+                .await?;
+                run_command(executable, ["plugin", "enable", PLUGIN_NAME]).await?;
+            }
             AgentIntegrationProvider::Codex => {
                 let marketplace_root = self.provider_root(provider);
                 let marketplaces =
@@ -612,6 +681,13 @@ impl AgentIntegrationService {
         executable: &Path,
     ) -> Result<(), String> {
         match provider {
+            AgentIntegrationProvider::Agy => {
+                let plugins = command_json(executable, ["plugin", "list", "--json"]).await?;
+                if let Some(entry) = plugin_entry(&plugins, "name", PLUGIN_NAME) {
+                    self.agy_owned_plugin_path(entry)?;
+                    run_command(executable, ["plugin", "uninstall", PLUGIN_NAME]).await?;
+                }
+            }
             AgentIntegrationProvider::Codex => {
                 let marketplaces =
                     command_json(executable, ["plugin", "marketplace", "list", "--json"]).await?;
@@ -779,6 +855,11 @@ impl AgentIntegrationService {
     async fn prepare_package(&self, provider: AgentIntegrationProvider) -> Result<(), String> {
         let root = self.provider_root(provider);
         match provider {
+            AgentIntegrationProvider::Agy => {
+                write_asset(&root.join("plugin.json"), AGY_MANIFEST).await?;
+                write_asset(&root.join("hooks.json"), AGY_HOOKS).await?;
+                write_json(&root.join(AGY_OWNERSHIP_FILE), &self.agy_ownership()).await?;
+            }
             AgentIntegrationProvider::Codex => {
                 write_asset(
                     &root.join(format!("plugins/{PLUGIN_NAME}/.codex-plugin/plugin.json")),
@@ -863,6 +944,7 @@ impl AgentIntegrationService {
             AgentIntegrationProvider::Pi => "pi",
             AgentIntegrationProvider::Omp => "omp-marketplace",
             AgentIntegrationProvider::Hermes => "hermes",
+            AgentIntegrationProvider::Agy => "agy",
         })
     }
 
@@ -874,15 +956,18 @@ impl AgentIntegrationService {
                 .join("plugins")
                 .join(PLUGIN_NAME)
                 .join("skills/term-server-access/SKILL.md"),
-            AgentIntegrationProvider::Pi | AgentIntegrationProvider::Hermes => {
-                root.join("skills/term-server-access/SKILL.md")
-            }
+            AgentIntegrationProvider::Pi
+            | AgentIntegrationProvider::Hermes
+            | AgentIntegrationProvider::Agy => root.join("skills/term-server-access/SKILL.md"),
         }
     }
 
     fn assets_current(&self, provider: AgentIntegrationProvider) -> bool {
         let root = self.provider_root(provider);
         let assets: &[(&str, &str)] = match provider {
+            AgentIntegrationProvider::Agy => {
+                &[("plugin.json", AGY_MANIFEST), ("hooks.json", AGY_HOOKS)]
+            }
             AgentIntegrationProvider::Codex => &[
                 (
                     "plugins/term-server-agent-events/.codex-plugin/plugin.json",
@@ -943,9 +1028,24 @@ impl AgentIntegrationService {
                 &omp_marketplace(),
             ),
             AgentIntegrationProvider::Hermes => true,
+            AgentIntegrationProvider::Agy => {
+                json_file_matches(&root.join(AGY_OWNERSHIP_FILE), &self.agy_ownership())
+            }
         };
         assets_current && marketplace_current
     }
+}
+
+fn agy_assets_current(root: &Path) -> bool {
+    [
+        ("plugin.json", AGY_MANIFEST),
+        ("hooks.json", AGY_HOOKS),
+        ("skills/term-server-access/SKILL.md", ACCESS_SKILL),
+    ]
+    .iter()
+    .all(|(path, expected)| {
+        std::fs::read_to_string(root.join(path)).is_ok_and(|content| content == *expected)
+    })
 }
 
 fn codex_marketplace() -> Value {
@@ -2087,6 +2187,158 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agy_install_repair_and_remove_preserve_foreign_plugins() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let installed = directory.path().join("installed");
+        let listing = directory.path().join("listing.json");
+        let log = directory.path().join("calls");
+        let executable = directory.path().join("agy");
+        let enabled =
+            serde_json::json!([{"name": PLUGIN_NAME, "enabled": true, "path": installed}]);
+        std::fs::write(&listing, "[]").unwrap();
+        let script = format!(
+            "#!/bin/sh\nset -eu\ncase \"$1 $2\" in\n\
+             'plugin list') cat '{}' ;;\n\
+             'plugin install') printf 'install\\n' >> '{}'; mkdir -p '{}'; cp -R \"$3/.\" '{}'; printf '%s' '{}' > '{}' ;;\n\
+             'plugin enable') printf 'enable\\n' >> '{}'; printf '%s' '{}' > '{}' ;;\n\
+             'plugin uninstall') printf 'uninstall\\n' >> '{}'; printf '[]' > '{}' ;;\n\
+             *) exit 1 ;;\nesac\n",
+            listing.display(),
+            log.display(),
+            installed.display(),
+            installed.display(),
+            enabled,
+            listing.display(),
+            log.display(),
+            enabled,
+            listing.display(),
+            log.display(),
+            listing.display()
+        );
+        std::fs::write(&executable, script).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let service = AgentIntegrationService::new(&directory.path().join("server"));
+        assert_eq!(
+            service.agy_status(&executable).await.unwrap().state,
+            AgentIntegrationState::NotInstalled
+        );
+        service
+            .install(AgentIntegrationProvider::Agy, &executable)
+            .await
+            .unwrap();
+        assert_eq!(
+            service.agy_status(&executable).await.unwrap().state,
+            AgentIntegrationState::Installed
+        );
+        assert_eq!(
+            std::fs::read_to_string(installed.join("skills/term-server-access/SKILL.md")).unwrap(),
+            ACCESS_SKILL
+        );
+
+        std::fs::write(
+            &listing,
+            serde_json::json!([{"name":PLUGIN_NAME,"enabled":false,"path":installed}]).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            service.agy_status(&executable).await.unwrap().state,
+            AgentIntegrationState::NeedsRepair
+        );
+        std::fs::write(installed.join("hooks.json"), "{}").unwrap();
+        service
+            .install(AgentIntegrationProvider::Agy, &executable)
+            .await
+            .unwrap();
+        assert_eq!(
+            service.agy_status(&executable).await.unwrap().state,
+            AgentIntegrationState::Installed
+        );
+
+        std::fs::remove_file(installed.join(AGY_OWNERSHIP_FILE)).unwrap();
+        let before = std::fs::read(&log).unwrap();
+        assert!(
+            service
+                .agy_status(&executable)
+                .await
+                .unwrap_err()
+                .contains("not owned")
+        );
+        assert!(
+            service
+                .install(AgentIntegrationProvider::Agy, &executable)
+                .await
+                .unwrap_err()
+                .contains("not owned")
+        );
+        assert!(
+            service
+                .remove(AgentIntegrationProvider::Agy, &executable)
+                .await
+                .unwrap_err()
+                .contains("not owned")
+        );
+        assert_eq!(std::fs::read(&log).unwrap(), before);
+        assert!(installed.join("hooks.json").exists());
+        write_json(
+            &installed.join(AGY_OWNERSHIP_FILE),
+            &service.agy_ownership(),
+        )
+        .await
+        .unwrap();
+        service
+            .remove(AgentIntegrationProvider::Agy, &executable)
+            .await
+            .unwrap();
+        assert_eq!(
+            service.agy_status(&executable).await.unwrap().state,
+            AgentIntegrationState::NotInstalled
+        );
+        assert!(
+            !service
+                .provider_root(AgentIntegrationProvider::Agy)
+                .exists()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agy_hooks_return_json_without_changing_permission_policy() {
+        use std::process::{Command as StdCommand, Stdio as StdStdio};
+        let manifest: Value = serde_json::from_str(AGY_HOOKS).unwrap();
+        let definition = manifest[PLUGIN_NAME].as_object().unwrap();
+        assert_eq!(definition.len(), 6);
+        for (name, groups) in definition {
+            let group = &groups[0];
+            let hook = if matches!(name.as_str(), "PreToolUse" | "PostToolUse") {
+                &group["hooks"][0]
+            } else {
+                group
+            };
+            let command = hook["command"].as_str().unwrap();
+            assert!(command.contains(&format!("--agent-event agy:{name}")));
+            assert!(command.contains("exec 3<&0"));
+            assert!(command.contains("<&3 >/dev/null 2>&1 &"));
+            let output = StdCommand::new("sh")
+                .args(["-c", command])
+                .env_remove("TERM_SERVER_EXECUTABLE")
+                .env_remove("TERM_SERVER_SESSION")
+                .env_remove("TERM_SERVER_BROKER_SOCKET")
+                .stdin(StdStdio::null())
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let reply: Value = serde_json::from_slice(&output.stdout).unwrap();
+            if name == "PreToolUse" {
+                assert_eq!(reply, serde_json::json!({"decision":"allow"}));
+            } else {
+                assert_eq!(reply, serde_json::json!({}));
+            }
+        }
+    }
 
     #[cfg(unix)]
     fn hook_commands(manifest: &str) -> Vec<String> {

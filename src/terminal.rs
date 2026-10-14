@@ -750,13 +750,13 @@ impl SessionActivity {
         {
             return false;
         }
-        // Codex hooks report lifecycle edges, not heartbeats. A quiet tool or
+        // Codex and Antigravity hooks report lifecycle edges, not heartbeats. A quiet tool or
         // subagent can run for minutes, and title generation can animate after
         // Stop. Neither silence nor a spinner should replace that lifecycle.
         // Recover from a missed Stop only when a newer explicit Ready status
         // or OSC progress end agrees with detection. Losing a title spinner is
         // not enough: titles can change while the parent turn is still active.
-        if self.native_provider.as_deref() == Some("codex")
+        if matches!(self.native_provider.as_deref(), Some("codex" | "agy"))
             && !(self.native_status == Some(AgentStatus::Working)
                 && explicit_idle_at.is_some_and(|at| at > self.native_updated_at)
                 && matches!(
@@ -1132,7 +1132,8 @@ pub(crate) fn screen_detection_outcome(
 ///    TUI is idle, and a settled agent reports itself as idle even when a
 ///    spinner frame lingers on screen. `Keep` (an overlay hiding the agent)
 ///    does not override a live connector signal — the agent is still reporting
-///    behind the overlay.
+///    behind the overlay. Antigravity has no permission-request hook, so its
+///    visible approval controls override a working report until it resumes.
 /// 2. Screen-content detection: `blocked` and `working` from a matched rule,
 ///    or a visible idle prompt.
 /// 3. The OSC-reported state and the CPU/output heuristics
@@ -1161,6 +1162,16 @@ fn resolve_agent_status(
     detection: Option<&agent_detection::Detection>,
     fallback: StatusFallback,
 ) -> AgentStatus {
+    // Antigravity has no PermissionRequest hook. A live approval dialog must
+    // override its preceding PreToolUse report until the tool resumes.
+    if fallback.agent_kind == "agy"
+        && native_status != Some(AgentStatus::Idle)
+        && native_status != Some(AgentStatus::Closed)
+        && detection.is_some_and(|detection| detection.visible_blocker)
+        && screen_detection_outcome(detection) == DetectionOutcome::Status(AgentStatus::Blocked)
+    {
+        return AgentStatus::Blocked;
+    }
     if let Some(native) = native_status {
         return native;
     }
@@ -4049,6 +4060,12 @@ fn agent_kind(process: &ProcessInfo) -> Option<String> {
     {
         return Some("hermes".to_owned());
     }
+    if tokens
+        .iter()
+        .any(|token| token == "agy" || token == "antigravity-cli")
+    {
+        return Some("agy".to_owned());
+    }
     None
 }
 
@@ -6249,6 +6266,14 @@ mod tests {
             Some("codex")
         );
         assert_eq!(
+            agent_kind(&process("/home/user/.local/bin/agy", &["agy"])).as_deref(),
+            Some("agy")
+        );
+        assert_eq!(
+            agent_kind(&process("node", &["node", "/opt/antigravity-cli/agy.js"])).as_deref(),
+            Some("agy")
+        );
+        assert_eq!(
             agent_kind(&process("node", &["node", "/opt/claude-code/cli.js"])).as_deref(),
             Some("claude")
         );
@@ -6757,6 +6782,50 @@ mod tests {
         // The idle marker on its own stays idle.
         signals.observe(b"\x1b]0;\xe2\x9c\xb3 Codex\x07", 2_000);
         assert_eq!(signals.agent_state, Some((ReportedAgentState::Idle, 2_000)));
+    }
+
+    #[test]
+    fn agy_approval_overrides_working_but_stop_overrides_lingering_controls() {
+        let blocked = agent_detection::detect(
+            "agy",
+            agent_detection::DetectionInput {
+                screen: "Run npm test?\ny Approve\nn Reject",
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let fallback = || StatusFallback {
+            agent_kind: "agy",
+            current_status: AgentStatus::Working,
+            reported_state: None,
+            now: 60_000,
+            input_submitted_at: 1_000,
+            resumed_after_completion: false,
+            active_samples: 0,
+            quiet_samples: 20,
+        };
+        assert_eq!(
+            resolve_agent_status(Some(AgentStatus::Working), Some(&blocked), fallback()),
+            AgentStatus::Blocked
+        );
+        assert_eq!(
+            resolve_agent_status(Some(AgentStatus::Idle), Some(&blocked), fallback()),
+            AgentStatus::Idle
+        );
+        assert_eq!(
+            resolve_agent_status(Some(AgentStatus::Working), None, fallback()),
+            AgentStatus::Working
+        );
+
+        let mut activity = SessionActivity {
+            native_provider: Some("agy".to_owned()),
+            native_status: Some(AgentStatus::Working),
+            native_updated_at: 1_000,
+            ..Default::default()
+        };
+        assert!(!activity.expire_native_state(600_000, None, None));
+        activity.native_status = Some(AgentStatus::Idle);
+        assert!(!activity.expire_native_state(600_000, None, None));
     }
 
     #[test]

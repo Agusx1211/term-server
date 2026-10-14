@@ -36,6 +36,51 @@ fn matched_rule_id(detection: &Detection) -> Option<&str> {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn agy_matches_live_approval_controls_without_matching_transcript_prose() {
+    let blocked = classify("agy", screen("Run npm test?\ny Approve\nn Reject"));
+    assert_eq!(blocked.state, DetectedState::Blocked);
+    assert!(blocked.visible_blocker);
+    assert_eq!(
+        classify(
+            "agy",
+            screen("Press y to approve and n to reject a command someday.\n> What next?")
+        )
+        .matched_rule,
+        None
+    );
+    assert_eq!(
+        classify(
+            "agy",
+            screen("The previous command required approval.\n> What next?")
+        )
+        .matched_rule,
+        None
+    );
+    assert_eq!(
+        classify(
+            "agy",
+            DetectionInput {
+                osc_title: "Thinking | Antigravity",
+                ..Default::default()
+            }
+        )
+        .state,
+        DetectedState::Working
+    );
+    assert_eq!(
+        classify(
+            "agy",
+            DetectionInput {
+                osc_title: "Ready | Antigravity",
+                ..Default::default()
+            }
+        )
+        .state,
+        DetectedState::Idle
+    );
+}
+
+#[test]
 fn every_bundled_manifest_compiles() {
     for (agent, source) in BUNDLED_MANIFESTS {
         let (manifest, compiled) =
