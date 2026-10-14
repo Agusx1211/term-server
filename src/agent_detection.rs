@@ -45,6 +45,7 @@ const MAX_MATCHER_CHARS: usize = 512;
 const MAX_OVERRIDE_BYTES: u64 = 256 * 1024;
 
 const BUNDLED_MANIFESTS: &[(&str, &str)] = &[
+    ("agy", include_str!("agent_detection/manifests/agy.toml")),
     (
         "claude",
         include_str!("agent_detection/manifests/claude.toml"),

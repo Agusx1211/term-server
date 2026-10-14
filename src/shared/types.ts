@@ -8,7 +8,7 @@ export interface AgentActivity {
 }
 
 export interface AgentInfo {
-  kind: "codex" | "claude" | "pi" | "hermes" | string;
+  kind: "codex" | "claude" | "pi" | "hermes" | "agy" | string;
   status: AgentStatus;
   statusChangedAt: number;
   startedAt: number;
@@ -344,7 +344,7 @@ export interface FiliStream {
   events: FiliStreamEvent[];
 }
 
-export type AgentIntegrationProvider = "codex" | "claude" | "pi" | "omp" | "hermes";
+export type AgentIntegrationProvider = "codex" | "claude" | "pi" | "omp" | "hermes" | "agy";
 export type AgentIntegrationState =
   | "unavailable"
   | "notInstalled"

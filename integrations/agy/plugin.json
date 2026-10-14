@@ -1,0 +1,4 @@
+{
+  "name": "term-server-agent-events",
+  "description": "Report Antigravity lifecycle and tool activity to term-server and provide terminal-scoped broker access."
+}

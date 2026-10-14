@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.22.0 - 2026-10-14
+
+### Added
+
+- **Google Antigravity CLI (`agy`).** Settings can install, repair, and remove a native Antigravity plugin that reports model invocations, commands, file edits, searches, subagent work, questions, and turn completion. Quiet commands stay Working until the turn ends; approval dialogs and questions show Needs you. Antigravity sessions also support the existing elapsed timer, completion notifications, and Closed state.
+- **Antigravity broker access and skills.** The native plugin supplies `term-server-access` for terminal-scoped secrets and sudo approvals. Artifact skill management includes Antigravity's global skills directory. Run `agy` in the Supervisor terminal to use the existing scoped control CLI and project-local Supervisor skill.
+- **Safe plugin management.** Antigravity installation checks both staged and installed files, re-enables disabled managed plugins on repair, and refuses to overwrite or remove another installation's plugin with the same name.
+
+### Upgrade notes
+
+- Safe for automatic installation over `0.21.0`, with no data migration or changes to existing approval rules. Existing terminals remain available on their original brokers. Install the Google Antigravity integration under Settings → Live agent activity, install its artifact skill under Settings → Artifact skill, and create a new terminal running `agy` to load the plugin and updated broker detection.
+- Antigravity's native plugin does not grant access to other terminals. Supervisor controls remain available only inside the dedicated Supervisor terminal.
+
 ## 0.21.0 - 2026-10-05
 
 Record a voice note from any terminal and its file path is typed straight into that terminal.

@@ -332,6 +332,10 @@ fn destinations_for_home(
             AgentIntegrationProvider::Pi,
             home.join(".pi/agent/skills").join(SKILL_NAME),
         ),
+        (
+            AgentIntegrationProvider::Agy,
+            home.join(".gemini/antigravity-cli/skills").join(SKILL_NAME),
+        ),
     ]
 }
 
@@ -573,6 +577,32 @@ mod tests {
             service.status().providers[0].state,
             ArtifactSkillState::NotInstalled
         );
+    }
+
+    #[test]
+    fn agy_artifact_skill_is_linked_in_its_global_skill_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let home = directory.path().join("home");
+        write_skill(&source, "current");
+        let service = ArtifactSkillService::new(Some(source), &home);
+        let installed = service
+            .apply(AgentIntegrationProvider::Agy, ArtifactSkillAction::Install)
+            .unwrap();
+        let agy = installed
+            .providers
+            .iter()
+            .find(|provider| provider.provider == AgentIntegrationProvider::Agy)
+            .unwrap();
+        assert_eq!(agy.state, ArtifactSkillState::Installed);
+        assert_eq!(
+            Path::new(&agy.path),
+            home.join(".gemini/antigravity-cli/skills/term-server-artifacts")
+        );
+        service
+            .apply(AgentIntegrationProvider::Agy, ArtifactSkillAction::Remove)
+            .unwrap();
+        assert!(!Path::new(&agy.path).exists());
     }
 
     #[cfg(unix)]

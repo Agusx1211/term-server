@@ -1,0 +1,65 @@
+# Antigravity CLI fallback rules. Hooks supply lifecycle state; live approval
+# controls fill the gap because Antigravity has no PermissionRequest event.
+id = "agy"
+version = "2026.10.14.1"
+min_engine_version = 2
+updated_at = "2026-10-14T00:00:00Z"
+aliases = ["antigravity", "antigravity-cli"]
+
+[[rules]]
+id = "approval_controls"
+state = "blocked"
+priority = 1100
+region = "bottom_non_empty_lines(8)"
+visible_blocker = true
+all = [
+  { any = [
+    { line_regex = ['(?i)^\s*[│┃]?\s*(?:\[?y\]?|\(y\))\s*[:·-]?\s*(?:approve|allow|yes)\b'] },
+    { line_regex = ['(?i)^\s*[│┃]?\s*(?:approve|allow|yes)\s*\(y\)'] },
+  ] },
+  { any = [
+    { line_regex = ['(?i)(?:^\s*[│┃]?\s*|\s{2,}|[·•|]\s*)(?:\[?n\]?|\(n\))\s*[:·-]?\s*(?:reject|deny|no)\b'] },
+    { line_regex = ['(?i)^\s*[│┃]?\s*(?:reject|deny|no)\s*\(n\)'] },
+  ] },
+]
+
+[[rules]]
+id = "subagent_approval_controls"
+state = "blocked"
+priority = 1050
+region = "bottom_non_empty_lines(8)"
+visible_blocker = true
+all = [
+  { regex = ['(?i)subagent.*(?:asks to|awaiting|needs.*approval)'] },
+  { regex = ['(?i)(?:ctrl\+k|⌃k).*approve'] },
+]
+
+[[rules]]
+id = "osc_title_blocked"
+state = "blocked"
+priority = 1000
+region = "osc_title"
+visible_blocker = true
+regex = ['(?i)^(?:⚠[\u{fe0e}\u{fe0f}]?\s|waiting for (?:approval|permission|input)|action required)']
+
+[[rules]]
+id = "osc_title_working"
+state = "working"
+priority = 500
+region = "osc_title"
+visible_working = true
+any = [
+  { regex = ['^[\u{2800}-\u{28ff}]\s'] },
+  { regex = ['(?i)^(?:working|thinking|running)\b'] },
+]
+
+[[rules]]
+id = "osc_title_idle"
+state = "idle"
+priority = 100
+region = "osc_title"
+visible_idle = true
+any = [
+  { regex = ['^✓[\u{fe0e}\u{fe0f}]?\s'] },
+  { regex = ['(?i)^ready(?:\s*\||$)'] },
+]
