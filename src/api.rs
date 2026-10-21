@@ -43,9 +43,9 @@ use uuid::Uuid;
 #[cfg(unix)]
 use crate::broker::BrokerWebSocket;
 #[cfg(unix)]
-use crate::supervisor::{
-    BrowserTabCommandAck, BrowserTabHeartbeat, BrowserTabSnapshot, SupervisorError,
-    SupervisorService,
+use crate::terminal_control::{
+    BrowserTabCommandAck, BrowserTabHeartbeat, BrowserTabSnapshot, ControlError,
+    TerminalControlDetail, TerminalControlService, TerminalControlSummary, UpdateTerminalControl,
 };
 use crate::{
     access::{
@@ -88,7 +88,7 @@ pub struct AppState {
     pub auth: AuthService,
     pub workspace: WorkspaceBackend,
     #[cfg(unix)]
-    pub supervisor: Arc<SupervisorService>,
+    pub terminal_control: Arc<TerminalControlService>,
     pub login_limiter: Arc<LoginLimiter>,
     pub allowed_origins: Arc<[String]>,
     pub secure: bool,
@@ -235,14 +235,18 @@ impl From<WorkspaceError> for ApiError {
 }
 
 #[cfg(unix)]
-impl From<SupervisorError> for ApiError {
-    fn from(error: SupervisorError) -> Self {
+impl From<ControlError> for ApiError {
+    fn from(error: ControlError) -> Self {
         match error {
-            SupervisorError::Unauthorized => Self::Unauthorized,
-            SupervisorError::Invalid(message) => Self::BadRequest(message),
-            SupervisorError::Workspace(error) => error.into(),
-            SupervisorError::Unavailable(message) => Self::BadGateway(message),
-            SupervisorError::Io(_) | SupervisorError::Json(_) => Self::Internal,
+            ControlError::Unauthorized => Self::Unauthorized,
+            ControlError::ControlDisabled
+            | ControlError::NotShared
+            | ControlError::ReadOnly
+            | ControlError::Denied(_) => Self::Conflict(error.to_string()),
+            ControlError::Invalid(message) => Self::BadRequest(message),
+            ControlError::Workspace(error) => error.into(),
+            ControlError::Unavailable(message) => Self::BadGateway(message),
+            ControlError::Io(_) | ControlError::Json(_) => Self::Internal,
         }
     }
 }
@@ -329,14 +333,17 @@ struct ClientTerminalInfo {
     #[serde(flatten)]
     terminal: TerminalInfo,
     activity_viewed: ActivityView,
+    #[cfg(unix)]
+    control: TerminalControlSummary,
 }
 
 impl ClientTerminalInfo {
-    fn new(terminal: TerminalInfo, activity_views: &ActivityViewService) -> Self {
-        let activity_viewed = activity_views.get(terminal.id);
+    fn new(terminal: TerminalInfo, state: &AppState) -> Self {
         Self {
+            activity_viewed: state.activity_views.get(terminal.id),
+            #[cfg(unix)]
+            control: state.terminal_control.summary(terminal.id),
             terminal,
-            activity_viewed,
         }
     }
 }
@@ -1004,10 +1011,12 @@ async fn list_terminals(
 ) -> Result<Json<Vec<ClientTerminalInfo>>, ApiError> {
     require_auth(&jar, &state)?;
     let terminals = state.workspace.list().await?;
+    #[cfg(unix)]
+    state.terminal_control.retain(&terminals);
     Ok(Json(
         terminals
             .into_iter()
-            .map(|terminal| ClientTerminalInfo::new(terminal, &state.activity_views))
+            .map(|terminal| ClientTerminalInfo::new(terminal, &state))
             .collect(),
     ))
 }
@@ -1024,24 +1033,49 @@ async fn create_terminal(
     let terminal = state.workspace.create(body).await?;
     Ok((
         StatusCode::CREATED,
-        Json(ClientTerminalInfo::new(terminal, &state.activity_views)),
+        Json(ClientTerminalInfo::new(terminal, &state)),
     ))
 }
 
 #[cfg(unix)]
-async fn open_supervisor(
+async fn terminal_control_detail(
     State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    jar: CookieJar,
+) -> Result<Json<TerminalControlDetail>, ApiError> {
+    require_auth(&jar, &state)?;
+    require_terminal(&state, id).await?;
+    Ok(Json(state.terminal_control.detail(id)))
+}
+
+#[cfg(unix)]
+async fn update_terminal_control(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
     headers: HeaderMap,
     uri: Uri,
     jar: CookieJar,
-) -> Result<Json<ClientTerminalInfo>, ApiError> {
+    Json(body): Json<UpdateTerminalControl>,
+) -> Result<Json<TerminalControlSummary>, ApiError> {
     require_origin(&headers, &uri, &state)?;
     require_auth(&jar, &state)?;
-    let terminal = state.supervisor.open_or_create().await?;
-    Ok(Json(ClientTerminalInfo::new(
-        terminal,
-        &state.activity_views,
-    )))
+    require_terminal(&state, id).await?;
+    Ok(Json(state.terminal_control.update(id, body)?))
+}
+
+#[cfg(unix)]
+async fn require_terminal(state: &AppState, id: Uuid) -> Result<(), ApiError> {
+    if state
+        .workspace
+        .list()
+        .await?
+        .iter()
+        .any(|terminal| terminal.id == id)
+    {
+        Ok(())
+    } else {
+        Err(ApiError::NotFound)
+    }
 }
 
 #[cfg(unix)]
@@ -1056,7 +1090,7 @@ async fn browser_tab_heartbeat(
     require_origin(&headers, &uri, &state)?;
     require_auth(&jar, &state)?;
     state
-        .supervisor
+        .terminal_control
         .browser_heartbeat(view_id, snapshot)
         .await
         .map(Json)
@@ -1075,7 +1109,7 @@ async fn acknowledge_browser_tab_command(
     require_origin(&headers, &uri, &state)?;
     require_auth(&jar, &state)?;
     state
-        .supervisor
+        .terminal_control
         .acknowledge_browser_command(view_id, command_id, ack)
         .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -1092,10 +1126,7 @@ async fn rename_terminal(
     require_origin(&headers, &uri, &state)?;
     require_auth(&jar, &state)?;
     let terminal = state.workspace.rename(id, body).await?;
-    Ok(Json(ClientTerminalInfo::new(
-        terminal,
-        &state.activity_views,
-    )))
+    Ok(Json(ClientTerminalInfo::new(terminal, &state)))
 }
 
 async fn update_terminal_activity_view(
@@ -1147,8 +1178,8 @@ async fn remove_terminal(
     require_auth(&jar, &state)?;
     state.workspace.remove(id).await?;
     #[cfg(unix)]
-    if let Err(error) = state.supervisor.revoke_if_registered(id).await {
-        tracing::warn!(%error, terminal_id = %id, "unable to revoke supervisor credentials");
+    if let Err(error) = state.terminal_control.forget(id) {
+        tracing::warn!(%error, terminal_id = %id, "unable to forget terminal control settings");
     }
     if let Err(error) = state.activity_views.remove(id) {
         tracing::warn!(
@@ -2262,7 +2293,10 @@ pub fn build_router(state: AppState, client_directory: Option<PathBuf>) -> Route
 
     #[cfg(unix)]
     let api = api
-        .route("/supervisor", post(open_supervisor))
+        .route(
+            "/terminals/{id}/control",
+            get(terminal_control_detail).put(update_terminal_control),
+        )
         .route(
             "/browser-tabs/{view_id}",
             axum::routing::put(browser_tab_heartbeat).layer(DefaultBodyLimit::max(128 * 1024)),
@@ -2356,18 +2390,14 @@ mod tests {
         let fili = Arc::new(FiliService::new(&directory));
         let workspace = WorkspaceBackend::local(terminals, fili);
         #[cfg(unix)]
-        let supervisor = SupervisorService::new(
-            workspace.clone(),
-            &directory,
-            &std::env::current_exe().unwrap(),
-        )
-        .await
-        .unwrap();
+        let terminal_control = TerminalControlService::new(workspace.clone(), &directory)
+            .await
+            .unwrap();
         AppState {
             auth,
             workspace,
             #[cfg(unix)]
-            supervisor,
+            terminal_control,
             login_limiter: Arc::new(LoginLimiter::default()),
             allowed_origins: Arc::from([]),
             secure: false,
@@ -4366,56 +4396,117 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn supervisor_creation_is_authenticated_and_singleton() {
+    async fn terminal_control_defaults_off_and_only_the_user_changes_it() {
         let (app, cookie) = authenticated_app().await;
+        let terminal_id = create_test_terminal(&app, &cookie).await;
+        let control = |method: &str, body: Option<&str>, cookie: Option<&str>| {
+            let mut request = Request::builder()
+                .method(method)
+                .uri(format!("/api/terminals/{terminal_id}/control"))
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(cookie) = cookie {
+                request = request.header(header::COOKIE, cookie);
+            }
+            request
+                .body(body.map_or_else(Body::empty, |body| Body::from(body.to_owned())))
+                .unwrap()
+        };
+        let read_json = |response: axum::response::Response| async move {
+            serde_json::from_slice::<serde_json::Value>(
+                &to_bytes(response.into_body(), 64 * 1024).await.unwrap(),
+            )
+            .unwrap()
+        };
+
         let unauthenticated = app
             .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/supervisor")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(control("PUT", Some(r#"{"exposure":"write"}"#), None))
             .await
             .unwrap();
         assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
 
-        let open = |app: Router, cookie: String| async move {
-            let response = app
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/api/supervisor")
-                        .header(header::COOKIE, cookie)
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            serde_json::from_slice::<serde_json::Value>(
-                &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
-            )
-            .unwrap()
-        };
-        let first = open(app.clone(), cookie.clone()).await;
-        let second = open(app.clone(), cookie.clone()).await;
-        assert_eq!(first["id"], second["id"]);
-        assert_eq!(first["kind"], "supervisor");
+        let initial = app
+            .clone()
+            .oneshot(control("GET", None, Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(initial.status(), StatusCode::OK);
+        assert_eq!(
+            read_json(initial).await,
+            serde_json::json!({"exposure": "off", "controller": false, "activity": []})
+        );
 
-        let response = app
+        let updated = app
+            .clone()
+            .oneshot(control(
+                "PUT",
+                Some(r#"{"exposure":"read","controller":true}"#),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(updated.status(), StatusCode::OK);
+        assert_eq!(
+            read_json(updated).await,
+            serde_json::json!({"exposure": "read", "controller": true})
+        );
+
+        let invalid = app
+            .clone()
+            .oneshot(control(
+                "PUT",
+                Some(r#"{"exposure":"admin"}"#),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert!(invalid.status().is_client_error());
+
+        let listed = app
+            .clone()
             .oneshot(
                 Request::builder()
-                    .method("DELETE")
-                    .uri(format!("/api/terminals/{}", first["id"].as_str().unwrap()))
-                    .header(header::COOKIE, cookie)
+                    .uri("/api/terminals")
+                    .header(header::COOKIE, &cookie)
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let terminals = read_json(listed).await;
+        assert_eq!(
+            terminals[0]["control"],
+            serde_json::json!({"exposure": "read", "controller": true})
+        );
+
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/terminals/{}/control", Uuid::new_v4()))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::from(r#"{"exposure":"write"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let removed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/terminals/{terminal_id}"))
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(removed.status(), StatusCode::NO_CONTENT);
     }
 
     #[cfg(unix)]

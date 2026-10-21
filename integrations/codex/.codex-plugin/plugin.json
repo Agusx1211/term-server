@@ -10,8 +10,8 @@
   "keywords": ["term-server", "observability", "hooks"],
   "interface": {
     "displayName": "term-server agent events",
-    "shortDescription": "Show live Codex activity and Supervisor history in term-server.",
-    "longDescription": "Reports lifecycle state plus bounded messages and tool activity/results to the private term-server session broker. Retained history is available only to the capability-checked Supervisor CLI and the integration is inactive outside term-server.",
+    "shortDescription": "Show live Codex activity and retained history in term-server.",
+    "longDescription": "Reports lifecycle state plus bounded messages and tool activity/results to the private term-server session broker. Retained history is available only to terminals the user allowed to control the shared terminal, and the integration is inactive outside term-server.",
     "developerName": "term-server",
     "category": "Productivity",
     "capabilities": ["Lifecycle hooks"],

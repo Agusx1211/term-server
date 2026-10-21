@@ -551,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn retains_semantic_hook_details_for_supervisor_history() {
+    fn retains_semantic_hook_details_for_controlling_terminals() {
         let event = AgentEvent::from_hook_input(
             "codex",
             &serde_json::json!({

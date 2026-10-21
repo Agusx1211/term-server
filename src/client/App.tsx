@@ -53,7 +53,6 @@ import {
   takeFrontendRecording,
 } from "./lib/debug-recording";
 import { installE2EDiagnostics } from "./lib/e2e-diagnostics";
-import { armSupervisorRequestTimeout } from "./lib/supervisor-request";
 import {
   agentNeedsAttention,
   parseViewedAgentRevisions,
@@ -378,7 +377,6 @@ export function App() {
   const uploadSequence = useRef(0);
   const [theme, setTheme] = useState<ThemeName>(initialTheme);
   const [creating, setCreating] = useState(false);
-  const [creatingSupervisor, setCreatingSupervisor] = useState(false);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
   const [checkingForUpdate, setCheckingForUpdate] = useState(false);
   const [updatingUpdateChannel, setUpdatingUpdateChannel] = useState(false);
@@ -443,7 +441,6 @@ export function App() {
   activeIdRef.current = activeId;
   const browserSnapshotRef = useRef<BrowserTabSnapshot>();
   const browserHeartbeatRef = useRef<() => void>();
-  const supervisorRequestRef = useRef<Promise<TerminalInfo> | null>(null);
 
   const trackAuthRequest = (): AbortController => {
     const controller = new AbortController();
@@ -1153,8 +1150,10 @@ export function App() {
     })),
     [terminals],
   );
-  const supervisorActive = terminals.some((terminal) => (
-    terminal.kind === "supervisor" && terminal.status === "running"
+  // Controlling terminals can list and close tabs, so the browser only
+  // reports its tabs while at least one terminal is allowed to control others.
+  const controllerActive = terminals.some((terminal) => (
+    terminal.control?.controller === true && terminal.status === "running"
   ));
   const visibleTerminals = paneIds.map((id) => terminalById.get(id)).filter(Boolean) as TerminalInfo[];
   const browserTabSnapshot = useMemo(
@@ -1458,7 +1457,7 @@ export function App() {
     return commandAck(decision);
   };
   useEffect(() => {
-    if (!authenticated || !supervisorActive) {
+    if (!authenticated || !controllerActive) {
       browserHeartbeatRef.current = undefined;
       return;
     }
@@ -1519,7 +1518,7 @@ export function App() {
       clearInterval(timer);
       if (browserHeartbeatRef.current === sendHeartbeat) browserHeartbeatRef.current = undefined;
     };
-  }, [authenticated, supervisorActive]);
+  }, [authenticated, controllerActive]);
 
   useEffect(() => {
     browserHeartbeatRef.current?.();
@@ -1629,55 +1628,6 @@ export function App() {
       setCreating(false);
     }
   };
-  const openSupervisor = () => {
-    const existing = terminalsRef.current.find((terminal) => (
-      terminal.kind === "supervisor" && terminal.status === "running"
-    ));
-    if (existing) {
-      openTerminal(existing.id);
-      return;
-    }
-    if (supervisorRequestRef.current) return;
-
-    const generation = authGeneration.current;
-    const controller = trackAuthRequest();
-    const cancelTimeout = armSupervisorRequestTimeout(controller);
-    setCreatingSupervisor(true);
-    const request = api.createSupervisor(controller.signal);
-    supervisorRequestRef.current = request;
-    void request
-      .then((created) => {
-        if (generation !== authGeneration.current) return;
-        const currentSupervisor = terminalsRef.current.find((terminal) => (
-          terminal.kind === "supervisor" && terminal.status === "running"
-        ));
-        const target = currentSupervisor ?? created;
-        if (!currentSupervisor) {
-          setTerminals((current) => (
-            [
-              ...current.filter((terminal) => terminal.kind !== "supervisor"),
-              created,
-            ].sort((left, right) => left.path.localeCompare(right.path))
-          ));
-        }
-        openTerminal(target.id);
-      })
-      .catch((error) => {
-        if (generation === authGeneration.current) {
-          const message = error instanceof DOMException && error.name === "AbortError"
-            ? "Supervisor creation timed out; try again"
-            : error instanceof Error ? error.message : "Unable to open supervisor";
-          showNotice(message);
-        }
-      })
-      .finally(() => {
-        cancelTimeout();
-        releaseAuthRequest(controller);
-        if (supervisorRequestRef.current === request) supervisorRequestRef.current = null;
-        setCreatingSupervisor(false);
-      });
-  };
-
   const removeTerminal = async (terminal: TerminalInfo) => {
     if (!terminalKillAllowed(terminal.path, confirmTerminalKills)) return;
     try {
@@ -2138,10 +2088,6 @@ export function App() {
           attentionTerminalIds={attentionTerminalIds}
           artifactCounts={artifactCounts}
           mobileOpen={mobileSidebar}
-          supervisor={terminals.find((terminal) => (
-            terminal.kind === "supervisor" && terminal.status === "running"
-          ))}
-          supervisorCreating={creatingSupervisor}
           creating={creating}
           settingsActive={settingsActive}
           updateAvailable={updateStatus?.state === "available"}
@@ -2150,7 +2096,6 @@ export function App() {
           pushover={config.pushover}
           theme={theme}
           onMobileClose={closeMobileSidebar}
-          onSupervisor={openSupervisor}
           onNew={(cwd) => void createTerminal(cwd)}
           onOpen={(id) => openTerminal(id)}
           onSplit={(id) => openTerminal(id, true)}

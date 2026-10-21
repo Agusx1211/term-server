@@ -16,6 +16,9 @@ import type {
   CreateTerminalRequest,
   RenameTerminalRequest,
   TerminalInfo,
+  TerminalControlDetail,
+  TerminalControlSummary,
+  UpdateTerminalControl,
   FiliConfig,
   FiliStream,
   ProcessInspectorSnapshot,
@@ -219,12 +222,6 @@ export const api = {
     body: JSON.stringify({ action }),
     timeoutMs: COMMAND_REQUEST_TIMEOUT_MS,
   }),
-  createSupervisor: (signal?: AbortSignal) =>
-    request<TerminalInfo>("/api/supervisor", {
-      method: "POST",
-      body: JSON.stringify({}),
-      signal,
-    }),
   browserTabHeartbeat: (viewId: string, snapshot: BrowserTabSnapshot) =>
     request<BrowserTabHeartbeat>(`/api/browser-tabs/${encodeURIComponent(viewId)}`, {
       method: "PUT",
@@ -251,6 +248,13 @@ export const api = {
   removeTerminal: (id: string) => request<void>(`/api/terminals/${id}`, { method: "DELETE" }),
   terminalProcesses: (id: string) =>
     request<ProcessInspectorSnapshot>(`/api/terminals/${id}/processes`),
+  terminalControl: (id: string, signal?: AbortSignal) =>
+    request<TerminalControlDetail>(`/api/terminals/${id}/control`, { signal }),
+  updateTerminalControl: (id: string, update: UpdateTerminalControl) =>
+    request<TerminalControlSummary>(`/api/terminals/${id}/control`, {
+      method: "PUT",
+      body: JSON.stringify(update),
+    }),
   terminalAccess: (id: string, signal?: AbortSignal) =>
     request<AccessSnapshot>(`/api/terminals/${id}/access`, { signal }),
   addTerminalSecret: (id: string, name: string, value: string, description?: string) =>

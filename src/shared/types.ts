@@ -38,11 +38,40 @@ export interface UpdateActivityView {
   commandCompletedAt?: number;
 }
 
+/** What controlling terminals may do to a terminal. */
+export type TerminalExposure = "off" | "read" | "write";
+
+export interface TerminalControlSummary {
+  exposure: TerminalExposure;
+  /** Whether agents in this terminal may control the terminals shared with them. */
+  controller: boolean;
+  /** The controlling terminal that opened this one. */
+  createdBy?: string;
+  lastReadAt?: number;
+  lastReadBy?: string;
+}
+
+export interface TerminalControlActivity {
+  at: number;
+  controllerId: string;
+  controllerName: string;
+  agent: string;
+  action: string;
+}
+
+export interface TerminalControlDetail extends TerminalControlSummary {
+  activity: TerminalControlActivity[];
+}
+
+export interface UpdateTerminalControl {
+  exposure?: TerminalExposure;
+  controller?: boolean;
+}
+
 export interface TerminalInfo {
   id: string;
+  /** "supervisor" only comes from brokers that predate per-terminal control. */
   kind: TerminalKind;
-  /** Managed skill root for supervisor terminals; omitted by older brokers. */
-  supervisorRoot?: string | null;
   name: string;
   workspace: string;
   path: string;
@@ -63,6 +92,8 @@ export interface TerminalInfo {
   broker?: BuildInfo | null;
   /** Present on REST responses; broker-ready messages from older patch releases omit it. */
   activityViewed?: ActivityView;
+  /** Present on REST responses; broker-ready messages omit it. */
+  control?: TerminalControlSummary;
 }
 
 export interface BrowserTerminalPaneSnapshot {
