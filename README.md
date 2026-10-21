@@ -68,7 +68,7 @@ On first boot, open `https://127.0.0.1:8090`. term-server prints a random passwo
 - **Process visibility and control:** a lightweight Linux `/proc` sampler shows the complete live descendant process tree, foreground job, CPU and memory usage, and lets you send SIGTERM to a selected process. Command lines are secret-aware and redacted; input, output, and exited processes are not retained.
 - **Terminal-scoped access approvals:** each terminal has one Access panel for secret requests, proactive in-memory secret grants, revocation, activity, and reviewed local sudo commands. Secret values never return to the agent; sudo requires the user's password for the immutable command shown in the panel. Agents can also have the broker generate a secret they never see and hand it to the user for a single reveal in the panel.
 - **Agent awareness:** Codex, Claude, Pi, OMP, Hermes, and Google Antigravity (`agy`) sessions show working, blocked, idle, and closed states. An agent waiting on an approval or a question is marked **Needs you** for as long as it waits, so a stalled agent is visible without opening it. An unseen return to idle gets a distinct bell until you focus that terminal. Alerts can appear in-app, as desktop notifications, in both places, or remain off. In-app cards inherit their terminal color and can be placed in any corner with a configurable dismissal time.
-- **Supervisor terminal:** one visibly marked, singleton terminal can inspect and control the other term-server sessions without embedding an AI provider into the server. Run OMP, Pi, Codex, Claude, or an ordinary shell command yourself; only descendants of that supervisor receive the embedded skill and scoped control tools. The tools expose terminal screens, input, names, process trees, creation and termination, plus open-tab listing and closure. They deliberately provide no project organizer, pane arranger, scheduler, or job system.
+- **Per-terminal control access:** any terminal can be allowed to control others, and each terminal is shared with controlling terminals as off (the default), read, or read & write. An agent in a controlling terminal lists the terminals you shared, reads their screens, history, and processes, types into the ones shared read & write, and opens new terminals for handoffs, through the same `term-server access` CLI it uses for secrets. Badges on the sidebar row and pane header show every role at all times, and the target's Access panel logs each write.
 - **Secure defaults:** loopback binding, HTTPS, Argon2 password hashing, signed HTTP-only SameSite cookies, origin enforcement, CSP, HSTS, login throttling, and bounded memory use.
 - **Deployment choices:** one native executable plus static browser assets, with Docker Compose and a systemd user service included.
 
@@ -242,20 +242,43 @@ until `Stop`; live approval controls and question tools show Needs you. Hooks re
 without automatically approving or rejecting tools and are inert outside term-server.
 
 Install the artifact skill separately in **Settings → Artifact skill**; its managed link lives in
-`~/.gemini/antigravity-cli/skills/term-server-artifacts`. Inside the dedicated Supervisor terminal,
-`agy` discovers `.agents/skills/term-server-supervisor` and `GEMINI.md`, and can run the existing
-`term-server-supervisor` control CLI. A normal `agy` terminal can use its own access broker and
-artifact helper; controlling other terminals requires the Supervisor's scoped environment.
+`~/.gemini/antigravity-cli/skills/term-server-artifacts`. Like every other agent, `agy` controls
+other terminals only from a terminal where you turned on **Control other terminals**.
 
-### Supervisor terminal
+### Controlling other terminals
 
-Use the compact crown action in the workspace header to create or reopen the singleton supervisor. It is a normal persistent terminal: there is no provider chooser and closing its pane does not stop it. Creation requests time out instead of leaving the control busy indefinitely. Run `omp`, `pi`, `codex`, `claude`, or `agy` as usual, or stay in the shell.
+Terminal control is off everywhere until you turn it on, and it has two independent settings in
+each terminal's Access panel:
 
-The terminal starts in a private managed directory containing provider-local instructions and the `term-server-supervisor` skill. Its `PATH` contains the scoped control CLI, which is the only supervisor control interface. Codex, Claude, Pi, OMP, and Antigravity discover the same skill through their normal project-local paths; term-server does not inject MCP servers or provider-specific tool adapters. Existing `HOME` and provider credential locations are left unchanged. Normal terminals receive none of this environment and cannot authenticate to the control socket.
+- **Share with controlling terminals:** **Off** (the default) hides the terminal completely; a
+  controlling agent cannot tell it from a terminal that does not exist. **Read** exposes its rendered
+  screen, retained scrollback, agent transcript, and process tree. **Read & write** also lets a
+  controlling agent type text and keys, rename it, terminate one of its processes, close its pane, or
+  kill it.
+- **Control other terminals:** lets agents running in this terminal use the control commands at all.
 
-The sidebar row and pane header turn amber when the shell leaves the managed supervisor directory, and the pane shows the exact root to return to before starting an agent. Subdirectories remain valid because provider skill discovery walks their ancestors.
+An agent in a controlling terminal uses the same CLI as secrets and sudo, through the bundled
+`term-server-access` skill:
 
-The agent composes behavior from low-level primitives: list terminals and detected agents, read a rendered screen or bounded output tail, send text, single-character keys, or named keys, create or rename a terminal, inspect or terminate a descendant process, and list or close open terminal panes and non-dirty resource tabs. Closing a pane leaves its PTY alive; killing a terminal ends it. There is no built-in “organize project,” layout-arrangement, delayed-action, scheduler, or job command.
+```bash
+"$TERM_SERVER_EXECUTABLE" access terminals --agent claude list
+"$TERM_SERVER_EXECUTABLE" access terminals --agent claude screen <terminal-id>
+"$TERM_SERVER_EXECUTABLE" access terminals --agent claude create --cwd ~/project --name fix-login
+"$TERM_SERVER_EXECUTABLE" access terminals --agent claude send <terminal-id> --text 'codex' --enter
+```
+
+Terminals an agent opens appear in your sidebar like any other, are shared read & write with
+controlling terminals, and cannot control terminals themselves until you allow it. Each request is
+authorized from the caller's kernel-reported process id, which must be a live descendant of the
+terminal it claims to run in, so a process in one terminal cannot borrow another terminal's access.
+The sidebar row and pane header carry a badge for every role a terminal holds (**CONTROLS**,
+**SHARED · READ**, **SHARED · RW**); clicking the pane badge opens its Access panel. The panel of a
+shared terminal shows when it was last read and by whom, and lists every write a controlling agent
+made with a short, control-free preview of what it typed. Settings survive server restarts and are
+dropped with their terminal.
+
+The commands are low-level primitives: there is no built-in project organizer, pane arranger,
+scheduler, or job system. Closing a pane leaves its PTY alive; killing a terminal ends it.
 
 ### Blocked agents and screen detection
 
@@ -297,8 +320,8 @@ them removes only term-server's package and dedicated local marketplace. They do
 term-server terminal. Native integrations forward lifecycle state plus a size-bounded semantic
 thread of messages, tool activity/results, compaction markers, and status changes to the private
 session broker. That retained thread may contain prompts, command text, tool arguments, tool output,
-and model responses; it is available only through the capability-checked
-`term-server-supervisor transcript` CLI. `scrollback` exposes the separately retained terminal output
+and model responses; it is available only to terminals you allowed to control others, and only for
+terminals you shared, through `term-server access terminals transcript`. `scrollback` exposes the separately retained terminal output
 as control-free text. Fallback inference remains enabled whether a package is installed, unavailable,
 broken, or removed, and automatically takes over if a native update goes stale. Codex requires a
 one-time review of newly installed hooks through `/hooks`; start a new agent session after any

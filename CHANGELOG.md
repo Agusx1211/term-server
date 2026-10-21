@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.23.0 - 2026-10-21
+
+Any terminal can now be allowed to control the terminals you share with it, replacing the singleton Supervisor terminal.
+
+### Changed
+
+- **Per-terminal control access replaces the Supervisor terminal.** Each terminal's Access panel has a **Terminal control** section with two settings, both off by default: **Share with controlling terminals** (Off, Read, or Read & write) and **Control other terminals**. Any terminal can be allowed to control others, so an agent you already run (a personal assistant, an orchestrator) can watch what is running, read agent transcripts, and open new terminals to hand work off, without a special terminal or managed directory.
+- **One CLI for access.** Controlling agents use `"$TERM_SERVER_EXECUTABLE" access terminals` (`list`, `screen`, `scrollback`, `transcript`, `processes`, `send`, `rename`, `create`, `kill`, `terminate`, `tabs`, `close-tab`), documented in the bundled `term-server-access` skill. Refusals exit `126`, like rejected access requests.
+- **Always-visible roles and an audit trail.** Sidebar rows and pane headers show a badge for every role a terminal holds. A shared terminal's Access panel shows when it was last read and by which agent, and lists each write with a short preview of the input.
+
+### Removed
+
+- The singleton Supervisor terminal, its crown action, its managed directory and skill, the `term-server-supervisor` command, and `POST /api/supervisor`.
+
+### Security
+
+- Control requests are authorized from the caller's kernel-reported process id, which must be a live descendant of the terminal it claims, replacing the Supervisor's environment token. Hidden terminals are indistinguishable from missing ones, read-only terminals refuse every write, and terminals opened by a controlling agent never inherit control.
+
+### Upgrade notes
+
+- Safe for automatic installation over `0.22.0`; no broker restart is required. Nothing is shared after upgrading: every terminal, including a running former Supervisor, starts with control off and hidden. Turn on **Control other terminals** where your agent runs and share the terminals it should see. The former Supervisor's credentials are deleted on startup; its terminal keeps running as an ordinary terminal, and `term-server-supervisor` there prints how to switch. Start a new agent session after repairing **Settings → Live agent activity** so it loads the updated `term-server-access` skill.
+
 ## 0.22.0 - 2026-10-14
 
 ### Added

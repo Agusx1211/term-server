@@ -14,7 +14,7 @@ use clap::Parser;
 #[cfg(unix)]
 use term_server::broker::{BrokerClient, BrokerPool, legacy_socket_path, run_session_broker};
 #[cfg(unix)]
-use term_server::supervisor::{self, SupervisorControlSocket, SupervisorService};
+use term_server::terminal_control::{ControlSocket, TerminalControlService};
 #[cfg(unix)]
 use term_server::{access_cli, config::CliCommand};
 use term_server::{
@@ -42,8 +42,11 @@ const AGENT_EVENT_FORWARD_TIMEOUT: Duration = Duration::from_millis(500);
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(unix)]
-    if supervisor::is_client_invocation() {
-        return supervisor::run_client().await.map_err(Into::into);
+    if is_retired_supervisor_invocation() {
+        eprintln!(
+            "term-server-supervisor was replaced by per-terminal control access. Turn on \"Control other terminals\" in this terminal's Access panel, share terminals from theirs, then use \"$TERM_SERVER_EXECUTABLE\" access terminals --help."
+        );
+        std::process::exit(2);
     }
     let cli = Cli::parse();
     #[cfg(unix)]
@@ -97,12 +100,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(directory)
     };
 
-    // Claiming the supervisor control socket is what makes this process the
+    // Claiming the terminal control socket is what makes this process the
     // single server for its data directory. It happens before the workspace is
     // opened so a second server cannot reconfigure the running server's session
     // broker on its way to being rejected.
     #[cfg(unix)]
-    let control_socket = SupervisorControlSocket::claim(&cli.data_dir).await?;
+    let control_socket = ControlSocket::claim(&cli.data_dir).await?;
     let loaded_auth = load_auth(
         &cli.data_dir,
         env::var("TERM_SERVER_PASSWORD").ok(),
@@ -118,9 +121,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let address = cli.socket_addr()?;
     let workspace = load_workspace(&cli, &executable).await?;
     #[cfg(unix)]
-    let supervisor = SupervisorService::new(workspace.clone(), &cli.data_dir, &executable).await?;
+    let terminal_control = TerminalControlService::new(workspace.clone(), &cli.data_dir).await?;
     #[cfg(unix)]
-    supervisor.serve(control_socket);
+    terminal_control.serve(control_socket);
     let updates = Arc::new(UpdateService::new(
         client_directory.as_deref(),
         cli.update_channel.clone(),
@@ -141,7 +144,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         auth: loaded_auth.service,
         workspace: workspace.clone(),
         #[cfg(unix)]
-        supervisor,
+        terminal_control,
         login_limiter: Arc::new(LoginLimiter::default()),
         allowed_origins: cli.allowed_origins.clone().into(),
         secure: cli.is_https(),
@@ -194,6 +197,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         restart_process(&executable, &restart_arguments)?;
     }
     Ok(())
+}
+
+/// The retired Supervisor terminal ran a symlink to this executable under
+/// that name; it may still be on the PATH of a terminal that predates removal.
+#[cfg(unix)]
+fn is_retired_supervisor_invocation() -> bool {
+    env::args_os()
+        .next()
+        .and_then(|value| PathBuf::from(value).file_name().map(|name| name.to_owned()))
+        .is_some_and(|name| name == "term-server-supervisor")
 }
 
 #[cfg(unix)]

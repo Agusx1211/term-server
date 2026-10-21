@@ -12,8 +12,10 @@ import {
   Hourglass,
   KeyRound,
   LoaderCircle,
+  Keyboard,
   LockKeyhole,
   Plus,
+  Radar,
   ShieldAlert,
   ShieldCheck,
   TerminalSquare,
@@ -28,10 +30,13 @@ import type {
   AccessSnapshot,
   SecretGrant,
   SecretShare,
+  TerminalControlDetail,
+  TerminalExposure,
   TerminalInfo,
 } from "../../shared/types";
 import { orderShares, shareOutcome, untilTime } from "../lib/access-shares";
 import { api } from "../lib/api";
+import { exposureLabel } from "../lib/terminal-control";
 
 interface AccessPanelProps {
   open: boolean;
@@ -70,13 +75,19 @@ export function AccessPanel({
   const [busy, setBusy] = useState<string | null>(null);
   // Held only while the panel is open so a revealed value never outlives the view.
   const [revealed, setRevealed] = useState<RevealedShare | null>(null);
+  const [control, setControl] = useState<TerminalControlDetail | null>(null);
   const pendingShares = snapshot.shares.filter((share) => share.state === "pending").length;
   const pendingCount = snapshot.requests.filter((request) => request.state === "pending").length
     + pendingShares;
 
   const refresh = useCallback(async (signal?: AbortSignal) => {
-    const next = await api.terminalAccess(terminal.id, signal);
+    const [next, nextControl] = await Promise.all([
+      api.terminalAccess(terminal.id, signal),
+      // Terminal control is Unix-only; the rest of the panel works without it.
+      api.terminalControl(terminal.id, signal).catch(() => null),
+    ]);
     setSnapshot(next);
+    setControl(nextControl);
     setError("");
     setLoading(false);
   }, [terminal.id]);
@@ -86,6 +97,7 @@ export function AccessPanel({
     const controller = new AbortController();
     let timer = 0;
     setSnapshot(emptySnapshot(terminal.id));
+    setControl(null);
     setRevealed(null);
     setLoading(true);
     setError("");
@@ -240,6 +252,30 @@ export function AccessPanel({
     );
   };
 
+  const setExposure = async (exposure: TerminalExposure) => {
+    if (!control || control.exposure === exposure) return;
+    if (exposure === "write" && !window.confirm(
+      `Let controlling terminals type into ${terminal.name}?\n\nAn agent with this access can run any command here, as you.`,
+    )) return;
+    await perform(
+      "control-exposure",
+      () => api.updateTerminalControl(terminal.id, { exposure }),
+      `${terminal.name}: ${exposureLabel(exposure).toLowerCase()}`,
+    );
+  };
+
+  const setController = async (controller: boolean) => {
+    if (!control || control.controller === controller) return;
+    if (controller && !window.confirm(
+      `Let agents in ${terminal.name} control other terminals?\n\nThey can list and read every terminal you share, type into the ones shared read & write, and open new terminals.`,
+    )) return;
+    await perform(
+      "control-controller",
+      () => api.updateTerminalControl(terminal.id, { controller }),
+      controller ? `${terminal.name} can control shared terminals` : `${terminal.name} can no longer control terminals`,
+    );
+  };
+
   if (!open) return null;
 
   return (
@@ -276,6 +312,14 @@ export function AccessPanel({
               />
             ))}
           </section>
+        )}
+        {control && (
+          <TerminalControlSection
+            control={control}
+            busy={busy}
+            onExposure={(exposure) => void setExposure(exposure)}
+            onController={(controller) => void setController(controller)}
+          />
         )}
         <section class="process-section access-section">
           <div class="process-section-heading">
@@ -527,6 +571,89 @@ function SecretGrantRow({ grant, busy, onRevoke }: { grant: SecretGrant; busy: b
         {busy ? <LoaderCircle class="spin" size={13} /> : <Trash2 size={13} />}
       </button>
     </div>
+  );
+}
+
+const EXPOSURE_CHOICES: { exposure: TerminalExposure; label: string }[] = [
+  { exposure: "off", label: "Off" },
+  { exposure: "read", label: "Read" },
+  { exposure: "write", label: "Read & write" },
+];
+
+function TerminalControlSection({
+  control,
+  busy,
+  onExposure,
+  onController,
+}: {
+  control: TerminalControlDetail;
+  busy: string | null;
+  onExposure: (exposure: TerminalExposure) => void;
+  onController: (controller: boolean) => void;
+}) {
+  const disabled = busy !== null;
+  return (
+    <section class="process-section access-section access-control-section" data-terminal-control-section>
+      <div class="process-section-heading">
+        <span>Terminal control</span>
+        <span>{control.controller ? "controls" : exposureLabel(control.exposure).toLowerCase()}</span>
+      </div>
+      <div class="access-control-row">
+        <span class="access-control-copy">
+          <strong><Eye size={12} /> Share with controlling terminals</strong>
+          <small>Read lets them see the screen, history, and processes. Read &amp; write also lets them type, rename, and close it.</small>
+        </span>
+        <span class="access-segmented" role="radiogroup" aria-label="Share this terminal with controlling terminals">
+          {EXPOSURE_CHOICES.map((choice) => (
+            <button
+              key={choice.exposure}
+              type="button"
+              role="radio"
+              aria-checked={control.exposure === choice.exposure}
+              class={`access-segment ${choice.exposure} ${control.exposure === choice.exposure ? "selected" : ""}`}
+              data-exposure={choice.exposure}
+              disabled={disabled}
+              onClick={() => onExposure(choice.exposure)}
+            >
+              {choice.label}
+            </button>
+          ))}
+        </span>
+      </div>
+      <label class="access-control-row access-control-toggle">
+        <span class="access-control-copy">
+          <strong><Radar size={12} /> Control other terminals</strong>
+          <small>Agents here can list the terminals you share, read them, type into the ones shared read &amp; write, and open new ones.</small>
+        </span>
+        <input
+          type="checkbox"
+          role="switch"
+          data-terminal-controller-toggle
+          checked={control.controller}
+          disabled={disabled}
+          onChange={(event) => onController(event.currentTarget.checked)}
+        />
+      </label>
+      {control.lastReadAt !== undefined && (
+        <div class="access-control-meta">
+          <Eye size={10} /> Last read by {control.lastReadBy ?? "a controlling terminal"} {relativeTime(control.lastReadAt)}
+        </div>
+      )}
+      {control.activity.length > 0 && (
+        <div class="access-activity-list">
+          {control.activity.map((entry) => (
+            <div class="access-activity control" key={`${entry.at}-${entry.action}`}>
+              <span class="access-activity-icon"><Keyboard size={13} /></span>
+              <span class="access-activity-copy">
+                <strong>{entry.agent} in {entry.controllerName}</strong>
+                <small>{entry.action}</small>
+              </span>
+              <time>{relativeTime(entry.at)}</time>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
   );
 }
 

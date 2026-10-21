@@ -9,18 +9,20 @@ import {
   ChevronRight,
   ChevronsDownUp,
   CircleCheck,
-  Crown,
   CirclePause,
   CircleX,
   Download,
+  Eye,
   Folder,
   FolderSearch,
   FolderOpen,
   Hand,
+  Keyboard,
   LoaderCircle,
   PackageOpen,
   Pencil,
   Plus,
+  Radar,
   Radio,
   Search,
   Settings,
@@ -58,7 +60,7 @@ import {
   SIDEBAR_WIDTH_STORAGE_KEY,
 } from "../lib/sidebar-width";
 import { buildTerminalTree, type TerminalTreeNode } from "../lib/tree";
-import { supervisorContextActive } from "../lib/supervisor-context";
+import { terminalControlBadges, type TerminalControlBadge } from "../lib/terminal-control";
 import { FileExplorer } from "./FileExplorer";
 import { WorkingDuration } from "./WorkingDuration";
 
@@ -72,8 +74,6 @@ interface SidebarProps {
   attentionTerminalIds: Set<string>;
   artifactCounts: ReadonlyMap<string, number>;
   mobileOpen: boolean;
-  supervisor?: TerminalInfo;
-  supervisorCreating: boolean;
   creating: boolean;
   settingsActive: boolean;
   updateAvailable: boolean;
@@ -81,7 +81,6 @@ interface SidebarProps {
   previewSettings: TerminalPreviewSettings;
   pushover: PushoverConfig;
   theme: ThemeName;
-  onSupervisor: () => void;
   onMobileClose: () => void;
   onNew: (cwd?: string) => void;
   onOpen: (id: string) => void;
@@ -97,7 +96,6 @@ interface SidebarProps {
 interface NodeProps {
   node: TerminalTreeNode;
   depth: number;
-  pinned?: boolean;
   collapsed: Set<string>;
   activeIds: string[];
   attentionTerminalIds: Set<string>;
@@ -120,7 +118,6 @@ interface NodeProps {
 function TreeNode({
   node,
   depth,
-  pinned = false,
   collapsed,
   activeIds,
   attentionTerminalIds,
@@ -148,8 +145,7 @@ function TreeNode({
     const artifactCount = artifactCounts.get(terminal.id) ?? 0;
     const pendingAccessRequests = terminal.pendingAccessRequests ?? 0;
     const waitingForAccess = pendingAccessRequests > 0;
-    const isSupervisor = terminal.kind === "supervisor";
-    const supervisorOutsideRoot = isSupervisor && !supervisorContextActive(terminal);
+    const controlBadges = terminalControlBadges(terminal.control);
     const activityClass = terminal.agent
       ? `agent-row agent-${terminal.agent.status}`
       : terminal.command
@@ -157,12 +153,9 @@ function TreeNode({
         : "shell-row";
     return (
       <div
-        class={`tree-row terminal-row ${isSupervisor ? "supervisor-row" : ""} ${pinned ? "supervisor-pinned-row" : ""} ${supervisorOutsideRoot ? "supervisor-context-outside" : ""} ${activityClass} ${waitingForAccess ? "access-attention" : needsAttention ? "activity-attention" : ""} ${activeIds.includes(terminal.id) ? "active" : ""}`}
+        class={`tree-row terminal-row ${activityClass} ${waitingForAccess ? "access-attention" : needsAttention ? "activity-attention" : ""} ${activeIds.includes(terminal.id) ? "active" : ""}`}
         data-terminal-id={terminal.id}
-        data-terminal-kind={terminal.kind}
-        data-supervisor={isSupervisor ? "true" : "false"}
-        data-supervisor-context={isSupervisor ? (supervisorOutsideRoot ? "outside" : "active") : undefined}
-        data-supervisor-pinned={pinned ? "true" : undefined}
+        data-terminal-control={controlBadges.map((badge) => badge.kind).join(" ") || undefined}
         data-pending-access-requests={waitingForAccess ? String(pendingAccessRequests) : undefined}
         style={{ "--depth": depth, "--workspace-color": terminal.color }}
         onPointerEnter={(event) => (
@@ -181,23 +174,20 @@ function TreeNode({
             onDragStart(terminal.id);
           }}
           onDragEnd={onDragEnd}
-          title={supervisorOutsideRoot
-            ? "Supervisor skill discovery is inactive outside its managed directory"
-            : isSupervisor ? "Supervisor terminal" : `${terminal.name} — ${terminal.cwd}`}
+          title={`${terminal.name} — ${terminal.cwd}`}
         >
-          <span class={`terminal-kind ${isSupervisor ? "supervisor" : terminal.agent ? "agent" : "shell"}`} aria-hidden="true" data-supervisor-identity={isSupervisor ? "sidebar" : undefined}>
-            {isSupervisor ? <Crown size={14} /> : terminal.agent ? <Bot size={15} /> : <TerminalSquare size={14} />}
+          <span class={`terminal-kind ${terminal.agent ? "agent" : "shell"}`} aria-hidden="true">
+            {terminal.agent ? <Bot size={15} /> : <TerminalSquare size={14} />}
           </span>
           <span class="terminal-copy">
             <span class="terminal-title">{terminal.name}</span>
             <span class="terminal-meta">
-              <span>{supervisorOutsideRoot
-                ? "Return to supervisor directory"
-                : terminal.agent
-                  ? agentSubtitle(terminal.agent)
-                  : terminal.command
-                    ? commandSubtitle(terminal.command)
-                    : isSupervisor ? "Supervisor shell" : terminal.program}</span>
+              <span>{terminal.agent
+                ? agentSubtitle(terminal.agent)
+                : terminal.command
+                  ? commandSubtitle(terminal.command)
+                  : terminal.program}</span>
+              {controlBadges.map((badge) => <ControlBadgeIcon key={badge.kind} badge={badge} />)}
               {artifactCount > 0 && (
                 <span
                   class="terminal-artifact-count"
@@ -329,13 +319,10 @@ export function Sidebar({
   attentionTerminalIds,
   artifactCounts,
   mobileOpen,
-  supervisor,
-  supervisorCreating,
   creating,
   settingsActive,
   updateAvailable,
   fileRoot,
-  onSupervisor,
   previewSettings,
   pushover,
   theme,
@@ -364,24 +351,11 @@ export function Sidebar({
     terminal: TerminalInfo;
     position: { left: number; top: number };
   }>();
-  const supervisorNodes = useMemo<TerminalTreeNode[]>(
-    () => terminals
-      .filter((terminal) => terminal.kind === "supervisor")
-      .map((terminal) => ({
-        key: `supervisor:${terminal.id}`,
-        name: terminal.name,
-        path: `supervisor:${terminal.id}`,
-        terminal,
-        children: [],
-      })),
-    [terminals],
-  );
   const matching = useMemo(() => {
-    const workspaceTerminals = terminals.filter((terminal) => terminal.kind !== "supervisor");
     const needle = query.trim().toLocaleLowerCase();
     return needle
-      ? workspaceTerminals.filter((terminal) => terminal.path.toLocaleLowerCase().includes(needle))
-      : workspaceTerminals;
+      ? terminals.filter((terminal) => terminal.path.toLocaleLowerCase().includes(needle))
+      : terminals;
   }, [query, terminals]);
   const tree = useMemo(() => buildTerminalTree(matching), [matching]);
 
@@ -518,12 +492,11 @@ export function Sidebar({
     localStorage.setItem("term-server:collapsed", JSON.stringify(categoryPaths));
   };
   const visibleCollapsed = query ? new Set<string>() : collapsed;
-  const renderNode = (node: TerminalTreeNode, pinned = false) => (
+  const renderNode = (node: TerminalTreeNode) => (
     <TreeNode
       key={node.key}
       node={node}
       depth={0}
-      pinned={pinned}
       collapsed={visibleCollapsed}
       activeIds={activeIds}
       attentionTerminalIds={attentionTerminalIds}
@@ -572,22 +545,6 @@ export function Sidebar({
           >
             {filesOpen ? <TerminalSquare size={15} /> : <FolderSearch size={15} />}
           </button>
-          <button
-            class={`icon-button supervisor-action ${supervisor ? "active" : ""}`}
-            onClick={onSupervisor}
-            disabled={supervisorCreating}
-            aria-busy={supervisorCreating}
-            aria-label={supervisorCreating
-              ? "Creating supervisor terminal"
-              : supervisor ? "Open supervisor terminal" : "Create supervisor terminal"}
-            title={supervisorCreating
-              ? "Creating supervisor terminal…"
-              : supervisor ? "Open supervisor terminal" : "Create supervisor terminal"}
-            data-supervisor-action="true"
-            data-supervisor-open={supervisor ? "true" : "false"}
-          >
-            <Crown size={15} />
-          </button>
           {!filesOpen && (
             <>
               <button class="icon-button" onClick={() => onNew()} disabled={creating} aria-label="New terminal in home" title="New terminal in home">
@@ -613,19 +570,9 @@ export function Sidebar({
             {query && <button onClick={() => setQuery("")} aria-label="Clear filter"><X size={13} /></button>}
           </div>
           <div class="tree">
-            {supervisorNodes.length > 0 && (
-              <div
-                class="supervisor-pinned"
-                role="group"
-                aria-label="Supervisor"
-                data-supervisor-pinned-container="true"
-              >
-                {supervisorNodes.map((node) => renderNode(node, true))}
-              </div>
-            )}
             <div class="workspace-tree" role="tree">
               {tree.map((node) => renderNode(node))}
-              {!matching.length && !supervisorNodes.length && (
+              {!matching.length && (
                 <div class="sidebar-empty">
                   <TerminalSquare size={20} />
                   <span>{terminals.length ? "No matching workspaces" : "No terminals yet"}</span>
@@ -760,6 +707,21 @@ function CommandState({
       {command.status === "running"
         ? <WorkingDuration since={command.startedAt} />
         : <span class="activity-status-label">{label}</span>}
+    </span>
+  );
+}
+
+function ControlBadgeIcon({ badge }: { badge: TerminalControlBadge }) {
+  return (
+    <span
+      class={`terminal-control-badge ${badge.kind}`}
+      title={badge.title}
+      aria-label={badge.label}
+      data-terminal-control-badge={badge.kind}
+    >
+      {badge.kind === "controller" ? <Radar size={9} />
+        : badge.kind === "write" ? <Keyboard size={9} />
+        : <Eye size={9} />}
     </span>
   );
 }

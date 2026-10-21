@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
@@ -202,6 +202,8 @@ pub struct ForegroundCommandInfo {
 pub enum TerminalKind {
     #[default]
     Regular,
+    /// Reported by brokers from before per-terminal control access, for the
+    /// retired singleton Supervisor terminal. It is now an ordinary terminal.
     Supervisor,
 }
 
@@ -210,8 +212,6 @@ pub enum TerminalKind {
 pub struct TerminalInfo {
     #[serde(default)]
     pub kind: TerminalKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub supervisor_root: Option<PathBuf>,
     pub id: Uuid,
     pub name: String,
     pub workspace: String,
@@ -242,15 +242,6 @@ pub struct CreateTerminal {
     pub cwd: Option<PathBuf>,
     pub shell: Option<String>,
     pub clone_from: Option<Uuid>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateSupervisorTerminal {
-    #[serde(flatten)]
-    pub terminal: CreateTerminal,
-    #[serde(default)]
-    pub environment: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -1951,9 +1942,9 @@ impl TerminalSession {
         /// A foreground process that never reads its stdin fills the line
         /// discipline buffer, and the writer thread then blocks in `write_all`
         /// for as long as that process runs. Callers hold a socket, a broker
-        /// request, and a supervisor invocation open behind this wait, so it is
+        /// request, and a terminal control invocation open behind this wait, so it is
         /// bounded and reported instead of parking forever. It stays well under
-        /// the supervisor control response budget so the caller is told why the
+        /// the terminal control response budget so the caller is told why the
         /// input was refused rather than that its own read timed out.
         const CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -2996,26 +2987,6 @@ impl TerminalManager {
     }
 
     pub fn create(&self, request: CreateTerminal) -> Result<TerminalInfo, TerminalError> {
-        self.create_with(request, TerminalKind::Regular, BTreeMap::new())
-    }
-
-    pub fn create_supervisor(
-        &self,
-        request: CreateSupervisorTerminal,
-    ) -> Result<TerminalInfo, TerminalError> {
-        self.create_with(
-            request.terminal,
-            TerminalKind::Supervisor,
-            request.environment,
-        )
-    }
-
-    fn create_with(
-        &self,
-        request: CreateTerminal,
-        kind: TerminalKind,
-        environment: BTreeMap<String, String>,
-    ) -> Result<TerminalInfo, TerminalError> {
         self.prune_exited_sessions();
         let requested_name = request
             .path
@@ -3056,11 +3027,10 @@ impl TerminalManager {
             }
             (name, false)
         } else {
-            (executable_name(&shell), kind == TerminalKind::Regular)
+            (executable_name(&shell), true)
         };
         let workspace = workspace_for(&cwd, &self.home_directory);
         let path = terminal_path(&workspace, &name);
-        let supervisor_root = (kind == TerminalKind::Supervisor).then(|| cwd.clone());
 
         let id = Uuid::new_v4();
         let pty_system = native_pty_system();
@@ -3078,9 +3048,6 @@ impl TerminalManager {
         let mut command = CommandBuilder::new(&shell);
         command.cwd(&cwd);
         configure_terminal_environment(&mut command);
-        for (name, value) in environment {
-            command.env(name, value);
-        }
         command.env_remove("TERM_SERVER_BROKER_CONTROL_TOKEN");
         command.env("TERM_SERVER_SESSION", id.to_string());
         if let (Some(executable), Some(socket)) = (&self.executable, &self.agent_event_socket) {
@@ -3115,8 +3082,7 @@ impl TerminalManager {
         let replay_bytes = self.replay_bytes.load(Ordering::Relaxed);
         let session = Arc::new(TerminalSession {
             info: RwLock::new(TerminalInfo {
-                kind,
-                supervisor_root,
+                kind: TerminalKind::Regular,
                 id,
                 name,
                 color: color_for(&workspace),

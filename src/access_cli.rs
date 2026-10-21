@@ -14,6 +14,7 @@ use crate::{
         current_process_start_ticks,
     },
     broker::BrokerClient,
+    terminal_control::{self, TerminalsCli},
 };
 
 const BROKER_SOCKET_ENV: &str = "TERM_SERVER_BROKER_SOCKET";
@@ -31,6 +32,8 @@ enum AccessCliCommand {
     Secret(SecretCli),
     /// Ask the user to review and run one exact local command through sudo.
     Sudo(SudoCli),
+    /// Read and drive the terminals the user shared, when this terminal may control them.
+    Terminals(TerminalsCli),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -218,6 +221,9 @@ async fn run_inner(command: AccessCli) -> Result<i32, Box<dyn std::error::Error>
     let terminal_id = env::var(TERMINAL_SESSION_ENV)
         .map_err(|_| "this command must run inside a term-server terminal")?
         .parse::<Uuid>()?;
+    if let AccessCliCommand::Terminals(cli) = command.command {
+        return Ok(terminal_control::run_cli(cli, terminal_id, &socket).await);
+    }
     let client = BrokerClient::new(socket);
     match command.command {
         AccessCliCommand::Secret(secret) => match secret.command {
@@ -389,6 +395,7 @@ async fn run_inner(command: AccessCli) -> Result<i32, Box<dyn std::error::Error>
                 .await?;
             consume_events(body).await
         }
+        AccessCliCommand::Terminals(_) => unreachable!("handled before connecting to the broker"),
     }
 }
 

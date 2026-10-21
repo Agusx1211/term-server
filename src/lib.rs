@@ -21,9 +21,9 @@ pub mod fili;
 pub mod history;
 pub mod pushover;
 pub mod status;
-#[cfg(unix)]
-pub mod supervisor;
 pub mod terminal;
+#[cfg(unix)]
+pub mod terminal_control;
 mod terminal_state;
 pub mod tls;
 pub mod update;

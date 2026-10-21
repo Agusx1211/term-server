@@ -60,7 +60,7 @@ export function getBrowserViewId(
   return generated;
 }
 
-/** Build the exact payload sent to the browser-tab supervisor endpoint. */
+/** Build the exact payload sent to the browser-tab endpoint. */
 export function buildBrowserTabSnapshot(input: BrowserTabSnapshotInput): BrowserTabSnapshot {
   const terminalPanes: BrowserTerminalPaneSnapshot[] = input.terminalPanes.map((terminal) => ({
     terminalId: terminal.terminalId,
