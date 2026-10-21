@@ -25,9 +25,10 @@ export function terminalControlBadges(
     badges.push({
       kind: control.exposure,
       label: exposureLabel(control.exposure),
-      title: control.exposure === "write"
+      title: (control.exposure === "write"
         ? "Controlling terminals can read this terminal and type into it"
-        : "Controlling terminals can read this terminal but not type into it",
+        : "Controlling terminals can read this terminal but not type into it")
+        + (control.exposureDefault ? " (the default for all terminals)" : ""),
     });
   }
   return badges;

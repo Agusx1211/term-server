@@ -16,6 +16,7 @@ import type {
   CreateTerminalRequest,
   RenameTerminalRequest,
   TerminalInfo,
+  TerminalControlDefaults,
   TerminalControlDetail,
   TerminalControlSummary,
   UpdateTerminalControl,
@@ -250,6 +251,13 @@ export const api = {
     request<ProcessInspectorSnapshot>(`/api/terminals/${id}/processes`),
   terminalControl: (id: string, signal?: AbortSignal) =>
     request<TerminalControlDetail>(`/api/terminals/${id}/control`, { signal }),
+  terminalControlDefaults: (signal?: AbortSignal) =>
+    request<TerminalControlDefaults>("/api/terminal-control", { signal }),
+  updateTerminalControlDefaults: (defaults: TerminalControlDefaults) =>
+    request<TerminalControlDefaults>("/api/terminal-control", {
+      method: "PUT",
+      body: JSON.stringify(defaults),
+    }),
   updateTerminalControl: (id: string, update: UpdateTerminalControl) =>
     request<TerminalControlSummary>(`/api/terminals/${id}/control`, {
       method: "PUT",

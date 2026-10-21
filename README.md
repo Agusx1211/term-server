@@ -257,6 +257,10 @@ each terminal's Access panel:
   kill it.
 - **Control other terminals:** lets agents running in this terminal use the control commands at all.
 
+To share everything at once, set **Default for all terminals** in any Access panel. It applies to every terminal
+without a setting of its own, including new ones; a terminal's own choice (or **Default**, to follow it again)
+always wins.
+
 An agent in a controlling terminal uses the same CLI as secrets and sudo, through the bundled
 `term-server-access` skill:
 

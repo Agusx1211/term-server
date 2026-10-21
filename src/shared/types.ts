@@ -42,7 +42,10 @@ export interface UpdateActivityView {
 export type TerminalExposure = "off" | "read" | "write";
 
 export interface TerminalControlSummary {
+  /** The exposure in effect: this terminal's own choice, or the default. */
   exposure: TerminalExposure;
+  /** Whether the exposure comes from the default for all terminals. */
+  exposureDefault?: boolean;
   /** Whether agents in this terminal may control the terminals shared with them. */
   controller: boolean;
   /** The controlling terminal that opened this one. */
@@ -63,8 +66,13 @@ export interface TerminalControlDetail extends TerminalControlSummary {
   activity: TerminalControlActivity[];
 }
 
+export interface TerminalControlDefaults {
+  defaultExposure: TerminalExposure;
+}
+
 export interface UpdateTerminalControl {
-  exposure?: TerminalExposure;
+  /** "default" drops this terminal's own choice so it follows the default again. */
+  exposure?: TerminalExposure | "default";
   controller?: boolean;
 }
 
