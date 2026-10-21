@@ -2,7 +2,7 @@ import { expect, test } from "../fixtures/test.js";
 import { expectTerminalBuffer } from "../assertions/terminal-state.js";
 import { installBrowserErrorCollectors } from "../fixtures/artifacts.js";
 import { LoginPage } from "../pages/login-page.js";
-import type { Page } from "@playwright/test";
+import type { Locator, Page } from "@playwright/test";
 import type { TerminalPanePage } from "../pages/terminal-pane.js";
 import { WorkbenchPage } from "../pages/workbench-page.js";
 
@@ -55,6 +55,10 @@ async function openAccessPanel(pane: TerminalPanePage) {
   return section;
 }
 
+function shareChoices(section: Locator): Locator {
+  return section.getByRole("radiogroup", { name: "Share this terminal with controlling terminals" });
+}
+
 async function closeAccessPanel(pane: TerminalPanePage) {
   await pane.root.getByRole("button", { name: "Close access panel", exact: true }).click();
   await expect(pane.root.locator("[data-terminal-control-section]")).toHaveCount(0);
@@ -78,6 +82,7 @@ test("P0-22 Terminal control is off by default and granted per terminal @p0", as
 
   const host = await createShellTerminal(page, "control-host");
   const target = await createShellTerminal(page, "control-target");
+  const plain = await createShellTerminal(page, "control-plain");
   await page.reload({ waitUntil: "load" });
   await workbench.expectVisible();
   await expect(page.locator("[data-terminal-control-badge]")).toHaveCount(0);
@@ -91,7 +96,7 @@ test("P0-22 Terminal control is off by default and granted per terminal @p0", as
   });
 
   const hostControl = await openAccessPanel(hostPane);
-  await expect(hostControl.getByRole("radio", { name: "Off", exact: true })).toHaveAttribute(
+  await expect(shareChoices(hostControl).getByRole("radio", { name: "Default (Off)", exact: true })).toHaveAttribute(
     "aria-checked",
     "true",
   );
@@ -121,7 +126,7 @@ test("P0-22 Terminal control is off by default and granted per terminal @p0", as
   await targetPane.expectConnected();
   await targetPane.sendInput("printf 'TARGET-READY\\n'", true);
   const targetControl = await openAccessPanel(targetPane);
-  await targetControl.getByRole("radio", { name: "Read", exact: true }).click();
+  await shareChoices(targetControl).getByRole("radio", { name: "Read", exact: true }).click();
   await expect(targetPane.root.locator('[data-terminal-control-badge="read"]')).toBeVisible({
     timeout: WAIT_TIMEOUT_MS,
   });
@@ -145,7 +150,7 @@ test("P0-22 Terminal control is off by default and granted per terminal @p0", as
   await workbench.openTerminal({ id: target.id, name: target.name });
   const writableControl = await openAccessPanel(targetPane);
   page.once("dialog", async (dialog) => dialog.accept());
-  await writableControl.getByRole("radio", { name: "Read & write", exact: true }).click();
+  await shareChoices(writableControl).getByRole("radio", { name: "Read & write", exact: true }).click();
   await expect(targetPane.root.locator('[data-terminal-control-badge="write"]')).toBeVisible({
     timeout: WAIT_TIMEOUT_MS,
   });
@@ -191,6 +196,30 @@ test("P0-22 Terminal control is off by default and granted per terminal @p0", as
   await expect(openedRow).toHaveCount(1, { timeout: WAIT_TIMEOUT_MS });
   await expect(openedRow.locator('[data-terminal-control-badge="write"]')).toBeVisible();
   await expect(openedRow.locator('[data-terminal-control-badge="controller"]')).toHaveCount(0);
+
+  // The default shares every terminal that has no setting of its own.
+  await hostPane.sendInput(`${CONTROL} screen ${plain.id}; echo "PLAIN-HIDDEN=$?"`, true);
+  await expectTerminalBuffer(page, host.id, { contains: "PLAIN-HIDDEN=126" }, {
+    timeout: WAIT_TIMEOUT_MS,
+  });
+  const defaultsControl = await openAccessPanel(hostPane);
+  await defaultsControl.locator('[data-default-exposure="read"]').click();
+  await expect(defaultsControl.locator('[data-default-exposure="read"]')).toHaveAttribute(
+    "aria-checked",
+    "true",
+    { timeout: WAIT_TIMEOUT_MS },
+  );
+  await closeAccessPanel(hostPane);
+  await expect(
+    page.locator(`.sidebar .terminal-row[data-terminal-id="${plain.id}"] [data-terminal-control-badge="read"]`),
+  ).toBeVisible({ timeout: WAIT_TIMEOUT_MS });
+  await hostPane.sendInput(`${CONTROL} screen ${plain.id}; echo "PLAIN-SHARED=$?"`, true);
+  await expectTerminalBuffer(page, host.id, { contains: "PLAIN-SHARED=0" }, {
+    timeout: WAIT_TIMEOUT_MS,
+  });
+  await expect(
+    page.locator(`.sidebar .terminal-row[data-terminal-id="${target.id}"] [data-terminal-control-badge="write"]`),
+  ).toBeVisible();
 
   // Settings survive a reload.
   await page.reload({ waitUntil: "load" });

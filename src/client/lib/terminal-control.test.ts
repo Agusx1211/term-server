@@ -21,4 +21,11 @@ describe("terminal control badges", () => {
     expect(write?.label).toBe("Shared · read & write");
     expect(exposureLabel("off")).toBe("Not shared");
   });
+
+  it("says when the sharing comes from the default for all terminals", () => {
+    const [inherited] = terminalControlBadges({ exposure: "read", exposureDefault: true, controller: false });
+    expect(inherited?.title).toContain("default for all terminals");
+    const [own] = terminalControlBadges({ exposure: "read", exposureDefault: false, controller: false });
+    expect(own?.title).not.toContain("default");
+  });
 });

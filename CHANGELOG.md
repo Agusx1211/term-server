@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.24.0 - 2026-10-21
+
+Share every terminal with controlling terminals at once.
+
+### Added
+
+- **Default for all terminals.** The Terminal control section of any Access panel has a **Default for all terminals** setting (Off, Read, or Read & write) that applies to every terminal without a setting of its own, including terminals opened later. Each terminal's own choice still wins; its sharing control gains a **Default** option to follow the default again. Sidebar and pane badges show inherited sharing, and their tooltips say when it comes from the default.
+
+### Upgrade notes
+
+- Safe for automatic installation over `0.23.0`; no broker restart is required. The default starts at Off, so nothing new is shared until you change it. Settings saved by 0.23.0 are migrated: a terminal left at Off now follows the default, and terminals you shared keep their choice.
+
 ## 0.23.0 - 2026-10-21
 
 Any terminal can now be allowed to control the terminals you share with it, replacing the singleton Supervisor terminal.

@@ -45,7 +45,8 @@ use crate::broker::BrokerWebSocket;
 #[cfg(unix)]
 use crate::terminal_control::{
     BrowserTabCommandAck, BrowserTabHeartbeat, BrowserTabSnapshot, ControlError,
-    TerminalControlDetail, TerminalControlService, TerminalControlSummary, UpdateTerminalControl,
+    TerminalControlDefaults, TerminalControlDetail, TerminalControlService, TerminalControlSummary,
+    UpdateTerminalControl,
 };
 use crate::{
     access::{
@@ -1061,6 +1062,28 @@ async fn update_terminal_control(
     require_auth(&jar, &state)?;
     require_terminal(&state, id).await?;
     Ok(Json(state.terminal_control.update(id, body)?))
+}
+
+#[cfg(unix)]
+async fn terminal_control_defaults(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> Result<Json<TerminalControlDefaults>, ApiError> {
+    require_auth(&jar, &state)?;
+    Ok(Json(state.terminal_control.defaults()))
+}
+
+#[cfg(unix)]
+async fn update_terminal_control_defaults(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+    Json(body): Json<TerminalControlDefaults>,
+) -> Result<Json<TerminalControlDefaults>, ApiError> {
+    require_origin(&headers, &uri, &state)?;
+    require_auth(&jar, &state)?;
+    Ok(Json(state.terminal_control.set_defaults(body)?))
 }
 
 #[cfg(unix)]
@@ -2296,6 +2319,10 @@ pub fn build_router(state: AppState, client_directory: Option<PathBuf>) -> Route
         .route(
             "/terminals/{id}/control",
             get(terminal_control_detail).put(update_terminal_control),
+        )
+        .route(
+            "/terminal-control",
+            get(terminal_control_defaults).put(update_terminal_control_defaults),
         )
         .route(
             "/browser-tabs/{view_id}",
@@ -4433,7 +4460,7 @@ mod tests {
         assert_eq!(initial.status(), StatusCode::OK);
         assert_eq!(
             read_json(initial).await,
-            serde_json::json!({"exposure": "off", "controller": false, "activity": []})
+            serde_json::json!({"exposure": "off", "exposureDefault": true, "controller": false, "activity": []})
         );
 
         let updated = app
@@ -4448,7 +4475,7 @@ mod tests {
         assert_eq!(updated.status(), StatusCode::OK);
         assert_eq!(
             read_json(updated).await,
-            serde_json::json!({"exposure": "read", "controller": true})
+            serde_json::json!({"exposure": "read", "exposureDefault": false, "controller": true})
         );
 
         let invalid = app
@@ -4476,7 +4503,41 @@ mod tests {
         let terminals = read_json(listed).await;
         assert_eq!(
             terminals[0]["control"],
-            serde_json::json!({"exposure": "read", "controller": true})
+            serde_json::json!({"exposure": "read", "exposureDefault": false, "controller": true})
+        );
+
+        let defaults = |method: &str, body: Option<&str>| {
+            Request::builder()
+                .method(method)
+                .uri("/api/terminal-control")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, &cookie)
+                .body(body.map_or_else(Body::empty, |body| Body::from(body.to_owned())))
+                .unwrap()
+        };
+        let initial_defaults = app.clone().oneshot(defaults("GET", None)).await.unwrap();
+        assert_eq!(
+            read_json(initial_defaults).await,
+            serde_json::json!({"defaultExposure": "off"})
+        );
+        let updated_defaults = app
+            .clone()
+            .oneshot(defaults("PUT", Some(r#"{"defaultExposure":"write"}"#)))
+            .await
+            .unwrap();
+        assert_eq!(updated_defaults.status(), StatusCode::OK);
+        let reverted = app
+            .clone()
+            .oneshot(control(
+                "PUT",
+                Some(r#"{"exposure":"default"}"#),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_json(reverted).await,
+            serde_json::json!({"exposure": "write", "exposureDefault": true, "controller": true})
         );
 
         let missing = app

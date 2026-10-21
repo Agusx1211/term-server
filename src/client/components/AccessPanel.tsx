@@ -30,6 +30,7 @@ import type {
   AccessSnapshot,
   SecretGrant,
   SecretShare,
+  TerminalControlDefaults,
   TerminalControlDetail,
   TerminalExposure,
   TerminalInfo,
@@ -76,18 +77,21 @@ export function AccessPanel({
   // Held only while the panel is open so a revealed value never outlives the view.
   const [revealed, setRevealed] = useState<RevealedShare | null>(null);
   const [control, setControl] = useState<TerminalControlDetail | null>(null);
+  const [controlDefaults, setControlDefaults] = useState<TerminalControlDefaults | null>(null);
   const pendingShares = snapshot.shares.filter((share) => share.state === "pending").length;
   const pendingCount = snapshot.requests.filter((request) => request.state === "pending").length
     + pendingShares;
 
   const refresh = useCallback(async (signal?: AbortSignal) => {
-    const [next, nextControl] = await Promise.all([
+    const [next, nextControl, nextDefaults] = await Promise.all([
       api.terminalAccess(terminal.id, signal),
       // Terminal control is Unix-only; the rest of the panel works without it.
       api.terminalControl(terminal.id, signal).catch(() => null),
+      api.terminalControlDefaults(signal).catch(() => null),
     ]);
     setSnapshot(next);
     setControl(nextControl);
+    setControlDefaults(nextDefaults);
     setError("");
     setLoading(false);
   }, [terminal.id]);
@@ -252,15 +256,31 @@ export function AccessPanel({
     );
   };
 
-  const setExposure = async (exposure: TerminalExposure) => {
-    if (!control || control.exposure === exposure) return;
-    if (exposure === "write" && !window.confirm(
+  const setExposure = async (exposure: TerminalExposure | "default") => {
+    if (!control) return;
+    if (exposure === "default" ? control.exposureDefault : !control.exposureDefault && control.exposure === exposure) return;
+    const effective = exposure === "default" ? controlDefaults?.defaultExposure ?? "off" : exposure;
+    if (effective === "write" && control.exposure !== "write" && !window.confirm(
       `Let controlling terminals type into ${terminal.name}?\n\nAn agent with this access can run any command here, as you.`,
     )) return;
     await perform(
       "control-exposure",
       () => api.updateTerminalControl(terminal.id, { exposure }),
-      `${terminal.name}: ${exposureLabel(exposure).toLowerCase()}`,
+      exposure === "default"
+        ? `${terminal.name} follows the default again`
+        : `${terminal.name}: ${exposureLabel(exposure).toLowerCase()}`,
+    );
+  };
+
+  const setDefaultExposure = async (defaultExposure: TerminalExposure) => {
+    if (!controlDefaults || controlDefaults.defaultExposure === defaultExposure) return;
+    if (defaultExposure === "write" && !window.confirm(
+      "Let controlling terminals type into every terminal that has no setting of its own?\n\nAn agent with this access can run any command in those terminals, as you. Terminals you set individually keep their setting.",
+    )) return;
+    await perform(
+      "control-default",
+      () => api.updateTerminalControlDefaults({ defaultExposure }),
+      `Default for all terminals: ${exposureLabel(defaultExposure).toLowerCase()}`,
     );
   };
 
@@ -316,8 +336,10 @@ export function AccessPanel({
         {control && (
           <TerminalControlSection
             control={control}
+            defaults={controlDefaults}
             busy={busy}
             onExposure={(exposure) => void setExposure(exposure)}
+            onDefaultExposure={(exposure) => void setDefaultExposure(exposure)}
             onController={(controller) => void setController(controller)}
           />
         )}
@@ -582,16 +604,22 @@ const EXPOSURE_CHOICES: { exposure: TerminalExposure; label: string }[] = [
 
 function TerminalControlSection({
   control,
+  defaults,
   busy,
   onExposure,
+  onDefaultExposure,
   onController,
 }: {
   control: TerminalControlDetail;
+  defaults: TerminalControlDefaults | null;
   busy: string | null;
-  onExposure: (exposure: TerminalExposure) => void;
+  onExposure: (exposure: TerminalExposure | "default") => void;
+  onDefaultExposure: (exposure: TerminalExposure) => void;
   onController: (controller: boolean) => void;
 }) {
   const disabled = busy !== null;
+  const defaultExposure = defaults?.defaultExposure ?? "off";
+  const defaultLabel = EXPOSURE_CHOICES.find((choice) => choice.exposure === defaultExposure)?.label ?? "Off";
   return (
     <section class="process-section access-section access-control-section" data-terminal-control-section>
       <div class="process-section-heading">
@@ -604,22 +632,61 @@ function TerminalControlSection({
           <small>Read lets them see the screen, history, and processes. Read &amp; write also lets them type, rename, and close it.</small>
         </span>
         <span class="access-segmented" role="radiogroup" aria-label="Share this terminal with controlling terminals">
-          {EXPOSURE_CHOICES.map((choice) => (
-            <button
-              key={choice.exposure}
-              type="button"
-              role="radio"
-              aria-checked={control.exposure === choice.exposure}
-              class={`access-segment ${choice.exposure} ${control.exposure === choice.exposure ? "selected" : ""}`}
-              data-exposure={choice.exposure}
-              disabled={disabled}
-              onClick={() => onExposure(choice.exposure)}
-            >
-              {choice.label}
-            </button>
-          ))}
+          <button
+            type="button"
+            role="radio"
+            aria-checked={control.exposureDefault === true}
+            class={`access-segment default ${defaultExposure} ${control.exposureDefault ? "selected" : ""}`}
+            data-exposure="default"
+            title="Follow the default for all terminals"
+            disabled={disabled || !defaults}
+            onClick={() => onExposure("default")}
+          >
+            Default ({defaultLabel})
+          </button>
+          {EXPOSURE_CHOICES.map((choice) => {
+            const selected = !control.exposureDefault && control.exposure === choice.exposure;
+            return (
+              <button
+                key={choice.exposure}
+                type="button"
+                role="radio"
+                aria-checked={selected}
+                class={`access-segment ${choice.exposure} ${selected ? "selected" : ""}`}
+                data-exposure={choice.exposure}
+                disabled={disabled}
+                onClick={() => onExposure(choice.exposure)}
+              >
+                {choice.label}
+              </button>
+            );
+          })}
         </span>
       </div>
+      {defaults && (
+        <div class="access-control-row">
+          <span class="access-control-copy">
+            <strong><Eye size={12} /> Default for all terminals</strong>
+            <small>Applies to every terminal without a setting of its own, including new ones.</small>
+          </span>
+          <span class="access-segmented" role="radiogroup" aria-label="Default sharing for all terminals">
+            {EXPOSURE_CHOICES.map((choice) => (
+              <button
+                key={choice.exposure}
+                type="button"
+                role="radio"
+                aria-checked={defaultExposure === choice.exposure}
+                class={`access-segment ${choice.exposure} ${defaultExposure === choice.exposure ? "selected" : ""}`}
+                data-default-exposure={choice.exposure}
+                disabled={disabled}
+                onClick={() => onDefaultExposure(choice.exposure)}
+              >
+                {choice.label}
+              </button>
+            ))}
+          </span>
+        </div>
+      )}
       <label class="access-control-row access-control-toggle">
         <span class="access-control-copy">
           <strong><Radar size={12} /> Control other terminals</strong>

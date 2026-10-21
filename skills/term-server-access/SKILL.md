@@ -83,7 +83,7 @@ Exit codes are the command's exit code after approval, `126` for rejection, and 
 
 ## Other terminals
 
-When the user turns on **Control other terminals** in this terminal's Access panel, you can see and drive the terminals they share. Every terminal is hidden by default; the user shares each one as **Read** (screen, history, processes) or **Read & write** (also typing, renaming, terminating processes, killing). Hidden terminals look exactly like missing ones. Use this only when the user asks you to look at, follow, or start work in other terminals.
+When the user turns on **Control other terminals** in this terminal's Access panel, you can see and drive the terminals they share. Every terminal is hidden unless the user shares it, one by one or through a default for all terminals, as **Read** (screen, history, processes) or **Read & write** (also typing, renaming, terminating processes, killing). Hidden terminals look exactly like missing ones. Use this only when the user asks you to look at, follow, or start work in other terminals.
 
 ```bash
 "$TERM_SERVER_EXECUTABLE" access terminals --agent omp list

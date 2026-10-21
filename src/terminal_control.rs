@@ -3,7 +3,9 @@
 //! Every terminal carries two independent settings that only the user can
 //! change from its Access panel: how much a controlling terminal may do to it
 //! (`exposure`: off, read, or read and write), and whether processes inside it
-//! may control other terminals at all (`controller`). Both default to off.
+//! may control other terminals at all (`controller`). Both default to off. A
+//! terminal without its own exposure uses the user's default exposure, which
+//! also starts off.
 //!
 //! A controlling process proves which terminal it runs in the same way access
 //! requests do: the control socket reads the peer's kernel-reported pid, and
@@ -50,7 +52,9 @@ use crate::{
 pub const CONTROL_SOCKET_NAME: &str = "terminal-control.sock";
 pub const CONTROL_SOCKET_ENV: &str = "TERM_SERVER_CONTROL_SOCKET";
 const SETTINGS_FILE_NAME: &str = "terminal-control.json";
-const SETTINGS_SCHEMA_VERSION: u8 = 1;
+/// Version 1 stored every terminal's exposure, with off meaning "not shared";
+/// version 2 stores only exposures the user chose, plus the default.
+const SETTINGS_SCHEMA_VERSION: u8 = 2;
 /// Left behind by the singleton Supervisor this module replaced.
 const LEGACY_CREDENTIALS_FILE_NAME: &str = "supervisor-credentials.json";
 const MAX_CONTROL_REQUEST_BYTES: u64 = 128 * 1024;
@@ -132,8 +136,9 @@ pub enum TerminalExposure {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalControlSettings {
-    #[serde(default)]
-    pub exposure: TerminalExposure,
+    /// The user's choice for this terminal; `None` follows the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exposure: Option<TerminalExposure>,
     #[serde(default)]
     pub controller: bool,
     /// The controlling terminal that created this one, if any.
@@ -151,9 +156,36 @@ impl TerminalControlSettings {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UpdateTerminalControl {
     #[serde(default)]
-    pub exposure: Option<TerminalExposure>,
+    pub exposure: Option<ExposureChoice>,
     #[serde(default)]
     pub controller: Option<bool>,
+}
+
+/// A per-terminal exposure, or `default` to follow the user's default again.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ExposureChoice {
+    Off,
+    Read,
+    Write,
+    Default,
+}
+
+impl ExposureChoice {
+    fn exposure(self) -> Option<TerminalExposure> {
+        match self {
+            Self::Off => Some(TerminalExposure::Off),
+            Self::Read => Some(TerminalExposure::Read),
+            Self::Write => Some(TerminalExposure::Write),
+            Self::Default => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TerminalControlDefaults {
+    pub default_exposure: TerminalExposure,
 }
 
 /// One action a controlling terminal took on a terminal.
@@ -171,8 +203,13 @@ pub struct TerminalControlActivity {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalControlSummary {
-    #[serde(flatten)]
-    pub settings: TerminalControlSettings,
+    /// The exposure in effect: the terminal's own choice, or the default.
+    pub exposure: TerminalExposure,
+    /// Whether `exposure` comes from the default rather than this terminal.
+    pub exposure_default: bool,
+    pub controller: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_read_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -199,6 +236,8 @@ struct Observations {
 #[serde(rename_all = "camelCase")]
 struct StoredSettings {
     schema_version: u8,
+    #[serde(default)]
+    default_exposure: TerminalExposure,
     #[serde(default)]
     terminals: HashMap<Uuid, TerminalControlSettings>,
 }
@@ -660,6 +699,8 @@ pub struct TerminalControlService {
     socket_path: PathBuf,
     settings_path: PathBuf,
     settings: parking_lot::RwLock<HashMap<Uuid, TerminalControlSettings>>,
+    /// Locked after `settings` whenever both are needed.
+    default_exposure: parking_lot::RwLock<TerminalExposure>,
     observations: parking_lot::Mutex<HashMap<Uuid, Observations>>,
     missing_since: parking_lot::Mutex<HashMap<Uuid, Instant>>,
     prune_grace: Duration,
@@ -682,12 +723,13 @@ impl TerminalControlService {
             }
         }
         let settings_path = data_directory.join(SETTINGS_FILE_NAME);
-        let settings = load_settings(&settings_path);
+        let (default_exposure, settings) = load_settings(&settings_path);
         Ok(Arc::new(Self {
             workspace,
             socket_path: data_directory.join(CONTROL_SOCKET_NAME),
             settings_path,
             settings: parking_lot::RwLock::new(settings),
+            default_exposure: parking_lot::RwLock::new(default_exposure),
             observations: parking_lot::Mutex::new(HashMap::new()),
             missing_since: parking_lot::Mutex::new(HashMap::new()),
             prune_grace: PRUNE_GRACE,
@@ -745,12 +787,43 @@ impl TerminalControlService {
             .unwrap_or_default()
     }
 
+    /// The exposure in effect for a terminal.
+    pub fn exposure(&self, terminal_id: Uuid) -> TerminalExposure {
+        self.settings(terminal_id)
+            .exposure
+            .unwrap_or_else(|| *self.default_exposure.read())
+    }
+
+    pub fn defaults(&self) -> TerminalControlDefaults {
+        TerminalControlDefaults {
+            default_exposure: *self.default_exposure.read(),
+        }
+    }
+
+    /// Changes the exposure of every terminal without a choice of its own.
+    pub fn set_defaults(
+        &self,
+        defaults: TerminalControlDefaults,
+    ) -> Result<TerminalControlDefaults, ControlError> {
+        let settings = self.settings.write();
+        let mut default_exposure = self.default_exposure.write();
+        if *default_exposure != defaults.default_exposure {
+            persist_settings(&self.settings_path, defaults.default_exposure, &settings)?;
+            *default_exposure = defaults.default_exposure;
+        }
+        Ok(defaults)
+    }
+
     pub fn summary(&self, terminal_id: Uuid) -> TerminalControlSummary {
         let settings = self.settings(terminal_id);
+        let default_exposure = *self.default_exposure.read();
         let observations = self.observations.lock();
         let observed = observations.get(&terminal_id);
         TerminalControlSummary {
-            settings,
+            exposure: settings.exposure.unwrap_or(default_exposure),
+            exposure_default: settings.exposure.is_none(),
+            controller: settings.controller,
+            created_by: settings.created_by,
             last_read_at: observed.and_then(|observed| observed.last_read_at),
             last_read_by: observed.and_then(|observed| observed.last_read_by.clone()),
         }
@@ -774,8 +847,8 @@ impl TerminalControlService {
         update: UpdateTerminalControl,
     ) -> Result<TerminalControlSummary, ControlError> {
         self.modify(terminal_id, |settings| {
-            if let Some(exposure) = update.exposure {
-                settings.exposure = exposure;
+            if let Some(choice) = update.exposure {
+                settings.exposure = choice.exposure();
             }
             if let Some(controller) = update.controller {
                 settings.controller = controller;
@@ -793,7 +866,7 @@ impl TerminalControlService {
         }
         let mut updated = settings.clone();
         updated.remove(&terminal_id);
-        persist_settings(&self.settings_path, &updated)?;
+        persist_settings(&self.settings_path, *self.default_exposure.read(), &updated)?;
         *settings = updated;
         Ok(())
     }
@@ -833,7 +906,8 @@ impl TerminalControlService {
             } else {
                 let mut updated = settings.clone();
                 updated.retain(|id, _| !expired.contains(id));
-                match persist_settings(&self.settings_path, &updated) {
+                match persist_settings(&self.settings_path, *self.default_exposure.read(), &updated)
+                {
                     Ok(()) => {
                         *settings = updated;
                         true
@@ -869,7 +943,7 @@ impl TerminalControlService {
         } else {
             updated.insert(terminal_id, next);
         }
-        persist_settings(&self.settings_path, &updated)?;
+        persist_settings(&self.settings_path, *self.default_exposure.read(), &updated)?;
         *settings = updated;
         Ok(())
     }
@@ -991,7 +1065,7 @@ impl TerminalControlService {
             .iter()
             .find(|terminal| terminal.id == terminal_id)
             .ok_or(ControlError::NotShared)?;
-        match self.settings(terminal_id).exposure {
+        match self.exposure(terminal_id) {
             TerminalExposure::Off => Err(ControlError::NotShared),
             exposure if exposure < needed => Err(ControlError::ReadOnly),
             _ => Ok(terminal),
@@ -1034,7 +1108,7 @@ impl TerminalControlService {
                 let visible = terminals
                     .iter()
                     .filter_map(|terminal| {
-                        let access = self.settings(terminal.id).exposure;
+                        let access = self.exposure(terminal.id);
                         let is_self = terminal.id == caller.id;
                         (is_self || access != TerminalExposure::Off).then(|| ControlledTerminal {
                             terminal: terminal.clone(),
@@ -1122,7 +1196,7 @@ impl TerminalControlService {
                     })
                     .await?;
                 if let Err(error) = self.modify(created.id, |settings| {
-                    settings.exposure = TerminalExposure::Write;
+                    settings.exposure = Some(TerminalExposure::Write);
                     settings.created_by = Some(caller.id);
                 }) {
                     let _ = self.workspace.remove(created.id).await;
@@ -1242,17 +1316,31 @@ fn current_millis() -> u64 {
         .unwrap_or_default()
 }
 
-fn load_settings(path: &Path) -> HashMap<Uuid, TerminalControlSettings> {
+fn load_settings(path: &Path) -> (TerminalExposure, HashMap<Uuid, TerminalControlSettings>) {
     match std::fs::read(path) {
         Ok(bytes) => match serde_json::from_slice::<StoredSettings>(&bytes) {
-            Ok(stored) if stored.schema_version == SETTINGS_SCHEMA_VERSION => stored.terminals,
+            Ok(stored) if stored.schema_version == SETTINGS_SCHEMA_VERSION => {
+                (stored.default_exposure, stored.terminals)
+            }
+            Ok(mut stored) if stored.schema_version == 1 => {
+                // Version 1 had no default, so its "off" only meant not shared yet.
+                for settings in stored.terminals.values_mut() {
+                    if settings.exposure == Some(TerminalExposure::Off) {
+                        settings.exposure = None;
+                    }
+                }
+                stored
+                    .terminals
+                    .retain(|_, settings| !settings.is_default());
+                (TerminalExposure::Off, stored.terminals)
+            }
             Ok(stored) => {
                 tracing::warn!(
                     path = %path.display(),
                     schema_version = stored.schema_version,
                     "ignoring terminal control settings with an unsupported schema"
                 );
-                HashMap::new()
+                (TerminalExposure::Off, HashMap::new())
             }
             Err(error) => {
                 tracing::warn!(
@@ -1260,23 +1348,26 @@ fn load_settings(path: &Path) -> HashMap<Uuid, TerminalControlSettings> {
                     path = %path.display(),
                     "ignoring invalid terminal control settings"
                 );
-                HashMap::new()
+                (TerminalExposure::Off, HashMap::new())
             }
         },
-        Err(error) if error.kind() == io::ErrorKind::NotFound => HashMap::new(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            (TerminalExposure::Off, HashMap::new())
+        }
         Err(error) => {
             tracing::warn!(
                 %error,
                 path = %path.display(),
                 "unable to load terminal control settings"
             );
-            HashMap::new()
+            (TerminalExposure::Off, HashMap::new())
         }
     }
 }
 
 fn persist_settings(
     path: &Path,
+    default_exposure: TerminalExposure,
     settings: &HashMap<Uuid, TerminalControlSettings>,
 ) -> io::Result<()> {
     let parent = path
@@ -1285,6 +1376,7 @@ fn persist_settings(
     std::fs::create_dir_all(parent)?;
     let stored = StoredSettings {
         schema_version: SETTINGS_SCHEMA_VERSION,
+        default_exposure,
         terminals: settings.clone(),
     };
     let mut temporary = NamedTempFile::new_in(parent)?;
@@ -1834,11 +1926,16 @@ mod tests {
     }
 
     fn share(service: &TerminalControlService, terminal_id: Uuid, exposure: TerminalExposure) {
+        let choice = match exposure {
+            TerminalExposure::Off => ExposureChoice::Off,
+            TerminalExposure::Read => ExposureChoice::Read,
+            TerminalExposure::Write => ExposureChoice::Write,
+        };
         service
             .update(
                 terminal_id,
                 UpdateTerminalControl {
-                    exposure: Some(exposure),
+                    exposure: Some(choice),
                     controller: None,
                 },
             )
@@ -2097,7 +2194,7 @@ mod tests {
             serde_json::from_value::<ControlledTerminal>(created.result.unwrap()).unwrap();
         assert_eq!(created.access, TerminalExposure::Write);
         let settings = service.settings(created.terminal.id);
-        assert_eq!(settings.exposure, TerminalExposure::Write);
+        assert_eq!(settings.exposure, Some(TerminalExposure::Write));
         assert_eq!(settings.created_by, Some(caller.id));
         assert!(!settings.controller);
         assert_eq!(
@@ -2190,29 +2287,123 @@ mod tests {
         assert_eq!(
             reloaded.settings(kept.id),
             TerminalControlSettings {
-                exposure: TerminalExposure::Read,
+                exposure: Some(TerminalExposure::Read),
                 controller: true,
                 created_by: None,
             }
         );
-        assert_eq!(reloaded.settings(gone).exposure, TerminalExposure::Write);
+        assert_eq!(
+            reloaded.settings(gone).exposure,
+            Some(TerminalExposure::Write)
+        );
         let listed = workspace.list().await.unwrap();
         reloaded.retain(&listed);
         assert_eq!(
             reloaded.settings(gone).exposure,
-            TerminalExposure::Write,
+            Some(TerminalExposure::Write),
             "a terminal missing from one listing keeps its settings"
         );
         Arc::get_mut(&mut reloaded).unwrap().prune_grace = Duration::ZERO;
         reloaded.retain(&listed);
         assert_eq!(reloaded.settings(gone), TerminalControlSettings::default());
-        assert_eq!(reloaded.settings(kept.id).exposure, TerminalExposure::Read);
+        assert_eq!(
+            reloaded.settings(kept.id).exposure,
+            Some(TerminalExposure::Read)
+        );
         reloaded.forget(kept.id).unwrap();
         let after = TerminalControlService::new(workspace.clone(), directory.path())
             .await
             .unwrap();
         assert_eq!(after.settings(kept.id), TerminalControlSettings::default());
         workspace.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_default_shares_every_terminal_without_its_own_choice() {
+        let (directory, service, workspace, _terminals) = test_service().await;
+        let caller = shell(&workspace, "default-caller").await;
+        let unset = shell(&workspace, "default-unset").await;
+        let hidden = shell(&workspace, "default-hidden").await;
+        allow_control(&service, caller.id);
+        share(&service, hidden.id, TerminalExposure::Off);
+        service
+            .set_defaults(TerminalControlDefaults {
+                default_exposure: TerminalExposure::Read,
+            })
+            .unwrap();
+
+        let summary = service.summary(unset.id);
+        assert_eq!(summary.exposure, TerminalExposure::Read);
+        assert!(summary.exposure_default);
+        assert!(!service.summary(hidden.id).exposure_default);
+        let listed = control(&service, caller.id, ControlCommand::Terminals).await;
+        let listed = serde_json::from_value::<Vec<ControlledTerminal>>(listed.result.unwrap())
+            .unwrap()
+            .into_iter()
+            .map(|terminal| (terminal.terminal.id, terminal.access))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(listed.get(&unset.id), Some(&TerminalExposure::Read));
+        assert_eq!(listed.get(&caller.id), Some(&TerminalExposure::Read));
+        assert!(
+            !listed.contains_key(&hidden.id),
+            "an explicit off overrides the default"
+        );
+        let refused = control(
+            &service,
+            caller.id,
+            ControlCommand::Send {
+                terminal_id: unset.id,
+                data: "echo no\r".into(),
+            },
+        )
+        .await;
+        assert_eq!(
+            refused.error.as_deref(),
+            Some(ControlError::ReadOnly.to_string().as_str())
+        );
+
+        service
+            .update(
+                hidden.id,
+                UpdateTerminalControl {
+                    exposure: Some(ExposureChoice::Default),
+                    controller: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(service.exposure(hidden.id), TerminalExposure::Read);
+
+        let reloaded = TerminalControlService::new(workspace.clone(), directory.path())
+            .await
+            .unwrap();
+        assert_eq!(reloaded.defaults().default_exposure, TerminalExposure::Read);
+        assert_eq!(reloaded.exposure(unset.id), TerminalExposure::Read);
+        workspace.shutdown().await;
+    }
+
+    #[test]
+    fn version_one_settings_treat_off_as_unset() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(SETTINGS_FILE_NAME);
+        let shared = Uuid::from_u128(1);
+        let controller = Uuid::from_u128(2);
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 1,
+                "terminals": {
+                    shared.to_string(): {"exposure": "write", "controller": false},
+                    controller.to_string(): {"exposure": "off", "controller": true},
+                },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let (default_exposure, settings) = load_settings(&path);
+        assert_eq!(default_exposure, TerminalExposure::Off);
+        assert_eq!(settings[&shared].exposure, Some(TerminalExposure::Write));
+        assert_eq!(settings[&controller].exposure, None);
+        assert!(settings[&controller].controller);
     }
 
     #[tokio::test]
