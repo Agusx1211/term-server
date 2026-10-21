@@ -4,61 +4,69 @@ import { expect, test } from "../fixtures/test.js";
 import { expectTerminalBuffer } from "../assertions/terminal-state.js";
 import { installBrowserErrorCollectors } from "../fixtures/artifacts.js";
 import { LoginPage } from "../pages/login-page.js";
-import { TerminalPanePage } from "../pages/terminal-pane.js";
 import { WorkbenchPage } from "../pages/workbench-page.js";
 
 const WAIT_TIMEOUT_MS = 20_000;
+const CONTROL = '"$TERM_SERVER_EXECUTABLE" access terminals --agent e2e';
 
 interface TerminalResponse {
   id: string;
   name: string;
-  kind: "regular" | "supervisor";
 }
 
-async function createShellTerminal(page: Page): Promise<TerminalResponse> {
-  return page.evaluate(async () => {
+async function createShellTerminal(page: Page, path: string): Promise<TerminalResponse> {
+  return page.evaluate(async (path) => {
     const response = await fetch("/api/terminals", {
       method: "POST",
       credentials: "same-origin",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        path: "supervisor-history-target",
-        cwd: "/tmp",
-        shell: "/bin/sh",
-      }),
+      body: JSON.stringify({ path, cwd: "/tmp", shell: "/bin/sh" }),
     });
     if (!response.ok) throw new Error(`terminal creation failed (${response.status})`);
     return await response.json() as TerminalResponse;
-  });
+  }, path);
 }
 
-test("P0-24 Supervisor delivery and retained history are acknowledged @p0", async ({ page, baseURL }) => {
+async function updateControl(
+  page: Page,
+  terminalId: string,
+  update: { exposure?: "off" | "read" | "write"; controller?: boolean },
+): Promise<void> {
+  await page.evaluate(async ({ terminalId, update }) => {
+    const response = await fetch(`/api/terminals/${terminalId}/control`, {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(update),
+    });
+    if (!response.ok) throw new Error(`control update failed (${response.status})`);
+  }, { terminalId, update });
+}
+
+test("P0-24 Controlled delivery and retained history are acknowledged @p0", async ({ page, baseURL }) => {
   const browserErrors = installBrowserErrorCollectors(page);
   await page.goto(baseURL);
   await new LoginPage(page).login();
   const workbench = new WorkbenchPage(page);
   await workbench.expectVisible();
 
-  const target = await createShellTerminal(page);
+  const target = await createShellTerminal(page, "controlled-history-target");
+  const controller = await createShellTerminal(page, "history-controller");
+  await updateControl(page, controller.id, { controller: true });
+  await updateControl(page, target.id, { exposure: "write" });
   await page.reload({ waitUntil: "load" });
   await workbench.expectVisible();
 
-  const supervisorResponse = page.waitForResponse((response) => (
-    response.request().method() === "POST"
-    && new URL(response.url()).pathname === "/api/supervisor"
-  ));
-  await page.getByRole("button", { name: "Create supervisor terminal", exact: true }).click();
-  const supervisor = await (await supervisorResponse).json() as TerminalResponse;
-  const supervisorPane = new TerminalPanePage(page, supervisor.id);
-  await supervisorPane.expectConnected();
+  const controllerPane = await workbench.openTerminal({ id: controller.id, name: controller.name });
+  await controllerPane.expectConnected();
 
-  const wakeMarker = "SUPERVISOR-DELIVERY-WAKE";
+  const wakeMarker = "CONTROL-DELIVERY-WAKE";
   const wakeCommand = `printf '${wakeMarker}\\n'`;
-  await supervisorPane.sendInput(
-    `term-server-supervisor send ${target.id} --text ${JSON.stringify(wakeCommand)} --enter`,
+  await controllerPane.sendInput(
+    `${CONTROL} send ${target.id} --text ${JSON.stringify(wakeCommand)} --enter`,
     true,
   );
-  await expectTerminalBuffer(page, supervisor.id, { contains: '"sent": true' }, {
+  await expectTerminalBuffer(page, controller.id, { contains: '"sent": true' }, {
     timeout: WAIT_TIMEOUT_MS,
   });
 
@@ -77,14 +85,14 @@ test("P0-24 Supervisor delivery and retained history are acknowledged @p0", asyn
         sourceId: "message-1",
         timestamp: 1,
         role: "user",
-        text: "SUPERVISOR-HISTORY-FIRST",
+        text: "CONTROL-HISTORY-FIRST",
       },
       {
         kind: "message",
         sourceId: "message-2",
         timestamp: 2,
         role: "assistant",
-        text: "SUPERVISOR-HISTORY-SECOND",
+        text: "CONTROL-HISTORY-SECOND",
       },
     ],
   };
@@ -97,62 +105,62 @@ test("P0-24 Supervisor delivery and retained history are acknowledged @p0", asyn
     timeout: WAIT_TIMEOUT_MS,
   });
 
-  await page.getByRole("button", { name: "Open supervisor terminal", exact: true }).click();
-  await supervisorPane.expectConnected();
-  await supervisorPane.sendInput(
-    `term-server-supervisor transcript ${target.id} --limit 1 --jsonl`,
+  await workbench.openTerminal({ id: controller.id, name: controller.name });
+  await controllerPane.expectConnected();
+  await controllerPane.sendInput(
+    `${CONTROL} transcript ${target.id} --limit 1 --jsonl`,
     true,
   );
-  await expectTerminalBuffer(page, supervisor.id, { contains: "SUPERVISOR-HISTORY-FIRST" }, {
+  await expectTerminalBuffer(page, controller.id, { contains: "CONTROL-HISTORY-FIRST" }, {
     timeout: WAIT_TIMEOUT_MS,
   });
-  await expectTerminalBuffer(page, supervisor.id, { contains: '"nextSequence":1' }, {
+  await expectTerminalBuffer(page, controller.id, { contains: '"nextSequence":1' }, {
     timeout: WAIT_TIMEOUT_MS,
   });
-  await supervisorPane.sendInput(
-    `term-server-supervisor transcript ${target.id} --from-sequence 1 --limit 1 --jsonl`,
+  await controllerPane.sendInput(
+    `${CONTROL} transcript ${target.id} --from-sequence 1 --limit 1 --jsonl`,
     true,
   );
-  await expectTerminalBuffer(page, supervisor.id, { contains: "SUPERVISOR-HISTORY-SECOND" }, {
+  await expectTerminalBuffer(page, controller.id, { contains: "CONTROL-HISTORY-SECOND" }, {
     timeout: WAIT_TIMEOUT_MS,
   });
-  await supervisorPane.sendInput(
-    `term-server-supervisor scrollback ${target.id} --jsonl`,
+  await controllerPane.sendInput(
+    `${CONTROL} scrollback ${target.id} --jsonl`,
     true,
   );
-  await expectTerminalBuffer(page, supervisor.id, { contains: wakeMarker }, {
+  await expectTerminalBuffer(page, controller.id, { contains: wakeMarker }, {
     timeout: WAIT_TIMEOUT_MS,
   });
-  await expectTerminalBuffer(page, supervisor.id, { contains: '"recordType":"scrollback"' }, {
+  await expectTerminalBuffer(page, controller.id, { contains: '"recordType":"scrollback"' }, {
     timeout: WAIT_TIMEOUT_MS,
   });
 
   await workbench.openTerminal({ id: target.id, name: target.name });
   await targetPane.expectConnected();
-  await targetPane.sendInput(`term-server-supervisor transcript ${target.id}`, true);
-  await expectTerminalBuffer(page, target.id, { contains: "term-server-supervisor: not found" }, {
+  await targetPane.sendInput(`${CONTROL} transcript ${controller.id}; echo "DENIED-EXIT=$?"`, true);
+  await expectTerminalBuffer(page, target.id, { contains: "DENIED-EXIT=126" }, {
     timeout: WAIT_TIMEOUT_MS,
   });
 
-  await page.getByRole("button", { name: "Open supervisor terminal", exact: true }).click();
-  await supervisorPane.sendInput(
-    `term-server-supervisor send ${target.id} --text exit --enter`,
+  await workbench.openTerminal({ id: controller.id, name: controller.name });
+  await controllerPane.sendInput(
+    `${CONTROL} send ${target.id} --text exit --enter`,
     true,
   );
   const targetRow = page.locator(`.terminal-row[data-terminal-id="${target.id}"]`);
   await expect(targetRow.locator(".tree-status")).toBeVisible({ timeout: WAIT_TIMEOUT_MS });
-  await supervisorPane.sendInput(
-    `term-server-supervisor send ${target.id} --text 'echo SHOULD-NOT-BE-SENT' --enter`,
+  await controllerPane.sendInput(
+    `${CONTROL} send ${target.id} --text 'echo SHOULD-NOT-BE-SENT' --enter`,
     true,
   );
-  await expectTerminalBuffer(page, supervisor.id, { contains: "terminal is not running" }, {
+  await expectTerminalBuffer(page, controller.id, { contains: "terminal is not running" }, {
     timeout: WAIT_TIMEOUT_MS,
   });
-  await supervisorPane.sendInput(
-    `term-server-supervisor transcript ${target.id} --from-sequence 0 --jsonl`,
+  await controllerPane.sendInput(
+    `${CONTROL} transcript ${target.id} --from-sequence 0 --jsonl`,
     true,
   );
-  await expectTerminalBuffer(page, supervisor.id, { contains: "SUPERVISOR-HISTORY-SECOND" }, {
+  await expectTerminalBuffer(page, controller.id, { contains: "CONTROL-HISTORY-SECOND" }, {
     timeout: WAIT_TIMEOUT_MS,
   });
 

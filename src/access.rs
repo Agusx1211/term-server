@@ -2773,7 +2773,6 @@ mod tests {
     fn terminal_info(id: Uuid) -> TerminalInfo {
         TerminalInfo {
             kind: TerminalKind::Regular,
-            supervisor_root: None,
             id,
             name: "test".to_owned(),
             workspace: "test".to_owned(),

@@ -20,10 +20,9 @@ use crate::{
     fili::{FiliClientConfig, FiliService, FiliStream, UpdateFiliSettings},
     history::{AgentTranscriptKind, AgentTranscriptPage, TerminalScrollbackPage},
     terminal::{
-        CreateSupervisorTerminal, CreateTerminal, ProcessInspectorSnapshot, ProcessSignalError,
-        RenameTerminal, TerminalError, TerminalEvent, TerminalInfo, TerminalManager,
-        TerminalScreenSnapshot, TerminalSession, TerminalSizeState, TerminalViewport,
-        terminate_descendant_process,
+        CreateTerminal, ProcessInspectorSnapshot, ProcessSignalError, RenameTerminal,
+        TerminalError, TerminalEvent, TerminalInfo, TerminalManager, TerminalScreenSnapshot,
+        TerminalSession, TerminalSizeState, TerminalViewport, terminate_descendant_process,
     },
     terminal_state::{
         SequencedOutput, SyncMode, TERMINAL_OUTPUT_FRAME_BYTES, TerminalResume, TerminalSync,
@@ -206,26 +205,6 @@ impl WorkspaceBackend {
             }
             #[cfg(unix)]
             Self::Broker(client) => client.create(request).await,
-        }
-    }
-
-    pub async fn create_supervisor(
-        &self,
-        request: CreateSupervisorTerminal,
-    ) -> Result<TerminalInfo, WorkspaceError> {
-        match self {
-            Self::Local { terminals, .. } => {
-                let terminals = terminals.clone();
-                tokio::task::spawn_blocking(move || terminals.create_supervisor(request))
-                    .await
-                    .map_err(|error| WorkspaceError::Unavailable(error.to_string()))?
-                    .map_err(|error| WorkspaceError::Remote {
-                        status: StatusCode::BAD_REQUEST,
-                        message: error.to_string(),
-                    })
-            }
-            #[cfg(unix)]
-            Self::Broker(client) => client.create_supervisor(request).await,
         }
     }
 

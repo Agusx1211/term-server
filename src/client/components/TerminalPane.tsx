@@ -11,8 +11,8 @@ import {
   ClipboardCopy,
   ClipboardPaste,
   CopyPlus,
-  Crown,
   EllipsisVertical,
+  Eye,
   GripVertical,
   Hand,
   Keyboard,
@@ -20,6 +20,7 @@ import {
   ListTree,
   Maximize2,
   PackageOpen,
+  Radar,
   Radio,
   RefreshCw,
   Search,
@@ -79,7 +80,7 @@ import {
   MIN_TERMINAL_FONT_SIZE,
   terminalZoomPercent,
 } from "../lib/terminal-zoom";
-import { supervisorContextActive } from "../lib/supervisor-context";
+import { terminalControlBadges } from "../lib/terminal-control";
 import {
   addTerminalStreamProtocol,
   closeTerminalSocket,
@@ -314,9 +315,7 @@ export function TerminalPane({
   );
   const artifactSignature = artifacts.map((artifact) => artifact.id).join("\u0000");
   const artifactsVisible = artifactsOpen && artifacts.length > 0;
-  const isSupervisor = terminal.kind === "supervisor";
-  const supervisorOutsideRoot = isSupervisor && !supervisorContextActive(terminal);
-  const supervisorRoot = terminal.supervisorRoot ?? "the supervisor directory";
+  const controlBadges = terminalControlBadges(terminal.control);
 
   useEffect(() => {
     const handle = diagnostics.current;
@@ -2052,14 +2051,12 @@ export function TerminalPane({
   return (
     <section
       role="region"
-      aria-label={isSupervisor ? "Supervisor terminal" : `Terminal ${terminal.name}`}
+      aria-label={`Terminal ${terminal.name}`}
       data-terminal-id={terminal.id}
       data-pane-id={paneId}
-      data-terminal-kind={terminal.kind}
-      data-supervisor={isSupervisor ? "true" : "false"}
-      data-supervisor-context={isSupervisor ? (supervisorOutsideRoot ? "outside" : "active") : undefined}
+      data-terminal-control={controlBadges.map((badge) => badge.kind).join(" ") || undefined}
       ref={pane}
-      class={`terminal-pane ${isSupervisor ? "supervisor" : ""} ${supervisorOutsideRoot ? "supervisor-context-outside" : ""} ${active ? "active" : ""} ${artifactsVisible ? "artifacts-visible" : ""}`}
+      class={`terminal-pane ${active ? "active" : ""} ${artifactsVisible ? "artifacts-visible" : ""}`}
       style={{
         "--terminal-color": terminal.color,
         "--terminal-background": mixedTerminalBackground(theme, terminal.color),
@@ -2086,19 +2083,21 @@ export function TerminalPane({
           <GripVertical size={13} />
         </span>
         <span class="terminal-color" style={{ background: terminal.color }} />
-        {isSupervisor && (
-          <span
-            class={`supervisor-identity ${supervisorOutsideRoot ? "warning" : ""}`}
-            data-supervisor-identity="pane"
-            title={supervisorOutsideRoot
-              ? `Supervisor skill discovery is inactive outside ${supervisorRoot}`
-              : "Supervisor controls active"}
+        {controlBadges.map((badge) => (
+          <button
+            key={badge.kind}
+            type="button"
+            class={`pane-control-badge ${badge.kind}`}
+            data-terminal-control-badge={badge.kind}
+            title={`${badge.title}. Change it in the Access panel.`}
+            onClick={() => setAccessOpen(true)}
           >
-            <Crown size={11} aria-hidden="true" />
-            {supervisorOutsideRoot && <TriangleAlert size={11} aria-hidden="true" />}
-            {supervisorOutsideRoot ? "SUPERVISOR · CONTEXT OFF" : "SUPERVISOR"}
-          </span>
-        )}
+            {badge.kind === "controller" ? <Radar size={11} aria-hidden="true" />
+              : badge.kind === "write" ? <Keyboard size={11} aria-hidden="true" />
+              : <Eye size={11} aria-hidden="true" />}
+            {badge.kind === "controller" ? "CONTROLS" : badge.kind === "write" ? "SHARED · RW" : "SHARED · READ"}
+          </button>
+        ))}
         <TerminalPath path={terminal.path} />
         {terminal.broker && (
           terminal.broker.version !== config.build.version
@@ -2285,14 +2284,6 @@ export function TerminalPane({
           )}
         </div>
       </header>
-      {supervisorOutsideRoot && (
-        <div class="supervisor-context-warning" role="status">
-          <TriangleAlert size={14} aria-hidden="true" />
-          <span>
-            Supervisor skill discovery is inactive here. Return to <code>{supervisorRoot}</code> before starting an agent.
-          </span>
-        </div>
-      )}
       <div class="terminal-body">
         <div
           ref={container}

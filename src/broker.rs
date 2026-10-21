@@ -50,8 +50,8 @@ use crate::{
         DEFAULT_TRANSCRIPT_RECORDS, TerminalScrollbackPage,
     },
     terminal::{
-        AgentDetectionExplain, CreateSupervisorTerminal, CreateTerminal, ProcessInspectorSnapshot,
-        RenameTerminal, TerminalInfo, TerminalManager, TerminalScreenSnapshot, TerminalViewport,
+        AgentDetectionExplain, CreateTerminal, ProcessInspectorSnapshot, RenameTerminal,
+        TerminalInfo, TerminalManager, TerminalScreenSnapshot, TerminalViewport,
         is_terminal_descendant, normalize_terminal_path,
     },
     terminal_state::TerminalResume,
@@ -70,7 +70,7 @@ const BROKER_CONTROL_HEADER: &str = "x-term-server-broker-control";
 const DRAIN_INTERVAL: Duration = Duration::from_secs(2);
 /// Every server to broker request is bounded. A broker that accepts the
 /// connection but never answers must not park the caller forever: the same
-/// request holds a supervisor connection, a browser request, or the startup
+/// request holds a terminal control connection, a browser request, or the startup
 /// path behind it, and each retry would leak another stuck task.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 /// Creating a terminal opens a pty and spawns a shell.
@@ -230,14 +230,6 @@ impl BrokerClient {
 
     pub async fn create(&self, request: CreateTerminal) -> Result<TerminalInfo, BrokerError> {
         self.send_json_within(Method::POST, "/terminals", Some(&request), CREATE_TIMEOUT)
-            .await
-    }
-
-    pub async fn create_supervisor(
-        &self,
-        request: CreateSupervisorTerminal,
-    ) -> Result<TerminalInfo, BrokerError> {
-        self.send_json_within(Method::POST, "/supervisor", Some(&request), CREATE_TIMEOUT)
             .await
     }
 
@@ -1091,23 +1083,6 @@ impl BrokerPool {
         Ok(self.current.terminal(terminal))
     }
 
-    pub async fn create_supervisor(
-        &self,
-        request: CreateSupervisorTerminal,
-    ) -> Result<TerminalInfo, BrokerError> {
-        let _guard = self.create_lock.lock().await;
-        let terminals = self.list().await?;
-        if let Some(path) = request.terminal.path.as_deref() {
-            ensure_unique_terminal_name(path, None, &terminals)?;
-        }
-        let terminal = self.current.client.create_supervisor(request).await?;
-        self.owners
-            .write()
-            .await
-            .insert(terminal.id, self.current.clone());
-        Ok(self.current.terminal(terminal))
-    }
-
     pub async fn rename(
         &self,
         id: Uuid,
@@ -1575,6 +1550,20 @@ pub fn legacy_socket_path(data_directory: &Path) -> PathBuf {
     data_directory.join(SOCKET_NAME)
 }
 
+/// The data directory a broker socket belongs to, for clients that only know
+/// the socket path from their environment.
+pub fn data_directory_for_socket(socket: &Path) -> Option<PathBuf> {
+    let parent = socket.parent()?;
+    if parent
+        .file_name()
+        .is_some_and(|name| name == BROKER_DIRECTORY)
+    {
+        parent.parent().map(Path::to_path_buf)
+    } else {
+        Some(parent.to_path_buf())
+    }
+}
+
 fn current_socket_path(data_directory: &Path) -> PathBuf {
     let version = build::VERSION
         .chars()
@@ -1820,7 +1809,6 @@ pub async fn run_session_broker(
         .route("/config", axum::routing::put(configure_broker))
         .route("/fili", get(broker_fili_config).patch(update_broker_fili))
         .route("/fili/stream", get(broker_fili_stream))
-        .route("/supervisor", post(create_broker_supervisor))
         .route(
             "/terminals",
             get(list_broker_terminals).post(create_broker_terminal),
@@ -1993,21 +1981,6 @@ async fn create_broker_terminal(
         .await
         .map_err(|error| {
             tracing::error!(%error, "broker terminal creation task failed");
-            BrokerApiError::Internal
-        })?
-        .map_err(|error| BrokerApiError::BadRequest(error.to_string()))?;
-    Ok((StatusCode::CREATED, Json(state.terminal_info(terminal))))
-}
-
-async fn create_broker_supervisor(
-    State(state): State<BrokerState>,
-    Json(request): Json<CreateSupervisorTerminal>,
-) -> Result<(StatusCode, Json<TerminalInfo>), BrokerApiError> {
-    let terminals = state.terminals.clone();
-    let terminal = tokio::task::spawn_blocking(move || terminals.create_supervisor(request))
-        .await
-        .map_err(|error| {
-            tracing::error!(%error, "broker supervisor creation task failed");
             BrokerApiError::Internal
         })?
         .map_err(|error| BrokerApiError::BadRequest(error.to_string()))?;
