@@ -221,3 +221,89 @@ test("Rendered Markdown keeps feedback outside the source @pr", async ({ page, s
   await page.getByRole("button", { name: "Preview", exact: true }).click();
   await expect(page.getByText("Save your edits before adding a comment.")).toBeVisible();
 });
+
+test("Markdown review keeps comments beside their passages @pr", async ({ page, server, baseURL }) => {
+  const workspace = join(server.dataDir, "layout-workspace");
+  await mkdir(workspace);
+  const file = join(workspace, "proposal.md");
+  await writeFile(file, [
+    "| Field | Value |",
+    "| --- | --- |",
+    "| Description | A short summary of the proposed change and why it matters. |",
+    "| Discussion | Weekly review call |",
+    "",
+    "# Proposal",
+    "",
+    "The rollout starts with a single region and expands after one week.",
+    "",
+  ].join("\n"));
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto(baseURL);
+  await new LoginPage(page).login();
+  const terminal = await createTerminalInCwd(page, workspace);
+  await page.reload();
+  const sidebar = new SidebarPage(page);
+  await sidebar.openTerminal(terminal.name);
+  await sidebar.openFileExplorer();
+  await page.locator("button.file-result").filter({ hasText: "proposal.md" }).click();
+  const article = page.locator(".markdown-preview article");
+  await expect(article.getByRole("heading")).toHaveText("Proposal");
+
+  // Table labels keep whole words on a single line.
+  const label = article.getByRole("cell", { name: "Description", exact: true });
+  expect(await label.evaluate((cell) => {
+    const range = document.createRange();
+    range.selectNodeContents(cell);
+    return range.getClientRects().length;
+  })).toBe(1);
+
+  // A mouse selection opens the composer beside the passage; typing goes straight into it.
+  const passage = "a single region";
+  const points = await article.locator("p").evaluate((paragraph, quote) => {
+    const node = paragraph.firstChild!;
+    const start = node.textContent!.indexOf(quote);
+    const range = document.createRange();
+    range.setStart(node, start);
+    range.setEnd(node, start + quote.length);
+    const rects = Array.from(range.getClientRects());
+    const first = rects[0]!;
+    const last = rects[rects.length - 1]!;
+    return { x1: first.left + 1, y1: first.top + first.height / 2, x2: last.right - 1, y2: last.top + last.height / 2, top: first.top };
+  }, passage);
+  await page.mouse.move(points.x1, points.y1);
+  await page.mouse.down();
+  await page.mouse.move(points.x2, points.y2, { steps: 8 });
+  await page.mouse.up();
+  expect(await page.evaluate(() => window.getSelection()?.toString())).toBe(passage);
+  const comment = page.getByRole("textbox", { name: "Comment", exact: true });
+  await expect(comment).toBeVisible();
+  await page.keyboard.type("Which region goes first?");
+  await expect(comment).toHaveValue("Which region goes first?");
+  await page.keyboard.press("Control+Enter");
+  const card = page.locator(".markdown-comment");
+  await expect(card).toContainText("Which region goes first?");
+  await expect(comment).toHaveCount(0);
+  const cardBox = await card.boundingBox();
+  const articleBox = await article.boundingBox();
+  expect(cardBox!.x).toBeGreaterThan(articleBox!.x + articleBox!.width);
+  expect(Math.abs(cardBox!.y - points.top)).toBeLessThan(24);
+  const review = await page.locator(".markdown-preview section code").innerText();
+  expect(JSON.parse(await readFile(review, "utf8"))).toMatchObject({ comments: [{ quote: passage, body: "Which region goes first?" }] });
+
+  // Read hides review tools without losing an unsent draft.
+  await article.locator("p").evaluate((paragraph) => {
+    const range = document.createRange();
+    range.selectNodeContents(paragraph);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    paragraph.dispatchEvent(new PointerEvent("pointerup", { bubbles: true }));
+  });
+  await comment.fill("Add the expansion criteria.");
+  await page.getByRole("button", { name: "Read", exact: true }).click();
+  await expect(card).toHaveCount(0);
+  await expect(comment).toHaveCount(0);
+  await page.getByRole("button", { name: "Review", exact: true }).click();
+  await expect(card).toHaveCount(1);
+  await expect(comment).toHaveValue("Add the expansion criteria.");
+  expect(await readFile(file, "utf8")).toContain("The rollout starts with a single region");
+});
