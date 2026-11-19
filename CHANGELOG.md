@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.25.1 - 2026-11-19
+
+- Markdown comments appear beside the passages they refer to. Select text to start a comment, or select a highlighted passage to see its feedback. On narrow screens, comments open in a bottom sheet.
+- Switch to **Read** to hide comments and return to **Review** to continue an unfinished draft. Wide screens show a table of contents, and wide tables scroll within the page.
+
 ## 0.25.0 - 2026-11-19
 
 - Markdown files now open in a rendered preview from terminal file links, Files, and artifact tabs. Choose **Edit source** to use the existing editor.
