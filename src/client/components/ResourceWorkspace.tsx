@@ -1,3 +1,4 @@
+import { MarkdownPreview } from "./MarkdownPreview";
 import { useEffect, useRef, useState } from "preact/hooks";
 import { basicSetup, EditorView } from "codemirror";
 import { Compartment, EditorState, StateEffect } from "@codemirror/state";
@@ -36,6 +37,8 @@ interface ResourceDocumentsProps {
   tabs: ResourceTab[];
   activePath?: string;
   theme: ThemeName;
+  reviewTarget?: string;
+  onPasteReview: (path: string) => void;
   onDirty: (path: string, dirty: boolean) => void;
   onNotice: (message: string) => void;
   onOpenArtifactSession: (sessionId: string) => void;
@@ -47,6 +50,8 @@ export function ResourceDocuments({
   activePath,
   theme,
   onDirty,
+  reviewTarget,
+  onPasteReview,
   onNotice,
   onOpenArtifactSession,
   onDeleteArtifact,
@@ -92,6 +97,8 @@ export function ResourceDocuments({
               theme={theme}
               lineWrapping={lineWrapping}
               onToggleLineWrapping={toggleLineWrapping}
+              reviewTarget={reviewTarget}
+              onPasteReview={onPasteReview}
               onDirty={onDirty}
               onNotice={onNotice}
               onOpenArtifactSession={onOpenArtifactSession}
@@ -266,6 +273,8 @@ interface TextDocumentProps {
   theme: ThemeName;
   lineWrapping: boolean;
   onToggleLineWrapping: () => void;
+  reviewTarget?: string;
+  onPasteReview: (path: string) => void;
   onDirty: (path: string, dirty: boolean) => void;
   onNotice: (message: string) => void;
   onOpenArtifactSession: (sessionId: string) => void;
@@ -278,6 +287,8 @@ function TextDocument({
   lineWrapping,
   onToggleLineWrapping,
   onDirty,
+  reviewTarget,
+  onPasteReview,
   onNotice,
   onOpenArtifactSession,
   onDeleteArtifact,
@@ -296,6 +307,15 @@ function TextDocument({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const isArtifact = Boolean(tab.artifact);
+
+  const markdown = /\.(?:md|markdown)$/i.test(tab.name);
+  const [preview, setPreview] = useState(markdown);
+  const [reloadRequest, setReloadRequest] = useState(0);
+  const reloadSource = () => {
+    if (tab.dirty) return;
+    held.current = { loaded: "", saved: "" };
+    setReloadRequest((count) => count + 1);
+  };
 
   // Reload the buffer when the tab points at a revision it does not hold yet.
   // The content is pushed into the live editor rather than remounting it: the
@@ -340,7 +360,7 @@ function TextDocument({
     return () => {
       cancelled = true;
     };
-  }, [tab.path, tab.modifiedAt, tab.dirty]);
+  }, [tab.path, tab.modifiedAt, tab.dirty, reloadRequest]);
 
   const save = async () => {
     if (!document || saving) return;
@@ -353,12 +373,12 @@ function TextDocument({
         version: version.current,
       });
       version.current = saved.version;
-      savedContent.current = content.current;
+      savedContent.current = saved.content;
       // The save already returned the stored content, and the artifact poll
       // reports this modification time moments later; neither is worth a reload.
       held.current.saved = resourceRevision({ path: tab.path, modifiedAt: saved.modifiedAt });
       setDocument(saved);
-      onDirty(tab.path, false);
+      onDirty(tab.path, content.current !== saved.content);
       onNotice(`Saved ${tab.name}`);
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : "Unable to save file";
@@ -452,6 +472,9 @@ function TextDocument({
         <span>{isArtifact ? tab.name : tab.path}</span>
         <ArtifactOriginAction tab={tab} onOpen={onOpenArtifactSession} />
         <em>{isArtifact ? `Artifact · ${language}` : language}</em>
+        {markdown && <button class="resource-editor-action" onClick={() => setPreview(!preview)}>
+          {preview ? "Edit source" : "Preview"}
+        </button>}
         <DownloadAction tab={tab} />
         <button
           class="resource-editor-action resource-copy"
@@ -485,7 +508,16 @@ function TextDocument({
       </header>
       <div class="text-document-body">
         {error && <div key="error" class="resource-error">{error}</div>}
-        <div key="editor" ref={host} class="code-editor" />
+        <div key="editor" ref={host} class="code-editor" style={preview ? { display: "none" } : undefined} />
+        {markdown && document && <MarkdownPreview
+          visible={preview}
+          file={document}
+          content={preview ? content.current : document.content}
+          dirty={tab.dirty}
+          reloadSource={reloadSource}
+          reviewTarget={reviewTarget}
+          onPasteReview={onPasteReview}
+        />}
         {loading && (
           <div key="loading" class="resource-loading loading-overlay">
             <LoaderCircle class="spin" size={16} /> Loading {tab.name}…

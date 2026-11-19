@@ -324,6 +324,9 @@ export const api = {
     if (cwd) params.set("cwd", cwd);
     return request<FileSearchResults>(`/api/files/search?${params}`, { signal });
   },
+  markdownReview: (path: string) => request<MarkdownReview>(`/api/files/review?${fileQuery({ path })}`),
+  addMarkdownComment: (path: string, comment: MarkdownComment) =>
+    request<MarkdownReview>(`/api/files/review?${fileQuery({ path })}`, { method: "POST", body: JSON.stringify(comment) }),
   readFile: (target: FileTarget) => request<FileDocument>(`/api/files/content?${fileQuery(target)}`),
   saveFile: (file: SaveFileRequest) =>
     request<FileDocument>("/api/files/content", { method: "PUT", body: JSON.stringify(file) }),
@@ -402,3 +405,16 @@ export const api = {
       timeoutMs: PROVIDER_REQUEST_TIMEOUT_MS,
     }),
 };
+
+export interface MarkdownComment {
+  id: string;
+  offset: number;
+  version: string;
+  quote: string;
+  body: string;
+}
+
+export interface MarkdownReview {
+  path: string;
+  comments: MarkdownComment[];
+}

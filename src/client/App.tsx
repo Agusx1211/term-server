@@ -2322,6 +2322,12 @@ export function App() {
                 <ResourceDocuments
                   tabs={resources}
                   activePath={activeResource}
+                  reviewTarget={terminals.find((terminal) => terminal.id === activeId && terminal.status === "running")?.name}
+                  onPasteReview={(path) => {
+                    if (!activeId || /[\x00-\x1f\x7f]/.test(path)) return;
+                    openTerminal(activeId);
+                    setPasteRequest({ id: activeId, text: shellQuote(path), nonce: Date.now() });
+                  }}
                   theme={theme}
                   onDirty={(path, dirty) => {
                     const next = resourcesRef.current.map((resource) => (

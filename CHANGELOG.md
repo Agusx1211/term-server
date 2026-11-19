@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.25.0 - 2026-11-19
+
+- Markdown files now open in a rendered preview from terminal file links, Files, and artifact tabs. Choose **Edit source** to use the existing editor.
+- Select a passage and add a comment. Comments persist separately from the source and keep the quoted text and revision. Use **Copy review path** to give a terminal collaborator the stored feedback.
+- Existing installations can update automatically. No broker restart or data migration is required.
+
 ## 0.24.0 - 2026-10-21
 
 Share every terminal with controlling terminals at once.
