@@ -1,6 +1,6 @@
 {
   "name": "term-server",
-  "version": "0.24.0",
+  "version": "0.25.0",
   "description": "A fast, secure, Rust-powered web terminal workspace.",
   "type": "module",
   "private": true,
@@ -56,11 +56,13 @@
     "@xterm/xterm": "6.1.0-beta.291",
     "codemirror": "^6.0.2",
     "lucide-preact": "^1.25.0",
+    "markdown-it": "^15.0.3",
     "preact": "^10.29.7"
   },
   "devDependencies": {
     "@playwright/test": "1.62.1",
     "@preact/preset-vite": "^2.10.6",
+    "@types/markdown-it": "^14.2.0",
     "@types/ws": "8.18.1",
     "@xterm/headless": "6.1.0-beta.291",
     "concurrently": "9.2.4",
