@@ -185,6 +185,11 @@ test("Rendered Markdown keeps feedback outside the source @pr", async ({ page, s
   await selectPassage();
   await page.getByRole("button", { name: "Add comment" }).click();
   await expect(page.locator(".markdown-comment")).toHaveCount(2);
+  await writeFile(file, external + "\ntomorrow\n");
+  await page.getByRole("button", { name: "Refresh review" }).click();
+  await expect(article.locator("p").last()).toHaveText("tomorrow");
+  await page.getByRole("button", { name: "Show passage" }).first().click();
+  await expect(page.getByRole("alert")).toHaveText("This passage changed or appears more than once in the current revision.");
   await writeFile(file, external.replace("tomorrow", "Friday"));
   await page.reload();
   await sidebar.openTerminal(terminal.name);
