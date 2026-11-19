@@ -87,6 +87,7 @@ const SESSION_COOKIE: &str = "term_server_session";
 #[derive(Clone)]
 pub struct AppState {
     pub auth: AuthService,
+    pub review_directory: PathBuf,
     pub workspace: WorkspaceBackend,
     #[cfg(unix)]
     pub terminal_control: Arc<TerminalControlService>,
@@ -1651,6 +1652,48 @@ fn content_disposition(kind: &str, name: &str) -> Result<HeaderValue, ApiError> 
     .map_err(|_| ApiError::Internal)
 }
 
+async fn markdown_review(
+    State(state): State<AppState>,
+    Query(query): Query<FilePathQuery>,
+    jar: CookieJar,
+) -> Result<Json<files::MarkdownReview>, ApiError> {
+    require_auth(&jar, &state)?;
+    let review = tokio::task::spawn_blocking(move || {
+        files::markdown_review(
+            &state.review_directory,
+            &query.path,
+            query.cwd.as_deref(),
+            None,
+        )
+    })
+    .await
+    .map_err(|_| ApiError::Internal)??;
+    Ok(Json(review))
+}
+
+async fn add_markdown_comment(
+    State(state): State<AppState>,
+    Query(query): Query<FilePathQuery>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+    Json(comment): Json<files::MarkdownComment>,
+) -> Result<Json<files::MarkdownReview>, ApiError> {
+    require_origin(&headers, &uri, &state)?;
+    require_auth(&jar, &state)?;
+    let review = tokio::task::spawn_blocking(move || {
+        files::markdown_review(
+            &state.review_directory,
+            &query.path,
+            query.cwd.as_deref(),
+            Some(comment),
+        )
+    })
+    .await
+    .map_err(|_| ApiError::Internal)??;
+    Ok(Json(review))
+}
+
 async fn save_file(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2297,6 +2340,10 @@ pub fn build_router(state: AppState, client_directory: Option<PathBuf>) -> Route
             "/artifacts/{session_id}/{artifact_id}",
             delete(remove_artifact),
         )
+        .route(
+            "/files/review",
+            get(markdown_review).post(add_markdown_comment),
+        )
         .route("/files/meta", get(file_metadata))
         .route("/files/probe", post(probe_files))
         .route("/files/list", get(list_files))
@@ -2421,6 +2468,7 @@ mod tests {
             .await
             .unwrap();
         AppState {
+            review_directory: directory.join("markdown-reviews"),
             auth,
             workspace,
             #[cfg(unix)]

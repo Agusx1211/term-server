@@ -88,8 +88,13 @@ describe("findSpacedFileCandidates", () => {
     expect(texts(findSpacedFileCandidates(lines("a.png b c.png")))).toEqual(["b c.png"]);
   });
 
+  it("probes Markdown filenames containing spaces", () => {
+    const candidates = findSpacedFileCandidates(lines("drafts/My Review.md"));
+    expect(candidates.map((candidate) => candidate.text)).toContain("drafts/My Review.md");
+  });
+
   it("ignores text with no previewable extension and single words", () => {
-    expect(findSpacedFileCandidates(lines("see my notes.txt and README.md"))).toEqual([]);
+    expect(findSpacedFileCandidates(lines("see my notes.txt and config.toml"))).toEqual([]);
     expect(findSpacedFileCandidates(lines("clip.mp4"))).toEqual([]);
   });
 

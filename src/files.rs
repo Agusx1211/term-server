@@ -11,7 +11,7 @@ use std::{
 
 use ignore::WalkBuilder;
 use percent_encoding::percent_decode_str;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use thiserror::Error;
@@ -36,6 +36,8 @@ const MAX_UPLOAD_NAME_ATTEMPTS: usize = 32;
 
 #[derive(Debug, Error)]
 pub enum FileError {
+    #[error("invalid Markdown comment or unsupported document")]
+    InvalidComment,
     #[error("file path is empty")]
     EmptyPath,
     #[error("remote file URIs are not supported")]
@@ -511,6 +513,82 @@ pub fn read_document(raw: &str, cwd: Option<&str>) -> Result<FileDocument, FileE
     })
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct MarkdownComment {
+    pub id: uuid::Uuid,
+    pub offset: u32,
+    pub version: String,
+    pub quote: String,
+    pub body: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ReviewFile {
+    document: String,
+    comments: Vec<MarkdownComment>,
+}
+
+#[derive(Serialize)]
+pub struct MarkdownReview {
+    path: PathBuf,
+    #[serde(flatten)]
+    file: ReviewFile,
+}
+
+pub fn markdown_review(
+    directory: &Path,
+    raw: &str,
+    cwd: Option<&str>,
+    comment: Option<MarkdownComment>,
+) -> Result<MarkdownReview, FileError> {
+    static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let document = read_document(raw, cwd)?;
+    let extension = Path::new(&document.name)
+        .extension()
+        .and_then(|ext| ext.to_str());
+    if !extension
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown"))
+    {
+        return Err(FileError::InvalidComment);
+    }
+    let path = directory.join(format!("{}.json", version(document.path.as_bytes())));
+    let _guard = WRITE_LOCK
+        .lock()
+        .map_err(|_| std::io::Error::other("review lock unavailable"))?;
+    let mut file: ReviewFile = match fs::File::open(&path) {
+        Ok(file) => serde_json::from_reader(file).map_err(std::io::Error::other)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ReviewFile {
+            document: document.path,
+            comments: Vec::new(),
+        },
+        Err(error) => return Err(error.into()),
+    };
+    if let Some(comment) = comment {
+        if file.comments.iter().any(|item| item.id == comment.id) {
+            return Ok(MarkdownReview { path, file });
+        }
+        if comment.version != document.version {
+            return Err(FileError::Conflict);
+        }
+        if comment.quote.trim().is_empty()
+            || comment.body.trim().is_empty()
+            || comment.quote.len() > 8192
+            || comment.body.len() > 8192
+            || file.comments.len() >= 500
+        {
+            return Err(FileError::InvalidComment);
+        }
+        file.comments.push(comment);
+        fs::create_dir_all(directory)?;
+        let mut temp = NamedTempFile::new_in(directory)?;
+        serde_json::to_writer_pretty(&mut temp, &file).map_err(std::io::Error::other)?;
+        temp.as_file().sync_all()?;
+        temp.persist(&path)
+            .map_err(|err| FileError::Io(err.error))?;
+    }
+    Ok(MarkdownReview { path, file })
+}
+
 pub fn file_asset(raw: &str, cwd: Option<&str>) -> Result<FileAsset, FileError> {
     let path = resolve_existing(raw, cwd)?;
     if !path.is_file() {
@@ -718,6 +796,56 @@ impl PendingUpload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn markdown_comments_are_isolated_retryable_and_revision_checked() {
+        let root = tempfile::tempdir().unwrap();
+        let draft = root.path().join("draft.md");
+        let other = root.path().join("other.md");
+        fs::write(&draft, "# draft").unwrap();
+        fs::write(&other, "# draft").unwrap();
+        let dir = root.path().join("reviews");
+        let draft = draft.to_str().unwrap();
+        let id = uuid::Uuid::new_v4();
+        let comment = |id| MarkdownComment {
+            id,
+            version: version(b"# draft"),
+            offset: 0,
+            quote: "draft".into(),
+            body: "Revise this".into(),
+        };
+        let first = markdown_review(&dir, draft, None, Some(comment(id))).unwrap();
+        assert_eq!(first.file.comments.len(), 1);
+        assert!(first.path.is_file());
+        assert_eq!(
+            markdown_review(&dir, draft, None, Some(comment(id)))
+                .unwrap()
+                .file
+                .comments
+                .len(),
+            1
+        );
+        assert!(
+            markdown_review(&dir, other.to_str().unwrap(), None, None)
+                .unwrap()
+                .file
+                .comments
+                .is_empty()
+        );
+        fs::write(draft, "new text").unwrap();
+        assert!(matches!(
+            markdown_review(&dir, draft, None, Some(comment(uuid::Uuid::new_v4()))),
+            Err(FileError::Conflict)
+        ));
+        assert_eq!(
+            markdown_review(&dir, draft, None, None)
+                .unwrap()
+                .file
+                .comments[0]
+                .quote,
+            "draft"
+        );
+    }
 
     #[test]
     fn resolves_percent_encoded_local_file_uri() {

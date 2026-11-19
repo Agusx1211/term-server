@@ -34,7 +34,7 @@ const previewableExtensions = [
   "png", "jpg", "jpeg", "gif", "webp", "bmp", "avif", "svg", "ico",
   "mp4", "m4v", "webm", "mov", "mkv", "ogv",
   "mp3", "wav", "ogg", "oga", "opus", "flac", "m4a", "aac", "weba",
-  "pdf",
+  "pdf", "md", "markdown",
 ];
 const previewableEndPattern = new RegExp(
   `^(.*\\.(?:${previewableExtensions.join("|")}))[)\\]}>"'\`.,;:!?]*$`,
