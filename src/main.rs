@@ -141,7 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "unknown".to_owned());
     let state = AppState {
-        review_directory: cli.data_dir.join("markdown-reviews"),
+        review_directory: std::path::absolute(&cli.data_dir)?.join("markdown-reviews"),
         auth: loaded_auth.service,
         workspace: workspace.clone(),
         #[cfg(unix)]

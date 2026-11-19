@@ -89,7 +89,7 @@ The unframed workspace capture used for the hero is also available at [docs/scre
 
 ## Everyday use
 
-Open a Markdown file from a terminal file link, the Files explorer, or an artifact tab. Select text in the rendered preview, type your feedback, and choose **Add comment**. **Show passage** returns to the selection on the same revision. **Edit source** opens the Markdown editor. Feedback stays in a separate JSON file. Choose **Paste path in …** to place its path in the named terminal, or **Copy review path** to share it elsewhere.
+Ctrl-click a Markdown path in terminal output (Cmd-click on macOS), or open the file from the Files explorer or an artifact tab. Select text in the rendered preview, type your feedback, and choose **Add comment**. **Show passage** returns to the selection on the same revision. **Edit source** opens the Markdown editor. Feedback stays in a separate JSON file. Choose **Paste path in …** to place its path in the named terminal, or **Copy review path** to share it elsewhere.
 
 Click the main `+` to open a shell in your home directory, or use a workspace row’s `+` to start in that directory. A terminal’s name follows its foreground process until you pin a custom name. Click a terminal to open it in the active pane; use its row actions to rename, split, or kill it directly, or drag it onto the left, right, top, or bottom of another pane to build a nested layout. Kill actions ask for confirmation by default; turn off **Settings → Terminal behavior → Confirm before killing terminals** to make them immediate.
 

@@ -523,10 +523,16 @@ pub struct MarkdownComment {
 }
 
 #[derive(Serialize, Deserialize)]
+struct ReviewFile {
+    document: String,
+    comments: Vec<MarkdownComment>,
+}
+
+#[derive(Serialize)]
 pub struct MarkdownReview {
-    pub path: PathBuf,
-    pub document: String,
-    pub comments: Vec<MarkdownComment>,
+    path: PathBuf,
+    #[serde(flatten)]
+    file: ReviewFile,
 }
 
 pub fn markdown_review(
@@ -549,18 +555,17 @@ pub fn markdown_review(
     let _guard = WRITE_LOCK
         .lock()
         .map_err(|_| std::io::Error::other("review lock unavailable"))?;
-    let mut review: MarkdownReview = match fs::File::open(&path) {
+    let mut file: ReviewFile = match fs::File::open(&path) {
         Ok(file) => serde_json::from_reader(file).map_err(std::io::Error::other)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => MarkdownReview {
-            path: path.clone(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ReviewFile {
             document: document.path,
             comments: Vec::new(),
         },
         Err(error) => return Err(error.into()),
     };
     if let Some(comment) = comment {
-        if review.comments.iter().any(|item| item.id == comment.id) {
-            return Ok(review);
+        if file.comments.iter().any(|item| item.id == comment.id) {
+            return Ok(MarkdownReview { path, file });
         }
         if comment.version != document.version {
             return Err(FileError::Conflict);
@@ -569,19 +574,19 @@ pub fn markdown_review(
             || comment.body.trim().is_empty()
             || comment.quote.len() > 8192
             || comment.body.len() > 8192
-            || review.comments.len() >= 500
+            || file.comments.len() >= 500
         {
             return Err(FileError::InvalidComment);
         }
-        review.comments.push(comment);
+        file.comments.push(comment);
         fs::create_dir_all(directory)?;
         let mut temp = NamedTempFile::new_in(directory)?;
-        serde_json::to_writer_pretty(&mut temp, &review).map_err(std::io::Error::other)?;
+        serde_json::to_writer_pretty(&mut temp, &file).map_err(std::io::Error::other)?;
         temp.as_file().sync_all()?;
         temp.persist(&path)
             .map_err(|err| FileError::Io(err.error))?;
     }
-    Ok(review)
+    Ok(MarkdownReview { path, file })
 }
 
 pub fn file_asset(raw: &str, cwd: Option<&str>) -> Result<FileAsset, FileError> {
@@ -810,11 +815,12 @@ mod tests {
             body: "Revise this".into(),
         };
         let first = markdown_review(&dir, draft, None, Some(comment(id))).unwrap();
-        assert_eq!(first.comments.len(), 1);
+        assert_eq!(first.file.comments.len(), 1);
         assert!(first.path.is_file());
         assert_eq!(
             markdown_review(&dir, draft, None, Some(comment(id)))
                 .unwrap()
+                .file
                 .comments
                 .len(),
             1
@@ -822,6 +828,7 @@ mod tests {
         assert!(
             markdown_review(&dir, other.to_str().unwrap(), None, None)
                 .unwrap()
+                .file
                 .comments
                 .is_empty()
         );
@@ -831,7 +838,11 @@ mod tests {
             Err(FileError::Conflict)
         ));
         assert_eq!(
-            markdown_review(&dir, draft, None, None).unwrap().comments[0].quote,
+            markdown_review(&dir, draft, None, None)
+                .unwrap()
+                .file
+                .comments[0]
+                .quote,
             "draft"
         );
     }
